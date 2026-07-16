@@ -662,9 +662,11 @@ async def system_health(user: Dict = Depends(get_current_user)):
     except Exception:
         mongo_ok = False
 
-    # HackRF live if we have a spectrum ingest within 10s
+    # HackRF live if we have a spectrum ingest within 30s (real hackrf_sweep passes
+    # over 2.4/5.8GHz bands routinely take several seconds each; 10s was too tight
+    # for genuine per-band sweep cadence and made a truly-live feed look "down").
     ing = _last_spectrum_ingest
-    hackrf_live = bool(ing and (datetime.now(timezone.utc) - ing["ts"]).total_seconds() < 10)
+    hackrf_live = bool(ing and (datetime.now(timezone.utc) - ing["ts"]).total_seconds() < 30)
 
     # SiK live if any detection with source SIK_RADIO seen in last 60s
     since = datetime.now(timezone.utc) - timedelta(seconds=60)
