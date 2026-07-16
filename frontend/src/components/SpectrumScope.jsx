@@ -5,8 +5,9 @@ import { AudioWaveform } from "lucide-react";
 // Time-domain oscilloscope trace, driven by real spectrum peak power.
 // Peak dBm -> carrier amplitude, so the sine visibly grows/shrinks with
 // real signal strength instead of being purely decorative.
-const CARRIER_HZ = 3; // visual cycles across the trace width, not an RF frequency
-const POINTS = 400;
+const CARRIER_HZ = 14; // visual cycles across the trace width, not an RF frequency
+const POINTS = 600;
+const PHASE_STEP = 0.55; // fast scroll, like a real scope's continuous sweep
 
 export default function SpectrumScope() {
   const canvasRef = useRef(null);
@@ -89,7 +90,7 @@ export default function SpectrumScope() {
       ctx.stroke();
       ctx.shadowBlur = 0;
 
-      phaseRef.current += 0.08;
+      phaseRef.current += PHASE_STEP;
       rafRef.current = requestAnimationFrame(draw);
     };
 

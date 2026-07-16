@@ -1,0 +1,17 @@
+[Unit]
+Description=CEMA cUAS - passive HackRF/SiK detection bridge (RX only)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=rajtech
+WorkingDirectory=/home/rajtech/joydipdemo/field-bridge
+ExecStart=/usr/bin/python3 -u hackrf_rx.py --console-url http://localhost:8001 --email operator@cema.mil --password cema@2026 --interval-s 3
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/rajtech/hackrf_rx.log
+StandardError=append:/home/rajtech/hackrf_rx.log
+
+[Install]
+WantedBy=multi-user.target
