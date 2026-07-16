@@ -3,6 +3,7 @@ import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { Waves, Upload, ChevronRight, CheckCircle2 } from "lucide-react";
 import SpectrumWaterfall from "@/components/SpectrumWaterfall";
+import SpectrumScope from "@/components/SpectrumScope";
 
 const STAGES = [
   { key: "CAPTURE",   what: "Wide-band RF acquisition via multi-channel SDR",       how: "IQ streams @ 25 MSPS across sub-GHz to 6 GHz" },
@@ -93,7 +94,10 @@ export default function Signals() {
         </div>
       </div>
 
-      <SpectrumWaterfall />
+      <div className="grid grid-cols-1 xl:grid-cols-2 gap-4">
+        <SpectrumWaterfall />
+        <SpectrumScope />
+      </div>
 
       <div className="grid grid-cols-1 lg:grid-cols-4 gap-0 tactical-border">
         <div className="lg:col-span-1 tactical-border-r" style={{ background: "var(--bg-surface)" }}>
