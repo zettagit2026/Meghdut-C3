@@ -588,7 +588,11 @@ async def deploy_payload(body: DeployPayloadBody,
         target_sys = detection.get("system_id", 1)
         target_comp = detection.get("component_id", 1)
 
-    frame = builder(target_sys, target_comp, 0) if not body.broadcast else builder(seq=0)
+    # target_sys/target_comp are already 0/0 for the broadcast case (set above),
+    # so always pass them through — calling builder(seq=0) alone previously
+    # raised TypeError for every payload except PL-010 (missing required
+    # positional target_sys), which FastAPI surfaced as an unhandled 500.
+    frame = builder(target_sys, target_comp, 0)
     pkt = {
         "id": str(uuid.uuid4()),
         "ts": datetime.now(timezone.utc).isoformat(),
