@@ -368,9 +368,11 @@ async def delete_detection(det_id: str, user: Dict = Depends(get_current_user)):
 async def spectrum_waterfall(bins: int = 96, rows: int = 24,
                              user: Dict = Depends(get_current_user)):
     # Serve real waterfall from the RF bridge if it has published data
-    # within the last 10 seconds; otherwise fall back to the simulator.
+    # within the last 30 seconds (matches /health's hackrf_live window —
+    # real hackrf_sweep cadence is slower than a 10s cutoff allowed for);
+    # otherwise fall back to the simulator.
     ing = _last_spectrum_ingest
-    if ing and (datetime.now(timezone.utc) - ing["ts"]).total_seconds() < 10:
+    if ing and (datetime.now(timezone.utc) - ing["ts"]).total_seconds() < 30:
         return {"bins": ing["bins"], "rows": ing["rows"], "source": "HACKRF"}
     return {"bins": bins,
             "rows": [generate_waterfall(bins) for _ in range(rows)],
