@@ -20,16 +20,30 @@ export default function SpectrumScope() {
 
     const pollAmplitude = async () => {
       try {
-        const { data } = await api.get("/spectrum/waterfall", { params: { bins: 96, rows: 1 } });
+        // Drive amplitude from CONFIRMED detections, not the raw last-ingested
+        // waterfall row. hackrf_rx.py cycles through SiK-915 / DJI-2.4G / DJI-5.8G
+        // and overwrites the same "last ingest" each time it posts a band, so a
+        // waterfall-based amplitude could show a flat trace right when the DJI's
+        // own 2.4GHz reading isn't the most recently ingested band, even though
+        // it's actively being detected. Detections persist per contact instead.
+        const { data } = await api.get("/detections");
         if (stopped) return;
-        const row = data.rows?.[0] || [];
-        const peak = row.length ? Math.max(...row) : -80;
-        const floor = row.length ? Math.min(...row) : -90;
-        // Normalize peak power to a 0.08-0.95 amplitude band so a hot signal
-        // visibly fills the scope and a quiet one stays a flat-ish line.
-        const norm = Math.max(0, Math.min(1, (peak - floor) / 40));
-        ampRef.current = 0.08 + norm * 0.87;
-        setMeta({ source: data.source, peakDbm: peak });
+        const now = Date.now();
+        const recent = (data || []).filter((d) => {
+          const age = now - new Date(d.last_seen).getTime();
+          return d.source === "HACKRF" || d.source === "SIK_RADIO" ? age < 15000 : false;
+        });
+        if (recent.length) {
+          const peak = Math.max(...recent.map((d) => d.rssi_dbm));
+          // Detections only exist above the per-band confirm threshold, so a
+          // fixed floor/span (rather than a per-poll min) keeps the scale stable.
+          const norm = Math.max(0, Math.min(1, (peak - -70) / 55));
+          ampRef.current = 0.1 + norm * 0.85;
+          setMeta({ source: "HACKRF", peakDbm: peak });
+        } else {
+          ampRef.current = 0.06;
+          setMeta({ source: "SIM", peakDbm: null });
+        }
       } catch { /* keep last amplitude, silent */ }
     };
 
