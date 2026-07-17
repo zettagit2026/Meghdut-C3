@@ -425,9 +425,41 @@ async def spectrum_ingest(body: SpectrumIngestBody,
     return {"ok": True, "accepted_rows": len(body.rows)}
 
 
+DETECTION_MERGE_WINDOW_S = 20  # re-ingests of the same real contact within this
+                               # window update the existing record instead of
+                               # spawning a new one — a continuously-running RX
+                               # bridge otherwise floods the log with dozens of
+                               # near-duplicate "new" detections per minute.
+
+
 @api.post("/detections/ingest")
 async def detection_ingest(body: DetectionIngestBody,
                            user: Dict = Depends(get_current_user)):
+    since = (datetime.now(timezone.utc) - timedelta(seconds=DETECTION_MERGE_WINDOW_S)).isoformat()
+    existing = await db.detections.find_one({
+        "source": body.source,
+        "model": body.model,
+        "protocol": body.protocol,
+        "status": "ACTIVE",
+        "last_seen": {"$gt": since},
+    })
+
+    if existing:
+        updates = {
+            "threat_level": body.threat_level,
+            "rssi_dbm": body.rssi_dbm,
+            "snr_db": body.snr_db,
+            "bearing_deg": body.bearing_deg,
+            "distance_m": body.distance_m,
+            "altitude_m": body.altitude_m,
+            "speed_ms": body.speed_ms,
+            "last_seen": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.detections.update_one({"id": existing["id"]}, {"$set": updates})
+        det = {**existing, **updates}
+        det.pop("_id", None)
+        return det
+
     det = new_detection()  # gives a sane skeleton with id/uuid + timestamps
     det.update({
         "callsign": body.callsign or det["callsign"],

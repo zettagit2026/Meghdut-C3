@@ -9,10 +9,27 @@ const CARRIER_HZ = 14; // visual cycles across the trace width, not an RF freque
 const POINTS = 600;
 const PHASE_STEP = 0.55; // fast scroll, like a real scope's continuous sweep
 
+// Calibrated against this deployment's actual measured range (2026-07-16/17
+// field tests): quiet/just-above-confirm-threshold sits around -70 to -65dBm,
+// strong contacts (DJI close-in, SiK near-field) have hit -6 to -22dBm.
+// Tightening the span to this real range (vs. the earlier generic -70/55)
+// makes weak-vs-strong contacts visually distinct instead of everything
+// pinning near max amplitude.
+const FLOOR_DBM = -72;
+const SPAN_DB = 68;
+const AMP_MIN = 0.05;
+const AMP_MAX = 0.95;
+
+// How fast the displayed amplitude chases the polled target. Higher = snappier,
+// more like a real analyzer's near-instant response; lower = smoother/slower.
+const AMP_LERP = 0.18;
+const NOISE_FLOOR_PX = 1.6; // subtle per-point "grass" jitter, like real RF noise on a scope
+
 export default function SpectrumScope() {
   const canvasRef = useRef(null);
   const phaseRef = useRef(0);
-  const ampRef = useRef(0.15);
+  const targetAmpRef = useRef(0.08);
+  const displayAmpRef = useRef(0.08);
   const [meta, setMeta] = useState({ source: "SIM", peakDbm: null });
   const rafRef = useRef(null);
 
@@ -32,17 +49,15 @@ export default function SpectrumScope() {
         const now = Date.now();
         const recent = (data || []).filter((d) => {
           const age = now - new Date(d.last_seen).getTime();
-          return d.source === "HACKRF" || d.source === "SIK_RADIO" ? age < 15000 : false;
+          return (d.source === "HACKRF" || d.source === "SIK_RADIO") && age < 10000;
         });
         if (recent.length) {
           const peak = Math.max(...recent.map((d) => d.rssi_dbm));
-          // Detections only exist above the per-band confirm threshold, so a
-          // fixed floor/span (rather than a per-poll min) keeps the scale stable.
-          const norm = Math.max(0, Math.min(1, (peak - -70) / 55));
-          ampRef.current = 0.1 + norm * 0.85;
+          const norm = Math.max(0, Math.min(1, (peak - FLOOR_DBM) / SPAN_DB));
+          targetAmpRef.current = AMP_MIN + norm * (AMP_MAX - AMP_MIN);
           setMeta({ source: "HACKRF", peakDbm: peak });
         } else {
-          ampRef.current = 0.06;
+          targetAmpRef.current = AMP_MIN;
           setMeta({ source: "SIM", peakDbm: null });
         }
       } catch { /* keep last amplitude, silent */ }
@@ -71,14 +86,18 @@ export default function SpectrumScope() {
       }
       ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
 
-      // the sine trace itself: single series, one hue, 2px line
-      const amp = ampRef.current;
+      // Chase the polled target smoothly frame-to-frame instead of snapping
+      // on each 1.5s poll, like a real analyzer's continuously-updating trace.
+      displayAmpRef.current += (targetAmpRef.current - displayAmpRef.current) * AMP_LERP;
+      const amp = displayAmpRef.current;
       const mid = h / 2;
+
       ctx.beginPath();
       for (let i = 0; i <= POINTS; i++) {
         const x = (i / POINTS) * w;
         const t = i / POINTS;
-        const y = mid - Math.sin(t * Math.PI * 2 * CARRIER_HZ + phaseRef.current) * amp * (mid - 6);
+        const jitter = (Math.random() - 0.5) * NOISE_FLOOR_PX; // real-RF "grass" texture
+        const y = mid - Math.sin(t * Math.PI * 2 * CARRIER_HZ + phaseRef.current) * amp * (mid - 6) + jitter;
         if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
       }
       // canvas can't read CSS custom properties directly; this matches --accent-info (#00F0FF)
@@ -95,7 +114,7 @@ export default function SpectrumScope() {
     };
 
     pollAmplitude();
-    const pollId = setInterval(pollAmplitude, 1500);
+    const pollId = setInterval(pollAmplitude, 1000);
     rafRef.current = requestAnimationFrame(draw);
     return () => {
       stopped = true;
