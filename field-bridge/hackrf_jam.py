@@ -25,7 +25,17 @@ import time
 import numpy as np
 
 MAX_DURATION_S = 10.0
-SAMPLE_RATE_HZ = 10_000_000  # 10 Msps
+SAMPLE_RATE_HZ = 20_000_000  # 20 Msps, matches /CEMA/drone-kit/dronev5/cema/cema_base.py's
+                              # proven RATE for these same bands.
+
+# Center frequencies from /CEMA/drone-kit/dronev5/cema/cema_{433,915,24,58}.py
+# (already field-validated on this rig), exposed here as --band shortcuts.
+BAND_PRESETS_MHZ = {
+    "433": 435.0,
+    "915": 915.0,
+    "2g4": 2450.0,
+    "5g8": 5800.0,
+}
 
 
 def check_authorized(confirmed_flag: bool) -> None:
@@ -51,8 +61,10 @@ def build_noise_iq(duration_s: float, bandwidth_khz: float, sample_rate: int = S
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--freq-mhz", type=float, required=True,
-                     help="Target center frequency, e.g. 915 (SiK), 2440 (DJI 2.4G), 5787 (DJI 5.8G)")
+    ap.add_argument("--band", choices=list(BAND_PRESETS_MHZ.keys()),
+                     help="Shortcut for a validated center freq: 433, 915, 2g4, 5g8")
+    ap.add_argument("--freq-mhz", type=float,
+                     help="Explicit center frequency in MHz (overrides --band if both given)")
     ap.add_argument("--bandwidth-khz", type=float, default=500)
     ap.add_argument("--duration-s", type=float, default=5)
     ap.add_argument("--tx-gain", type=int, default=20, help="HackRF TX VGA gain, 0-47")
@@ -60,6 +72,12 @@ def main() -> None:
     args = ap.parse_args()
 
     check_authorized(args.i_confirm_authorized_range)
+
+    freq_mhz = args.freq_mhz if args.freq_mhz is not None else BAND_PRESETS_MHZ.get(args.band)
+    if freq_mhz is None:
+        print("ERROR: pass --band {433,915,2g4,5g8} or an explicit --freq-mhz.", file=sys.stderr)
+        sys.exit(1)
+    args.freq_mhz = freq_mhz
 
     duration = min(args.duration_s, MAX_DURATION_S)
     if duration != args.duration_s:
