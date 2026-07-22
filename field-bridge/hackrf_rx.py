@@ -24,6 +24,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import requests
 
+from hackrf_device_lock import HackrfDeviceBusy, hackrf_device_lock
+
 BANDS_MHZ: List[Tuple[str, int, int, str]] = [
     ("SiK-915", 902, 928, "SiK/ISM 915MHz"),
     ("DJI-2G4", 2400, 2483, "OcuSync/Wi-Fi 2.4GHz"),
@@ -318,13 +320,32 @@ def _one_sweep(low_mhz: int, high_mhz: int, bin_width_khz: int) -> List[float]:
         "-1",  # one-shot
     ]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=SWEEP_TIMEOUT_S)
+        # Device-access coordination: hackrf_rx.py's own sweep loop (this
+        # function) and ml_classify_bridge.py's gate-check sweeps + IQ
+        # captures (iq_capture.py's capture_iq()) both drive the SAME single
+        # physical HackRF, which only supports one open handle at a time.
+        # Previously these two processes relied purely on timing separation
+        # (12s vs 3s interval) with no actual coordination -- a latent risk
+        # of a collision if both happened to try to open the device at once.
+        # This lock (see hackrf_device_lock.py) makes that mutual exclusion
+        # explicit and process-safe: only one of the two processes can be
+        # mid-subprocess-call against the device at a time; the other waits
+        # briefly (bounded) or skips this pass rather than colliding.
+        with hackrf_device_lock():
+            out = subprocess.run(cmd, capture_output=True, text=True, timeout=SWEEP_TIMEOUT_S)
     except FileNotFoundError:
         print("ERROR: hackrf_sweep not found. Install the `hackrf` package (brew/apt).", file=sys.stderr)
         sys.exit(1)
     except subprocess.TimeoutExpired:
         print(f"WARN: hackrf_sweep wedged on {low_mhz}-{high_mhz}MHz (device busy/USB hang) — "
               f"killed and skipping this pass.", file=sys.stderr)
+        return []
+    except HackrfDeviceBusy as e:
+        # The other HackRF-using process (hackrf_rx.py's sweep loop or
+        # ml_classify_bridge.py's gate-check/IQ-capture) is currently holding
+        # the device. Treat this exactly like a wedged/skipped pass rather
+        # than crashing -- the next scheduled sweep will simply try again.
+        print(f"WARN: hackrf_sweep skipped on {low_mhz}-{high_mhz}MHz — {e}", file=sys.stderr)
         return []
     finally:
         time.sleep(SETTLE_S)

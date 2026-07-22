@@ -127,6 +127,9 @@ import shutil
 import subprocess
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hackrf_device_lock import HackrfDeviceBusy, hackrf_device_lock  # shared device mutex, see that module's docstring
+
 
 def _hackrf_transfer_path() -> str:
     """Locate the hackrf_transfer binary, failing loudly if it's missing."""
@@ -275,7 +278,23 @@ def capture_iq(
         f"-> {num_samples} samples ({num_samples * 2} bytes, ci8)"
     )
 
-    result = subprocess.run(cmd, capture_output=False, check=False)
+    # Device-access coordination: this capture and hackrf_rx.py's/
+    # ml_classify_bridge.py's hackrf_sweep passes both drive the SAME single
+    # physical HackRF (only one open handle supported at a time). Previously
+    # there was no coordination between the two processes beyond timing
+    # separation -- a real risk of collision. This lock (see
+    # hackrf_device_lock.py) ensures only one subprocess call against the
+    # device runs at a time; if the sweep loop is mid-pass, this capture
+    # waits briefly (bounded) rather than colliding with it.
+    try:
+        with hackrf_device_lock():
+            result = subprocess.run(cmd, capture_output=False, check=False)
+    except HackrfDeviceBusy as e:
+        raise RuntimeError(
+            f"hackrf_transfer could not start: {e} Treat this capture as "
+            "failed/skipped for this cycle -- the device was busy with "
+            "another sweep/capture, not a hardware fault."
+        ) from e
     if result.returncode != 0:
         raise RuntimeError(
             f"hackrf_transfer exited with code {result.returncode}. "
