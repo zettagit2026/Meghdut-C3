@@ -1049,13 +1049,21 @@ async def broadcast_packet(body: MavlinkCraftBody, user: Dict = Depends(require_
     }
     await db.mav_packets.insert_one(pkt.copy())
     pkt.pop("_id", None)
-    await ws_manager.broadcast_json({"type": "packet", "packet": pkt})
+    # RACE FIX: register the pending ack BEFORE broadcasting the packet. A
+    # real, fast bridge (rf-bridge/mavlink_bridge.py) can write to serial and
+    # send its tx_ack back over the same WS in under a millisecond -- faster
+    # than this coroutine would otherwise get back around to inserting into
+    # _pending_acks after the broadcast. If that happens, _handle_tx_ack pops
+    # nothing (logs "unknown/expired"), the ack is silently dropped, and the
+    # request incorrectly rides out to TX_TIMEOUT even though the bridge did
+    # everything right. Registering first closes that window.
     _pending_acks[request_id] = {
         "ts": datetime.now(timezone.utc),
         "detection_ids": [],
         "spec_name": f"raw msgid={body.message_id}",
         "broadcast": True,
     }
+    await ws_manager.broadcast_json({"type": "packet", "packet": pkt})
     await log_event("MAVLINK",
                     f"Requested broadcast msgid={body.message_id} cmd={body.command} → "
                     f"sys={body.target_system} — awaiting bridge TX confirmation (request {request_id})",
@@ -1190,16 +1198,6 @@ async def deploy_payload(body: DeployPayloadBody,
     }
     await db.mav_packets.insert_one(pkt.copy())
     pkt.pop("_id", None)
-    await ws_manager.broadcast_json({"type": "packet", "packet": pkt})
-    await log_event(
-        "PAYLOAD",
-        f"Requested {spec.name} ({spec.severity}) on "
-        f"{'BROADCAST' if body.broadcast else detection.get('callsign','?')} "
-        f"— awaiting bridge TX confirmation (request {request_id})",
-        meta={"payload_id": spec.id, "packet_id": pkt["id"], "broadcast": body.broadcast,
-              "target_detection_id": body.target_detection_id, "request_id": request_id},
-        actor=user["email"],
-    )
 
     # Do NOT mark NEUTRALIZED here — this is the exact bug that caused the
     # earlier live-demo failure (frame broadcast over WS to whichever bridge
@@ -1207,6 +1205,17 @@ async def deploy_payload(body: DeployPayloadBody,
     # with zero confirmation the bridge wrote it to the real radio). Instead
     # park the detection(s) in AWAITING_ACK and register the pending ack so
     # _handle_tx_ack / _expire_pending_acks can resolve it for real.
+    #
+    # RACE FIX: all of this (DB updates + _pending_acks registration) MUST
+    # happen BEFORE ws_manager.broadcast_json() below. A real, fast bridge
+    # (rf-bridge/mavlink_bridge.py) can receive the packet, write it to
+    # serial, and send its tx_ack back over the same WS in under a
+    # millisecond — faster than this coroutine would otherwise get back
+    # around to inserting into _pending_acks after the broadcast. If the
+    # broadcast goes out first, _handle_tx_ack pops nothing for the ack
+    # (logs "unknown/expired"), the ack is silently dropped, and the
+    # request incorrectly rides out to TX_TIMEOUT even though the bridge
+    # did everything right and the bytes genuinely reached the radio.
     detection_ids: List[str] = []
     if detection is not None:
         detection_ids = [detection["id"]]
@@ -1235,6 +1244,17 @@ async def deploy_payload(body: DeployPayloadBody,
         "spec_name": spec.name,
         "broadcast": body.broadcast,
     }
+
+    await ws_manager.broadcast_json({"type": "packet", "packet": pkt})
+    await log_event(
+        "PAYLOAD",
+        f"Requested {spec.name} ({spec.severity}) on "
+        f"{'BROADCAST' if body.broadcast else detection.get('callsign','?')} "
+        f"— awaiting bridge TX confirmation (request {request_id})",
+        meta={"payload_id": spec.id, "packet_id": pkt["id"], "broadcast": body.broadcast,
+              "target_detection_id": body.target_detection_id, "request_id": request_id},
+        actor=user["email"],
+    )
 
     pkt["status"] = "AWAITING_ACK"
     return pkt
