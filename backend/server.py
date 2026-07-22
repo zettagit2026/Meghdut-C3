@@ -45,6 +45,7 @@ load_dotenv(ROOT_DIR / ".env")
 import asyncio
 import base64
 import binascii
+import importlib.util
 import json
 import logging
 import os
@@ -605,6 +606,40 @@ class WSManager:
 
 
 ws_manager = WSManager()
+
+# ---- TX-path health: WS upgrade capability -------------------------------
+# Root-cause signal for the real bug found this session: /api/ws/mavlink was
+# completely broken for a period because the `websockets` package (uvicorn's
+# WebSocket implementation) was missing from the environment. RX-side health
+# signals (mongo/hackrf/sik_radio) never caught this because RX bridges POST
+# over plain HTTP (/detections/ingest, /spectrum/ingest) and don't touch the
+# WS upgrade path at all — only a TX bridge (rf-bridge/mavlink_bridge.py,
+# field-bridge/jam_bridge.py) needs a working WS upgrade to receive
+# jam_request/packet messages and send tx_ack/jam_ack back.
+#
+# This is intentionally a narrow, honest proxy: "is the WS upgrade mechanism
+# even POSSIBLE" (the dependency uvicorn needs to speak the WebSocket
+# protocol is importable), NOT "is a bridge currently connected" (that's
+# ws_clients, already reported below) and NOT a live self-test of the route
+# (a synchronous health handler can't cleanly open a WS connection to itself
+# without its own client/event-loop gymnastics that would add more failure
+# surface than they remove). Computed once at import time since the
+# installed package set doesn't change while the process is running.
+WS_UPGRADE_CAPABLE = importlib.util.find_spec("websockets") is not None
+if not WS_UPGRADE_CAPABLE:
+    logger.error(
+        "websockets package is NOT importable — the /api/ws/mavlink WebSocket "
+        "route cannot accept ANY connection (this is the exact failure mode "
+        "found and fixed this session: no bridge, TX or RX, could ever "
+        "connect, regardless of ws_clients or whether one 'looks' connected)."
+    )
+
+# Recent-outcome window for the TX health tally below: long enough to reflect
+# the current engagement/session rather than the whole mission history, short
+# enough that a fixed problem (e.g. bridge reconnected) stops showing up
+# quickly. Independent of DETECTION_STALE_TIMEOUT_S (that's about detection
+# liveness, this is about recent TX ack outcomes).
+TX_HEALTH_RECENT_WINDOW_S = 900  # 15 min
 
 
 # =====================================================================
@@ -1413,14 +1448,64 @@ async def system_health(user: Dict = Depends(get_current_user)):
     active_targets = await db.detections.count_documents({"status": "ACTIVE"})
     total_packets = await db.mav_packets.count_documents({})
 
+    # ---- TX-path health signals -----------------------------------------
+    # These exist specifically to catch the TWO real TX failure modes this
+    # project has actually experienced, neither of which the RX-side signals
+    # above (mongo/hackrf/sik_radio/ws_clients>0 alone) would catch:
+    #   1. The original live-demo incident: a bridge silently not connected,
+    #      so a deploy command had nowhere to go (mitigated by the
+    #      AWAITING_ACK/tx_ack state machine — surfaced here as pending/
+    #      recent-outcome counts).
+    #   2. This session's real bug: /api/ws/mavlink fundamentally unable to
+    #      accept ANY connection because `websockets` wasn't installed — a
+    #      failure ws_clients alone can't distinguish from "no bridge happens
+    #      to be connected right now" (surfaced here as ws_upgrade_capable).
+
+    # Lazy-expire first so the counts below reflect true current state, same
+    # pattern as /detections and /detections/{id} above.
+    await _expire_pending_acks()
+    await _expire_pending_jam()
+
+    tx_pending_acks = len(_pending_acks)
+
+    recent_cutoff = (
+        datetime.now(timezone.utc) - timedelta(seconds=TX_HEALTH_RECENT_WINDOW_S)
+    ).isoformat()
+    tx_recent_neutralized = await db.detections.count_documents({
+        "status": "NEUTRALIZED", "last_seen": {"$gt": recent_cutoff},
+    })
+    tx_recent_timeout = await db.detections.count_documents({
+        "status": "TX_TIMEOUT", "last_seen": {"$gt": recent_cutoff},
+    })
+    tx_recent_failed = await db.detections.count_documents({
+        "status": "TX_FAILED", "last_seen": {"$gt": recent_cutoff},
+    })
+    tx_awaiting_ack = await db.detections.count_documents({"status": "AWAITING_ACK"})
+
+    # Heuristic flag: every recent terminal TX outcome was bad and at least
+    # one bad outcome actually happened — i.e. the bridge IS reachable enough
+    # to be attempted against, but every attempt in the recent window failed
+    # or timed out. This is exactly "looks connected but TX path is broken",
+    # distinct from ws_clients==0 (nothing connected at all). Deliberately
+    # conservative: says nothing when there's no recent TX activity to judge.
+    tx_recent_total = tx_recent_neutralized + tx_recent_timeout + tx_recent_failed
+    tx_path_degraded = tx_recent_total > 0 and tx_recent_neutralized == 0
+
     return {
         "backend": True,
         "mongo": mongo_ok,
         "hackrf": hackrf_live,
         "sik_radio": sik_count > 0,
         "ws_clients": len(ws_manager.clients),
+        "ws_upgrade_capable": WS_UPGRADE_CAPABLE,
         "active_targets": active_targets,
         "total_packets_tx": total_packets,
+        "tx_pending_acks": tx_pending_acks,
+        "tx_awaiting_ack_detections": tx_awaiting_ack,
+        "tx_recent_neutralized": tx_recent_neutralized,
+        "tx_recent_timeout": tx_recent_timeout,
+        "tx_recent_failed": tx_recent_failed,
+        "tx_path_degraded": tx_path_degraded,
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
 

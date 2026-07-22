@@ -227,19 +227,34 @@ if [ -z "$HEALTH_JSON" ]; then
 else
   if [ "$HAVE_JQ" -eq 1 ]; then
     ws_clients="$(echo "$HEALTH_JSON" | jq -r '.ws_clients // "null"')"
-    mongo_ok="$(echo "$HEALTH_JSON" | jq -r '.mongo // "null"')"
-    hackrf_live="$(echo "$HEALTH_JSON" | jq -r '.hackrf // "null"')"
-    sik_live="$(echo "$HEALTH_JSON" | jq -r '.sik_radio // "null"')"
+    ws_upgrade_capable="$(echo "$HEALTH_JSON" | jq -r 'if .ws_upgrade_capable == null then "null" else (.ws_upgrade_capable | tostring) end')"
+    mongo_ok="$(echo "$HEALTH_JSON" | jq -r 'if .mongo == null then "null" else (.mongo | tostring) end')"
+    hackrf_live="$(echo "$HEALTH_JSON" | jq -r 'if .hackrf == null then "null" else (.hackrf | tostring) end')"
+    sik_live="$(echo "$HEALTH_JSON" | jq -r 'if .sik_radio == null then "null" else (.sik_radio | tostring) end')"
     active_targets="$(echo "$HEALTH_JSON" | jq -r '.active_targets // "null"')"
+    tx_pending_acks="$(echo "$HEALTH_JSON" | jq -r '.tx_pending_acks // "null"')"
+    tx_awaiting_ack_detections="$(echo "$HEALTH_JSON" | jq -r '.tx_awaiting_ack_detections // "null"')"
+    tx_recent_timeout="$(echo "$HEALTH_JSON" | jq -r '.tx_recent_timeout // "null"')"
+    tx_recent_failed="$(echo "$HEALTH_JSON" | jq -r '.tx_recent_failed // "null"')"
+    tx_recent_neutralized="$(echo "$HEALTH_JSON" | jq -r '.tx_recent_neutralized // "null"')"
+    tx_path_degraded="$(echo "$HEALTH_JSON" | jq -r 'if .tx_path_degraded == null then "null" else (.tx_path_degraded | tostring) end')"
   else
     ws_clients="$(echo "$HEALTH_JSON" | grep -o '"ws_clients"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')"
+    ws_upgrade_capable="$(echo "$HEALTH_JSON" | grep -o '"ws_upgrade_capable"[[:space:]]*:[[:space:]]*[a-z]*' | grep -o '[a-z]*$')"
     mongo_ok="$(echo "$HEALTH_JSON" | grep -o '"mongo"[[:space:]]*:[[:space:]]*[a-z]*' | grep -o '[a-z]*$')"
     hackrf_live="$(echo "$HEALTH_JSON" | grep -o '"hackrf"[[:space:]]*:[[:space:]]*[a-z]*' | grep -o '[a-z]*$')"
     sik_live="$(echo "$HEALTH_JSON" | grep -o '"sik_radio"[[:space:]]*:[[:space:]]*[a-z]*' | grep -o '[a-z]*$')"
     active_targets="?"
+    tx_pending_acks="$(echo "$HEALTH_JSON" | grep -o '"tx_pending_acks"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')"
+    tx_awaiting_ack_detections="$(echo "$HEALTH_JSON" | grep -o '"tx_awaiting_ack_detections"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')"
+    tx_recent_timeout="$(echo "$HEALTH_JSON" | grep -o '"tx_recent_timeout"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')"
+    tx_recent_failed="$(echo "$HEALTH_JSON" | grep -o '"tx_recent_failed"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')"
+    tx_recent_neutralized="$(echo "$HEALTH_JSON" | grep -o '"tx_recent_neutralized"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$')"
+    tx_path_degraded="$(echo "$HEALTH_JSON" | grep -o '"tx_path_degraded"[[:space:]]*:[[:space:]]*[a-z]*' | grep -o '[a-z]*$')"
   fi
 
   echo "  Backend health payload: mongo=$mongo_ok  hackrf=$hackrf_live  sik_radio=$sik_live  ws_clients=$ws_clients  active_targets=$active_targets"
+  echo "  TX-path health: ws_upgrade_capable=$ws_upgrade_capable  tx_pending_acks=$tx_pending_acks  tx_awaiting_ack_detections=$tx_awaiting_ack_detections  tx_recent(neutralized=$tx_recent_neutralized timeout=$tx_recent_timeout failed=$tx_recent_failed)  tx_path_degraded=$tx_path_degraded"
 
   if [ "$mongo_ok" = "true" ]; then
     pass "Mongo ping OK (per /api/health)."
@@ -253,6 +268,22 @@ else
     fail "ws_clients=0 (or unreported) — NO bridge/frontend is connected to the WebSocket bus. This is the exact silent-failure condition from the original incident: a deploy command would appear to succeed but nothing downstream would receive it. Do NOT proceed with a live demo until a bridge/frontend client is confirmed connected."
   fi
 
+  # *** critical signal, added after this session's real incident ***: even
+  # with ws_clients==0 above being a WARN/FAIL-worthy state on its own, that
+  # signal alone cannot distinguish "no bridge happens to be connected right
+  # now" from "the WS endpoint is fundamentally broken and NOTHING could ever
+  # connect" — which is exactly what a missing `websockets` dependency caused
+  # this session. ws_upgrade_capable is a real, checkable proxy for the
+  # latter: it is FALSE only when the WS mechanism itself is unusable,
+  # regardless of whether any bridge happens to be connected right now.
+  if [ "$ws_upgrade_capable" = "true" ]; then
+    pass "ws_upgrade_capable=true — the WebSocket upgrade mechanism (websockets package) is available; /api/ws/mavlink can accept connections."
+  elif [ "$ws_upgrade_capable" = "false" ]; then
+    fail "ws_upgrade_capable=false — the websockets package is NOT importable in the backend. /api/ws/mavlink CANNOT accept ANY connection, regardless of ws_clients or whether a bridge 'looks' connected. This is the exact dependency bug found this session — rebuild/redeploy the backend with the websockets package installed before any live demo."
+  else
+    warn "ws_upgrade_capable not reported (unexpected — check backend version)."
+  fi
+
   if [ "$hackrf_live" = "true" ]; then
     pass "HackRF spectrum ingest is live (< 30s old)."
   else
@@ -263,6 +294,21 @@ else
     pass "SiK radio detection stream is live (< 60s old)."
   else
     warn "SiK radio detection stream not live (sik_radio=$sik_live). Confirm this is expected for today's demo config."
+  fi
+
+  # TX ack/outcome signals — catches a bridge that LOOKS connected (ws_clients
+  # > 0) but whose deploy/broadcast requests never actually resolve to a real
+  # confirmed NEUTRALIZED outcome (stuck bridge, serial write failing, etc).
+  if [ -n "$tx_pending_acks" ] && [ "$tx_pending_acks" != "null" ] && [ "$tx_pending_acks" -gt 0 ] 2>/dev/null; then
+    warn "tx_pending_acks=$tx_pending_acks — TX request(s) currently awaiting bridge confirmation. Expected to be transient (resolves within ACK_TIMEOUT_S); if this persists across repeated preflight runs, the bridge may be stuck."
+  else
+    pass "tx_pending_acks=0 — no TX requests stuck awaiting bridge confirmation."
+  fi
+
+  if [ "$tx_path_degraded" = "true" ]; then
+    fail "tx_path_degraded=true — every recent TX outcome (last 15 min) was TX_TIMEOUT/TX_FAILED with zero NEUTRALIZED confirmations (timeout=$tx_recent_timeout failed=$tx_recent_failed). A bridge may be connected (ws_clients) but the TX path itself is not actually working. Investigate before a live demo."
+  else
+    pass "tx_path_degraded=false — no evidence of a systematically failing TX path in the last 15 min (neutralized=$tx_recent_neutralized timeout=$tx_recent_timeout failed=$tx_recent_failed)."
   fi
 fi
 
