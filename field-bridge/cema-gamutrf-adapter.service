@@ -1,0 +1,61 @@
+[Unit]
+Description=CEMA cUAS - GamutRF MQTT inference ingest adapter (RX only, no transmission, ADDITIONAL parallel signal path alongside ml_classify_bridge.py/hackrf_rx.py -- NOT a replacement)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as cema-ml-classify-bridge.service /
+# cema-hackrf-rx.service. There is deliberately only ONE copy of this unit in
+# the repo; do not fork per-host copies with hardcoded paths/users baked in.
+# Keep host-specific values out of this file — they belong in the
+# EnvironmentFile below.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# Credentials and console URL are NOT hardcoded here. They are supplied via
+# EnvironmentFile, which must define at minimum:
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+# Optional overrides (see gamutrf_backend_adapter.py module docstring for
+# defaults and full explanation of each):
+#   GAMUTRF_MQTT_HOST=localhost
+#   GAMUTRF_MQTT_PORT=1883
+#   GAMUTRF_MQTT_TOPIC=gamutrf/inference
+#   GAMUTRF_INGEST_MIN_INTERVAL_S=2.0
+# Point this at either the project-root .env or a dedicated field-bridge/.env.
+# This file must be created per-deployment; it is not committed to the repo.
+# Restrict its permissions: chmod 600.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+ExecStart=/usr/bin/python3 -u gamutrf_backend_adapter.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/gamutrf_backend_adapter.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/gamutrf_backend_adapter.log
+
+[Install]
+WantedBy=multi-user.target
+
+# ---------------------------------------------------------------------------
+# NOT YET INSTALLED / ENABLED. This is a parallel build alongside the existing
+# GamutRF/HackRF-driver integration work; no `systemctl enable/start` has been
+# run for this unit. Requires:
+#   1. `pip install paho-mqtt` in the environment gamutrf_backend_adapter.py
+#      runs under (not yet confirmed installed anywhere in this deployment).
+#   2. A running GamutRF stack (docker compose -f orchestrator.yml -f
+#      torchserve.yml up -d) actually publishing to MQTT topic
+#      gamutrf/inference on the host/port configured above -- see the
+#      GamutRF sync/build/pipeline-standup work tracked separately for this
+#      integration for current status of that stack.
+#   3. Confirmation of GamutRF's real inference message field names against
+#      a live message from this deployment's actual GamutRF build -- the
+#      adapter's `_extract_fields()` is defensive/best-effort against
+#      several likely key-name variants documented in the adapter's module
+#      docstring, but has not yet been validated against a real captured
+#      message from this specific GamutRF build/version.
+# Pending all of the above being confirmed working end-to-end, do not enable
+# this unit.
+# ---------------------------------------------------------------------------

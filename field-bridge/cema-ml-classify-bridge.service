@@ -30,6 +30,11 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 # Restrict its permissions: chmod 600.
 EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
+# NOTE: this script requires torch (see gamutrf_infer.py) which is typically
+# installed in a dedicated venv, not system Python -- point this at that
+# venv's python3 (e.g. /home/<user>/ml_venv/bin/python3), NOT /usr/bin/python3,
+# or the service will crash-loop with ModuleNotFoundError: No module named 'torch'.
+# Adjust this path per-deployment.
 ExecStart=/usr/bin/python3 -u ml_classify_bridge.py
 Restart=always
 RestartSec=5
