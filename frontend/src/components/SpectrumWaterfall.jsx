@@ -31,7 +31,7 @@ function dbmToColor(v, min, max) {
 export default function SpectrumWaterfall() {
   const canvasRef = useRef(null);
   const historyRef = useRef([]); // array of rows (each an array of dBm bins), newest first
-  const [meta, setMeta] = useState({ bins: 0, source: "SIM" });
+  const [meta, setMeta] = useState({ bins: 0, source: "NONE" });
 
   useEffect(() => {
     let stopped = false;
@@ -92,7 +92,7 @@ export default function SpectrumWaterfall() {
             borderColor: meta.source === "HACKRF" ? "var(--accent-success)" : "var(--accent-warning)",
           }}
         >
-          {meta.source === "HACKRF" ? "● LIVE HACKRF" : "○ SIMULATED"}
+          {meta.source === "HACKRF" ? "● LIVE HACKRF" : "○ NO SIGNAL"}
         </span>
       </div>
       <div className="p-3">

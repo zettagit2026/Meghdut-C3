@@ -1,0 +1,10 @@
+# CEMA cUAS field-bridge — Python worker deps
+# Install with: pip install -r requirements.txt
+#
+# Shared across field-bridge/*.py. Versions match rf-bridge/requirements.txt
+# for consistency across the two bridge directories.
+
+requests==2.32.3
+numpy>=1.26.0
+pyserial==3.5
+pymavlink==2.4.41

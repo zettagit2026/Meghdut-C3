@@ -5,6 +5,16 @@
 #   docker compose up           -> subsequent runs
 #   docker compose down         -> stop
 #   docker compose down -v      -> stop AND wipe database
+#
+# SECURITY: this file intentionally ships with NO default secrets. Before
+# `docker compose up`, create a `.env` file next to this file (already
+# excluded by .gitignore — never commit it) defining at minimum:
+#   JWT_SECRET=<output of: openssl rand -hex 32>
+#   ADMIN_EMAIL=<real operator email>
+#   ADMIN_PASSWORD=<a strong, non-default password>
+#   CORS_ORIGINS=http://localhost:3000,http://<your-LAN-IP>:3000
+# The backend fails fast at startup if any of these are unset or match a
+# known placeholder/default value (see backend/server.py).
 
 services:
   mongo:
@@ -14,7 +24,9 @@ services:
     volumes:
       - cema_mongo_data:/data/db
     ports:
-      - "27017:27017"
+      # Bound to localhost only — this Mongo instance has no auth configured,
+      # so it must never be reachable from other hosts on a shared LAN.
+      - "127.0.0.1:27017:27017"
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 10s
@@ -32,10 +44,12 @@ services:
     environment:
       MONGO_URL: "mongodb://mongo:27017"
       DB_NAME: "cema_cuas_db"
-      CORS_ORIGINS: "*"
-      JWT_SECRET: "${JWT_SECRET:-change-me-1b5e594016718b935efbb2a63e3786eb46973054f45b4bc84d7b03ea5e0f35f8}"
-      ADMIN_EMAIL: "${ADMIN_EMAIL:-operator@cema.mil}"
-      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-cema@2026}"
+      # No defaults for these — they must come from your gitignored .env
+      # file. See the note at the top of this file.
+      CORS_ORIGINS: "${CORS_ORIGINS}"
+      JWT_SECRET: "${JWT_SECRET}"
+      ADMIN_EMAIL: "${ADMIN_EMAIL}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
     ports:
       - "8001:8001"
 

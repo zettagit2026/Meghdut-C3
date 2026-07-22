@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Radar, Plus, Skull, Activity, Signal, TrendingUp } from "lucide-react";
+import { Radar, Skull, Activity, Signal, TrendingUp } from "lucide-react";
 import SystemHealth from "@/components/SystemHealth";
 
 const THREAT_COLOR = {
@@ -13,14 +13,14 @@ const THREAT_COLOR = {
 
 function Waterfall() {
   const [rows, setRows] = useState([]);
-  const [source, setSource] = useState("SIM");
+  const [source, setSource] = useState("NONE");
   useEffect(() => {
     let id;
     const load = async () => {
       try {
         const { data } = await api.get("/spectrum/waterfall?bins=96&rows=24");
-        setRows(data.rows);
-        setSource(data.source || "SIM");
+        setRows(data.rows || []);
+        setSource(data.source || "NONE");
       } catch { /* silent */ }
     };
     load();
@@ -54,7 +54,7 @@ function Waterfall() {
               background: isReal ? "rgba(57,255,20,0.08)" : "rgba(255,214,10,0.06)",
             }}
           >
-            {isReal ? "● HACKRF LIVE" : "◌ SIM MODE"}
+            {isReal ? "● HACKRF LIVE" : "◌ NO SIGNAL"}
           </span>
         </div>
         <span className="font-mono text-[10px] text-slate-600 blink">● LIVE</span>
@@ -94,9 +94,27 @@ function StatTile({ label, value, sub, color = "var(--accent-info)", testid }) {
   );
 }
 
+// Small local relative-time formatter (no date lib in this project) so
+// "LAST SEEN" reads as "3s ago" / "2m ago" / "1h ago" and keeps ticking live.
+function formatRelativeTime(isoString, now) {
+  if (!isoString) return "—";
+  const then = new Date(isoString).getTime();
+  if (Number.isNaN(then)) return "—";
+  const diffSec = Math.max(0, Math.floor((now - then) / 1000));
+  if (diffSec < 5) return "just now";
+  if (diffSec < 60) return `${diffSec}s ago`;
+  const diffMin = Math.floor(diffSec / 60);
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.floor(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.floor(diffHr / 24);
+  return `${diffDay}d ago`;
+}
+
 export default function Dashboard() {
   const [detections, setDetections] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [now, setNow] = useState(() => Date.now());
 
   const load = async () => {
     try {
@@ -111,30 +129,26 @@ export default function Dashboard() {
 
   useEffect(() => {
     load();
-    const id = setInterval(load, 5000);
+    const id = setInterval(load, 60000);
     return () => clearInterval(id);
+  }, []);
+
+  // Ticks once a second purely to keep the "LAST SEEN" relative-time column
+  // live without needing to re-fetch detections.
+  useEffect(() => {
+    const tickId = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tickId);
   }, []);
 
   const active = detections.filter((d) => d.status === "ACTIVE");
   const swarmCount = new Set(active.filter((d) => d.swarm_id).map((d) => d.swarm_id)).size;
   const critical = active.filter((d) => d.threat_level === "CRITICAL").length;
   const neutralized = detections.filter((d) => d.status === "NEUTRALIZED").length;
-  // Any detection whose source is NOT the simulator counts as a live hardware feed.
-  const liveSources = new Set(
-    detections
-      .map((d) => d.source)
-      .filter((s) => s && s !== "SIM" && s !== "UPLOAD")
-  );
-
-  const simulate = async () => {
-    try {
-      await api.post("/detections/simulate");
-      toast.success("New contact detected");
-      load();
-    } catch (e) {
-      toast.error("Simulate failed", { description: formatApiError(e) });
-    }
-  };
+  // All detections now originate exclusively from real hardware ingest
+  // (HackRF / SiK radio bridges via POST /detections/ingest) — there is no
+  // longer any code path that injects a simulated contact, so every source
+  // present here is a live feed by construction.
+  const liveSources = new Set(detections.map((d) => d.source).filter(Boolean));
 
   return (
     <div className="space-y-6">
@@ -160,14 +174,6 @@ export default function Dashboard() {
             Tactical Overview
           </h1>
         </div>
-        <button
-          data-testid="simulate-detection-btn"
-          onClick={simulate}
-          title="Inject a fake contact for testing. Real detections come from HackRF / SiK radio."
-          className="flex items-center gap-2 px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest hover:bg-white hover:text-black transition-colors scanline-btn"
-        >
-          <Plus size={14} strokeWidth={1.5} /> INJECT SIM
-        </button>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-0 tactical-border">
@@ -196,7 +202,9 @@ export default function Dashboard() {
                 <Activity size={14} strokeWidth={1.5} style={{ color: "var(--accent-info)" }} />
                 <span className="font-mono text-xs uppercase tracking-widest">Active Contacts</span>
               </div>
-              <span className="font-mono text-[10px] text-slate-500">{active.length} tracked</span>
+              <div className="flex items-center gap-3">
+                <span className="font-mono text-[10px] text-slate-500">{active.length} tracked</span>
+              </div>
             </div>
             <div className="overflow-x-auto">
               <table className="w-full text-xs" data-testid="detections-table">
@@ -210,30 +218,27 @@ export default function Dashboard() {
                     <th className="text-right p-2">FREQ (GHz)</th>
                     <th className="text-right p-2">RSSI</th>
                     <th className="text-right p-2">DIST (m)</th>
+                    <th className="text-left p-2">LAST SEEN</th>
                     <th className="text-left p-2">CEMA</th>
                     <th className="text-left p-2">KC</th>
                   </tr>
                 </thead>
                 <tbody className="font-mono">
                   {loading && (
-                    <tr><td colSpan={10} className="p-4 text-center text-slate-500">acquiring<span className="term-caret" /></td></tr>
+                    <tr><td colSpan={11} className="p-4 text-center text-slate-500">acquiring<span className="term-caret" /></td></tr>
                   )}
                   {!loading && detections.length === 0 && (
-                    <tr><td colSpan={10} className="p-4 text-center text-slate-500">No contacts. Trigger INJECT SIM or start the RF bridge.</td></tr>
+                    <tr><td colSpan={11} className="p-4 text-center text-slate-500">No contacts. Start the RF bridge to begin detecting.</td></tr>
                   )}
                   {detections.map((d) => {
-                    const src = d.source || "SIM";
-                    const isLive = src === "HACKRF" || src === "SIK_RADIO";
-                    const srcColor = isLive ? "var(--accent-success)"
-                                     : src === "UPLOAD" ? "var(--accent-warning)"
-                                     : "var(--text-muted)";
+                    const src = d.source || "UNKNOWN";
                     return (
                       <tr key={d.id} data-testid={`row-${d.id}`}
                           className="tactical-border-b hover:bg-[#0F1626] transition-colors">
                         <td className="p-2">
                           <span data-testid={`src-${d.id}`}
                                 className="px-1.5 py-0.5 tactical-border font-bold text-[9px]"
-                                style={{ color: srcColor, borderColor: srcColor }}>
+                                style={{ color: "var(--accent-success)", borderColor: "var(--accent-success)" }}>
                             {src}
                           </span>
                         </td>
@@ -248,7 +253,18 @@ export default function Dashboard() {
                         </td>
                         <td className="p-2 text-right text-slate-300">{d.center_freq_ghz}</td>
                         <td className="p-2 text-right text-slate-300">{d.rssi_dbm}</td>
-                        <td className="p-2 text-right text-slate-300">{d.distance_m}</td>
+                        <td className="p-2 text-right text-slate-300">
+                          {d.distance_estimated === true ? (
+                            <span title="RSSI-based estimate, not a precise measurement">
+                              ~{d.distance_m}
+                            </span>
+                          ) : (
+                            d.distance_m
+                          )}
+                        </td>
+                        <td className="p-2 text-slate-400" title={d.last_seen || ""}>
+                          {formatRelativeTime(d.last_seen, now)}
+                        </td>
                         <td className="p-2 text-[10px]" style={{ color: "var(--accent-info)" }}>{d.cema_stage}</td>
                         <td className="p-2 text-[10px]"
                             style={{ color: d.status === "NEUTRALIZED" ? "var(--accent-critical)" : "var(--accent-success)" }}>

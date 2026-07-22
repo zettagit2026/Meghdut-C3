@@ -68,6 +68,10 @@ def main() -> None:
     ap.add_argument("--bandwidth-khz", type=float, default=500)
     ap.add_argument("--duration-s", type=float, default=5)
     ap.add_argument("--tx-gain", type=int, default=20, help="HackRF TX VGA gain, 0-47")
+    ap.add_argument("--continuous", action="store_true",
+                     help="Keep transmitting repeated bursts until you press Ctrl+C. "
+                          "Still requires the one-time TRANSMIT confirmation before starting; "
+                          "you retain full manual control to stop it at any moment.")
     ap.add_argument("--i-confirm-authorized-range", action="store_true")
     args = ap.parse_args()
 
@@ -83,15 +87,18 @@ def main() -> None:
     if duration != args.duration_s:
         print(f"Duration capped at {MAX_DURATION_S}s per invocation (requested {args.duration_s}s).")
 
-    print(f"Preparing {duration}s noise burst @ {args.freq_mhz} MHz, "
+    mode = "CONTINUOUS (until you press Ctrl+C)" if args.continuous else f"{duration}s burst"
+    print(f"Preparing {mode} @ {args.freq_mhz} MHz, "
           f"~{args.bandwidth_khz}kHz bandwidth, TX gain {args.tx_gain}.")
     iq_bytes = build_noise_iq(duration, args.bandwidth_khz)
 
     with tempfile.NamedTemporaryFile(suffix=".iq") as f:
         f.write(iq_bytes)
         f.flush()
-        confirm = input(f"About to TRANSMIT at {args.freq_mhz} MHz for {duration}s. "
-                         f"Type 'TRANSMIT' to proceed: ")
+        prompt = (f"About to TRANSMIT CONTINUOUSLY at {args.freq_mhz} MHz until you press Ctrl+C. "
+                  f"Type 'TRANSMIT' to proceed: " if args.continuous else
+                  f"About to TRANSMIT at {args.freq_mhz} MHz for {duration}s. Type 'TRANSMIT' to proceed: ")
+        confirm = input(prompt)
         if confirm.strip() != "TRANSMIT":
             print("Aborted — no transmission sent.")
             return
@@ -104,16 +111,35 @@ def main() -> None:
             "-a", "1",
         ]
         print("Running:", " ".join(cmd))
-        try:
-            subprocess.run(cmd, timeout=duration + 5, check=True)
-        except FileNotFoundError:
-            print("ERROR: hackrf_transfer not found. Install the `hackrf` package.", file=sys.stderr)
-            sys.exit(1)
-        except subprocess.CalledProcessError as e:
-            print(f"hackrf_transfer exited with error: {e}", file=sys.stderr)
-            sys.exit(1)
-        except subprocess.TimeoutExpired:
-            pass  # expected — the burst is bounded, this just means it ran the full duration
+        if args.continuous:
+            print("TRANSMITTING CONTINUOUSLY — press Ctrl+C at any time to stop.")
+            total_bursts = 0
+            try:
+                while True:
+                    try:
+                        subprocess.run(cmd, timeout=duration + 5, check=True)
+                    except subprocess.TimeoutExpired:
+                        pass  # expected per-burst boundary, loop continues
+                    total_bursts += 1
+                    print(f"  ...burst #{total_bursts} complete, continuing "
+                          f"({total_bursts * duration:.0f}s transmitted so far)")
+            except KeyboardInterrupt:
+                print(f"\nStopped by operator after {total_bursts} bursts "
+                      f"(~{total_bursts * duration:.0f}s total transmission).")
+            except FileNotFoundError:
+                print("ERROR: hackrf_transfer not found. Install the `hackrf` package.", file=sys.stderr)
+                sys.exit(1)
+        else:
+            try:
+                subprocess.run(cmd, timeout=duration + 5, check=True)
+            except FileNotFoundError:
+                print("ERROR: hackrf_transfer not found. Install the `hackrf` package.", file=sys.stderr)
+                sys.exit(1)
+            except subprocess.CalledProcessError as e:
+                print(f"hackrf_transfer exited with error: {e}", file=sys.stderr)
+                sys.exit(1)
+            except subprocess.TimeoutExpired:
+                pass  # expected — the burst is bounded, this just means it ran the full duration
 
     print("Transmission window complete.")
 

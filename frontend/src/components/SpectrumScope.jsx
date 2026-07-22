@@ -30,7 +30,7 @@ export default function SpectrumScope() {
   const phaseRef = useRef(0);
   const targetAmpRef = useRef(0.08);
   const displayAmpRef = useRef(0.08);
-  const [meta, setMeta] = useState({ source: "SIM", peakDbm: null });
+  const [meta, setMeta] = useState({ source: "NONE", peakDbm: null });
   const rafRef = useRef(null);
 
   useEffect(() => {
@@ -58,7 +58,7 @@ export default function SpectrumScope() {
           setMeta({ source: "HACKRF", peakDbm: peak });
         } else {
           targetAmpRef.current = AMP_MIN;
-          setMeta({ source: "SIM", peakDbm: null });
+          setMeta({ source: "NONE", peakDbm: null });
         }
       } catch { /* keep last amplitude, silent */ }
     };
@@ -137,7 +137,7 @@ export default function SpectrumScope() {
             borderColor: meta.source === "HACKRF" ? "var(--accent-success)" : "var(--accent-warning)",
           }}
         >
-          {meta.source === "HACKRF" ? "● LIVE HACKRF" : "○ SIMULATED"}
+          {meta.source === "HACKRF" ? "● LIVE HACKRF" : "○ NO SIGNAL"}
           {meta.peakDbm != null && <span className="ml-2 text-slate-400">{meta.peakDbm.toFixed(1)} dBm pk</span>}
         </span>
       </div>

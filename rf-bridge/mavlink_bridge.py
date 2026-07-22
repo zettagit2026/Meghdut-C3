@@ -48,6 +48,13 @@ class MavlinkBridge:
         self.ws: Optional[websocket.WebSocketApp] = None
         self.stop_flag = threading.Event()
         self.known_systems: Dict[int, float] = {}  # sysid → last_seen_ts
+        # SECURITY #3: server-side "abort"/"resume" WS messages are now
+        # authoritative here too. Previously this bridge had no handling at
+        # all for an "abort" message type — /emergency/abort only broadcast a
+        # cooperative notice that nothing here ever acted on, so frames kept
+        # being forwarded to the radio after an "emergency abort". Now we stop
+        # forwarding to serial until an explicit "resume" is received.
+        self.tx_halted = False
 
     # ---- serial ----------------------------------------------------------
     def open_serial(self) -> None:
@@ -83,8 +90,31 @@ class MavlinkBridge:
                 data = json.loads(msg)
             except Exception:
                 return
-            if data.get("type") != "packet":
+
+            mtype = data.get("type")
+            if mtype == "abort":
+                if not self.tx_halted:
+                    log.warning(
+                        "EMERGENCY ABORT received from server (operator=%s) — "
+                        "halting all TX to serial until resume.",
+                        data.get("operator"),
+                    )
+                self.tx_halted = True
                 return
+            if mtype == "resume":
+                log.warning(
+                    "RESUME received from server (operator=%s) — TX to serial re-enabled.",
+                    data.get("operator"),
+                )
+                self.tx_halted = False
+                return
+            if mtype != "packet":
+                return
+
+            if self.tx_halted:
+                log.warning("TX suppressed: EMERGENCY ABORT in effect — dropping frame, not forwarding to serial.")
+                return
+
             pkt = data.get("packet", {})
             hex_str = pkt.get("hex")
             if not hex_str:

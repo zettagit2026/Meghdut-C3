@@ -39,7 +39,9 @@ pip install pyserial numpy requests
 
 ```bash
 # 1. Passive detection — safe anywhere, run this first
-python3 hackrf_rx.py --console-url http://<console-host>:8001 --email operator@cema.mil --password cema@2026
+# Credentials/console URL can be passed as flags, or (preferred, especially under
+# systemd) via env vars CEMA_API_URL / CEMA_EMAIL / CEMA_PASSWORD.
+python3 hackrf_rx.py --console-url http://<console-host>:8001 --email operator@meghaduta.mil --password <current-admin-password>
 
 # 2. Real MAVLink injection over SiK — only at STEAG, paired craft only
 export CEMA_AUTHORIZED_RANGE=1
@@ -52,6 +54,40 @@ export CEMA_AUTHORIZED_RANGE=1
 python3 hackrf_jam.py --freq-mhz 915 --bandwidth-khz 500 --duration-s 5 \
   --i-confirm-authorized-range
 ```
+
+## Running `hackrf_rx.py` as a systemd service (RX only)
+
+`cema-hackrf-rx.service` is the single canonical unit for the passive RX
+bridge. It does **not** hardcode credentials — it loads them from an
+`EnvironmentFile` at deploy time. Before enabling it on any host:
+
+1. Edit the unit's `User=`, `WorkingDirectory=`, and `EnvironmentFile=` paths
+   to match that host (same convention as `rf-bridge/cema-rf-bridge.service`
+   — the checked-in file is a template, not a working per-host config).
+2. Create the env file referenced by `EnvironmentFile=` (it is intentionally
+   **not** committed to the repo) containing at minimum:
+   ```
+   CEMA_API_URL=http://localhost:8001
+   CEMA_EMAIL=operator@meghaduta.mil
+   CEMA_PASSWORD=<this host's current admin password from its docker-compose .env>
+   ```
+   `chmod 600` that file.
+3. Only then:
+   ```bash
+   sudo cp cema-hackrf-rx.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now cema-hackrf-rx.service
+   ```
+
+There is deliberately only one RX unit file in the repo now — the previous
+`cema-hackrf-rx-backup.service` (which duplicated this file with different
+hardcoded user/path and the same stale plaintext credentials) has been
+removed. Do not recreate per-host copies; parameterize the one unit instead.
+
+This section covers the RX-only detection bridge exclusively. It does not
+apply to `rf-bridge/cema-rf-bridge.service`, which also runs the MAVLink TX
+bridge and is out of scope here — do not enable/start that unit as part of
+this change.
 
 ## Frequency notes for tomorrow's demo
 

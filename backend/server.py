@@ -2,11 +2,20 @@
 
 Endpoints (all under /api):
   auth: /login /logout /me
-  detections: /detections /detections/simulate /detections/upload /detections/{id}/cema-advance /detections/{id}/killchain-advance /detections/{id}
+  detections: /detections /detections/ingest /detections/{id}/cema-advance /detections/{id}/killchain-advance /detections/{id}/authorize-target /detections/{id}
   spectrum: /spectrum/waterfall
-  mavlink: /mavlink/craft /mavlink/broadcast /mavlink/packets  (ws /ws/mavlink)
-  payloads: /payloads /payloads/deploy
+  mavlink: /mavlink/craft (preview-only) /mavlink/broadcast (commander-only, transmits) /mavlink/packets  (ws /ws/mavlink)
+  payloads: /payloads /payloads/deploy (commander-only + arm-token for CRITICAL/broadcast)
+  arm: /arm (commander-only, issues a 60s single-use arm token)
+  emergency: /emergency/abort (any operator) /emergency/resume (commander-only)
   logs:  /logs
+
+RBAC: two roles, "operator" and "commander". Anything that transmits a
+kinetic/broadcast command (/payloads/deploy, /mavlink/broadcast) requires
+"commander". CRITICAL-severity payload deploys and any broadcast
+(target_system=0) additionally require a fresh arm token from POST /arm.
+Targeting a specific detection requires it be explicitly authorized via
+POST /detections/{id}/authorize-target (friendly-fire interlock).
 """
 from __future__ import annotations
 
@@ -31,10 +40,8 @@ from fastapi import (
     APIRouter,
     Depends,
     FastAPI,
-    File,
     HTTPException,
     Request,
-    UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -52,21 +59,51 @@ from mavlink_codec import (
     CRC_EXTRA,
 )
 from payload_library import PAYLOAD_CATALOG, PAYLOAD_BUILDERS, get_payload_by_id
-from simulator import (
+from detection_state import (
     CEMA_STAGES,
     KILL_CHAIN,
     advance_cema,
     advance_kill_chain,
-    generate_waterfall,
-    new_detection,
-    parse_iq_file_stub,
 )
 
 # ---------- Config ----------
-JWT_SECRET = os.environ["JWT_SECRET"]
+# SECURITY: no hardcoded/default secrets. Operators MUST supply real values via
+# the environment (e.g. a `.env` file next to docker-compose.yml — already
+# excluded by .gitignore; never commit it). We fail fast at import time rather
+# than silently booting with a known-weak or placeholder credential.
+_PLACEHOLDER_SECRETS = {
+    "", "change-me", "changeme", "change-this", "cema@2026", "password",
+    "secret", "admin", "admin123",
+}
+
+
+def _require_env(name: str) -> str:
+    val = os.environ.get(name, "")
+    if not val:
+        raise RuntimeError(
+            f"{name} is not set. Set it via the environment (e.g. a gitignored "
+            f".env file) before starting the backend — no default is provided "
+            f"for safety-critical deployments."
+        )
+    return val
+
+
+JWT_SECRET = _require_env("JWT_SECRET")
+if JWT_SECRET.lower() in _PLACEHOLDER_SECRETS or JWT_SECRET.lower().startswith("change-me"):
+    raise RuntimeError(
+        "JWT_SECRET matches a known placeholder/default value. Generate a real "
+        "secret (e.g. `openssl rand -hex 32`) and set it via a gitignored .env file."
+    )
 JWT_ALGO = "HS256"
-ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "operator@cema.mil")
-ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "cema@2026")
+
+ADMIN_EMAIL = _require_env("ADMIN_EMAIL")
+
+ADMIN_PASSWORD = _require_env("ADMIN_PASSWORD")
+if ADMIN_PASSWORD.lower() in _PLACEHOLDER_SECRETS:
+    raise RuntimeError(
+        "ADMIN_PASSWORD matches a known placeholder/default value ('cema@2026', "
+        "'change-me', etc). Set a strong password via a gitignored .env file."
+    )
 
 # ---------- Mongo ----------
 mongo_url = os.environ["MONGO_URL"]
@@ -125,6 +162,62 @@ async def get_current_user(
     return user
 
 
+# ---- RBAC ----
+# Two roles: "operator" (can observe, craft/preview, request arming) and
+# "commander" (elevated — required for anything that transmits a kinetic /
+# broadcast-takedown command). This is intentionally simple (single elevated
+# role) rather than a full permission matrix — sufficient for this eval-stage
+# fix per the review's scope.
+async def require_commander(user: Dict = Depends(get_current_user)) -> Dict:
+    if user.get("role") != "commander":
+        raise HTTPException(403, "Commander role required for this action")
+    return user
+
+
+# ---- Arm-token (second factor for CRITICAL-severity / broadcast actions) ----
+# A short-lived, single-use, server-side token. A commander must explicitly
+# POST /arm to obtain one; it must then be presented on the very next
+# CRITICAL-severity payload deploy or broadcast (target_system=0) request
+# within ARM_TOKEN_TTL_S seconds. This is the "second factor" that stops a
+# single click/request from ever being enough to trigger FORCE_DISARM,
+# FLIGHT_TERMINATION, or a swarm-wide PL-010 broadcast takedown.
+ARM_TOKEN_TTL_S = 60
+_arm_tokens: Dict[str, datetime] = {}
+
+
+def _issue_arm_token() -> Dict[str, Any]:
+    token = str(uuid.uuid4())
+    _arm_tokens[token] = datetime.now(timezone.utc) + timedelta(seconds=ARM_TOKEN_TTL_S)
+    return {"arm_token": token, "expires_in_s": ARM_TOKEN_TTL_S}
+
+
+def _consume_arm_token(token: Optional[str]) -> None:
+    """Validate and burn a single-use arm token. Raises 403 if missing/expired/unknown."""
+    if not token:
+        raise HTTPException(
+            403,
+            "Arm token required: this action needs a fresh POST /api/arm "
+            "(commander role) before it can proceed.",
+        )
+    expiry = _arm_tokens.pop(token, None)
+    if not expiry or datetime.now(timezone.utc) > expiry:
+        raise HTTPException(403, "Arm token invalid or expired — request a new one via POST /api/arm")
+
+
+# ---- Authoritative transmit-halt (server-side, checked before any TX) ----
+# Set by /emergency/abort, cleared by /emergency/resume. /payloads/deploy and
+# /mavlink/broadcast both check this BEFORE building/sending any frame — the
+# prior implementation only broadcast a cooperative WebSocket notice with no
+# server-side enforcement.
+_tx_halted = False
+
+
+def _check_tx_not_halted() -> None:
+    if _tx_halted:
+        raise HTTPException(409, "Transmission halted — EMERGENCY ABORT is in effect. "
+                                  "A commander must POST /api/emergency/resume first.")
+
+
 # =====================================================================
 # Startup: seed admin, indexes
 # =====================================================================
@@ -137,12 +230,12 @@ async def startup() -> None:
             "id": str(uuid.uuid4()),
             "email": ADMIN_EMAIL,
             "name": "Command Operator",
-            "role": "admin",
+            "role": "commander",
             "clearance": "RESTRICTED",
             "password_hash": hash_password(ADMIN_PASSWORD),
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
-        logger.info("Seeded admin operator.")
+        logger.info("Seeded commander operator.")
     elif not verify_password(ADMIN_PASSWORD, existing["password_hash"]):
         await db.users.update_one(
             {"email": ADMIN_EMAIL},
@@ -150,13 +243,10 @@ async def startup() -> None:
         )
         logger.info("Admin password hash refreshed.")
 
-    # Seed initial fleet of detections (idempotent-ish; only if empty)
-    count = await db.detections.count_documents({})
-    if count == 0:
-        for _ in range(6):
-            det = new_detection()
-            await db.detections.insert_one(det)
-        logger.info("Seeded initial detections.")
+    # NOTE: no synthetic/seeded detections are inserted here. An empty
+    # detections collection on first boot is correct and honest — real
+    # contacts are only ever created from real ingested data via
+    # POST /detections/ingest (HackRF / SiK radio bridges).
 
 
 @app.on_event("shutdown")
@@ -188,12 +278,18 @@ class MavlinkCraftBody(BaseModel):
     param5: float = 0.0
     param6: float = 0.0
     param7: float = 0.0
+    arm_token: Optional[str] = None  # required when target_system == 0 (broadcast)
 
 
 class DeployPayloadBody(BaseModel):
     payload_id: str
     target_detection_id: Optional[str] = None
     broadcast: bool = False
+    arm_token: Optional[str] = None  # required for CRITICAL severity or broadcast
+
+
+class AuthorizeTargetBody(BaseModel):
+    authorized: bool = True
 
 
 # =====================================================================
@@ -276,8 +372,54 @@ async def logout(user: Dict = Depends(get_current_user)):
 # =====================================================================
 # Routes: Detections
 # =====================================================================
+def _new_detection_skeleton() -> Dict[str, Any]:
+    """Build the non-RF, non-fabricated skeleton (id/callsign-label/state
+    machine defaults/timestamps) for a brand-new detection record. All actual
+    RF/positional/identity fields (model, protocol, RSSI, bearing, distance,
+    etc.) MUST come from a real ingest source (see /detections/ingest) — this
+    helper never invents them. The callsign default is derived from the
+    real, randomly-generated record id (not a fabricated attribute of the
+    contact itself) purely so the UI has a stable short label until a real
+    callsign is supplied by the ingest source."""
+    det_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    return {
+        "id": det_id,
+        "callsign": f"UAV-{det_id[:8].upper()}",
+        "swarm_id": None,
+        "cema_stage": "CAPTURE",
+        "cema_stage_index": 0,
+        "kill_chain_stage": "DETECT",
+        "kill_chain_index": 0,
+        "status": "ACTIVE",
+        # Friendly-fire interlock: a detection is NOT a valid kinetic-payload
+        # target until an operator explicitly authorizes it (POST
+        # /detections/{id}/authorize-target). Defaults closed.
+        "authorized_target": False,
+        "first_seen": now,
+        "last_seen": now,
+    }
+
+
+async def _expire_stale_detections() -> None:
+    """Flip any ACTIVE detection that hasn't been re-confirmed within
+    DETECTION_STALE_TIMEOUT_S to LOST. Lazy/on-read expiry: this app has no
+    background scheduler (asyncio is only used for locks/websockets), so we
+    run this check inline whenever detections are read, keeping reads
+    self-consistent without adding new infrastructure. Records are only
+    updated in place (status change), never deleted, to preserve the Mission
+    Log / audit trail.
+    """
+    cutoff = (datetime.now(timezone.utc) - timedelta(seconds=DETECTION_STALE_TIMEOUT_S)).isoformat()
+    await db.detections.update_many(
+        {"status": "ACTIVE", "last_seen": {"$lt": cutoff}},
+        {"$set": {"status": "LOST"}},
+    )
+
+
 @api.get("/detections")
 async def list_detections(user: Dict = Depends(get_current_user)):
+    await _expire_stale_detections()
     docs = await db.detections.find({}, {"_id": 0}).to_list(500)
     return docs
 
@@ -288,38 +430,6 @@ async def get_detection(det_id: str, user: Dict = Depends(get_current_user)):
     if not doc:
         raise HTTPException(404, "Detection not found")
     return doc
-
-
-@api.post("/detections/simulate")
-async def simulate_detection(user: Dict = Depends(get_current_user)):
-    det = new_detection()
-    await db.detections.insert_one(det.copy())
-    await log_event("DETECTION",
-                    f"New contact {det['callsign']} ({det['model']}) — {det['threat_level']}",
-                    meta={"detection_id": det["id"]}, actor=user["email"])
-    det.pop("_id", None)
-    return det
-
-
-@api.post("/detections/upload")
-async def upload_iq(file: UploadFile = File(...),
-                    user: Dict = Depends(get_current_user)):
-    contents = await file.read()
-    meta = parse_iq_file_stub(file.filename or "capture.iq", len(contents))
-    det = new_detection()
-    det["source"] = "UPLOAD"
-    det["upload_meta"] = meta
-    det["upload_filename"] = file.filename
-    det["upload_size_bytes"] = len(contents)
-    await db.detections.insert_one(det.copy())
-    await log_event(
-        "UPLOAD",
-        f"IQ/pcap ingested: {file.filename} ({len(contents)} bytes) → contact {det['callsign']}",
-        meta={"detection_id": det["id"], **meta},
-        actor=user["email"],
-    )
-    det.pop("_id", None)
-    return det
 
 
 @api.post("/detections/{det_id}/cema-advance")
@@ -352,6 +462,28 @@ async def kc_advance(det_id: str, user: Dict = Depends(get_current_user)):
     return doc
 
 
+@api.post("/detections/{det_id}/authorize-target")
+async def authorize_target(det_id: str, body: AuthorizeTargetBody,
+                           user: Dict = Depends(get_current_user)):
+    """Friendly-fire interlock: explicitly mark a detection as an authorized
+    kinetic-payload target (or revoke that authorization). Any authenticated
+    operator may authorize a single, individually-identified target — this is
+    the routine "yes, engage this contact" action. Broadcast/target_system=0
+    actions are NOT covered by this and separately require commander role +
+    an arm token (see /payloads/deploy, /mavlink/broadcast)."""
+    doc = await db.detections.find_one({"id": det_id})
+    if not doc:
+        raise HTTPException(404, "Detection not found")
+    await db.detections.update_one({"id": det_id}, {"$set": {"authorized_target": body.authorized}})
+    await log_event(
+        "TARGETING",
+        f"{doc['callsign']} {'AUTHORIZED' if body.authorized else 'DE-AUTHORIZED'} as kinetic target",
+        meta={"detection_id": det_id, "authorized": body.authorized},
+        actor=user["email"],
+    )
+    return {"ok": True, "detection_id": det_id, "authorized_target": body.authorized}
+
+
 @api.delete("/detections/{det_id}")
 async def delete_detection(det_id: str, user: Dict = Depends(get_current_user)):
     res = await db.detections.delete_one({"id": det_id})
@@ -369,14 +501,13 @@ async def spectrum_waterfall(bins: int = 96, rows: int = 24,
                              user: Dict = Depends(get_current_user)):
     # Serve real waterfall from the RF bridge if it has published data
     # within the last 30 seconds (matches /health's hackrf_live window —
-    # real hackrf_sweep cadence is slower than a 10s cutoff allowed for);
-    # otherwise fall back to the simulator.
+    # real hackrf_sweep cadence is slower than a 10s cutoff allowed for).
+    # No synthetic fallback: if there is no live ingest, we honestly report
+    # an empty spectrum rather than fabricating rows.
     ing = _last_spectrum_ingest
     if ing and (datetime.now(timezone.utc) - ing["ts"]).total_seconds() < 30:
         return {"bins": ing["bins"], "rows": ing["rows"], "source": "HACKRF"}
-    return {"bins": bins,
-            "rows": [generate_waterfall(bins) for _ in range(rows)],
-            "source": "SIM"}
+    return {"bins": bins, "rows": [], "source": "NONE"}
 
 
 # =====================================================================
@@ -403,12 +534,26 @@ class DetectionIngestBody(BaseModel):
     snr_db: float = 10.0
     bearing_deg: float = 0.0
     distance_m: float = 0.0
+    # True when distance_m is a model-based RSSI path-loss estimate, not a real
+    # range measurement (radar/TDOA/etc). Defaults False so existing sources
+    # (simulated data, any future real-ranging source) are not retroactively
+    # mislabeled as estimates.
+    distance_estimated: bool = False
     altitude_m: float = 0.0
     speed_ms: float = 0.0
     system_id: int = 1
     component_id: int = 1
     encrypted: bool = False
     source: str = "HACKRF"
+    # True only when this detection came from a genuinely decoded, real
+    # protocol-level message (e.g. a real MAVLink HEARTBEAT whose `autopilot`
+    # field was actually parsed off the wire — see
+    # field-bridge/mavlink_sniffer.py). False (the default) means this is an
+    # RF-energy heuristic / guess (RSSI thresholding, persistence filtering,
+    # etc.), same as every existing ingest source before this field existed.
+    # Defaults False for backward compatibility, following the same pattern
+    # used for distance_estimated above.
+    protocol_confirmed: bool = False
 
 
 @api.post("/spectrum/ingest")
@@ -431,6 +576,20 @@ DETECTION_MERGE_WINDOW_S = 20  # re-ingests of the same real contact within this
                                # bridge otherwise floods the log with dozens of
                                # near-duplicate "new" detections per minute.
 
+DETECTION_STALE_TIMEOUT_S = 600  # (10 min) NOT the same thing as the merge
+                               # window above. This is how long a detection
+                               # may go without a re-confirmation before it
+                               # stops counting as ACTIVE/tracked on the
+                               # operator dashboard. It must be meaningfully
+                               # longer than DETECTION_MERGE_WINDOW_S: real RF
+                               # contacts naturally have gaps between
+                               # confirmation cycles (especially given the
+                               # USB/sweep timing issues seen on this site),
+                               # and 20s would cause live contacts to flicker
+                               # in and out of ACTIVE. Detections that go
+                               # stale are marked LOST (not deleted) so they
+                               # remain in the Mission Log / audit history.
+
 
 @api.post("/detections/ingest")
 async def detection_ingest(body: DetectionIngestBody,
@@ -451,8 +610,10 @@ async def detection_ingest(body: DetectionIngestBody,
             "snr_db": body.snr_db,
             "bearing_deg": body.bearing_deg,
             "distance_m": body.distance_m,
+            "distance_estimated": body.distance_estimated,
             "altitude_m": body.altitude_m,
             "speed_ms": body.speed_ms,
+            "protocol_confirmed": body.protocol_confirmed,
             "last_seen": datetime.now(timezone.utc).isoformat(),
         }
         await db.detections.update_one({"id": existing["id"]}, {"$set": updates})
@@ -460,7 +621,7 @@ async def detection_ingest(body: DetectionIngestBody,
         det.pop("_id", None)
         return det
 
-    det = new_detection()  # gives a sane skeleton with id/uuid + timestamps
+    det = _new_detection_skeleton()  # id/timestamps/state only — no fabricated RF fields
     det.update({
         "callsign": body.callsign or det["callsign"],
         "model": body.model,
@@ -472,12 +633,14 @@ async def detection_ingest(body: DetectionIngestBody,
         "snr_db": body.snr_db,
         "bearing_deg": body.bearing_deg,
         "distance_m": body.distance_m,
+        "distance_estimated": body.distance_estimated,
         "altitude_m": body.altitude_m,
         "speed_ms": body.speed_ms,
         "system_id": body.system_id,
         "component_id": body.component_id,
         "encrypted": body.encrypted,
         "source": body.source,
+        "protocol_confirmed": body.protocol_confirmed,
     })
     await db.detections.insert_one(det.copy())
     await log_event("DETECTION",
@@ -532,7 +695,16 @@ async def craft_packet(body: MavlinkCraftBody, user: Dict = Depends(get_current_
 
 
 @api.post("/mavlink/broadcast")
-async def broadcast_packet(body: MavlinkCraftBody, user: Dict = Depends(get_current_user)):
+async def broadcast_packet(body: MavlinkCraftBody, user: Dict = Depends(require_commander)):
+    # #1/#13: raw MAVLink crafting can produce ANY MAV_CMD bypassing the vetted
+    # PAYLOAD_CATALOG metadata — transmitting it therefore requires commander
+    # role. /mavlink/craft (preview-only, never transmitted/persisted/broadcast
+    # to the RF bridge) remains available to any authenticated operator.
+    _check_tx_not_halted()
+    if body.target_system == 0:
+        # #4: broadcast (target_system=0) hits every drone in RF range,
+        # including friendlies — require a freshly-issued arm token.
+        _consume_arm_token(body.arm_token)
     frame = _craft(body)
     pkt = {
         "id": str(uuid.uuid4()),
@@ -602,13 +774,25 @@ async def list_payloads(user: Dict = Depends(get_current_user)):
 
 @api.post("/payloads/deploy")
 async def deploy_payload(body: DeployPayloadBody,
-                         user: Dict = Depends(get_current_user)):
+                         user: Dict = Depends(require_commander)):
+    # #1: FORCE_DISARM/FLIGHT_TERMINATION/PL-010 broadcast-takedown all deploy
+    # through this endpoint — commander role is required unconditionally.
+    _check_tx_not_halted()
+
     spec = get_payload_by_id(body.payload_id)
     if not spec:
         raise HTTPException(404, "Unknown payload id")
     builder = PAYLOAD_BUILDERS.get(body.payload_id)
     if not builder:
         raise HTTPException(500, "No builder registered for this payload")
+
+    # #1: CRITICAL-severity payloads (FORCE_DISARM, FLIGHT_TERMINATION,
+    # PROPELLER_STOP, MEMORY_ERASE, PL-010 broadcast, ...) additionally need a
+    # freshly-issued, single-use arm token as a server-enforced second factor.
+    # #4: any broadcast (target_system=0) needs the same, regardless of
+    # severity, since it can strike friendlies in RF range.
+    if spec.severity == "CRITICAL" or body.broadcast:
+        _consume_arm_token(body.arm_token)
 
     target_sys = 0
     target_comp = 0
@@ -619,6 +803,14 @@ async def deploy_payload(body: DeployPayloadBody,
         detection = await db.detections.find_one({"id": body.target_detection_id})
         if not detection:
             raise HTTPException(404, "Target detection not found")
+        # #4: friendly-fire interlock — refuse to engage anything not
+        # explicitly authorized as a target (see /detections/{id}/authorize-target).
+        if not detection.get("authorized_target"):
+            raise HTTPException(
+                403,
+                "Target not authorized — friendly-fire interlock: "
+                "POST /api/detections/{id}/authorize-target first.",
+            )
         target_sys = detection.get("system_id", 1)
         target_comp = detection.get("component_id", 1)
 
@@ -713,6 +905,10 @@ async def system_health(user: Dict = Depends(get_current_user)):
         "last_seen": {"$gt": since.isoformat()},
     })
 
+    # Run the same lazy staleness expiry the detections list uses, so this
+    # health tile's "active_targets" count doesn't disagree with the
+    # dashboard's Active Contacts count.
+    await _expire_stale_detections()
     active_targets = await db.detections.count_documents({"status": "ACTIVE"})
     total_packets = await db.mav_packets.count_documents({})
 
@@ -729,11 +925,30 @@ async def system_health(user: Dict = Depends(get_current_user)):
 
 
 # =====================================================================
+# Routes: Arm token (second factor for CRITICAL payloads / broadcasts)
+# =====================================================================
+@api.post("/arm")
+async def request_arm_token(user: Dict = Depends(require_commander)):
+    """Issue a single-use arm token, valid for ARM_TOKEN_TTL_S seconds, that a
+    commander must present when deploying a CRITICAL-severity payload or any
+    broadcast (target_system=0) action."""
+    tok = _issue_arm_token()
+    await log_event("ARM", f"Arm token issued (valid {ARM_TOKEN_TTL_S}s)", actor=user["email"])
+    return tok
+
+
+# =====================================================================
 # Routes: Emergency abort — halt all transmissions, mark ceasefire
 # =====================================================================
 @api.post("/emergency/abort")
 async def emergency_abort(user: Dict = Depends(get_current_user)):
-    # Broadcast a ceasefire signal to any listening TX bridge.
+    # Any authenticated operator may hit the emergency stop — this is a safety
+    # control, not a privileged one. #3: this now ALSO sets an authoritative,
+    # server-side flag that /payloads/deploy and /mavlink/broadcast check
+    # before building/sending any frame (previously this only broadcast a
+    # cooperative WebSocket notice with no server-side enforcement).
+    global _tx_halted
+    _tx_halted = True
     await ws_manager.broadcast_json({
         "type": "abort",
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -743,6 +958,22 @@ async def emergency_abort(user: Dict = Depends(get_current_user)):
                     "EMERGENCY ABORT — all TX halted by operator",
                     actor=user["email"])
     return {"ok": True, "ts": datetime.now(timezone.utc).isoformat()}
+
+
+@api.post("/emergency/resume")
+async def emergency_resume(user: Dict = Depends(require_commander)):
+    # Clearing the halt is commander-only — an emergency stop should not be
+    # liftable by whoever's nearest a keyboard.
+    global _tx_halted
+    _tx_halted = False
+    await ws_manager.broadcast_json({
+        "type": "resume",
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "operator": user["email"],
+    })
+    await log_event("ABORT", "TX resumed by commander after emergency abort",
+                    actor=user["email"])
+    return {"ok": True, "tx_halted": _tx_halted, "ts": datetime.now(timezone.utc).isoformat()}
 
 
 # =====================================================================
@@ -922,10 +1153,17 @@ async def root():
 # ---------- Register router + CORS ----------
 app.include_router(api)
 
+# #12: CORS_ORIGINS "*" combined with allow_credentials=True lets any site
+# make credentialed requests against this API. Default to an explicit,
+# localhost-only allow-list; deployments MUST override CORS_ORIGINS (comma
+# separated) with their real frontend origin(s) — e.g. the LAN/server IP the
+# frontend is actually served from.
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
+    allow_origins=os.environ.get(
+        "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+    ).split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )

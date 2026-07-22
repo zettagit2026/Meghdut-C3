@@ -1,7 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Waves, Upload, ChevronRight, CheckCircle2 } from "lucide-react";
+import { Waves, ChevronRight, CheckCircle2 } from "lucide-react";
 import SpectrumWaterfall from "@/components/SpectrumWaterfall";
 import SpectrumScope from "@/components/SpectrumScope";
 
@@ -18,7 +18,6 @@ const STAGES = [
 export default function Signals() {
   const [dets, setDets] = useState([]);
   const [selected, setSelected] = useState(null);
-  const fileRef = useRef(null);
 
   const load = async () => {
     try {
@@ -43,27 +42,6 @@ export default function Signals() {
     } catch (e) { toast.error("Advance failed", { description: formatApiError(e) }); }
   };
 
-  const upload = async (e) => {
-    const f = e.target.files?.[0];
-    if (!f) return;
-    const fd = new FormData();
-    fd.append("file", f);
-    try {
-      const { data } = await api.post("/detections/upload", fd, {
-        headers: { "Content-Type": "multipart/form-data" },
-      });
-      toast.success("Ingest complete", {
-        description: `${data.upload_meta.file_type} · ${data.callsign}`,
-      });
-      load();
-      setSelected(data.id);
-    } catch (err) {
-      toast.error("Upload failed", { description: formatApiError(err) });
-    } finally {
-      if (fileRef.current) fileRef.current.value = "";
-    }
-  };
-
   return (
     <div className="space-y-6">
       <div className="flex items-end justify-between">
@@ -74,23 +52,6 @@ export default function Signals() {
           <h1 className="font-heading font-black text-5xl uppercase tracking-tighter">
             CEMA 7-Stage Pipeline
           </h1>
-        </div>
-        <div className="flex items-center gap-2">
-          <input
-            ref={fileRef}
-            data-testid="iq-upload-input"
-            type="file"
-            accept=".iq,.bin,.pcap,.dat,.raw"
-            className="hidden"
-            onChange={upload}
-          />
-          <button
-            data-testid="iq-upload-btn"
-            onClick={() => fileRef.current?.click()}
-            className="flex items-center gap-2 px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest hover:bg-white hover:text-black transition-colors scanline-btn"
-          >
-            <Upload size={14} strokeWidth={1.5} /> INGEST IQ / PCAP
-          </button>
         </div>
       </div>
 
@@ -142,7 +103,7 @@ export default function Signals() {
                   <div className="font-mono text-xs text-slate-500 mt-1">
                     PROTOCOL: <span className="text-slate-300">{current.protocol}</span> · SYS-ID: <span className="text-slate-300">{current.system_id}</span> ·
                     ENCRYPT: <span className="text-slate-300">{current.encrypted ? "YES" : "NONE"}</span>
-                    {current.upload_meta && <> · SOURCE: <span className="text-slate-300">UPLOAD</span></>}
+                    {current.source && <> · SOURCE: <span className="text-slate-300">{current.source}</span></>}
                   </div>
                 </div>
                 <button
@@ -154,15 +115,6 @@ export default function Signals() {
                   ADVANCE STAGE <ChevronRight size={14} strokeWidth={1.5} />
                 </button>
               </div>
-
-              {current.upload_meta && (
-                <div className="mb-6 tactical-border p-4 font-mono text-xs">
-                  <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-2">Upload Metadata</div>
-                  <pre className="text-slate-300 whitespace-pre-wrap">
-{JSON.stringify(current.upload_meta, null, 2)}
-                  </pre>
-                </div>
-              )}
 
               <div className="space-y-0 tactical-border">
                 {STAGES.map((s, i) => {

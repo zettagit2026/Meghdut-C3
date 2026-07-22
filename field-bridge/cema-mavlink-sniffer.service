@@ -1,0 +1,42 @@
+[Unit]
+Description=CEMA cUAS - passive MAVLink HEARTBEAT sniffer (RX only, real protocol-level ArduPilot ID, no transmission)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as field-bridge/cema-hackrf-rx.service and
+# rf-bridge/cema-rf-bridge.service. There is deliberately only ONE copy of
+# this unit in the repo; do not fork per-host copies with hardcoded
+# paths/users baked in. Keep host-specific values out of this file — they
+# belong in the EnvironmentFile below.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# Credentials and console URL are NOT hardcoded here. They are supplied via
+# EnvironmentFile, which must define at minimum:
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+#   MAVLINK_SNIFF_SERIAL=/dev/ttyUSB1   (the SiK/RFD900 radio dedicated to
+#                                        PASSIVE intercept — do NOT point this
+#                                        at the same tty as any TX-capable
+#                                        bridge such as rf-bridge's
+#                                        mavlink_bridge.py; a serial port can
+#                                        only be opened by one process)
+#   MAVLINK_SNIFF_BAUD=57600
+# Point this at either the project-root .env (mapping ADMIN_EMAIL/
+# ADMIN_PASSWORD into CEMA_EMAIL/CEMA_PASSWORD) or a dedicated
+# field-bridge/.env. This file must be created per-deployment; it is not
+# committed to the repo. Restrict its permissions: chmod 600.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+ExecStart=/usr/bin/python3 -u mavlink_sniffer.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/mavlink_sniffer.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/mavlink_sniffer.log
+
+[Install]
+WantedBy=multi-user.target
