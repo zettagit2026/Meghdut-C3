@@ -143,6 +143,105 @@ WIFI_PERSIST_CYCLES = 5  # consecutive cycles a peak must sit within tolerance o
                           # something that has been sitting still far longer than a
                           # hopping/bursty drone link would.
 #
+# --- Bluetooth exclusion heuristic (DJI-2G4 only) ---------------------------
+# ADDED 2026-07-22: DJI-2G4 (2400-2483MHz) overlaps the classic Bluetooth band
+# (2.402-2.480GHz, 79x1MHz FHSS channels hopping ~1600 times/sec; BLE hops
+# across 40 channels). This is a SEPARATE exclusion reason from the Wi-Fi-AP
+# heuristic above, checked independently on the same band/peak.
+#
+# Physical reasoning: WiFi sits STILL on one fixed channel for a long time --
+# that's exactly why the persistence heuristic above works for it. Bluetooth
+# does the OPPOSITE: it hops continuously and essentially never settles on
+# one channel. A drone OcuSync/video link is also frequency-agile/bursty, but
+# its occupied bandwidth is much wider (several MHz of video/control signal)
+# than a single ~1MHz Bluetooth hop channel.
+#
+# HARD HARDWARE LIMITATION (stated plainly, not hidden): this system's
+# hackrf_sweep cycle re-scans the whole configured range roughly once every
+# --interval-s seconds (SWEEPS_PER_CYCLE=2 passes per cycle). It CANNOT
+# resolve genuine microsecond-scale Bluetooth hop timing -- that would require
+# IQ capture/demodulation, which is out of scope here (same caveat as the
+# Wi-Fi heuristic: no protocol classification, energy-detection only). What
+# IS observable at this sweep rate is a much coarser proxy: does the
+# strongest peak's frequency location keep moving to a materially different
+# spot on almost every consecutive REAL-DATA cycle (never settling anywhere
+# for BT_NONPERSIST_CYCLES in a row), AND is the peak narrow enough
+# (<= BT_MAX_BANDWIDTH_MHZ) to be consistent with a single ~1MHz BT channel
+# rather than a several-MHz-wide OcuSync/video carrier.
+#
+# KNOWN LIMITATION -- read before trusting this in the field: this is a MUCH
+# CRUDER signal than the Wi-Fi persistence heuristic. At a ~3s+ sweep
+# interval we are aliasing thousands of real Bluetooth hops per cycle down to
+# a single peak-held reading, so "moves every cycle" is at best a weak
+# correlate of real FHSS behavior -- plenty of things (multiple simultaneous
+# emitters, noise, a genuinely hopping drone link) could also produce a
+# peak that appears to move cycle-to-cycle. Expect a HIGHER false-positive
+# AND false-negative rate than the Wi-Fi case:
+#   - False positive: a real, weak/marginal drone link whose peak estimate
+#     jitters between adjacent bins cycle-to-cycle (due to noise near
+#     threshold, not real hopping) could be misclassified as Bluetooth and
+#     suppressed.
+#   - False negative: a drone link that happens to be narrowband and briefly
+#     "settles" for a few cycles (e.g. hovering, momentarily locked video
+#     channel) will simply fail the non-persistence check and pass through
+#     un-excluded -- i.e. this heuristic will often just do nothing, which is
+#     the safer failure mode but means it should not be read as "we detect
+#     Bluetooth reliably."
+# This is accepted as a best-effort coarse filter, not real BT/BLE
+# classification, given the single-HackRF/no-IQ-demod constraint.
+BT_NONPERSIST_CYCLES = 5  # consecutive real-data cycles the peak must keep moving
+                           # (never settling) before we call it likely-Bluetooth.
+                           # Matches WIFI_PERSIST_CYCLES in magnitude so both
+                           # heuristics require a comparably sustained pattern
+                           # before acting, even though the patterns are inverse.
+BT_MOVE_TOL_MHZ = 2.0  # peak must move by more than this between cycles to count
+                       # as "did not settle" (a little slack above 1 bin-width
+                       # avoids treating ordinary bin-to-bin measurement noise
+                       # as movement).
+BT_MAX_BANDWIDTH_MHZ = 2.0  # a single BT/BLE channel is ~1MHz; allow some sweep
+                             # slop but keep this well under a multi-MHz OcuSync
+                             # video carrier's occupied bandwidth.
+#
+# --- LoRa / low-duty-cycle exclusion heuristic (SiK-915 only) ---------------
+# ADDED 2026-07-22: SiK-915 (902-928MHz) currently has ZERO exclusion logic --
+# this is new logic for that band, not an extension of an existing check.
+#
+# Physical reasoning: a real SiK telemetry radio (what this pipeline's
+# "SIK_RADIO" classification represents) is a continuous/near-continuous
+# real-time control/telemetry link while the drone is airborne -- it should
+# show up as a hit on most/all cycles. LoRa/LoRaWAN devices sharing this ISM
+# band, by contrast, are regulatorily constrained to a very low duty cycle
+# (commonly under 1% airtime) -- a LoRa sensor/gateway sends a brief packet
+# then goes silent for seconds-to-minutes. So: track, over a rolling window
+# of the last LORA_WINDOW_CYCLES REAL-DATA cycles (using is_real_data from
+# sweep_band() to correctly ignore wedge/filler cycles, same pattern as the
+# Wi-Fi heuristic), what fraction of cycles had a genuine above-threshold hit.
+# Sparse/intermittent hits (isolated, never sustained) => likely a low-duty-
+# cycle device (LoRa-like) => exclude from drone-detection ingest for that
+# cycle. Sustained/continuous hits => leave it alone, consistent with a real
+# SiK link.
+#
+# KNOWN LIMITATION (explicitly not hidden, same class of tradeoff as the
+# Wi-Fi false-negative risk documented above): a real drone with a marginal
+# or weak SiK link -- e.g. at the edge of range, partially obstructed, or
+# suffering interference -- could also produce intermittent/sparse hits and
+# get misclassified as "likely_low_duty_cycle_device", suppressing a genuine
+# contact. This tradeoff is accepted because a LoRa sensor/gateway being
+# reported as a "MAVLink craft (candidate)" drone is the more visible/costly
+# failure mode to avoid; there is no IQ/demodulation-based way to tell a weak
+# real SiK link from a genuine LoRa packet apart from this duty-cycle proxy
+# given current hardware.
+LORA_WINDOW_CYCLES = 8  # rolling window size (in REAL-DATA cycles) over which
+                         # duty cycle is evaluated for SiK-915.
+LORA_MIN_REAL_CYCLES = 4  # require at least this many real-data samples in the
+                           # window before making a duty-cycle judgement at all
+                           # (avoid snap judgements off 1-2 samples right after
+                           # startup or a run of wedged cycles).
+LORA_MAX_HIT_RATIO = 0.5  # if the fraction of real-data cycles in the window
+                           # that were above-threshold hits is AT or BELOW this,
+                           # treat it as sparse/intermittent (LoRa-like) rather
+                           # than a persistent/continuous SiK telemetry link.
+
 # FIELD FIX 2026-07-22: the live deployment host has a real, unresolved
 # hardware/USB issue causing hackrf_sweep to "wedge" (device busy/USB hang) on
 # ~35-60% of passes (see sweep_band()/_one_sweep()); when that happens,
@@ -306,6 +405,14 @@ def main() -> None:
     # tracker since they produce independent peaks every cycle.
     wifi_persist = {"freq_mhz": None, "cycles": 0}  # DJI-2G4 (2.4GHz table)
     wifi_persist_5g8 = {"freq_mhz": None, "cycles": 0}  # DJI-5G8 (5GHz UNII-3 table)
+    # Bluetooth non-persistence tracker for DJI-2G4 only -- see BT_NONPERSIST_CYCLES
+    # comment block above. Tracks the last real-data cycle's peak freq and how many
+    # consecutive real-data cycles in a row the peak has kept moving (never settled).
+    bt_track = {"freq_mhz": None, "moving_cycles": 0}
+    # LoRa/low-duty-cycle rolling window for SiK-915 only -- see LORA_WINDOW_CYCLES
+    # comment block above. Only real-data cycles (is_real_data) are pushed into this
+    # deque; wedge/filler cycles are skipped entirely, same pattern as the Wi-Fi fix.
+    sik_hit_window: "collections.deque[bool]" = collections.deque(maxlen=LORA_WINDOW_CYCLES)
     i = 0
     while args.iterations == 0 or i < args.iterations:
         rows = []
@@ -374,7 +481,77 @@ def main() -> None:
                 # False) — see WIFI_PERSIST_CYCLES comment block above for why we
                 # deliberately leave persist_state untouched here instead of resetting.
 
-            if consecutive_hits[name] >= CONFIRM_CYCLES and not likely_wifi_ap:
+            # --- Bluetooth exclusion (DJI-2G4 only) -- see BT_NONPERSIST_CYCLES
+            # comment block above for full rationale and honestly-stated limitations.
+            # This is an ADDITIONAL, independent exclusion reason alongside the
+            # Wi-Fi-AP check above -- a DJI-2G4 peak can be excluded as either
+            # likely-WiFi OR likely-Bluetooth (or neither), both suppress ingest.
+            likely_bluetooth = False
+            if name == "DJI-2G4":
+                if peak > floor + DETECT_THRESHOLD_DB and powers:
+                    bin_width_mhz = 1.0
+                    peak_idx = int(np.argmax(powers))
+                    peak_freq_mhz = low + (peak_idx + 0.5) * bin_width_mhz
+                    # crude occupied-bandwidth estimate: width of the contiguous
+                    # run of bins within DETECT_THRESHOLD_DB/2 of the peak, centered
+                    # on peak_idx. Coarse by design -- no real spectral-mask analysis.
+                    half_thresh = floor + DETECT_THRESHOLD_DB / 2.0
+                    lo_idx = peak_idx
+                    while lo_idx > 0 and powers[lo_idx - 1] >= half_thresh:
+                        lo_idx -= 1
+                    hi_idx = peak_idx
+                    while hi_idx < len(powers) - 1 and powers[hi_idx + 1] >= half_thresh:
+                        hi_idx += 1
+                    occupied_bw_mhz = (hi_idx - lo_idx + 1) * bin_width_mhz
+
+                    prev_bt_freq = bt_track["freq_mhz"]
+                    moved = prev_bt_freq is None or abs(peak_freq_mhz - prev_bt_freq) > BT_MOVE_TOL_MHZ
+                    narrow = occupied_bw_mhz <= BT_MAX_BANDWIDTH_MHZ
+                    if is_real_data:
+                        if moved and narrow:
+                            bt_track["moving_cycles"] += 1
+                        else:
+                            bt_track["moving_cycles"] = 0
+                        bt_track["freq_mhz"] = peak_freq_mhz
+                    if bt_track["moving_cycles"] >= BT_NONPERSIST_CYCLES:
+                        likely_bluetooth = True
+                        print(f"[{label}] excluded likely-Bluetooth at {peak_freq_mhz:.1f}MHz "
+                              f"(non-persistent {bt_track['moving_cycles']} cycles, "
+                              f"~{occupied_bw_mhz:.0f}MHz wide) — coarse heuristic, see "
+                              f"BT_NONPERSIST_CYCLES limitations")
+                elif is_real_data:
+                    # No hit this cycle (real sweep, genuinely below threshold) --
+                    # nothing to track movement against; reset like the Wi-Fi case.
+                    bt_track["moving_cycles"] = 0
+                    bt_track["freq_mhz"] = None
+                # else: wedge/fallback filler cycle -- leave bt_track untouched,
+                # same rationale as the Wi-Fi persistence fix above.
+
+            # --- LoRa / low-duty-cycle exclusion (SiK-915 only) -- see
+            # LORA_WINDOW_CYCLES comment block above for full rationale and
+            # honestly-stated limitations. This band had NO exclusion logic before;
+            # this is new, not an extension of the Wi-Fi/Bluetooth checks.
+            likely_low_duty_cycle_device = False
+            if name == "SiK-915" and is_real_data:
+                is_hit = peak > floor + DETECT_THRESHOLD_DB
+                sik_hit_window.append(is_hit)
+                real_count = len(sik_hit_window)
+                if real_count >= LORA_MIN_REAL_CYCLES:
+                    hit_ratio = sum(sik_hit_window) / real_count
+                    if is_hit and hit_ratio <= LORA_MAX_HIT_RATIO:
+                        likely_low_duty_cycle_device = True
+                        print(f"[{label}] excluded likely_low_duty_cycle_device (LoRa-like) at "
+                              f"peak {peak:.1f}dBm — hit rate {hit_ratio:.2f} over last "
+                              f"{real_count} real-data cycles (<= {LORA_MAX_HIT_RATIO}) — "
+                              f"coarse heuristic, see LORA_WINDOW_CYCLES limitations")
+            # else (wedge/filler cycle): sik_hit_window is intentionally NOT
+            # appended to, so a run of wedged cycles doesn't get counted as
+            # "silence" and doesn't dilute the real-data duty-cycle estimate --
+            # same is_real_data-aware pattern as the Wi-Fi/Bluetooth checks above.
+
+            likely_excluded = likely_wifi_ap or likely_bluetooth or likely_low_duty_cycle_device
+
+            if consecutive_hits[name] >= CONFIRM_CYCLES and not likely_excluded:
                 # Coarse RSSI-based distance ESTIMATE (log-distance path-loss model,
                 # no site calibration) — see estimate_distance_m() above. Flagged
                 # via distance_estimated so the console/operators know this is not
@@ -399,7 +576,7 @@ def main() -> None:
                           f"{consecutive_hits[name]} consecutive cycles)")
                 except requests.RequestException as e:
                     print(f"ingest failed: {e}", file=sys.stderr)
-            elif consecutive_hits[name] > 0 and not likely_wifi_ap:
+            elif consecutive_hits[name] > 0 and not likely_excluded:
                 print(f"[{label}] possible contact: peak {peak:.1f} dBm — awaiting confirmation "
                       f"({consecutive_hits[name]}/{CONFIRM_CYCLES} cycles)")
 

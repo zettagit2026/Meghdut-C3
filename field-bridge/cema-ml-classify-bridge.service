@@ -1,0 +1,51 @@
+[Unit]
+Description=CEMA cUAS - gated ML classify-and-ingest bridge (RX only, no transmission, ADDITIONAL signal on top of hackrf_rx.py's RSSI heuristics -- NOT a replacement)
+After=network-online.target docker.service cema-hackrf-rx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as cema-hackrf-rx.service / cema-mavlink-sniffer.service.
+# There is deliberately only ONE copy of this unit in the repo; do not fork
+# per-host copies with hardcoded paths/users baked in. Keep host-specific
+# values out of this file — they belong in the EnvironmentFile below.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# Credentials and console URL are NOT hardcoded here. They are supplied via
+# EnvironmentFile, which must define at minimum:
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+# Optional overrides (see ml_classify_bridge.py module docstring for defaults
+# and full explanation of each):
+#   CEMA_ML_CHECKPOINT=/tmp/resnet18_leesburg_split_0.02_1_current.pt
+#   CEMA_ML_INTERVAL_S=12
+#   CEMA_ML_SAMPLE_RATE_HZ=10e6
+#   CEMA_ML_CAPTURE_S=0.3
+#   CEMA_ML_OFFSET_S=0.05
+# Point this at either the project-root .env or a dedicated field-bridge/.env.
+# This file must be created per-deployment; it is not committed to the repo.
+# Restrict its permissions: chmod 600.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+ExecStart=/usr/bin/python3 -u ml_classify_bridge.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/ml_classify_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/ml_classify_bridge.log
+
+[Install]
+WantedBy=multi-user.target
+
+# ---------------------------------------------------------------------------
+# NOT YET INSTALLED / ENABLED. Per project standing rule for this session:
+# code is deployed to field-bridge/ for QA/review, but this systemd unit is
+# intentionally left uninstalled and inactive (no `systemctl enable/start`
+# has been run) pending explicit confirmation this is ready for continuous
+# operation. See ml_classify_bridge.py's docstring for the empirically
+# confirmed Phase 1 finding (closed-world 3-class model hallucinates
+# confidently on pure noise) that motivated the energy gate this bridge
+# depends on, and the reasoning for its device-contention-aware interval.
+# ---------------------------------------------------------------------------

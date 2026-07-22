@@ -1,0 +1,50 @@
+[Unit]
+Description=CEMA cUAS - real HackRF barrage-jam bridge (WS-driven, bounded burst only)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as field-bridge/cema-hackrf-rx.service,
+# field-bridge/cema-mavlink-sniffer.service and rf-bridge/cema-rf-bridge.service.
+# There is deliberately only ONE copy of this unit in the repo; do not fork
+# per-host copies with hardcoded paths/users baked in. Keep host-specific
+# values out of this file — they belong in the EnvironmentFile below.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# Credentials and console URL are NOT hardcoded here. They are supplied via
+# EnvironmentFile, which must define at minimum:
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+#
+# =====================================================================
+# CEMA_AUTHORIZED_RANGE — DELIBERATELY NOT SET IN THIS UNIT FILE.
+# =====================================================================
+# This is the bridge-level, independent-of-the-app safety gate: jam_bridge.py
+# refuses to transmit ANY real RF unless CEMA_AUTHORIZED_RANGE=1 is present
+# in ITS OWN process environment, regardless of what the app/backend has
+# already approved (commander role + arm token + jam confirmation token —
+# see backend/server.py and field-bridge/jam_bridge.py's module docstring).
+#
+# Setting CEMA_AUTHORIZED_RANGE=1 is a DELIBERATE, SEPARATE, PER-DEPLOYMENT
+# decision that must be made by whoever configures the PHYSICAL bridge host,
+# confirming that THIS host, right now, is sitting at an authorized RF range
+# (STEAG) under Army Signals spectrum authorization. Do not add it to this
+# committed unit file, to a shared default .env, or to any image/template —
+# doing so would silently turn every deployment of this bridge into a live
+# transmitter and defeat the entire purpose of this gate. Set it only in a
+# host-specific, gitignored EnvironmentFile you create and maintain
+# yourself, and remove it again when that authorization period ends.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+ExecStart=/usr/bin/python3 -u jam_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/jam_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/jam_bridge.log
+
+[Install]
+WantedBy=multi-user.target

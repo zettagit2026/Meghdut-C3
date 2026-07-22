@@ -20,7 +20,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 
@@ -57,6 +59,118 @@ def build_noise_iq(duration_s: float, bandwidth_khz: float, sample_rate: int = S
     iq[0::2] = np.clip(noise.real, -127, 127).astype(np.int8)
     iq[1::2] = np.clip(noise.imag, -127, 127).astype(np.int8)
     return iq.tobytes()
+
+
+def transmit_burst(
+    freq_mhz: float,
+    bandwidth_khz: float,
+    duration_s: float,
+    tx_gain: int,
+    stop_event: Optional["threading.Event"] = None,
+    on_started: Optional[Callable[["subprocess.Popen"], None]] = None,
+) -> Dict[str, Any]:
+    """Non-interactive, mechanical HackRF TX primitive — the exact same
+    hackrf_transfer invocation as main()'s interactive CLI path below, minus
+    the terminal input() prompt (which cannot work over a WS-driven bridge —
+    there is no attached terminal to type into).
+
+    CALLER RESPONSIBILITY, NOT THIS FUNCTION'S: authorization gating. This
+    function does NOT check CEMA_AUTHORIZED_RANGE and does NOT ask for any
+    confirmation — it assumes the caller has already independently verified
+    both are satisfied. The two real callers are:
+      * main() below (interactive CLI): checks env var + --i-confirm flag at
+        argparse time, then still makes the operator type 'TRANSMIT' at the
+        terminal before ever reaching a transmit call.
+      * field-bridge/jam_bridge.py (WS-driven bridge, no terminal available):
+        checks its OWN env var CEMA_AUTHORIZED_RANGE (independently of any
+        app-side check) AND requires the incoming WS request to carry a
+        jam_confirm_token that the backend only mints at the exact moment an
+        operator completes the app UI's two-step SafetyGate-style confirm
+        (checklist + ARM & FIRE -> CONFIRM FIRE). That token is the digital
+        equivalent of physically typing 'TRANSMIT' — it cannot exist unless a
+        human deliberately went through the real confirmation flow.
+
+    Duration is hard-capped at MAX_DURATION_S regardless of what is
+    requested, same as the CLI path.
+
+    stop_event: if provided and set() while the burst is running, the
+    underlying hackrf_transfer process is terminated early (used by
+    jam_bridge.py to honor a live EMERGENCY ABORT mid-burst — the app's
+    existing Tier-0 "stop all TX now" control must also be able to kill a
+    real RF jam in progress, not just queued MAVLink frames).
+
+    on_started: optional callback invoked with the live subprocess.Popen the
+    instant the process is spawned, so the caller can store a handle to it
+    (e.g. to terminate it from a different thread on EMERGENCY ABORT).
+
+    Returns {"ok": bool, "error": Optional[str], "stopped_early": bool}.
+    Never raises for TX-side failures (bad hackrf_transfer exit, missing
+    binary) — those come back as ok=False with a reason so the caller can
+    send an honest ack rather than crash the bridge process.
+    """
+    duration = min(duration_s, MAX_DURATION_S)
+    iq_bytes = build_noise_iq(duration, bandwidth_khz)
+
+    with tempfile.NamedTemporaryFile(suffix=".iq") as f:
+        f.write(iq_bytes)
+        f.flush()
+        cmd = [
+            "hackrf_transfer",
+            "-t", f.name,
+            "-f", str(int(freq_mhz * 1_000_000)),
+            "-s", str(SAMPLE_RATE_HZ),
+            "-x", str(tx_gain),
+            "-a", "1",
+        ]
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except FileNotFoundError:
+            return {"ok": False, "error": "hackrf_transfer not found (install the `hackrf` package)",
+                     "stopped_early": False}
+
+        if on_started:
+            on_started(proc)
+
+        deadline = time.time() + duration + 5  # matches CLI's timeout=duration+5 margin
+        stopped_early = False
+        while True:
+            ret = proc.poll()
+            if ret is not None:
+                break
+            if stop_event is not None and stop_event.is_set():
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                stopped_early = True
+                break
+            if time.time() > deadline:
+                # Same as the CLI's expected TimeoutExpired boundary: the
+                # bounded burst ran its full duration; this is success, not
+                # failure.
+                proc.kill()
+                break
+            time.sleep(0.1)
+
+        if stopped_early:
+            return {"ok": True, "error": None, "stopped_early": True}
+
+        rc = proc.returncode
+        if rc == 0 or rc is None or rc < 0:
+            # rc < 0 / None: killed by our own deadline above — expected
+            # bounded-burst completion, not a failure (mirrors the CLI's
+            # "pass # expected" handling of subprocess.TimeoutExpired).
+            return {"ok": True, "error": None, "stopped_early": False}
+
+        stderr = ""
+        if proc.stderr:
+            try:
+                stderr = proc.stderr.read().decode(errors="replace")
+            except Exception:
+                pass
+        return {"ok": False, "error": f"hackrf_transfer exited {rc}: {stderr[:300]}",
+                 "stopped_early": False}
 
 
 def main() -> None:

@@ -7,7 +7,9 @@ import Dashboard from "@/pages/Dashboard";
 import Signals from "@/pages/Signals";
 import MavlinkConsole from "@/pages/MavlinkConsole";
 import Payloads from "@/pages/Payloads";
+import Jamming from "@/pages/Jamming";
 import KillChain from "@/pages/KillChain";
+import DetectionHistory from "@/pages/DetectionHistory";
 import MissionLog from "@/pages/MissionLog";
 import "@/App.css";
 
@@ -35,7 +37,9 @@ export default function App() {
             <Route path="signals"   element={<Signals />} />
             <Route path="mavlink"   element={<MavlinkConsole />} />
             <Route path="payloads"  element={<Payloads />} />
+            <Route path="jamming"   element={<Jamming />} />
             <Route path="killchain" element={<KillChain />} />
+            <Route path="history"   element={<DetectionHistory />} />
             <Route path="logs"      element={<MissionLog />} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />

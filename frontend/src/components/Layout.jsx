@@ -3,7 +3,7 @@ import { ClassificationBanner } from "@/components/ClassificationBanner";
 import EmergencyAbort from "@/components/EmergencyAbort";
 import { useAuth } from "@/context/AuthContext";
 import {
-  Radar, Waves, Radio, Bomb, Crosshair, ScrollText, LogOut, Terminal, Shield,
+  Radar, Waves, Radio, Bomb, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History,
 } from "lucide-react";
 
 const NAV = [
@@ -11,7 +11,9 @@ const NAV = [
   { to: "/signals",     label: "SIGNAL ANALYSIS",  icon: Waves,     testid: "nav-signals" },
   { to: "/mavlink",     label: "MAVLINK CONSOLE",  icon: Radio,     testid: "nav-mavlink" },
   { to: "/payloads",    label: "PAYLOAD LIBRARY",  icon: Bomb,      testid: "nav-payloads" },
+  { to: "/jamming",     label: "RF BARRAGE JAM",   icon: Zap,       testid: "nav-jamming" },
   { to: "/killchain",   label: "KILL CHAIN",       icon: Crosshair, testid: "nav-killchain" },
+  { to: "/history",     label: "DETECTION HISTORY",icon: History,   testid: "nav-history" },
   { to: "/logs",        label: "MISSION LOG",      icon: ScrollText,testid: "nav-logs" },
 ];
 
@@ -33,10 +35,10 @@ export default function Layout() {
           <div className="p-6 tactical-border-b">
             <div className="flex items-center gap-2">
               <Shield size={22} strokeWidth={1.5} style={{ color: "var(--accent-info)" }} />
-              <span className="font-heading font-black text-lg tracking-tighter">CEMA cUAS</span>
+              <span className="font-heading font-black text-lg tracking-tighter">MEGHADUTA C³</span>
             </div>
             <div className="mt-1 font-mono text-[10px] uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>
-              v0.9 · Zettawise
+              Command · Control · Communications
             </div>
           </div>
 

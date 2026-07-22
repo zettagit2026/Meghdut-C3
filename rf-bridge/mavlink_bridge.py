@@ -35,6 +35,22 @@ from common import CemaClient, cfg, cfg_int
 log = logging.getLogger("mav-bridge")
 
 
+def _send_tx_ack(ws, request_id: str, ok: bool, error: Optional[str] = None) -> None:
+    """Send a real ack back to the server over the same WS connection this
+    packet arrived on, after an actual write_frame() attempt (success or
+    exception) — this is what lets the server ever transition a detection out
+    of AWAITING_ACK. Never sent speculatively / before the write is attempted."""
+    if ws is None or not request_id:
+        return
+    ack = {"type": "tx_ack", "request_id": request_id, "ok": bool(ok), "ts": time.time()}
+    if error:
+        ack["error"] = str(error)[:300]
+    try:
+        ws.send(json.dumps(ack))
+    except Exception as e:
+        log.warning("failed to send tx_ack for request_id=%s: %s", request_id, e)
+
+
 class MavlinkBridge:
     def __init__(self) -> None:
         self.client = CemaClient()
@@ -63,13 +79,16 @@ class MavlinkBridge:
         log.info("Serial link up.")
 
     def write_frame(self, frame: bytes) -> None:
+        # NOTE: this now RAISES on any failure (including "port not open")
+        # instead of silently swallowing it. The caller (on_message, below)
+        # depends on that to send an honest tx_ack(ok=False) back to the
+        # server — this is precisely the gap that let a deploy report
+        # "success" to the operator while nothing was ever written to the
+        # real radio.
         if not self.ser or not self.ser.is_open:
-            return
-        try:
-            self.ser.write(frame)
-            self.ser.flush()
-        except serial.SerialException as e:
-            log.warning("serial write failed: %s", e)
+            raise RuntimeError("serial port not open")
+        self.ser.write(frame)
+        self.ser.flush()
 
     # ---- WS subscribe (TX path: app → radio → drone) ---------------------
     def start_ws_subscriber(self) -> None:
@@ -111,24 +130,37 @@ class MavlinkBridge:
             if mtype != "packet":
                 return
 
+            pkt = data.get("packet", {})
+            request_id = pkt.get("request_id")
+
             if self.tx_halted:
                 log.warning("TX suppressed: EMERGENCY ABORT in effect — dropping frame, not forwarding to serial.")
+                _send_tx_ack(_ws, request_id, False, "tx halted (EMERGENCY ABORT in effect on bridge)")
                 return
 
-            pkt = data.get("packet", {})
             hex_str = pkt.get("hex")
             if not hex_str:
                 return
             try:
                 frame = binascii.unhexlify(hex_str)
-            except binascii.Error:
+            except binascii.Error as e:
+                _send_tx_ack(_ws, request_id, False, f"invalid hex payload: {e}")
                 return
-            log.info("TX → serial: msgid=%s tgt_sys=%s len=%d bytes (%s)",
+            log.info("TX → serial: msgid=%s tgt_sys=%s len=%d bytes (%s) request_id=%s",
                      pkt.get("decoded", {}).get("message_id"),
                      pkt.get("target_system"),
                      len(frame),
-                     pkt.get("payload_name") or "manual")
-            self.write_frame(frame)
+                     pkt.get("payload_name") or "manual",
+                     request_id)
+            try:
+                self.write_frame(frame)
+            except Exception as e:
+                # Real failure signal — the frame did NOT reach the radio.
+                log.error("TX FAILED writing to serial (request_id=%s): %s", request_id, e)
+                _send_tx_ack(_ws, request_id, False, str(e))
+                return
+            log.info("TX confirmed written to serial (request_id=%s)", request_id)
+            _send_tx_ack(_ws, request_id, True)
 
         def on_error(_ws, err):
             emsg = str(err)
@@ -251,10 +283,12 @@ class MavlinkBridge:
                 source_system=255, source_component=190,
             )
             def write_via_pymav(frame: bytes) -> None:
-                try:
-                    self._pymav.write(frame)
-                except Exception as e:
-                    log.warning("pymav write failed: %s", e)
+                # Let exceptions propagate — on_message's try/except around
+                # write_frame() is what turns a real failure here into an
+                # honest tx_ack(ok=False) back to the server. Swallowing it
+                # here (as the previous version did) is exactly what allowed
+                # a deploy to look successful when nothing reached the radio.
+                self._pymav.write(frame)
             self.write_frame = write_via_pymav  # type: ignore
 
             # RX loop reads from self._pymav

@@ -44,9 +44,9 @@ export default function Login() {
           <div className="flex items-center gap-3">
             <Shield size={32} strokeWidth={1.5} style={{ color: "var(--accent-info)" }} />
             <div>
-              <div className="font-heading font-black text-2xl tracking-tighter">CEMA · cUAS</div>
+              <div className="font-heading font-black text-2xl tracking-tighter">MEGHADUTA C³</div>
               <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-                Counter-Unmanned Aircraft Ops · Zettawise
+                Command · Control · Communications · Zettawise
               </div>
             </div>
           </div>

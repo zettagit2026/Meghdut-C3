@@ -6,16 +6,33 @@ Endpoints (all under /api):
   spectrum: /spectrum/waterfall
   mavlink: /mavlink/craft (preview-only) /mavlink/broadcast (commander-only, transmits) /mavlink/packets  (ws /ws/mavlink)
   payloads: /payloads /payloads/deploy (commander-only + arm-token for CRITICAL/broadcast)
+  jamming: /payloads/jam (commander-only + arm-token + jam-confirm-token, always CRITICAL)
+           /jam/confirm (commander-only, issues a single-use jam-confirm token)
+           /jam/status  (current/last jam session state)
   arm: /arm (commander-only, issues a 60s single-use arm token)
   emergency: /emergency/abort (any operator) /emergency/resume (commander-only)
   logs:  /logs
 
 RBAC: two roles, "operator" and "commander". Anything that transmits a
-kinetic/broadcast command (/payloads/deploy, /mavlink/broadcast) requires
-"commander". CRITICAL-severity payload deploys and any broadcast
-(target_system=0) additionally require a fresh arm token from POST /arm.
-Targeting a specific detection requires it be explicitly authorized via
-POST /detections/{id}/authorize-target (friendly-fire interlock).
+kinetic/broadcast command (/payloads/deploy, /mavlink/broadcast, /payloads/jam)
+requires "commander". CRITICAL-severity payload deploys, any broadcast
+(target_system=0), and ALL real RF jamming additionally require a fresh arm
+token from POST /arm. Targeting a specific detection requires it be
+explicitly authorized via POST /detections/{id}/authorize-target
+(friendly-fire interlock).
+
+RF JAMMING (/payloads/jam) is a SEPARATE, additionally-gated capability on
+top of everything above: it also requires a jam_confirm_token from POST
+/jam/confirm, which the frontend is only supposed to request at the exact
+moment an operator completes SafetyGate.jsx's two-step confirm (checklist +
+ARM & FIRE -> CONFIRM FIRE) for the jam action — see frontend/src/pages/
+Jamming.jsx. This backend-side token is necessary but NOT sufficient on its
+own: the physical bridge host (field-bridge/jam_bridge.py) independently
+refuses to transmit unless CEMA_AUTHORIZED_RANGE=1 is set in its OWN
+environment, regardless of what this backend has already approved. See
+field-bridge/jam_bridge.py's module docstring for the full defense-in-depth
+chain and why it preserves — rather than casually approximates — the
+original interactive "type TRANSMIT" gate in field-bridge/hackrf_jam.py.
 """
 from __future__ import annotations
 
@@ -28,6 +45,7 @@ load_dotenv(ROOT_DIR / ".env")
 import asyncio
 import base64
 import binascii
+import json
 import logging
 import os
 import uuid
@@ -204,6 +222,48 @@ def _consume_arm_token(token: Optional[str]) -> None:
         raise HTTPException(403, "Arm token invalid or expired — request a new one via POST /api/arm")
 
 
+# ---- Jam-confirm token (SEPARATE from arm_token — the digital equivalent
+# of physically typing 'TRANSMIT' at hackrf_jam.py's interactive prompt) ----
+# RF jamming (/payloads/jam) needs its own, distinct, single-use token — NOT
+# a reuse of the arm token — because it stands for a different thing: proof
+# that the operator just walked through frontend/src/pages/Jamming.jsx's
+# SafetyGate-style two-step confirm (5-point checklist + ARM & FIRE ->
+# CONFIRM FIRE) for THIS specific jam action. POST /jam/confirm is meant to
+# be called by the frontend at the exact instant that confirm completes —
+# never pre-fetched, never cached, never reused across requests. This token
+# is then forwarded (already consumed here) inside the jam_request WS
+# message to field-bridge/jam_bridge.py, which additionally checks its own
+# shape (see jam_bridge.MIN_CONFIRM_TOKEN_LEN) as a defense-in-depth belt —
+# though the real single-use validation happens here, once, before the
+# bridge ever sees it.
+#
+# Short TTL (30s, shorter than the arm token's 60s) since this is meant to be
+# consumed within roughly one HTTP round-trip of the confirm click, not held
+# for later use.
+JAM_CONFIRM_TTL_S = 30
+_jam_confirm_tokens: Dict[str, datetime] = {}
+
+
+def _issue_jam_confirm_token() -> Dict[str, Any]:
+    token = str(uuid.uuid4())
+    _jam_confirm_tokens[token] = datetime.now(timezone.utc) + timedelta(seconds=JAM_CONFIRM_TTL_S)
+    return {"jam_confirm_token": token, "expires_in_s": JAM_CONFIRM_TTL_S}
+
+
+def _consume_jam_confirm_token(token: Optional[str]) -> None:
+    if not token:
+        raise HTTPException(
+            403,
+            "Jam confirmation token required: complete the SafetyGate checklist and "
+            "ARM & FIRE -> CONFIRM FIRE sequence in the Jamming UI, which requests a "
+            "fresh POST /api/jam/confirm at the moment of confirmation.",
+        )
+    expiry = _jam_confirm_tokens.pop(token, None)
+    if not expiry or datetime.now(timezone.utc) > expiry:
+        raise HTTPException(403, "Jam confirmation token invalid or expired — re-run the "
+                                  "confirmation sequence in the Jamming UI.")
+
+
 # ---- Authoritative transmit-halt (server-side, checked before any TX) ----
 # Set by /emergency/abort, cleared by /emergency/resume. /payloads/deploy and
 # /mavlink/broadcast both check this BEFORE building/sending any frame — the
@@ -216,6 +276,208 @@ def _check_tx_not_halted() -> None:
     if _tx_halted:
         raise HTTPException(409, "Transmission halted — EMERGENCY ABORT is in effect. "
                                   "A commander must POST /api/emergency/resume first.")
+
+
+# ---- Bridge TX acknowledgment (closes the "silent success" gap) ----
+# Root cause of the earlier live-demo failure: /payloads/deploy and
+# /mavlink/broadcast used to build a frame, broadcast it over the WS to
+# whichever bridge happened to be connected, and UNCONDITIONALLY mark the
+# detection NEUTRALIZED — with no confirmation the bridge was even connected,
+# let alone that it actually wrote the frame to the real serial radio. Now:
+# every deploy gets a request_id, the detection is parked in AWAITING_ACK,
+# and only a real tx_ack message FROM the bridge (rf-bridge/mavlink_bridge.py,
+# sent after its actual pyserial/pymavlink write call) flips it to
+# NEUTRALIZED (ok=True) or TX_FAILED (ok=False). If no ack arrives at all
+# (bridge not connected/crashed) a lazy on-read timeout flips it to
+# TX_TIMEOUT instead of leaving it stuck forever — distinct from TX_FAILED
+# because a timeout means "unknown outcome", not "confirmed failure".
+#
+# In-memory pending-ack table, consistent with the existing _arm_tokens
+# pattern (no new infra). request_id -> {ts, detection_ids, spec_name, broadcast}
+_pending_acks: Dict[str, Dict[str, Any]] = {}
+
+# 8s: real serial writes + WS round-trip to the bridge are sub-second; this
+# generously covers WS scheduling/latency on the bridge host while still
+# failing fast enough that an operator notices and can retry within the same
+# engagement window, rather than a stale AWAITING_ACK sitting for minutes.
+ACK_TIMEOUT_S = 8
+
+
+async def _expire_pending_acks() -> None:
+    """Lazy/on-read expiry (same pattern as _expire_stale_detections): any
+    pending ack older than ACK_TIMEOUT_S with no response from the bridge is
+    flipped from AWAITING_ACK to TX_TIMEOUT — a real 'we don't know' signal,
+    never silently promoted to success."""
+    now = datetime.now(timezone.utc)
+    expired = [rid for rid, p in _pending_acks.items()
+              if (now - p["ts"]).total_seconds() > ACK_TIMEOUT_S]
+    for rid in expired:
+        pending = _pending_acks.pop(rid, None)
+        if not pending:
+            continue
+        det_ids = pending.get("detection_ids") or []
+        if det_ids:
+            await db.detections.update_many(
+                {"id": {"$in": det_ids}, "status": "AWAITING_ACK"},
+                {"$set": {"status": "TX_TIMEOUT"}},
+            )
+        await log_event(
+            "BRIDGE_ACK",
+            f"No bridge ACK within {ACK_TIMEOUT_S}s for request {rid} "
+            f"({pending.get('spec_name', '?')}) — marking TX_TIMEOUT "
+            f"(bridge not connected or not responding)",
+            meta={"request_id": rid, "detection_ids": det_ids},
+            actor="SYSTEM",
+        )
+
+
+# ---- RF jam session tracking (separate from _pending_acks/_handle_tx_ack
+# above — jamming has its own richer state machine than a single
+# ack/no-ack, because a real HackRF burst has an observable *duration*, not
+# just a single accept/reject) ----
+#
+# request_id -> {ts, status, band/freq_mhz, duration_s, bandwidth_khz,
+#                tx_gain, actor, error}
+# status values: AWAITING_ACK -> JAM_ACTIVE -> JAM_COMPLETE | JAM_STOPPED
+#                | TX_FAILED | TX_TIMEOUT
+# (matches field-bridge/hackrf_jam.py's REAL behavior: a single bounded
+# burst, hard-capped at MAX_DURATION_S seconds — NOT continuous. See
+# field-bridge/jam_bridge.py's module docstring for why --continuous mode is
+# deliberately not exposed through this integration.)
+_pending_jam: Dict[str, Dict[str, Any]] = {}
+
+# Bridge ack ("started") must arrive within this window of the request being
+# sent, same reasoning as ACK_TIMEOUT_S above.
+JAM_ACK_TIMEOUT_S = 8
+# Once JAM_ACTIVE, a terminal ack (complete/failed/stopped) must arrive
+# within duration_s + this margin, else we've lost contact with the bridge
+# mid-burst (crashed, killed, network partition) — TX_TIMEOUT, not silently
+# left "active" forever.
+JAM_COMPLETE_MARGIN_S = 15
+
+
+async def _expire_pending_jam() -> None:
+    """Lazy/on-read expiry, same pattern as _expire_pending_acks. Two
+    distinct expiry conditions since jam sessions have two live states:
+      * AWAITING_ACK too long  -> bridge never even acknowledged the request
+        (not connected / didn't see it) -> TX_TIMEOUT.
+      * JAM_ACTIVE too long    -> bridge started transmitting but never sent
+        a terminal ack (complete/failed/stopped) within its own declared
+        duration + margin -> TX_TIMEOUT (distinct from TX_FAILED: we do not
+        know whether RF is still being emitted, which is itself worth
+        surfacing rather than silently clearing)."""
+    now = datetime.now(timezone.utc)
+    to_expire = []
+    for rid, p in _pending_jam.items():
+        if p["status"] == "AWAITING_ACK" and (now - p["ts"]).total_seconds() > JAM_ACK_TIMEOUT_S:
+            to_expire.append(rid)
+        elif p["status"] == "JAM_ACTIVE" and \
+                (now - p["ts"]).total_seconds() > p.get("duration_s", 10) + JAM_COMPLETE_MARGIN_S:
+            to_expire.append(rid)
+    for rid in to_expire:
+        p = _pending_jam.get(rid)
+        if not p:
+            continue
+        p["status"] = "TX_TIMEOUT"
+        await log_event(
+            "JAM",
+            f"No terminal bridge ack for jam request {rid} within expected window — "
+            f"marking TX_TIMEOUT (bridge not connected, crashed, or lost mid-burst)",
+            meta={"request_id": rid}, actor="SYSTEM",
+        )
+        await ws_manager.broadcast_json({"type": "jam_status", "request_id": rid, "status": "TX_TIMEOUT"})
+
+
+async def _handle_jam_ack(msg: Dict[str, Any]) -> None:
+    """Process a real {"type": "jam_ack", "phase": ..., ...} message from
+    field-bridge/jam_bridge.py. phase is one of started/complete/failed/stopped.
+    Only this function is allowed to move a jam session between states."""
+    request_id = msg.get("request_id")
+    phase = msg.get("phase")
+    pending = _pending_jam.get(request_id) if request_id else None
+    if not pending:
+        logger.warning("jam_ack received for unknown/expired request_id=%s (phase=%s)", request_id, phase)
+        return
+
+    phase_to_status = {
+        "started": "JAM_ACTIVE",
+        "complete": "JAM_COMPLETE",
+        "failed": "TX_FAILED",
+        "stopped": "JAM_STOPPED",
+    }
+    status = phase_to_status.get(phase)
+    if not status:
+        logger.warning("jam_ack with unrecognized phase=%s for request_id=%s", phase, request_id)
+        return
+
+    pending["status"] = status
+    pending["ts"] = datetime.now(timezone.utc)  # reset the clock for the next expiry window
+    error = msg.get("error")
+    if error:
+        pending["error"] = error
+
+    if status in ("JAM_COMPLETE", "TX_FAILED", "JAM_STOPPED"):
+        # Terminal — leave the record in _pending_jam (for GET /jam/status
+        # history/inspection) but it no longer needs expiry-tracking.
+        pending["terminal"] = True
+
+    await log_event(
+        "JAM",
+        (f"Bridge CONFIRMED jam TX started for request {request_id} "
+         f"({pending.get('freq_mhz')} MHz)") if status == "JAM_ACTIVE" else
+        (f"Jam burst complete for request {request_id}") if status == "JAM_COMPLETE" else
+        (f"Jam burst STOPPED early (EMERGENCY ABORT) for request {request_id}") if status == "JAM_STOPPED" else
+        (f"Jam burst FAILED for request {request_id}: {error or 'no reason given'}"),
+        meta={"request_id": request_id, "status": status, "error": error},
+        actor="BRIDGE",
+    )
+    await ws_manager.broadcast_json({"type": "jam_status", "request_id": request_id, "status": status,
+                                     "error": error})
+
+
+async def _handle_tx_ack(msg: Dict[str, Any]) -> None:
+    """Process a real {"type": "tx_ack", ...} message received FROM a
+    connected bridge client over the mavlink WS — see
+    rf-bridge/mavlink_bridge.py, sent only after its actual serial write
+    call succeeds or raises. This is the only path that is allowed to
+    transition a detection out of AWAITING_ACK into NEUTRALIZED."""
+    request_id = msg.get("request_id")
+    ok = bool(msg.get("ok"))
+    pending = _pending_acks.pop(request_id, None) if request_id else None
+    if not pending:
+        logger.warning("tx_ack received for unknown/expired request_id=%s (ok=%s)", request_id, ok)
+        return
+
+    det_ids = pending.get("detection_ids") or []
+    if det_ids:
+        update: Dict[str, Any] = {"last_seen": datetime.now(timezone.utc).isoformat()}
+        if ok:
+            update.update({
+                "status": "NEUTRALIZED",
+                "kill_chain_stage": "DEFEAT",
+                "kill_chain_index": len(KILL_CHAIN) - 1,
+                "cema_stage": "EXPLOIT",
+                "cema_stage_index": len(CEMA_STAGES) - 1,
+            })
+        else:
+            update["status"] = "TX_FAILED"
+        # Only advance detections still genuinely awaiting this ack (guards
+        # against a late/duplicate ack clobbering a status changed since).
+        await db.detections.update_many(
+            {"id": {"$in": det_ids}, "status": "AWAITING_ACK"},
+            {"$set": update},
+        )
+
+    err = msg.get("error")
+    await log_event(
+        "BRIDGE_ACK",
+        (f"Bridge CONFIRMED real serial TX for request {request_id} "
+         f"({pending.get('spec_name', '?')})") if ok else
+        (f"Bridge reported TX FAILED for request {request_id} "
+         f"({pending.get('spec_name', '?')}): {err or 'no reason given'}"),
+        meta={"request_id": request_id, "ok": ok, "detection_ids": det_ids, "error": err},
+        actor="BRIDGE",
+    )
 
 
 # =====================================================================
@@ -290,6 +552,28 @@ class DeployPayloadBody(BaseModel):
 
 class AuthorizeTargetBody(BaseModel):
     authorized: bool = True
+
+
+class JamRequestBody(BaseModel):
+    # Either band (a validated preset — see JAM_BAND_PRESETS_MHZ, mirrored
+    # from field-bridge/hackrf_jam.py's BAND_PRESETS_MHZ) or an explicit
+    # freq_mhz must be given; freq_mhz wins if both are present, same
+    # precedence as hackrf_jam.py's own CLI.
+    band: Optional[str] = Field(None, pattern="^(433|915|2g4|5g8)$")
+    freq_mhz: Optional[float] = None
+    bandwidth_khz: float = 500.0
+    duration_s: float = 5.0  # server-side clamps to JAM_MAX_DURATION_S regardless
+    tx_gain: int = 20
+    arm_token: str  # required unconditionally — jamming is always CRITICAL severity
+    jam_confirm_token: str  # required unconditionally — see /jam/confirm
+
+
+class JamConfirmBody(BaseModel):
+    # No fields needed today — this endpoint's only job is to mint a token
+    # at the moment it's called. Kept as an empty body (rather than no body
+    # at all) so a future addition (e.g. an operator note) doesn't require a
+    # breaking change to the call signature.
+    pass
 
 
 # =====================================================================
@@ -420,12 +704,14 @@ async def _expire_stale_detections() -> None:
 @api.get("/detections")
 async def list_detections(user: Dict = Depends(get_current_user)):
     await _expire_stale_detections()
+    await _expire_pending_acks()
     docs = await db.detections.find({}, {"_id": 0}).to_list(500)
     return docs
 
 
 @api.get("/detections/{det_id}")
 async def get_detection(det_id: str, user: Dict = Depends(get_current_user)):
+    await _expire_pending_acks()
     doc = await db.detections.find_one({"id": det_id}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Detection not found")
@@ -554,6 +840,35 @@ class DetectionIngestBody(BaseModel):
     # Defaults False for backward compatibility, following the same pattern
     # used for distance_estimated above.
     protocol_confirmed: bool = False
+    # --- ML classify-and-ingest bridge fields (field-bridge/ml_classify_bridge.py) ---
+    # This is an ADDITIONAL, SUPPLEMENTARY signal layered on top of the
+    # RSSI-heuristic detection above -- it does NOT replace protocol_confirmed
+    # or any existing field, and it is populated by a separate, independent
+    # bridge process, not by hackrf_rx.py itself.
+    #
+    # ml_label / ml_confidence come from real inference (a pretrained
+    # GamutRF-style ResNet18 checkpoint) run against a real captured IQ
+    # window. KNOWN LIMITATION: the only checkpoint currently deployed
+    # (resnet18_leesburg_split_0.02_1_current.pt) is a CLOSED-WORLD 3-class
+    # model -- {drone, wifi_2_4, wifi_5} -- with NO idle/noise/background/
+    # "none of the above" class, so it always emits a confident label even
+    # when the true signal doesn't match any of its 3 classes. Empirical
+    # testing on this deployment (real IQ capture at 3.6GHz, a genuinely
+    # quiet band) showed >99% confident "drone" predictions on pure
+    # noise-floor energy. Weight ml_label/ml_confidence accordingly,
+    # especially at lower confidence values -- this is informational,
+    # not a substitute for protocol_confirmed or the RSSI heuristic.
+    #
+    # ml_gated indicates whether ml_classify_bridge.py's energy gate passed
+    # before it ran inference (peak power above that band's established
+    # BAND_NOISE_FLOOR_DBM + DETECT_THRESHOLD_DB) -- this is the concrete
+    # mitigation for the noise-hallucination finding above: the classifier
+    # is only ever invoked on real above-floor energy, never on silence.
+    # Defaults None/False so existing sources (hackrf_rx.py, simulated data)
+    # are not retroactively mislabeled.
+    ml_label: Optional[str] = None
+    ml_confidence: Optional[float] = None
+    ml_gated: bool = False
 
 
 @api.post("/spectrum/ingest")
@@ -614,6 +929,9 @@ async def detection_ingest(body: DetectionIngestBody,
             "altitude_m": body.altitude_m,
             "speed_ms": body.speed_ms,
             "protocol_confirmed": body.protocol_confirmed,
+            "ml_label": body.ml_label,
+            "ml_confidence": body.ml_confidence,
+            "ml_gated": body.ml_gated,
             "last_seen": datetime.now(timezone.utc).isoformat(),
         }
         await db.detections.update_one({"id": existing["id"]}, {"$set": updates})
@@ -641,6 +959,9 @@ async def detection_ingest(body: DetectionIngestBody,
         "encrypted": body.encrypted,
         "source": body.source,
         "protocol_confirmed": body.protocol_confirmed,
+        "ml_label": body.ml_label,
+        "ml_confidence": body.ml_confidence,
+        "ml_gated": body.ml_gated,
     })
     await db.detections.insert_one(det.copy())
     await log_event("DETECTION",
@@ -706,8 +1027,14 @@ async def broadcast_packet(body: MavlinkCraftBody, user: Dict = Depends(require_
         # including friendlies — require a freshly-issued arm token.
         _consume_arm_token(body.arm_token)
     frame = _craft(body)
+    # Same request_id/ack correlation as /payloads/deploy — this frame has no
+    # associated detection to gate, but we still want a real bridge
+    # confirmation logged rather than declaring victory the instant the frame
+    # hits the WS (see _handle_tx_ack / _expire_pending_acks).
+    request_id = str(uuid.uuid4())
     pkt = {
         "id": str(uuid.uuid4()),
+        "request_id": request_id,
         "ts": datetime.now(timezone.utc).isoformat(),
         "hex": frame.hex().upper(),
         "length": len(frame),
@@ -723,10 +1050,18 @@ async def broadcast_packet(body: MavlinkCraftBody, user: Dict = Depends(require_
     await db.mav_packets.insert_one(pkt.copy())
     pkt.pop("_id", None)
     await ws_manager.broadcast_json({"type": "packet", "packet": pkt})
+    _pending_acks[request_id] = {
+        "ts": datetime.now(timezone.utc),
+        "detection_ids": [],
+        "spec_name": f"raw msgid={body.message_id}",
+        "broadcast": True,
+    }
     await log_event("MAVLINK",
-                    f"Broadcast msgid={body.message_id} cmd={body.command} → sys={body.target_system}",
-                    meta={"packet_id": pkt["id"], "length": len(frame)},
+                    f"Requested broadcast msgid={body.message_id} cmd={body.command} → "
+                    f"sys={body.target_system} — awaiting bridge TX confirmation (request {request_id})",
+                    meta={"packet_id": pkt["id"], "length": len(frame), "request_id": request_id},
                     actor=user["email"])
+    pkt["status"] = "AWAITING_ACK"
     return pkt
 
 
@@ -756,8 +1091,21 @@ async def ws_mavlink(ws: WebSocket):
     try:
         await ws.send_json({"type": "hello", "ts": datetime.now(timezone.utc).isoformat()})
         while True:
-            # keep the connection open; ignore client messages
-            await ws.receive_text()
+            # Bridge clients (rf-bridge/mavlink_bridge.py) send real messages
+            # back on this same connection now — specifically {"type":
+            # "tx_ack", ...} after a real serial write attempt. Anything else
+            # (or anything we fail to parse) is ignored, same as before.
+            raw = await ws.receive_text()
+            try:
+                incoming = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(incoming, dict) and incoming.get("type") == "tx_ack":
+                await _handle_tx_ack(incoming)
+            elif isinstance(incoming, dict) and incoming.get("type") == "jam_ack":
+                # From field-bridge/jam_bridge.py, after a real (or refused)
+                # hackrf_transfer attempt — see _handle_jam_ack.
+                await _handle_jam_ack(incoming)
     except WebSocketDisconnect:
         pass
     finally:
@@ -819,8 +1167,14 @@ async def deploy_payload(body: DeployPayloadBody,
     # raised TypeError for every payload except PL-010 (missing required
     # positional target_sys), which FastAPI surfaced as an unhandled 500.
     frame = builder(target_sys, target_comp, 0)
+    # SECURITY/RELIABILITY: request_id correlates this specific deploy to the
+    # tx_ack the bridge sends back after its real serial write — see
+    # _handle_tx_ack / rf-bridge/mavlink_bridge.py. Nothing here is marked
+    # NEUTRALIZED until that ack actually arrives with ok=True.
+    request_id = str(uuid.uuid4())
     pkt = {
         "id": str(uuid.uuid4()),
+        "request_id": request_id,
         "ts": datetime.now(timezone.utc).isoformat(),
         "hex": frame.hex().upper(),
         "length": len(frame),
@@ -839,36 +1193,163 @@ async def deploy_payload(body: DeployPayloadBody,
     await ws_manager.broadcast_json({"type": "packet", "packet": pkt})
     await log_event(
         "PAYLOAD",
-        f"Deployed {spec.name} ({spec.severity}) on {'BROADCAST' if body.broadcast else detection.get('callsign','?')}",
+        f"Requested {spec.name} ({spec.severity}) on "
+        f"{'BROADCAST' if body.broadcast else detection.get('callsign','?')} "
+        f"— awaiting bridge TX confirmation (request {request_id})",
         meta={"payload_id": spec.id, "packet_id": pkt["id"], "broadcast": body.broadcast,
-              "target_detection_id": body.target_detection_id},
+              "target_detection_id": body.target_detection_id, "request_id": request_id},
         actor=user["email"],
     )
 
-    # If targeting a specific drone, mark it neutralized after payload deploy
+    # Do NOT mark NEUTRALIZED here — this is the exact bug that caused the
+    # earlier live-demo failure (frame broadcast over WS to whichever bridge
+    # happened to be connected, detection unconditionally marked defeated,
+    # with zero confirmation the bridge wrote it to the real radio). Instead
+    # park the detection(s) in AWAITING_ACK and register the pending ack so
+    # _handle_tx_ack / _expire_pending_acks can resolve it for real.
+    detection_ids: List[str] = []
     if detection is not None:
+        detection_ids = [detection["id"]]
         await db.detections.update_one(
             {"id": detection["id"]},
             {"$set": {
-                "status": "NEUTRALIZED",
-                "kill_chain_stage": "DEFEAT",
-                "kill_chain_index": len(KILL_CHAIN) - 1,
-                "cema_stage": "EXPLOIT",
-                "cema_stage_index": len(CEMA_STAGES) - 1,
+                "status": "AWAITING_ACK",
                 "last_seen": datetime.now(timezone.utc).isoformat(),
                 "last_payload": spec.name,
             }},
         )
     elif body.broadcast:
-        await db.detections.update_many(
-            {"status": "ACTIVE"},
-            {"$set": {"status": "NEUTRALIZED",
-                      "kill_chain_stage": "DEFEAT",
-                      "kill_chain_index": len(KILL_CHAIN) - 1,
-                      "last_payload": spec.name}},
-        )
+        active = await db.detections.find(
+            {"status": "ACTIVE"}, {"_id": 0, "id": 1}
+        ).to_list(1000)
+        detection_ids = [d["id"] for d in active]
+        if detection_ids:
+            await db.detections.update_many(
+                {"id": {"$in": detection_ids}},
+                {"$set": {"status": "AWAITING_ACK", "last_payload": spec.name}},
+            )
 
+    _pending_acks[request_id] = {
+        "ts": datetime.now(timezone.utc),
+        "detection_ids": detection_ids,
+        "spec_name": spec.name,
+        "broadcast": body.broadcast,
+    }
+
+    pkt["status"] = "AWAITING_ACK"
     return pkt
+
+
+# =====================================================================
+# Routes: RF Jamming (real HackRF barrage-jam TX via field-bridge/jam_bridge.py)
+# =====================================================================
+# Mirrors field-bridge/hackrf_jam.py's own BAND_PRESETS_MHZ / MAX_DURATION_S —
+# duplicated here (rather than imported) because the backend and the field
+# bridge are separate deployable processes/hosts; kept as the same values by
+# convention. If hackrf_jam.py's presets ever change, update this dict too.
+JAM_BAND_PRESETS_MHZ = {"433": 435.0, "915": 915.0, "2g4": 2450.0, "5g8": 5800.0}
+JAM_MAX_DURATION_S = 10.0  # matches field-bridge/hackrf_jam.py's MAX_DURATION_S
+
+
+@api.post("/jam/confirm")
+async def jam_confirm(user: Dict = Depends(require_commander)):
+    """Mint a single-use jam_confirm_token, valid for JAM_CONFIRM_TTL_S
+    seconds. The frontend (frontend/src/pages/Jamming.jsx) must call this
+    EXACTLY at the moment its SafetyGate-style two-step confirm (5-point
+    checklist + ARM & FIRE -> CONFIRM FIRE) completes — never earlier, never
+    cached. This token is what stands in for hackrf_jam.py's interactive
+    'type TRANSMIT' prompt once the request reaches the WS-driven bridge
+    (field-bridge/jam_bridge.py), which cannot present that prompt itself."""
+    tok = _issue_jam_confirm_token()
+    await log_event("JAM_CONFIRM",
+                    f"Jam confirmation token issued (valid {JAM_CONFIRM_TTL_S}s) — "
+                    f"operator completed SafetyGate checklist + two-click confirm",
+                    actor=user["email"])
+    return tok
+
+
+@api.post("/payloads/jam")
+async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commander)):
+    """Request a real, bounded-duration HackRF barrage-jam burst.
+
+    Layered gates, ALL independently required (see field-bridge/jam_bridge.py's
+    module docstring for the full chain including the bridge-side gates this
+    endpoint cannot itself enforce):
+      1. require_commander (above).
+      2. _check_tx_not_halted — EMERGENCY ABORT blocks this like any other TX.
+      3. arm_token — jamming is unconditionally CRITICAL severity; always required.
+      4. jam_confirm_token — proof the frontend's SafetyGate-style two-step
+         confirm actually happened for THIS request; always required.
+    Neither token is optional or conditional here (unlike /payloads/deploy's
+    severity-dependent arm_token) — every jam request needs both, every time.
+    """
+    _check_tx_not_halted()
+    _consume_arm_token(body.arm_token)
+    _consume_jam_confirm_token(body.jam_confirm_token)
+
+    freq_mhz = body.freq_mhz if body.freq_mhz is not None else JAM_BAND_PRESETS_MHZ.get(body.band)
+    if not freq_mhz:
+        raise HTTPException(400, "Provide either `band` (433|915|2g4|5g8) or an explicit `freq_mhz`.")
+    duration_s = min(body.duration_s, JAM_MAX_DURATION_S)
+
+    request_id = str(uuid.uuid4())
+    _pending_jam[request_id] = {
+        "ts": datetime.now(timezone.utc),
+        "status": "AWAITING_ACK",
+        "band": body.band,
+        "freq_mhz": freq_mhz,
+        "bandwidth_khz": body.bandwidth_khz,
+        "duration_s": duration_s,
+        "tx_gain": body.tx_gain,
+        "actor": user["email"],
+    }
+
+    await ws_manager.broadcast_json({
+        "type": "jam_request",
+        "request_id": request_id,
+        "band": body.band,
+        "freq_mhz": freq_mhz,
+        "bandwidth_khz": body.bandwidth_khz,
+        "duration_s": duration_s,
+        "tx_gain": body.tx_gain,
+        # Forwarded AFTER being consumed above — its presence here is the
+        # bridge's evidence a real UI confirmation happened, not a live
+        # credential the bridge itself validates against the backend.
+        "jam_confirm_token": body.jam_confirm_token,
+        "actor": user["email"],
+    })
+
+    await log_event(
+        "JAM",
+        f"Requested RF jam burst: {freq_mhz} MHz, {body.bandwidth_khz}kHz BW, "
+        f"{duration_s}s, gain={body.tx_gain} — awaiting bridge TX confirmation (request {request_id})",
+        meta={"request_id": request_id, "freq_mhz": freq_mhz, "duration_s": duration_s},
+        actor=user["email"],
+    )
+    await ws_manager.broadcast_json({"type": "jam_status", "request_id": request_id, "status": "AWAITING_ACK"})
+
+    return {
+        "request_id": request_id,
+        "status": "AWAITING_ACK",
+        "freq_mhz": freq_mhz,
+        "bandwidth_khz": body.bandwidth_khz,
+        "duration_s": duration_s,
+        "tx_gain": body.tx_gain,
+    }
+
+
+@api.get("/jam/status")
+async def jam_status(user: Dict = Depends(get_current_user)):
+    """Current/most-recent jam session state(s), for the Jamming UI to poll
+    (same poll-and-render pattern as GET /detections used by
+    KillChain.jsx/Payloads.jsx) rather than needing its own WS consumer."""
+    await _expire_pending_jam()
+    sessions = sorted(
+        ({"request_id": rid, **{k: v for k, v in p.items() if k != "ts"},
+          "ts": p["ts"].isoformat()} for rid, p in _pending_jam.items()),
+        key=lambda s: s["ts"], reverse=True,
+    )
+    return {"sessions": sessions[:20]}
 
 
 # =====================================================================

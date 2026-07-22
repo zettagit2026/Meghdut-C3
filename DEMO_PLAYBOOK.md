@@ -1,4 +1,4 @@
-# CEMA cUAS — Army Demonstration Playbook
+# MEGHADUTA C³ — Army Demonstration Playbook
 
 **Classification:** RESTRICTED — For MoD / Army Tech Team evaluation only.
 **Build:** v0.9-eval · Zettawise
@@ -91,7 +91,7 @@ If any box is unchecked at T-0, **abort the demo, do not improvise on stage**.
 Read on stage. Each segment is timed.
 
 ### T-0:00 — Opening (30 s)
-> "This is the CEMA cUAS operator console. It implements the seven-stage
+> "This is the MEGHADUTA C³ operator console. It implements the seven-stage
 > Capture-through-Exploit pipeline from the requirements document, and
 > it runs entirely on off-the-shelf hardware — a HackRF One SDR and a
 > SiK-family telemetry radio. Everything I show is happening on real

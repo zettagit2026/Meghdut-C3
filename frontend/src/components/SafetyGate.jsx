@@ -14,13 +14,30 @@ const CHECKS = [
   "Legal authorisation for MAVLink emission on this frequency.",
 ];
 
-export default function SafetyGate({ open, onClose, onConfirm, payloadName, severity }) {
-  const [ticks, setTicks] = useState([false, false, false, false, false]);
+// Same rigor, adapted wording for a real RF barrage-jam TX burst instead of
+// a MAVLink kinetic/logical command — reused by frontend/src/pages/
+// Jamming.jsx via the `checks`/`actionLabel`/`irreversibleNote` props below,
+// rather than building a separate, weaker confirmation UI from scratch.
+export const JAM_CHECKS = [
+  "STEAG range clearance confirmed; Army Signals spectrum authorization current for this band.",
+  "No friendly/non-participating RF equipment operating in-band within range.",
+  "Physical safety perimeter established; personnel clear of the TX antenna.",
+  "Burst duration and frequency reviewed — this is a REAL RF transmission, not a preview.",
+  "This bridge host's CEMA_AUTHORIZED_RANGE has been deliberately set for this session.",
+];
+
+export default function SafetyGate({
+  open, onClose, onConfirm, payloadName, severity,
+  checks = CHECKS,
+  actionLabel = "FIRE",
+  irreversibleNote = "irreversible",
+}) {
+  const [ticks, setTicks] = useState(() => checks.map(() => false));
   const [confirming, setConfirming] = useState(false);
 
   useEffect(() => {
-    if (open) { setTicks([false, false, false, false, false]); setConfirming(false); }
-  }, [open]);
+    if (open) { setTicks(checks.map(() => false)); setConfirming(false); }
+  }, [open, checks]);
 
   if (!open) return null;
 
@@ -61,10 +78,10 @@ export default function SafetyGate({ open, onClose, onConfirm, payloadName, seve
                   style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}>
               {severity}
             </span>{" "}
-            — this action is <span className="text-[#FF3B30] font-bold">irreversible</span>.
+            — this action is <span className="text-[#FF3B30] font-bold">{irreversibleNote}</span>.
           </div>
           <div className="space-y-2">
-            {CHECKS.map((c, i) => (
+            {checks.map((c, i) => (
               <label key={i} data-testid={`safety-check-${i}`}
                      className="flex items-start gap-3 p-2 tactical-border cursor-pointer hover:bg-[#0F1626]">
                 <input
@@ -101,7 +118,7 @@ export default function SafetyGate({ open, onClose, onConfirm, payloadName, seve
               style={confirming ? { background: "#FF3B30" } : undefined}
             >
               <ShieldCheck size={14} strokeWidth={1.5} />
-              {confirming ? "CONFIRM FIRE" : "ARM & FIRE"}
+              {confirming ? `CONFIRM ${actionLabel}` : `ARM & ${actionLabel}`}
             </button>
           </div>
         </div>

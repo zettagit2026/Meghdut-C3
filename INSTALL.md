@@ -1,4 +1,4 @@
-# CEMA cUAS — Local Install
+# MEGHADUTA C³ — Local Install
 
 One-command local runner for **Windows / Linux / macOS**.
 Bundles: MongoDB + FastAPI backend + React frontend (Nginx).

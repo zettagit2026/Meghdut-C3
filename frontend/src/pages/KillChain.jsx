@@ -39,6 +39,16 @@ export default function KillChain() {
         {dets.map((d) => {
           const idx = d.kill_chain_index;
           const defeated = d.status === "NEUTRALIZED";
+          // Distinct bridge-ack states — see backend/server.py's
+          // AWAITING_ACK → NEUTRALIZED / TX_FAILED / TX_TIMEOUT state
+          // machine. "we requested this" (amber, pending) must never be
+          // rendered the same as "this is confirmed" (green) or "this
+          // failed" (red) — that conflation is exactly what caused the
+          // earlier live-demo incident.
+          const awaitingAck = d.status === "AWAITING_ACK";
+          const txFailed = d.status === "TX_FAILED";
+          const txTimeout = d.status === "TX_TIMEOUT";
+          const terminalOrPending = defeated || awaitingAck || txFailed || txTimeout;
           return (
             <div key={d.id} data-testid={`kc-${d.id}`}
                  className="p-5 tactical-border-b last:border-b-0"
@@ -54,7 +64,7 @@ export default function KillChain() {
                     {d.last_payload && <> · last-payload={d.last_payload}</>}
                   </div>
                 </div>
-                {!defeated && (
+                {!terminalOrPending && (
                   <button
                     data-testid={`kc-advance-${d.id}`}
                     onClick={() => advance(d.id)}
@@ -64,10 +74,25 @@ export default function KillChain() {
                     ADVANCE <ChevronRight size={12} strokeWidth={1.5} />
                   </button>
                 )}
+                {awaitingAck && (
+                  <span data-testid={`kc-status-${d.id}`}
+                        className="px-3 py-1.5 tactical-border font-mono text-[10px] uppercase tracking-widest blink"
+                        style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}>
+                    ◐ AWAITING ACK
+                  </span>
+                )}
                 {defeated && (
-                  <span className="px-3 py-1.5 tactical-border font-mono text-[10px] uppercase tracking-widest pulse-crit"
+                  <span data-testid={`kc-status-${d.id}`}
+                        className="px-3 py-1.5 tactical-border font-mono text-[10px] uppercase tracking-widest pulse-crit"
                         style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}>
                     ● NEUTRALIZED
+                  </span>
+                )}
+                {(txFailed || txTimeout) && (
+                  <span data-testid={`kc-status-${d.id}`}
+                        className="px-3 py-1.5 tactical-border font-mono text-[10px] uppercase tracking-widest pulse-crit"
+                        style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}>
+                    ✕ {txFailed ? "TX FAILED" : "TX TIMEOUT"}
                   </span>
                 )}
               </div>

@@ -227,10 +227,16 @@ export default function Dashboard() {
                   {loading && (
                     <tr><td colSpan={11} className="p-4 text-center text-slate-500">acquiring<span className="term-caret" /></td></tr>
                   )}
-                  {!loading && detections.length === 0 && (
-                    <tr><td colSpan={11} className="p-4 text-center text-slate-500">No contacts. Start the RF bridge to begin detecting.</td></tr>
+                  {!loading && active.length === 0 && (
+                    <tr>
+                      <td colSpan={11} className="p-4 text-center text-slate-500">
+                        {detections.length === 0
+                          ? "No contacts. Start the RF bridge to begin detecting."
+                          : "No active contacts in the last 10 minutes."}
+                      </td>
+                    </tr>
                   )}
-                  {detections.map((d) => {
+                  {active.map((d) => {
                     const src = d.source || "UNKNOWN";
                     return (
                       <tr key={d.id} data-testid={`row-${d.id}`}

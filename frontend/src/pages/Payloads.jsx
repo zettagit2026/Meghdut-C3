@@ -43,9 +43,19 @@ export default function Payloads() {
         target_detection_id: broadcast ? null : target,
         broadcast,
       });
-      toast.success(`${pl.name} DEPLOYED`, {
-        description: `pkt ${data.length}B · ${broadcast ? "BROADCAST" : `tgt sys=${data.target_system}`}`,
-      });
+      // The server no longer claims success the instant the frame hits the
+      // WS — it now reports AWAITING_ACK until the rf-bridge confirms it
+      // actually wrote the frame to the real serial radio. Reflect that
+      // honestly here instead of a blanket "DEPLOYED" toast.
+      if (data.status === "AWAITING_ACK") {
+        toast.info(`${pl.name} SENT — awaiting bridge ACK`, {
+          description: `pkt ${data.length}B · ${broadcast ? "BROADCAST" : `tgt sys=${data.target_system}`} · req ${data.request_id?.slice(0, 8)}`,
+        });
+      } else {
+        toast.success(`${pl.name} DEPLOYED`, {
+          description: `pkt ${data.length}B · ${broadcast ? "BROADCAST" : `tgt sys=${data.target_system}`}`,
+        });
+      }
       load();
     } catch (e) { toast.error("Deploy failed", { description: formatApiError(e) }); }
   };
