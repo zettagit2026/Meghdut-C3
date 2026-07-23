@@ -199,7 +199,18 @@ check_bridge_heartbeat() {
   fi
 
   now="$(date -u +%s)"
-  mtime="$(stat -f %m "$logfile" 2>/dev/null || stat -c %Y "$logfile" 2>/dev/null || echo "")"
+  # GNU stat (`-c %Y`, Linux) and BSD stat (`-f %m`, macOS) both exit 0 on
+  # the OTHER platform's flag but silently return the wrong thing (GNU's
+  # `-f` means "report on the filesystem", not the file) -- exit-code-only
+  # fallback (`||`) never trips, so validate the result is a bare integer
+  # before accepting it, trying GNU's form first since deploy hosts are Linux.
+  mtime="$(stat -c %Y "$logfile" 2>/dev/null || true)"
+  if ! [[ "$mtime" =~ ^[0-9]+$ ]]; then
+    mtime="$(stat -f %m "$logfile" 2>/dev/null || true)"
+  fi
+  if ! [[ "$mtime" =~ ^[0-9]+$ ]]; then
+    mtime=""
+  fi
   if [ -z "$mtime" ]; then
     warn "$svc — state=active, but could not read mtime of $logfile (unsupported stat variant) — cannot confirm heartbeat."
     return
