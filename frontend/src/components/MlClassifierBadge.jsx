@@ -24,8 +24,8 @@ export default function MlClassifierBadge({ detection }) {
 
   return (
     <span
-      className="ml-1.5 px-1.5 py-0.5 tactical-border font-mono text-[9px] uppercase tracking-widest align-middle"
-      style={{ color: "var(--text-muted)", borderColor: "var(--border-color, #1E2A3F)", background: "rgba(148,163,184,0.06)" }}
+      className="mt-1 inline-block w-fit px-1.5 py-0.5 tactical-border font-mono text-[11px] font-semibold uppercase tracking-wide"
+      style={{ color: "#94A8C7", borderColor: "#3D5273", background: "rgba(61,82,115,0.22)" }}
       title="Supplementary classifier signal only — closed-world 3-class model (drone / wifi 2.4 / wifi 5), no idle/noise class. Known to hallucinate &quot;drone&quot; on ungated noise. Not a confirmed verdict."
     >
       ML: {text}{pct !== null ? ` (${pct}%)` : ""}

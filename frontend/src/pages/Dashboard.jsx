@@ -253,11 +253,13 @@ export default function Dashboard() {
                         <td className="p-2 text-slate-300">{d.model}</td>
                         <td className="p-2 text-slate-400">{d.protocol}</td>
                         <td className="p-2">
-                          <span className="px-2 py-0.5 tactical-border font-bold text-[10px]"
-                                style={{ color: THREAT_COLOR[d.threat_level], borderColor: THREAT_COLOR[d.threat_level] }}>
-                            {d.threat_level}
-                          </span>
-                          <MlClassifierBadge detection={d} />
+                          <div className="flex flex-col items-start gap-0.5">
+                            <span className="px-2 py-0.5 tactical-border font-bold text-[10px]"
+                                  style={{ color: THREAT_COLOR[d.threat_level], borderColor: THREAT_COLOR[d.threat_level] }}>
+                              {d.threat_level}
+                            </span>
+                            <MlClassifierBadge detection={d} />
+                          </div>
                         </td>
                         <td className="p-2 text-right text-slate-300">{d.center_freq_ghz}</td>
                         <td className="p-2 text-right text-slate-300">{d.rssi_dbm}</td>
