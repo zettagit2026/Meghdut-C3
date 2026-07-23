@@ -9,6 +9,21 @@ pushes real waterfall rows + detections into the CEMA console over its
 existing /api/spectrum/ingest and /api/detections/ingest endpoints.
 
 Requires `hackrf_sweep` (from the `hackrf` package) on PATH.
+
+MULTI-DEVICE NOTE (2026-07): a second physical HackRF now exists (not yet
+passed through to this VM). `_one_sweep()`/`sweep_band()` below can now
+pin their `hackrf_sweep` invocation to one specific unit via the
+HACKRF_RX_SERIAL env var, which is passed through as `hackrf_sweep -d
+<serial>` -- the same `-d <serial>` device-select flag `hackrf_transfer`
+already uses (see iq_capture.py), and the standard convention across the
+`hackrf` CLI tool family (all built on the same libhackrf device-open code,
+which takes a serial for `hackrf_device_open_by_serial()`). This could not
+be verified against `hackrf_sweep --help` on this machine (hackrf-tools is
+not installed here -- only the VM running the actual devices has it), so
+IF a future `hackrf_sweep` build uses a different flag name, update the
+`DEVICE_SELECT_FLAG` constant below. When HACKRF_RX_SERIAL is unset
+(default), no `-d` flag is added at all -- unchanged "whichever HackRF
+responds first" behavior, exactly as before this change.
 """
 from __future__ import annotations
 
@@ -25,6 +40,11 @@ import numpy as np
 import requests
 
 from hackrf_device_lock import HackrfDeviceBusy, hackrf_device_lock
+
+# See MULTI-DEVICE NOTE above. Empty/unset = backward-compatible default
+# (no device selector passed to hackrf_sweep, first-responding HackRF wins).
+HACKRF_RX_SERIAL = os.environ.get("HACKRF_RX_SERIAL") or None
+DEVICE_SELECT_FLAG = "-d"  # matches hackrf_transfer's convention (see iq_capture.py)
 
 BANDS_MHZ: List[Tuple[str, int, int, str]] = [
     ("SiK-915", 902, 928, "SiK/ISM 915MHz"),
@@ -312,13 +332,16 @@ SETTLE_S = 0.4  # let the HackRF's USB stack settle between opens to avoid rapid
 # the continuous-sweep approach.
 
 
-def _one_sweep(low_mhz: int, high_mhz: int, bin_width_khz: int) -> List[float]:
+def _one_sweep(low_mhz: int, high_mhz: int, bin_width_khz: int,
+               serial: Optional[str] = HACKRF_RX_SERIAL) -> List[float]:
     cmd = [
         "hackrf_sweep",
         "-f", f"{low_mhz}:{high_mhz}",
         "-w", str(bin_width_khz * 1000),
         "-1",  # one-shot
     ]
+    if serial:
+        cmd += [DEVICE_SELECT_FLAG, serial]
     try:
         # Device-access coordination: hackrf_rx.py's own sweep loop (this
         # function) and ml_classify_bridge.py's gate-check sweeps + IQ
@@ -331,7 +354,10 @@ def _one_sweep(low_mhz: int, high_mhz: int, bin_width_khz: int) -> List[float]:
         # explicit and process-safe: only one of the two processes can be
         # mid-subprocess-call against the device at a time; the other waits
         # briefly (bounded) or skips this pass rather than colliding.
-        with hackrf_device_lock():
+        # `serial` is passed through so the lock is scoped to THIS specific
+        # physical device once HACKRF_RX_SERIAL is configured -- with no
+        # serial (default), this is the original shared-lockfile behavior.
+        with hackrf_device_lock(serial=serial):
             out = subprocess.run(cmd, capture_output=True, text=True, timeout=SWEEP_TIMEOUT_S)
     except FileNotFoundError:
         print("ERROR: hackrf_sweep not found. Install the `hackrf` package (brew/apt).", file=sys.stderr)
@@ -363,7 +389,8 @@ def _one_sweep(low_mhz: int, high_mhz: int, bin_width_khz: int) -> List[float]:
 
 
 def sweep_band(name: str, low_mhz: int, high_mhz: int, bin_width_khz: int = 1000,
-               sweeps: int = SWEEPS_PER_CYCLE) -> Tuple[List[float], float, bool]:
+               sweeps: int = SWEEPS_PER_CYCLE,
+               serial: Optional[str] = HACKRF_RX_SERIAL) -> Tuple[List[float], float, bool]:
     """Run several hackrf_sweep passes over [low, high] MHz and take the per-bin max,
     since frequency-hopping links (e.g. DJI OcuSync) are only in-band intermittently.
     Returns (peak-held power_dbm_bins, center_freq_mhz, is_real_data).
@@ -373,10 +400,15 @@ def sweep_band(name: str, low_mhz: int, high_mhz: int, bin_width_khz: int = 1000
     noise-floor filler rather than an actual sweep. Callers that track persistence
     across cycles (e.g. the Wi-Fi-AP exclusion heuristic in main()) need this
     distinction: a filler cycle is uninformative and must not be treated the same
-    as a genuine "no signal this cycle" reading."""
+    as a genuine "no signal this cycle" reading.
+
+    `serial`, if given, pins every pass in this cycle to one specific
+    physical HackRF (see MULTI-DEVICE NOTE at the top of this file);
+    defaults to HACKRF_RX_SERIAL (env var), which defaults to None/unset --
+    i.e. unchanged "whichever HackRF responds first" behavior."""
     held: List[float] = []
     for _ in range(sweeps):
-        powers = _one_sweep(low_mhz, high_mhz, bin_width_khz)
+        powers = _one_sweep(low_mhz, high_mhz, bin_width_khz, serial=serial)
         if not powers:
             continue
         if not held:

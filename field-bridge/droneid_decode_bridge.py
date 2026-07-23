@@ -95,6 +95,11 @@ CEMA_DRONEID_SAMPLE_RATE_HZ  IQ capture sample rate (default 16e6 -- must
 CEMA_DRONEID_CAPTURE_S    capture duration per frequency, seconds (default 1.3,
                           matches DroneSecurity's own live-receiver default)
 CEMA_DRONEID_INTERVAL_S   seconds between full hop-list sweeps (default 30)
+HACKRF_SERIAL             optional: pin captures to one specific physical
+                          HackRF (multi-device deployments). Unset/empty
+                          (default) = unchanged "whichever HackRF responds
+                          first" behavior. See hackrf_config.py for
+                          assigning this via a named PRIMARY/SECONDARY role.
 """
 from __future__ import annotations
 
@@ -124,6 +129,11 @@ CANDIDATE_FREQS_MHZ = [
 DEFAULT_SRC_DIR = os.path.normpath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "DroneSecurity", "src")
 )
+
+# MULTI-DEVICE NOTE (2026-07): see HACKRF_SERIAL in the module docstring
+# above. Unset/empty (default) = unchanged "whichever HackRF responds
+# first" behavior.
+HACKRF_SERIAL = os.environ.get("HACKRF_SERIAL") or None
 
 MIN_SAMPLE_RATE_HZ = 15.36e6 + 0.1e6  # DroneSecurity raises below this for packet_type="droneid"
 MAX_SAMPLE_RATE_HZ = 20e6  # HackRF One practical ceiling
@@ -215,6 +225,7 @@ def sweep_and_ingest(console_url: str, headers: dict, sample_rate_hz: float,
                 sample_rate_hz=sample_rate_hz,
                 duration_s=capture_s,
                 out_path=out_path,
+                serial=HACKRF_SERIAL,
                 description=f"droneid_decode_bridge capture @ {freq_mhz} MHz",
             )
             samples, sr, freq, dtype = load_sigmf(meta_path, out_path)

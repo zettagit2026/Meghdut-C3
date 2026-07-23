@@ -122,6 +122,14 @@ from gamutrf_infer import GamutRFClassifier, load_sigmf
 
 DEFAULT_CHECKPOINT = "/tmp/resnet18_leesburg_split_0.02_1_current.pt"
 
+# MULTI-DEVICE NOTE (2026-07): optional pin to one specific physical HackRF
+# for both this bridge's gate-check sweeps (sweep_band(), imported above)
+# and its gated IQ captures (capture_iq(), below). Unset/empty (default) =
+# unchanged "whichever HackRF responds first" behavior. See
+# hackrf_config.py for assigning a serial to this role via a named
+# PRIMARY/SECONDARY role instead of a raw serial, if preferred.
+HACKRF_SERIAL = os.environ.get("HACKRF_SERIAL") or None
+
 
 def gated_capture_and_classify(
     classifier: GamutRFClassifier,
@@ -143,6 +151,7 @@ def gated_capture_and_classify(
         sample_rate_hz=sample_rate_hz,
         duration_s=capture_s,
         out_path=out_path,
+        serial=HACKRF_SERIAL,
         description=f"ml_classify_bridge gated capture, band={name}",
     )
     data_path = out_path
@@ -206,7 +215,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="cema_ml_bridge_") as tmp_dir:
         while args.iterations == 0 or i < args.iterations:
             for name, low, high, label in BANDS_MHZ:
-                powers, center_mhz, is_real_data = sweep_band(name, low, high)
+                powers, center_mhz, is_real_data = sweep_band(name, low, high, serial=HACKRF_SERIAL)
                 if not is_real_data:
                     continue  # wedged/fallback filler cycle -- nothing genuine to gate on
                 peak = max(powers)
