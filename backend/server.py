@@ -1462,6 +1462,24 @@ async def detection_ingest(body: DetectionIngestBody,
     })
 
     if existing:
+        wifi_display = _ml_wifi_reclassification(body.ml_label, body.ml_confidence)
+        # DECISIVE-ML-ONLY confidence_type fix (see isUnconfirmedDetection()
+        # false-negative audit finding): a sub-threshold ML read (ml_label is
+        # e.g. "wifi_2_4" but ml_confidence < ML_RECLASSIFY_MIN_CONFIDENCE, so
+        # wifi_display is None below) does NOT reclassify model/protocol/
+        # threat_level -- it is explicitly inconclusive. Previously,
+        # confidence_type was still overwritten to "ml_probability" any time
+        # ml_label was present, even when inconclusive. Because confidence_type
+        # is never reset back to "heuristic_binary" by later non-ML ingests
+        # (see below), that permanently and silently disabled the frontend's
+        # isUnconfirmedDetection()/UnconfirmedTag logic for this detection --
+        # the record kept its original unreclassified heuristic model/threat
+        # display but stopped being flagged as unconfirmed, even though
+        # nothing had actually confirmed it. Only let an ML read change
+        # confidence_type when it is decisive: it actually reclassified the
+        # display (wifi_display truthy) or it confirms the drone guess
+        # (ml_label == "drone").
+        ml_is_decisive = wifi_display is not None or body.ml_label == "drone"
         updates = {
             "threat_level": body.threat_level,
             "rssi_dbm": body.rssi_dbm,
@@ -1491,10 +1509,9 @@ async def detection_ingest(body: DetectionIngestBody,
             "ml_label": body.ml_label if body.ml_label is not None else existing.get("ml_label"),
             "ml_confidence": body.ml_confidence if body.ml_label is not None else existing.get("ml_confidence"),
             "ml_gated": body.ml_gated if body.ml_label is not None else existing.get("ml_gated", False),
-            "confidence_type": body.confidence_type if body.ml_label is not None else existing.get("confidence_type"),
+            "confidence_type": body.confidence_type if (body.ml_label is not None and ml_is_decisive) else existing.get("confidence_type"),
             "last_seen": datetime.now(timezone.utc).isoformat(),
         }
-        wifi_display = _ml_wifi_reclassification(body.ml_label, body.ml_confidence)
         if wifi_display:
             # Preserve the FIRST-ever RSSI-heuristic guess only -- don't
             # clobber it on a second/third consecutive reclassified update
