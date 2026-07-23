@@ -4,6 +4,8 @@ import { toast } from "sonner";
 import { History } from "lucide-react";
 import MlClassifierBadge from "@/components/MlClassifierBadge";
 import ConfidenceTypeBadge from "@/components/ConfidenceTypeBadge";
+import UnconfirmedTag from "@/components/UnconfirmedTag";
+import { isUnconfirmedDetection } from "@/lib/detectionConfidence";
 
 const THREAT_COLOR = {
   LOW: "var(--accent-success)",
@@ -259,6 +261,7 @@ export default function DetectionHistory() {
                 const src = d.source || "UNKNOWN";
                 const statusStyle = STATUS_STYLE[d.status] || { color: "var(--text-muted)", label: d.status || "—" };
                 const isExpanded = expandedId === d.id;
+                const unconfirmed = isUnconfirmedDetection(d);
                 return (
                   <Fragment key={d.id}>
                   <tr data-testid={`hist-row-${d.id}`}
@@ -280,6 +283,7 @@ export default function DetectionHistory() {
                     <td className="p-2 text-white">{d.callsign}</td>
                     <td className="p-2 text-slate-300">
                       {d.model}
+                      {unconfirmed && <UnconfirmedTag />}
                       {d.original_model && d.original_model !== d.model && (
                         <div className="text-[9px] text-slate-600"
                              title="Original RSSI-heuristic guess, superseded by ML reclassification">
@@ -287,11 +291,21 @@ export default function DetectionHistory() {
                         </div>
                       )}
                     </td>
-                    <td className="p-2 text-slate-400">{d.protocol}</td>
+                    <td className="p-2 text-slate-400">
+                      {d.protocol}
+                      {unconfirmed && <UnconfirmedTag />}
+                    </td>
                     <td className="p-2">
                       <div className="flex flex-col items-start gap-0.5">
                         <span className="px-2 py-0.5 tactical-border font-bold text-[10px]"
-                              style={{ color: THREAT_COLOR[d.threat_level], borderColor: THREAT_COLOR[d.threat_level] }}>
+                              style={{
+                                color: THREAT_COLOR[d.threat_level],
+                                borderColor: THREAT_COLOR[d.threat_level],
+                                opacity: unconfirmed && d.threat_level === "MEDIUM" ? 0.6 : 1,
+                              }}
+                              title={unconfirmed && d.threat_level === "MEDIUM"
+                                ? "Softened: threat level based on an unconfirmed RSSI/persistence heuristic only, no ML classification or protocol decode."
+                                : undefined}>
                           {d.threat_level}
                         </span>
                         <MlClassifierBadge detection={d} />

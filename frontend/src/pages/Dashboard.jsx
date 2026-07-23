@@ -5,6 +5,8 @@ import { Radar, Skull, Activity, Signal, TrendingUp } from "lucide-react";
 import SystemHealth from "@/components/SystemHealth";
 import MlClassifierBadge from "@/components/MlClassifierBadge";
 import ConfidenceTypeBadge from "@/components/ConfidenceTypeBadge";
+import UnconfirmedTag from "@/components/UnconfirmedTag";
+import { isUnconfirmedDetection } from "@/lib/detectionConfidence";
 
 const THREAT_COLOR = {
   LOW: "var(--accent-success)",
@@ -240,6 +242,7 @@ export default function Dashboard() {
                   )}
                   {active.map((d) => {
                     const src = d.source || "UNKNOWN";
+                    const unconfirmed = isUnconfirmedDetection(d);
                     return (
                       <tr key={d.id} data-testid={`row-${d.id}`}
                           className="tactical-border-b hover:bg-[#0F1626] transition-colors">
@@ -253,6 +256,7 @@ export default function Dashboard() {
                         <td className="p-2 text-white">{d.callsign}</td>
                         <td className="p-2 text-slate-300">
                           {d.model}
+                          {unconfirmed && <UnconfirmedTag />}
                           {d.original_model && d.original_model !== d.model && (
                             <div className="text-[9px] text-slate-600"
                                  title="Original RSSI-heuristic guess, superseded by ML reclassification">
@@ -260,11 +264,21 @@ export default function Dashboard() {
                             </div>
                           )}
                         </td>
-                        <td className="p-2 text-slate-400">{d.protocol}</td>
+                        <td className="p-2 text-slate-400">
+                          {d.protocol}
+                          {unconfirmed && <UnconfirmedTag />}
+                        </td>
                         <td className="p-2">
                           <div className="flex flex-col items-start gap-0.5">
                             <span className="px-2 py-0.5 tactical-border font-bold text-[10px]"
-                                  style={{ color: THREAT_COLOR[d.threat_level], borderColor: THREAT_COLOR[d.threat_level] }}>
+                                  style={{
+                                    color: THREAT_COLOR[d.threat_level],
+                                    borderColor: THREAT_COLOR[d.threat_level],
+                                    opacity: unconfirmed && d.threat_level === "MEDIUM" ? 0.6 : 1,
+                                  }}
+                                  title={unconfirmed && d.threat_level === "MEDIUM"
+                                    ? "Softened: threat level based on an unconfirmed RSSI/persistence heuristic only, no ML classification or protocol decode."
+                                    : undefined}>
                               {d.threat_level}
                             </span>
                             <MlClassifierBadge detection={d} />
@@ -310,18 +324,28 @@ export default function Dashboard() {
               .slice()
               .sort((a, b) => ({ CRITICAL: 3, HIGH: 2, MEDIUM: 1, LOW: 0 }[b.threat_level] - { CRITICAL: 3, HIGH: 2, MEDIUM: 1, LOW: 0 }[a.threat_level]))
               .slice(0, 6)
-              .map((d) => (
+              .map((d) => {
+                const unconfirmed = isUnconfirmedDetection(d);
+                return (
                 <div key={d.id} className="tactical-border p-3">
                   <div className="flex items-center justify-between mb-2">
                     <span className="font-mono text-xs text-white">{d.callsign}</span>
                     <span className="px-2 py-0.5 tactical-border font-mono font-bold text-[10px]"
-                          style={{ color: THREAT_COLOR[d.threat_level], borderColor: THREAT_COLOR[d.threat_level] }}>
+                          style={{
+                            color: THREAT_COLOR[d.threat_level],
+                            borderColor: THREAT_COLOR[d.threat_level],
+                            opacity: unconfirmed && d.threat_level === "MEDIUM" ? 0.6 : 1,
+                          }}
+                          title={unconfirmed && d.threat_level === "MEDIUM"
+                            ? "Softened: threat level based on an unconfirmed RSSI/persistence heuristic only, no ML classification or protocol decode."
+                            : undefined}>
                       {d.threat_level}
                     </span>
                   </div>
                   <div className="font-mono text-[10px] text-slate-500 space-y-0.5">
                     <div>
                       MODEL: <span className="text-slate-300">{d.model}</span>
+                      {unconfirmed && <UnconfirmedTag />}
                       {d.original_model && d.original_model !== d.model && (
                         <span className="ml-1 text-slate-600" title="Original RSSI-heuristic guess, superseded by ML reclassification">
                           (was: {d.original_model})
@@ -337,7 +361,8 @@ export default function Dashboard() {
                     </div>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             {active.length === 0 && (
               <div className="font-mono text-xs text-slate-600 text-center py-4">— NO ACTIVE TARGETS —</div>
             )}
