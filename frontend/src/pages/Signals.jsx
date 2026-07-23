@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { Waves, ChevronRight, CheckCircle2 } from "lucide-react";
@@ -18,12 +19,28 @@ const STAGES = [
 export default function Signals() {
   const [dets, setDets] = useState([]);
   const [selected, setSelected] = useState(null);
+  // Deep-link support: Dashboard/DetectionHistory link here as
+  // /signals?contact=<id> so an operator clicking a CEMA-stage cell on the
+  // main tactical views lands directly on that contact's pipeline trace
+  // instead of having to hunt for it in the contacts rail.
+  const [searchParams] = useSearchParams();
+  const deepLinkedId = searchParams.get("contact");
+  const appliedDeepLinkRef = useRef(false);
 
   const load = async () => {
     try {
       const { data } = await api.get("/detections");
       setDets(data);
-      if (!selected && data.length) setSelected(data[0].id);
+      setSelected((prev) => {
+        if (deepLinkedId && !appliedDeepLinkRef.current && data.some((d) => d.id === deepLinkedId)) {
+          appliedDeepLinkRef.current = true;
+          return deepLinkedId;
+        }
+        if (!prev && data.length) {
+          return data[0].id;
+        }
+        return prev;
+      });
     } catch (e) {
       toast.error("Load failed", { description: formatApiError(e) });
     }

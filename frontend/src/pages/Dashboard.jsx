@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { Radar, Skull, Activity, Signal, TrendingUp } from "lucide-react";
@@ -299,10 +300,27 @@ export default function Dashboard() {
                         <td className="p-2 text-slate-400" title={d.last_seen || ""}>
                           {formatRelativeTime(d.last_seen, now)}
                         </td>
-                        <td className="p-2 text-[10px]" style={{ color: "var(--accent-info)" }}>{d.cema_stage}</td>
-                        <td className="p-2 text-[10px]"
-                            style={{ color: d.status === "NEUTRALIZED" ? "var(--accent-critical)" : "var(--accent-success)" }}>
-                          {d.status === "NEUTRALIZED" ? "DEFEAT" : d.kill_chain_stage}
+                        <td className="p-2 text-[10px]">
+                          <Link
+                            to={`/signals?contact=${d.id}`}
+                            data-testid={`cema-link-${d.id}`}
+                            title="View in CEMA pipeline →"
+                            className="hover:underline underline-offset-2 decoration-dotted"
+                            style={{ color: "var(--accent-info)" }}
+                          >
+                            {d.cema_stage}
+                          </Link>
+                        </td>
+                        <td className="p-2 text-[10px]">
+                          <Link
+                            to={`/killchain?contact=${d.id}`}
+                            data-testid={`kc-link-${d.id}`}
+                            title="View in Kill Chain →"
+                            className="hover:underline underline-offset-2 decoration-dotted"
+                            style={{ color: d.status === "NEUTRALIZED" ? "var(--accent-critical)" : "var(--accent-success)" }}
+                          >
+                            {d.status === "NEUTRALIZED" ? "DEFEAT" : d.kill_chain_stage}
+                          </Link>
                         </td>
                       </tr>
                     );

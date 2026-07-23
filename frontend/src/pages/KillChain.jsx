@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { Crosshair, ChevronRight } from "lucide-react";
@@ -7,12 +8,28 @@ const CHAIN = ["DETECT", "TRACK", "IDENTIFY", "DECIDE", "DEFEAT"];
 
 export default function KillChain() {
   const [dets, setDets] = useState([]);
+  // Deep-link support: Dashboard/DetectionHistory link here as
+  // /killchain?contact=<id> so an operator clicking a KC-stage cell on the
+  // main tactical views is scrolled straight to that contact's row instead
+  // of having to scan the flat list for it.
+  const [searchParams] = useSearchParams();
+  const deepLinkedId = searchParams.get("contact");
+  const scrolledRef = useRef(false);
 
   const load = async () => {
     try { const { data } = await api.get("/detections"); setDets(data); }
     catch (e) { toast.error("Load failed", { description: formatApiError(e) }); }
   };
   useEffect(() => { load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, []);
+
+  useEffect(() => {
+    if (!deepLinkedId || scrolledRef.current || dets.length === 0) return;
+    const el = document.getElementById(`kc-row-${deepLinkedId}`);
+    if (el) {
+      el.scrollIntoView({ behavior: "smooth", block: "center" });
+      scrolledRef.current = true;
+    }
+  }, [dets, deepLinkedId]);
 
   const advance = async (id) => {
     try { await api.post(`/detections/${id}/killchain-advance`); load(); }
@@ -49,10 +66,15 @@ export default function KillChain() {
           const txFailed = d.status === "TX_FAILED";
           const txTimeout = d.status === "TX_TIMEOUT";
           const terminalOrPending = defeated || awaitingAck || txFailed || txTimeout;
+          const isDeepLinked = deepLinkedId === d.id;
           return (
-            <div key={d.id} data-testid={`kc-${d.id}`}
+            <div key={d.id} data-testid={`kc-${d.id}`} id={`kc-row-${d.id}`}
                  className="p-5 tactical-border-b last:border-b-0"
-                 style={{ background: "var(--bg-surface)" }}>
+                 style={{
+                   background: "var(--bg-surface)",
+                   outline: isDeepLinked ? "1px solid var(--accent-info)" : "none",
+                   outlineOffset: -1,
+                 }}>
               <div className="flex items-center justify-between mb-3">
                 <div>
                   <div className="font-heading font-black text-xl tracking-tighter">
