@@ -9,3 +9,4 @@ numpy>=1.26.0
 pyserial==3.5
 pymavlink==2.4.41
 websocket-client==1.8.0  # jam_bridge.py — WS client to backend/server.py's /api/ws/mavlink
+Pillow>=10.0.0  # fpv_video_bridge.py — grayscale PNG reconstruction from AM envelope

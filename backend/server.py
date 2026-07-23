@@ -69,8 +69,11 @@ from fastapi import (
     APIRouter,
     Depends,
     FastAPI,
+    File,
+    Form,
     HTTPException,
     Request,
+    UploadFile,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -1222,6 +1225,87 @@ class DetectionIngestBody(BaseModel):
     # yet updated to set it -- absence means "render as before" (backward
     # compatible), same pattern as distance_estimated/protocol_confirmed above.
     confidence_type: Optional[str] = None
+
+
+# =====================================================================
+# Routes: analog FPV video bridge ingest (field-bridge/fpv_video_bridge.py)
+# =====================================================================
+# HONESTY NOTE (read before trusting anything served here): this ingests
+# whatever fpv_video_bridge.py produced from a REAL HackRF IQ capture, but
+# that bridge's own AM-envelope-demod + naive scanline reconstruction is
+# UNTESTED against a live analog FPV transmitter (no live analog FPV
+# transmitter was available this session) -- see that script's module
+# docstring for the full, load-bearing disclosure. This endpoint does not
+# strengthen or weaken that claim; it just stores/serves whatever the
+# bridge reports, including its own `validated_against_live_signal: False`
+# flag, unmodified, so the frontend can render the same caveat.
+#
+# DJI digital (OcuSync) video content is explicitly NOT decoded anywhere in
+# this pipeline -- only RF energy presence in-band could ever be implied,
+# never actual DJI video content. See fpv_video_bridge.py's docstring.
+_last_fpv_frame: Optional[Dict] = None
+_last_fpv_frame_png: Optional[bytes] = None
+
+
+@api.post("/fpv/ingest")
+async def fpv_ingest(
+    metadata: str = Form(...),
+    frame: Optional[UploadFile] = File(None),
+    user: Dict = Depends(get_current_user),
+):
+    """Receive one capture-and-demod result from fpv_video_bridge.py.
+
+    `metadata` is the JSON dict fpv_video_bridge.py's capture_and_demod()
+    returns (verbatim, including its honesty flags). `frame` is the
+    optional reconstructed PNG. Stores only the latest frame in memory
+    (this is a live-operator console, not a video archive) -- same
+    "no synthetic fallback, report exactly what was received" pattern as
+    /spectrum/ingest above.
+    """
+    global _last_fpv_frame, _last_fpv_frame_png
+    try:
+        meta = json.loads(metadata)
+    except (json.JSONDecodeError, TypeError):
+        raise HTTPException(status_code=400, detail="metadata must be valid JSON")
+
+    png_bytes = await frame.read() if frame is not None else None
+
+    _last_fpv_frame = {
+        **meta,
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "has_frame": png_bytes is not None,
+    }
+    _last_fpv_frame_png = png_bytes
+
+    await log_event(
+        "FPV_INGEST",
+        f"FPV video bridge ingest: channel={meta.get('channel')} "
+        f"freq={meta.get('center_freq_hz', 0)/1e6:.3f}MHz "
+        f"validated={meta.get('validated_against_live_signal')} "
+        f"has_frame={png_bytes is not None}",
+        actor=user["email"],
+    )
+    return {"ok": True, "stored": True, "has_frame": png_bytes is not None}
+
+
+@api.get("/fpv/latest-frame")
+async def fpv_latest_frame_meta(user: Dict = Depends(get_current_user)):
+    """Metadata for the most recent FPV capture, including this pipeline's
+    own honesty flags (validated_against_live_signal, dji_digital_video_decoded,
+    demod_method) -- no synthetic fallback: if nothing has been ingested yet,
+    this honestly reports that instead of fabricating a frame."""
+    if _last_fpv_frame is None:
+        return {"available": False, "source": "NONE"}
+    return {"available": True, "source": "HACKRF_REAL_IQ", **_last_fpv_frame}
+
+
+@api.get("/fpv/latest-frame.png")
+async def fpv_latest_frame_png(user: Dict = Depends(get_current_user)):
+    """The most recent reconstructed PNG itself, if one was produced."""
+    from fastapi.responses import Response as _Response
+    if _last_fpv_frame_png is None:
+        raise HTTPException(status_code=404, detail="no FPV frame captured yet")
+    return _Response(content=_last_fpv_frame_png, media_type="image/png")
 
 
 @api.post("/spectrum/ingest")
