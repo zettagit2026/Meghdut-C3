@@ -51,7 +51,14 @@ services:
       ADMIN_EMAIL: "${ADMIN_EMAIL}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
     ports:
-      - "8001:8001"
+      # Bind host defaults to all interfaces (unchanged behavior). Set
+      # BIND_HOST in .env to this host's specific LAN/management IP for
+      # defense-in-depth if a wireless NIC is ever added to a deploy host
+      # (this platform can jam WiFi itself -- no reason its own C2 ports
+      # should be reachable over that same medium). No current host in
+      # this project has WiFi hardware, so this is optional hardening,
+      # not a fix for an active exposure.
+      - "${BIND_HOST:-0.0.0.0}:8001:8001"
 
   frontend:
     build:
@@ -67,7 +74,7 @@ services:
     depends_on:
       - backend
     ports:
-      - "3000:3000"
+      - "${BIND_HOST:-0.0.0.0}:3000:3000"
 
 volumes:
   cema_mongo_data:
