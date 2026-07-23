@@ -10,3 +10,5 @@ pyserial==3.5
 pymavlink==2.4.41
 websocket-client==1.8.0  # jam_bridge.py — WS client to backend/server.py's /api/ws/mavlink
 Pillow>=10.0.0  # fpv_video_bridge.py — grayscale PNG reconstruction from AM envelope
+scikit-learn>=1.4.0  # rf_features.py — spectral-feature classifier INFRASTRUCTURE (untrained, no shipped model; see rf_features.py docstring)
+joblib>=1.3.0  # rf_features.py — model (de)serialization once a real trained model exists
