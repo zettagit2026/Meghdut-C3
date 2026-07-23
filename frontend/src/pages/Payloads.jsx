@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Bomb, AlertTriangle, Target as TargetIcon } from "lucide-react";
+import { Bomb, AlertTriangle, Target as TargetIcon, ShieldCheck, ShieldOff } from "lucide-react";
 import SafetyGate, { SAFETY_GATED } from "@/components/SafetyGate";
 import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
 
@@ -24,6 +24,7 @@ export default function Payloads() {
   const [dets, setDets] = useState([]);
   const [target, setTarget] = useState("");
   const [gate, setGate] = useState({ open: false, pl: null, broadcast: false });
+  const [authorizing, setAuthorizing] = useState(false);
 
   const load = async () => {
     try {
@@ -36,13 +37,56 @@ export default function Payloads() {
   };
   useEffect(() => { load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, []); // eslint-disable-line
 
+  const selectedDet = dets.find((d) => d.id === target);
+
+  // Friendly-fire interlock: an explicit, visible commander action distinct
+  // from "deploy" itself. Calls the real backend endpoint that flips
+  // authorized_target on the detection — no client-side bypass of the
+  // server-enforced check in /payloads/deploy.
+  const toggleAuthorize = async () => {
+    if (!selectedDet) return;
+    setAuthorizing(true);
+    try {
+      const nextAuthorized = !selectedDet.authorized_target;
+      await api.post(`/detections/${selectedDet.id}/authorize-target`, { authorized: nextAuthorized });
+      toast[nextAuthorized ? "success" : "info"](
+        `${selectedDet.callsign} ${nextAuthorized ? "AUTHORIZED" : "DE-AUTHORIZED"} as target`
+      );
+      await load();
+    } catch (e) {
+      toast.error("Authorize-target failed", { description: formatApiError(e) });
+    } finally {
+      setAuthorizing(false);
+    }
+  };
+
   const doDeploy = async (pl, broadcast) => {
     if (!broadcast && !target) { toast.error("No active target selected"); return; }
+    if (!broadcast && selectedDet && !selectedDet.authorized_target) {
+      toast.error("Target not authorized", {
+        description: "Friendly-fire interlock: authorize this target before deploying.",
+      });
+      return;
+    }
     try {
+      // Second factor for CRITICAL-severity payloads and ALL broadcasts,
+      // fetched right here — this call only ever happens as a direct
+      // consequence of the operator's confirmed deploy action (either the
+      // SafetyGate ARM & FIRE -> CONFIRM FIRE sequence for gated payloads,
+      // or this direct button click for non-gated ones), same convention as
+      // Jamming.jsx's fireJam(). Harmless to fetch unconditionally: the
+      // token is single-use/short-TTL and the backend only consumes it when
+      // spec.severity === "CRITICAL" or broadcast is true.
+      let arm_token;
+      if (pl.severity === "CRITICAL" || broadcast) {
+        const { data: arm } = await api.post("/arm");
+        arm_token = arm.arm_token;
+      }
       const { data } = await api.post("/payloads/deploy", {
         payload_id: pl.id,
         target_detection_id: broadcast ? null : target,
         broadcast,
+        arm_token,
       });
       // The server no longer claims success the instant the frame hits the
       // WS — it now reports AWAITING_ACK until the rf-bridge confirms it
@@ -92,9 +136,29 @@ export default function Payloads() {
             {dets.map((d) => (
               <option key={d.id} value={d.id}>
                 {d.callsign} · {d.model} · sys={d.system_id}
+                {d.authorized_target ? "" : " (NOT AUTHORIZED)"}
               </option>
             ))}
           </select>
+          {selectedDet && (
+            <button
+              data-testid="authorize-target-toggle"
+              onClick={toggleAuthorize}
+              disabled={authorizing}
+              className={`flex items-center gap-2 px-3 py-2 tactical-border font-mono text-[10px] uppercase tracking-widest transition-colors disabled:opacity-40 ${
+                selectedDet.authorized_target
+                  ? "text-[var(--accent-success)] border-[var(--accent-success)] hover:bg-[var(--accent-success)] hover:text-black"
+                  : "text-[var(--accent-critical)] border-[var(--accent-critical)] hover:bg-[var(--accent-critical)] hover:text-black"
+              }`}
+            >
+              {selectedDet.authorized_target ? (
+                <ShieldCheck size={14} strokeWidth={1.5} />
+              ) : (
+                <ShieldOff size={14} strokeWidth={1.5} />
+              )}
+              {selectedDet.authorized_target ? "TARGET AUTHORIZED" : "AUTHORIZE TARGET"}
+            </button>
+          )}
         </div>
       </div>
 
