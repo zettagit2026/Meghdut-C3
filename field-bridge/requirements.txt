@@ -12,3 +12,13 @@ websocket-client==1.8.0  # jam_bridge.py — WS client to backend/server.py's /a
 Pillow>=10.0.0  # fpv_video_bridge.py — grayscale PNG reconstruction from AM envelope
 scikit-learn>=1.4.0  # rf_features.py — spectral-feature classifier INFRASTRUCTURE (untrained, no shipped model; see rf_features.py docstring)
 joblib>=1.3.0  # rf_features.py — model (de)serialization once a real trained model exists
+canopen>=2.0  # canopen_parser.py — CANopen/CiA301 NMT decode INFRASTRUCTURE (HARDWARE-BLOCKED: needs a real CAN adapter, e.g. PEAK PCAN-USB or CANable; see canopen_parser.py docstring)
+python-can>=4.0  # canopen_parser.py — transport dependency of canopen (SocketCAN/pcan/gs_usb/slcan backends)
+# spectrogram_similarity_bridge.py — Classidyne-style spectrogram k-NN similarity
+# classifier INFRASTRUCTURE (DATA-BLOCKED: no real, multi-class reference
+# library exists yet; see spectrogram_similarity_bridge.py docstring). Not
+# wired into any live pipeline. torch/torchvision already required by
+# gamutrf_infer.py; timm/chromadb are new for this module only.
+timm>=1.0.0
+chromadb>=0.5.0
+
