@@ -429,7 +429,12 @@ def main() -> None:
     # Bluetooth non-persistence tracker for DJI-2G4 only -- see BT_NONPERSIST_CYCLES
     # comment block above. Tracks the last real-data cycle's peak freq and how many
     # consecutive real-data cycles in a row the peak has kept moving (never settled).
-    bt_track = {"freq_mhz": None, "moving_cycles": 0}
+    # advisory_posted latches True once a low-severity Bluetooth advisory has
+    # been posted for the CURRENT non-persistence episode, so we POST ONCE per
+    # episode (not once per cycle for the whole time BT_NONPERSIST_CYCLES stays
+    # satisfied) -- reset back to False whenever moving_cycles drops (pattern
+    # broke), so a genuinely new episode can post again later.
+    bt_track = {"freq_mhz": None, "moving_cycles": 0, "advisory_posted": False}
     # LoRa/low-duty-cycle rolling window for SiK-915 only -- see LORA_WINDOW_CYCLES
     # comment block above. Only real-data cycles (is_real_data) are pushed into this
     # deque; wedge/filler cycles are skipped entirely, same pattern as the Wi-Fi fix.
@@ -533,6 +538,7 @@ def main() -> None:
                             bt_track["moving_cycles"] += 1
                         else:
                             bt_track["moving_cycles"] = 0
+                            bt_track["advisory_posted"] = False  # episode broke, allow a future re-post
                         bt_track["freq_mhz"] = peak_freq_mhz
                     if bt_track["moving_cycles"] >= BT_NONPERSIST_CYCLES:
                         likely_bluetooth = True
@@ -541,6 +547,7 @@ def main() -> None:
                               f"~{occupied_bw_mhz:.0f}MHz wide) — coarse heuristic, see "
                               f"BT_NONPERSIST_CYCLES limitations")
                 elif is_real_data:
+                    bt_track["advisory_posted"] = False
                     # No hit this cycle (real sweep, genuinely below threshold) --
                     # nothing to track movement against; reset like the Wi-Fi case.
                     bt_track["moving_cycles"] = 0
@@ -571,6 +578,53 @@ def main() -> None:
             # same is_real_data-aware pattern as the Wi-Fi/Bluetooth checks above.
 
             likely_excluded = likely_wifi_ap or likely_bluetooth or likely_low_duty_cycle_device
+
+            # --- Bluetooth advisory ingest (NOT a threat detection) ----------------
+            # ADDED 2026-07-23: the likely_bluetooth exclusion above is intentionally
+            # a SUPPRESSION filter -- it correctly prevents a BT-pattern signal from
+            # ever being posted as a drone/WiFi contact, and that behavior is
+            # unchanged by this block. But suppressing it entirely means an operator
+            # gets zero visibility that something (probably BT) is sitting in the
+            # 2.4GHz band. This posts a SEPARATE, clearly-labeled, low-severity
+            # advisory record so it shows up in the Dashboard/Detection History for
+            # situational awareness only -- never folded into the drone/WiFi
+            # ingest path above, never affecting likely_excluded/consecutive_hits.
+            #
+            # Only fire when Bluetooth is the SOLE reason this cycle was excluded --
+            # if likely_wifi_ap or likely_low_duty_cycle_device also fired on the
+            # same band/cycle, skip the advisory to avoid a confusing double-ingest
+            # (that would already be reflected as excluded for a different, more
+            # specific reason).
+            #
+            # Paced the same way CONFIRM_CYCLES paces the drone ingest above: post
+            # once when the BT_NONPERSIST_CYCLES threshold is first reached for this
+            # episode (bt_track["advisory_posted"] latches True so we don't spam one
+            # advisory per cycle for as long as the pattern persists), and reset that
+            # latch whenever the non-persistence pattern breaks (see moving_cycles
+            # reset points above) so a later, distinct BT episode can post again.
+            if (name == "DJI-2G4" and likely_bluetooth and not likely_wifi_ap
+                    and not likely_low_duty_cycle_device and not bt_track["advisory_posted"]):
+                bt_track["advisory_posted"] = True
+                bt_det = {
+                    "model": "Bluetooth device (advisory)",
+                    "protocol": "Bluetooth (2.4GHz ISM, rapid-hop signature)",
+                    "threat_level": "LOW",
+                    "center_freq_ghz": center_mhz / 1000.0,
+                    "bandwidth_mhz": occupied_bw_mhz,
+                    "rssi_dbm": peak,
+                    "snr_db": peak - floor,
+                    "bearing_deg": 0.0,
+                    "distance_m": 0.0,
+                    "distance_estimated": False,  # not a range estimate -- advisory only
+                    "source": "HACKRF",
+                }
+                try:
+                    requests.post(f"{args.console_url}/api/detections/ingest", json=bt_det,
+                                  headers=headers, timeout=5)
+                    print(f"[{label}] posted low-severity Bluetooth advisory at "
+                          f"{peak_freq_mhz:.1f}MHz ({bt_track['moving_cycles']} non-persistent cycles)")
+                except requests.RequestException as e:
+                    print(f"bluetooth advisory ingest failed: {e}", file=sys.stderr)
 
             if consecutive_hits[name] >= CONFIRM_CYCLES and not likely_excluded:
                 # Coarse RSSI-based distance ESTIMATE (log-distance path-loss model,
