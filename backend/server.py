@@ -804,12 +804,18 @@ def _new_detection_skeleton() -> Dict[str, Any]:
     helper never invents them. The callsign default is derived from the
     real, randomly-generated record id (not a fabricated attribute of the
     contact itself) purely so the UI has a stable short label until a real
-    callsign is supplied by the ingest source."""
+    callsign is supplied by the ingest source. The prefix is deliberately
+    classification-NEUTRAL ("CONTACT-", not "UAV-"): this label is assigned
+    before any model/protocol classification (including ML reclassification,
+    see _ml_wifi_reclassification) has happened, and a detection created here
+    may later turn out to be Wi-Fi, not a drone. A classification-specific
+    prefix would falsely imply drone identity for non-drone contacts and
+    would need to be corrected on every current/future reclassification path."""
     det_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc).isoformat()
     return {
         "id": det_id,
-        "callsign": f"UAV-{det_id[:8].upper()}",
+        "callsign": f"CONTACT-{det_id[:8].upper()}",
         "swarm_id": None,
         "cema_stage": "CAPTURE",
         "cema_stage_index": 0,
