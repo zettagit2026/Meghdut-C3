@@ -244,7 +244,7 @@ def main() -> None:
                     "source": "SIK_RADIO" if name == "SiK-915" else "HACKRF",
                     "ml_label": ml_label,
                     "ml_confidence": round(ml_confidence, 4),
-                    "ml_gated": True,
+                    "ml_gated": False,
                 }
                 try:
                     requests.post(f"{args.console_url}/api/detections/ingest",
