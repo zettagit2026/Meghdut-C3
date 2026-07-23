@@ -251,7 +251,15 @@ export default function Dashboard() {
                           </span>
                         </td>
                         <td className="p-2 text-white">{d.callsign}</td>
-                        <td className="p-2 text-slate-300">{d.model}</td>
+                        <td className="p-2 text-slate-300">
+                          {d.model}
+                          {d.original_model && d.original_model !== d.model && (
+                            <div className="text-[9px] text-slate-600"
+                                 title="Original RSSI-heuristic guess, superseded by ML reclassification">
+                              was: {d.original_model}
+                            </div>
+                          )}
+                        </td>
                         <td className="p-2 text-slate-400">{d.protocol}</td>
                         <td className="p-2">
                           <div className="flex flex-col items-start gap-0.5">
@@ -312,7 +320,14 @@ export default function Dashboard() {
                     </span>
                   </div>
                   <div className="font-mono text-[10px] text-slate-500 space-y-0.5">
-                    <div>MODEL: <span className="text-slate-300">{d.model}</span></div>
+                    <div>
+                      MODEL: <span className="text-slate-300">{d.model}</span>
+                      {d.original_model && d.original_model !== d.model && (
+                        <span className="ml-1 text-slate-600" title="Original RSSI-heuristic guess, superseded by ML reclassification">
+                          (was: {d.original_model})
+                        </span>
+                      )}
+                    </div>
                     <div>BEARING: <span className="text-slate-300">{d.bearing_deg}°</span> · ALT: <span className="text-slate-300">{d.altitude_m}m</span></div>
                     <div className="flex items-center gap-2">
                       <TrendingUp size={10} strokeWidth={1.5} /> {d.speed_ms} m/s

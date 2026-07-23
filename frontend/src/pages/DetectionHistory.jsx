@@ -278,7 +278,15 @@ export default function DetectionHistory() {
                       </span>
                     </td>
                     <td className="p-2 text-white">{d.callsign}</td>
-                    <td className="p-2 text-slate-300">{d.model}</td>
+                    <td className="p-2 text-slate-300">
+                      {d.model}
+                      {d.original_model && d.original_model !== d.model && (
+                        <div className="text-[9px] text-slate-600"
+                             title="Original RSSI-heuristic guess, superseded by ML reclassification">
+                          was: {d.original_model}
+                        </div>
+                      )}
+                    </td>
                     <td className="p-2 text-slate-400">{d.protocol}</td>
                     <td className="p-2">
                       <div className="flex flex-col items-start gap-0.5">

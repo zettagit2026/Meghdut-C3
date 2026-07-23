@@ -11,6 +11,10 @@ Endpoints (all under /api):
            /jam/status  (current/last jam session state)
   arm: /arm (commander-only, issues a 60s single-use arm token)
   emergency: /emergency/abort (any operator) /emergency/resume (commander-only)
+  range-authorization: /range-authorization/status (any authenticated user)
+           /range-authorization (commander + password re-auth + confirm phrase
+           to enable; low-friction to disable) — see
+           backend/RANGE_AUTHORIZATION_REDESIGN.md
   logs:  /logs
 
 RBAC: two roles, "operator" and "commander". Anything that transmits a
@@ -28,8 +32,13 @@ moment an operator completes SafetyGate.jsx's two-step confirm (checklist +
 ARM & FIRE -> CONFIRM FIRE) for the jam action — see frontend/src/pages/
 Jamming.jsx. This backend-side token is necessary but NOT sufficient on its
 own: the physical bridge host (field-bridge/jam_bridge.py) independently
-refuses to transmit unless CEMA_AUTHORIZED_RANGE=1 is set in its OWN
-environment, regardless of what this backend has already approved. See
+checks this backend's live GET /api/range-authorization/status?effect=jam
+lease before transmitting, regardless of what this backend has already
+approved for the arm/jam-confirm tokens above. (Formerly this bridge-side
+check was a static CEMA_AUTHORIZED_RANGE=1 env var on the bridge host itself;
+that has been replaced by the GUI-controlled, auto-expiring
+range-authorization lease described in backend/RANGE_AUTHORIZATION_REDESIGN.md
+— see that document for the full threat model of this change.) See
 field-bridge/jam_bridge.py's module docstring for the full defense-in-depth
 chain and why it preserves — rather than casually approximates — the
 original interactive "type TRANSMIT" gate in field-bridge/hackrf_jam.py.
@@ -264,6 +273,90 @@ def _consume_jam_confirm_token(token: Optional[str]) -> None:
     if not expiry or datetime.now(timezone.utc) > expiry:
         raise HTTPException(403, "Jam confirmation token invalid or expired — re-run the "
                                   "confirmation sequence in the Jamming UI.")
+
+
+# ---- Range authorization (GUI-controlled replacement for the bridge-side
+# CEMA_AUTHORIZED_RANGE env var) — see backend/RANGE_AUTHORIZATION_REDESIGN.md
+# for the full threat model/rationale. Two INDEPENDENT in-memory leases
+# (jam/mavlink), in-memory ONLY (never persisted to Mongo, never survives a
+# restart — defaults OFF every boot, same convention as _arm_tokens/
+# _jam_confirm_tokens), each a short (15 min) TTL lease that must be
+# explicitly re-armed (with re-auth + confirm phrase) rather than a durable
+# on/off switch. field-bridge/jam_bridge.py and rf-bridge/mavlink_bridge.py
+# poll GET /api/range-authorization/status?effect=... at the moment of
+# transmission and fail closed on any error, exactly mirroring the old
+# `CEMA_AUTHORIZED_RANGE != "1"` behavior.
+RANGE_AUTH_TTL_S = 15 * 60
+RANGE_AUTH_CONFIRM_PHRASE = "AUTHORIZE LIVE RANGE"
+RANGE_AUTH_EFFECTS = ("jam", "mavlink")
+
+# effect -> {"enabled": bool, "expires_at": datetime|None, "enabled_by": str|None,
+#            "enabled_at": datetime|None}
+_range_authorization: Dict[str, Dict[str, Any]] = {
+    effect: {"enabled": False, "expires_at": None, "enabled_by": None, "enabled_at": None}
+    for effect in RANGE_AUTH_EFFECTS
+}
+
+# ---- Basic in-memory throttle on failed range-authorization re-auth attempts
+# (password or confirm-phrase mismatch) — per §2.6 of the redesign doc: without
+# this, the re-auth step becomes a low-cost online password-guessing oracle
+# against a commander account. Simple N-failures-per-window lockout, same
+# spirit as the other in-memory tables above (no new infra).
+RANGE_AUTH_MAX_FAILURES = 5
+RANGE_AUTH_LOCKOUT_WINDOW_S = 60
+_range_auth_failures: Dict[str, List[datetime]] = {}
+
+
+def _range_auth_locked_out(key: str) -> bool:
+    now = datetime.now(timezone.utc)
+    attempts = [t for t in _range_auth_failures.get(key, [])
+                if (now - t).total_seconds() <= RANGE_AUTH_LOCKOUT_WINDOW_S]
+    _range_auth_failures[key] = attempts
+    return len(attempts) >= RANGE_AUTH_MAX_FAILURES
+
+
+def _record_range_auth_failure(key: str) -> None:
+    _range_auth_failures.setdefault(key, []).append(datetime.now(timezone.utc))
+
+
+def _range_auth_status(effect: str) -> Dict[str, Any]:
+    lease = _range_authorization[effect]
+    expires_at = lease["expires_at"]
+    seconds_remaining = None
+    if lease["enabled"] and expires_at is not None:
+        seconds_remaining = max(0, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
+    return {
+        "enabled": bool(lease["enabled"]),
+        "effect": effect,
+        "expires_at": expires_at.isoformat() if expires_at else None,
+        "seconds_remaining": seconds_remaining,
+        "enabled_by": lease["enabled_by"],
+        "enabled_at": lease["enabled_at"].isoformat() if lease["enabled_at"] else None,
+    }
+
+
+async def _expire_range_authorization() -> None:
+    """Lazy/on-read expiry, same pattern as _expire_pending_acks/
+    _expire_pending_jam: any lease whose TTL has passed with no explicit
+    disable is flipped back to OFF and logged as RANGE_AUTH_EXPIRED. Called
+    from GET/POST /api/range-authorization* before computing/returning state,
+    so a stale 'enabled' can never be observed past its TTL."""
+    now = datetime.now(timezone.utc)
+    for effect, lease in _range_authorization.items():
+        if lease["enabled"] and lease["expires_at"] is not None and now > lease["expires_at"]:
+            lease["enabled"] = False
+            lease["expires_at"] = None
+            enabled_by = lease["enabled_by"]
+            lease["enabled_by"] = None
+            lease["enabled_at"] = None
+            await log_event(
+                "RANGE_AUTH_EXPIRED",
+                f"Range authorization for effect={effect} expired ({RANGE_AUTH_TTL_S}s TTL) — "
+                f"reverted to OFF (was enabled by {enabled_by})",
+                meta={"effect": effect, "enabled_by": enabled_by},
+                actor="SYSTEM",
+            )
+            await ws_manager.broadcast_json({"type": "range_authorization", **_range_auth_status(effect)})
 
 
 # ---- Authoritative transmit-halt (server-side, checked before any TX) ----
@@ -579,6 +672,14 @@ class JamConfirmBody(BaseModel):
     # at all) so a future addition (e.g. an operator note) doesn't require a
     # breaking change to the call signature.
     pass
+
+
+class RangeAuthorizationBody(BaseModel):
+    effect: str = Field(pattern="^(jam|mavlink)$")
+    enabled: bool
+    # Required (and checked) only when enabled=True — see POST handler.
+    password: Optional[str] = None
+    confirm_phrase: Optional[str] = None
 
 
 # =====================================================================
@@ -1161,6 +1262,47 @@ DETECTION_STALE_TIMEOUT_S = 600  # (10 min) NOT the same thing as the merge
                                # remain in the Mission Log / audit history.
 
 
+ML_RECLASSIFY_MIN_CONFIDENCE = 0.60
+# When the ML classify bridge's REAL inference explicitly says "wifi_2_4" or
+# "wifi_5" -- i.e. NOT "drone" -- at or above this confidence, we correct the
+# DISPLAYED model/protocol/threat_level away from the RSSI-heuristic's stale
+# drone-candidate guess. Root cause this fixes: field-bridge/
+# ml_classify_bridge.py always posts a drone-shaped model/protocol
+# ("DJI Mini (candidate)" / "MAVLink craft (candidate)") regardless of what
+# ml_label actually comes back as -- those values exist purely so the
+# merge-match query below finds the right existing record, not because the
+# bridge believes the contact is a drone. Left uncorrected, a detection could
+# display e.g. model="DJI Mini (candidate)" right next to an ML badge saying
+# "wifi_2_4" -- a visible, confusing contradiction an operator can see on the
+# Dashboard.
+#
+# This correction is intentionally ONE-DIRECTIONAL: only drone-guess -> wifi/
+# non-threat, never the reverse. ml_classify_bridge.py's own module docstring
+# documents a reproduced finding that this closed-world 3-class model (no
+# idle/noise/reject class) hallucinates "drone" at >99% confidence on pure
+# noise-floor energy -- so ml_label=="drone" must NOT be trusted to upgrade
+# or override a non-drone RSSI-heuristic guess. Choosing "wifi" over "drone"
+# is a different, more trustworthy signal (the flaw is false-positive drone
+# detection, not failure to recognize real wifi), so only that direction is
+# corrected here.
+ML_WIFI_RECLASSIFY_DISPLAY = {
+    "wifi_2_4": ("Wi-Fi 2.4GHz (ML reclassified)", "Wi-Fi 802.11"),
+    "wifi_5": ("Wi-Fi 5GHz (ML reclassified)", "Wi-Fi 802.11"),
+}
+
+
+def _ml_wifi_reclassification(ml_label: Optional[str], ml_confidence: Optional[float]):
+    """Returns (display_model, display_protocol) if this ingest's ML result
+    should reclassify the detection's displayed identity away from the
+    RSSI-heuristic's drone guess, else None. See ML_RECLASSIFY_MIN_CONFIDENCE
+    docstring above for why this is one-directional (wifi only, never drone)."""
+    if ml_label not in ML_WIFI_RECLASSIFY_DISPLAY:
+        return None
+    if ml_confidence is None or ml_confidence < ML_RECLASSIFY_MIN_CONFIDENCE:
+        return None
+    return ML_WIFI_RECLASSIFY_DISPLAY[ml_label]
+
+
 @api.post("/detections/ingest")
 async def detection_ingest(body: DetectionIngestBody,
                            user: Dict = Depends(get_current_user)):
@@ -1187,8 +1329,22 @@ async def detection_ingest(body: DetectionIngestBody,
             "ml_label": body.ml_label,
             "ml_confidence": body.ml_confidence,
             "ml_gated": body.ml_gated,
+            "confidence_type": body.confidence_type,
             "last_seen": datetime.now(timezone.utc).isoformat(),
         }
+        wifi_display = _ml_wifi_reclassification(body.ml_label, body.ml_confidence)
+        if wifi_display:
+            # Preserve the FIRST-ever RSSI-heuristic guess only -- don't
+            # clobber it on a second/third consecutive reclassified update
+            # for the same detection id.
+            updates["original_model"] = existing.get("original_model") or existing.get("model")
+            updates["original_protocol"] = existing.get("original_protocol") or existing.get("protocol")
+            updates["model"], updates["protocol"] = wifi_display
+            # A Wi-Fi AP is not a drone threat -- downgrade accordingly.
+            updates["threat_level"] = "LOW"
+            # The ML result is now the operative classification for this
+            # record, not the stale RSSI heuristic guess.
+            updates["confidence_type"] = "ml_probability"
         await db.detections.update_one(
             {"id": existing["id"]},
             {
@@ -1215,11 +1371,26 @@ async def detection_ingest(body: DetectionIngestBody,
         return det
 
     det = _new_detection_skeleton()  # id/timestamps/state only — no fabricated RF fields
+    model, protocol, threat_level = body.model, body.protocol, body.threat_level
+    original_model, original_protocol = None, None
+    confidence_type = body.confidence_type
+    wifi_display = _ml_wifi_reclassification(body.ml_label, body.ml_confidence)
+    if wifi_display:
+        # Same one-directional correction as the merge/update path above,
+        # applied on first-ever creation too (the ML bridge can itself be the
+        # first ingest to create a record, ahead of hackrf_rx.py's own post,
+        # within the merge window).
+        original_model, original_protocol = body.model, body.protocol
+        model, protocol = wifi_display
+        threat_level = "LOW"
+        confidence_type = "ml_probability"
     det.update({
         "callsign": body.callsign or det["callsign"],
-        "model": body.model,
-        "protocol": body.protocol,
-        "threat_level": body.threat_level,
+        "model": model,
+        "protocol": protocol,
+        "original_model": original_model,
+        "original_protocol": original_protocol,
+        "threat_level": threat_level,
         "center_freq_ghz": body.center_freq_ghz,
         "bandwidth_mhz": body.bandwidth_mhz,
         "rssi_dbm": body.rssi_dbm,
@@ -1237,6 +1408,7 @@ async def detection_ingest(body: DetectionIngestBody,
         "ml_label": body.ml_label,
         "ml_confidence": body.ml_confidence,
         "ml_gated": body.ml_gated,
+        "confidence_type": confidence_type,
     })
     await db.detections.insert_one(det.copy())
     await log_event("DETECTION",
@@ -1666,6 +1838,108 @@ async def jam_status(user: Dict = Depends(get_current_user)):
         key=lambda s: s["ts"], reverse=True,
     )
     return {"sessions": sessions[:20]}
+
+
+# =====================================================================
+# Routes: Range authorization (GUI-controlled replacement for the bridge-side
+# CEMA_AUTHORIZED_RANGE env var — see RANGE_AUTHORIZATION_REDESIGN.md)
+# =====================================================================
+@api.get("/range-authorization/status")
+async def range_authorization_status(effect: str, user: Dict = Depends(get_current_user)):
+    """Any authenticated user may read this (needed by the persistent banner
+    component on every page, and polled by field-bridge/rf-bridge services at
+    the moment of transmission)."""
+    if effect not in RANGE_AUTH_EFFECTS:
+        raise HTTPException(400, f"effect must be one of {RANGE_AUTH_EFFECTS}")
+    await _expire_range_authorization()
+    return _range_auth_status(effect)
+
+
+@api.post("/range-authorization")
+async def set_range_authorization(body: RangeAuthorizationBody, request: Request,
+                                  user: Dict = Depends(require_commander)):
+    """Arm/disarm a range-authorization lease for one effect (jam|mavlink).
+
+    enabled=True:  requires re-entering the current password (step-up auth —
+                   a stolen JWT alone is not enough) AND the fixed confirm
+                   phrase, both checked here even though require_commander
+                   already ran. Failures are throttled and fully audited.
+    enabled=False: no password/phrase required — disabling must always be
+                   low-friction (§2.3/2.6 of the redesign doc).
+    """
+    if body.effect not in RANGE_AUTH_EFFECTS:
+        raise HTTPException(400, f"effect must be one of {RANGE_AUTH_EFFECTS}")
+    await _expire_range_authorization()
+
+    source_ip = request.client.host if request.client else None
+    throttle_key = user["email"]
+
+    if body.enabled:
+        if _range_auth_locked_out(throttle_key):
+            await log_event(
+                "RANGE_AUTH_ENABLE_FAILED",
+                f"Range authorization enable for effect={body.effect} REFUSED: "
+                f"too many recent failed attempts (locked out {RANGE_AUTH_LOCKOUT_WINDOW_S}s)",
+                meta={"effect": body.effect, "reason": "locked_out", "source_ip": source_ip},
+                actor=user["email"],
+            )
+            raise HTTPException(429, "Too many failed range-authorization attempts — try again shortly.")
+
+        # Re-verify the user's CURRENT password against their stored hash —
+        # the bare JWT from require_commander is deliberately not treated as
+        # sufficient on its own for this specific action (see §2.1/2.2).
+        full_user = await db.users.find_one({"id": user["id"]})
+        if not body.password or not full_user or not verify_password(body.password, full_user["password_hash"]):
+            _record_range_auth_failure(throttle_key)
+            await log_event(
+                "RANGE_AUTH_ENABLE_FAILED",
+                f"Range authorization enable for effect={body.effect} REFUSED: bad password",
+                meta={"effect": body.effect, "reason": "bad_password", "source_ip": source_ip},
+                actor=user["email"],
+            )
+            raise HTTPException(401, "Password re-verification failed.")
+
+        if body.confirm_phrase != RANGE_AUTH_CONFIRM_PHRASE:
+            _record_range_auth_failure(throttle_key)
+            await log_event(
+                "RANGE_AUTH_ENABLE_FAILED",
+                f"Range authorization enable for effect={body.effect} REFUSED: "
+                f"confirm phrase mismatch",
+                meta={"effect": body.effect, "reason": "bad_confirm_phrase", "source_ip": source_ip},
+                actor=user["email"],
+            )
+            raise HTTPException(400, f"Confirmation phrase must exactly match \"{RANGE_AUTH_CONFIRM_PHRASE}\".")
+
+        now = datetime.now(timezone.utc)
+        lease = _range_authorization[body.effect]
+        lease["enabled"] = True
+        lease["expires_at"] = now + timedelta(seconds=RANGE_AUTH_TTL_S)
+        lease["enabled_by"] = user["email"]
+        lease["enabled_at"] = now
+        await log_event(
+            "RANGE_AUTH_ENABLE",
+            f"Range authorization ENABLED for effect={body.effect} "
+            f"(expires in {RANGE_AUTH_TTL_S}s)",
+            meta={"effect": body.effect, "source_ip": source_ip,
+                 "expires_at": lease["expires_at"].isoformat()},
+            actor=user["email"],
+        )
+    else:
+        lease = _range_authorization[body.effect]
+        lease["enabled"] = False
+        lease["expires_at"] = None
+        lease["enabled_by"] = None
+        lease["enabled_at"] = None
+        await log_event(
+            "RANGE_AUTH_DISABLE",
+            f"Range authorization DISABLED for effect={body.effect}",
+            meta={"effect": body.effect, "source_ip": source_ip},
+            actor=user["email"],
+        )
+
+    status = _range_auth_status(body.effect)
+    await ws_manager.broadcast_json({"type": "range_authorization", **status})
+    return status
 
 
 # =====================================================================
