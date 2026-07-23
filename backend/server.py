@@ -1416,10 +1416,26 @@ async def detection_ingest(body: DetectionIngestBody,
             "altitude_m": body.altitude_m,
             "speed_ms": body.speed_ms,
             "protocol_confirmed": body.protocol_confirmed,
-            "ml_label": body.ml_label,
-            "ml_confidence": body.ml_confidence,
-            "ml_gated": body.ml_gated,
-            "confidence_type": body.confidence_type,
+            # ROOT CAUSE FIX (see false-positive ml_label=null audit finding):
+            # hackrf_rx.py NEVER sends ml_label/ml_confidence/confidence_type
+            # (they default to None/"heuristic_binary" on its DetectionIngestBody).
+            # hackrf_rx.py re-confirms the SAME detection every ~3s (well inside
+            # DETECTION_MERGE_WINDOW_S=20s), while ml_classify_bridge.py only
+            # posts a real ml_label every ~12s+ per band (often slower under
+            # HackRF device-lock contention). Unconditionally overwriting these
+            # fields on every merge meant hackrf_rx.py's very next 3s
+            # re-confirmation almost always clobbered ml_classify_bridge.py's
+            # ml_label back to null within seconds of it being set -- this is
+            # NOT the earlier-fixed "stale label" bug, it's active clobbering
+            # on every non-ML ingest. Fix: only overwrite these ML-derived
+            # fields when THIS ingest actually carries ML data (ml_label is not
+            # None); otherwise preserve whatever the existing record already
+            # has, so hackrf_rx.py's frequent re-confirmations no longer erase
+            # ml_classify_bridge.py's slower, less frequent classifications.
+            "ml_label": body.ml_label if body.ml_label is not None else existing.get("ml_label"),
+            "ml_confidence": body.ml_confidence if body.ml_label is not None else existing.get("ml_confidence"),
+            "ml_gated": body.ml_gated if body.ml_label is not None else existing.get("ml_gated", False),
+            "confidence_type": body.confidence_type if body.ml_label is not None else existing.get("confidence_type"),
             "last_seen": datetime.now(timezone.utc).isoformat(),
         }
         wifi_display = _ml_wifi_reclassification(body.ml_label, body.ml_confidence)
