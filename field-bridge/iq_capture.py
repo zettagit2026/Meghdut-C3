@@ -287,7 +287,7 @@ def capture_iq(
     # device runs at a time; if the sweep loop is mid-pass, this capture
     # waits briefly (bounded) rather than colliding with it.
     try:
-        with hackrf_device_lock():
+        with hackrf_device_lock(serial=serial):
             result = subprocess.run(cmd, capture_output=False, check=False)
     except HackrfDeviceBusy as e:
         raise RuntimeError(

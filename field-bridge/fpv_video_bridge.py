@@ -358,6 +358,77 @@ def push_to_backend(result: dict, console_url: str, headers: dict, png_path: Opt
         print(f"[fpv_video_bridge] push to backend failed: {e}", file=sys.stderr)
 
 
+def run_poll_mode(
+    *,
+    channel_name: str,
+    freq_hz: float,
+    sample_rate_hz: float,
+    duration_s: float,
+    out_dir: str,
+    serial: Optional[str],
+    console_url: Optional[str],
+    headers: dict,
+    forward_url: Optional[str],
+    poll_interval_s: float,
+) -> None:
+    """GUI-trigger poll loop. Polls the backend's
+    GET /api/fpv/capture-request/status; when the operator clicks
+    'CAPTURE NOW' in the dashboard (POST /api/fpv/capture-request), this
+    performs exactly ONE real capture_and_demod() + push_to_backend()
+    cycle -- the SAME functions the one-shot CLI path uses, not a
+    reimplementation -- then resumes polling. Never invents a request:
+    if the backend says pending=False, nothing happens.
+    """
+    if not _HAVE_REQUESTS:
+        print("[fpv_video_bridge] `requests` not installed -- --poll mode requires it, "
+              "cannot poll backend", file=sys.stderr)
+        sys.exit(1)
+    if not console_url:
+        print("[fpv_video_bridge] --poll requires --console-url/CEMA_API_URL "
+              "(nothing to poll)", file=sys.stderr)
+        sys.exit(2)
+
+    status_url = console_url.rstrip("/") + "/api/fpv/capture-request/status"
+    print(f"[fpv_video_bridge] poll mode: watching {status_url} every "
+          f"{poll_interval_s}s for operator-triggered capture requests "
+          f"(GUI-only trigger, no SSH/CLI needed by the operator)", file=sys.stderr)
+
+    while True:
+        try:
+            resp = requests.get(status_url, headers=headers, timeout=10)
+            if resp.status_code == 200 and resp.json().get("pending"):
+                requested = resp.json()
+                req_channel = requested.get("channel") or channel_name
+                req_freq_hz = (ALL_FPV_CHANNELS_MHZ[req_channel] * 1e6
+                               if req_channel in ALL_FPV_CHANNELS_MHZ else freq_hz)
+                print(f"[fpv_video_bridge] capture request received (channel="
+                      f"{req_channel}) -- running one real capture+demod+ingest "
+                      f"cycle", file=sys.stderr)
+                try:
+                    result = capture_and_demod(
+                        channel_name=req_channel,
+                        center_freq_hz=req_freq_hz,
+                        sample_rate_hz=sample_rate_hz,
+                        duration_s=duration_s,
+                        out_dir=out_dir,
+                        serial=serial,
+                    )
+                    print(json.dumps(result, indent=2))
+                    if forward_url:
+                        forward_result(result, forward_url, result.get("png_path"))
+                    push_to_backend(result, console_url, headers, result.get("png_path"))
+                except Exception as e:
+                    print(f"[fpv_video_bridge] requested capture/demod cycle failed: {e}",
+                          file=sys.stderr)
+            elif resp.status_code != 200:
+                print(f"[fpv_video_bridge] capture-request poll got HTTP "
+                      f"{resp.status_code}", file=sys.stderr)
+        except Exception as e:
+            print(f"[fpv_video_bridge] capture-request poll failed: {e}", file=sys.stderr)
+
+        time.sleep(poll_interval_s)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--channel", default="5800_R1",
@@ -379,6 +450,18 @@ def main() -> None:
                          "NOT continuous streaming -- see module docstring)")
     ap.add_argument("--interval", type=float, default=15.0,
                     help="seconds between captures when --loop is set")
+    ap.add_argument("--poll", action="store_true",
+                    help="GUI-trigger mode: instead of capturing immediately/on a fixed "
+                         "--interval, poll the backend's "
+                         "GET /api/fpv/capture-request/status every --poll-interval "
+                         "seconds; when the operator has clicked 'CAPTURE NOW' in the "
+                         "dashboard (POST /api/fpv/capture-request), perform ONE real "
+                         "capture_and_demod()+ingest cycle, then resume polling. This is "
+                         "the whole point of this mode: the operator never needs SSH/CLI "
+                         "access to trigger a capture -- requires --console-url (or "
+                         "CEMA_API_URL) to be set.")
+    ap.add_argument("--poll-interval", type=float, default=3.0,
+                    help="seconds between capture-request polls when --poll is set")
     args = ap.parse_args()
 
     if args.channel in ALL_FPV_CHANNELS_MHZ:
@@ -392,6 +475,21 @@ def main() -> None:
             sys.exit(2)
 
     headers = {"Authorization": f"Bearer {args.token}"} if args.token else {}
+
+    if args.poll:
+        run_poll_mode(
+            channel_name=args.channel,
+            freq_hz=freq_hz,
+            sample_rate_hz=args.rate,
+            duration_s=args.duration,
+            out_dir=args.out_dir,
+            serial=args.serial,
+            console_url=args.console_url,
+            headers=headers,
+            forward_url=args.forward_url,
+            poll_interval_s=args.poll_interval,
+        )
+        return
 
     while True:
         try:

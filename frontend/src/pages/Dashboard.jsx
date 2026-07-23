@@ -82,89 +82,6 @@ function Waterfall() {
   );
 }
 
-// Analog FPV video bridge panel (field-bridge/fpv_video_bridge.py).
-//
-// HONESTY NOTE: this panel renders exactly what the backend /api/fpv/*
-// endpoints report, including the pipeline's own disclosed limitations --
-// it does NOT imply a validated, continuous video feed. See
-// field-bridge/fpv_video_bridge.py's module docstring for the full
-// disclosure this mirrors: AM-envelope + naive scanline reconstruction,
-// UNTESTED against a live analog FPV transmitter, snapshot-only (not
-// continuous streaming), and DJI digital video is never decoded here.
-function FpvVideoPanel() {
-  const [meta, setMeta] = useState(null);
-  const [imgKey, setImgKey] = useState(0);
-
-  useEffect(() => {
-    let id;
-    const load = async () => {
-      try {
-        const { data } = await api.get("/fpv/latest-frame");
-        setMeta(data);
-        setImgKey((k) => k + 1);
-      } catch { /* silent */ }
-    };
-    load();
-    id = setInterval(load, 5000);
-    return () => clearInterval(id);
-  }, []);
-
-  const available = meta?.available;
-
-  return (
-    <div data-testid="fpv-video-panel" className="tactical-border" style={{ background: "var(--bg-surface)" }}>
-      <div className="tactical-border-b px-4 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <Signal size={14} strokeWidth={1.5} style={{ color: "var(--accent-warning)" }} />
-          <span className="font-mono text-xs uppercase tracking-widest">Analog FPV Video (snapshot)</span>
-        </div>
-        <span
-          className="px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-widest tactical-border"
-          style={{
-            color: available ? "var(--accent-success)" : "var(--accent-warning)",
-            borderColor: available ? "var(--accent-success)" : "var(--accent-warning)",
-          }}
-        >
-          {available ? "● FRAME CAPTURED" : "◌ NO CAPTURE YET"}
-        </span>
-      </div>
-      <div className="p-4 space-y-3">
-        {available ? (
-          <>
-            <img
-              key={imgKey}
-              src={`${api.defaults.baseURL}/fpv/latest-frame.png?_=${imgKey}`}
-              alt="Reconstructed AM-envelope snapshot from analog FPV capture"
-              className="w-full tactical-border"
-              style={{ background: "#000", imageRendering: "pixelated" }}
-              onError={(e) => { e.currentTarget.style.display = "none"; }}
-            />
-            <div className="grid grid-cols-2 gap-2 font-mono text-[10px] text-slate-400">
-              <div>Channel: <span className="text-slate-200">{meta.channel}</span></div>
-              <div>Freq: <span className="text-slate-200">{(meta.center_freq_hz / 1e6).toFixed(3)} MHz</span></div>
-              <div>Captured: <span className="text-slate-200">{meta.captured_at}</span></div>
-              <div>Demod: <span className="text-slate-200">{meta.demod_method}</span></div>
-            </div>
-            <div
-              className="font-mono text-[10px] p-2 tactical-border"
-              style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}
-            >
-              {meta.note || "Snapshot pipeline, not continuous video. AM-envelope reconstruction, not validated against a live analog FPV transmitter."}
-              {" "}DJI digital video is never decoded — energy presence only.
-            </div>
-          </>
-        ) : (
-          <div className="font-mono text-[10px] text-slate-500">
-            No FPV capture ingested yet. Run field-bridge/fpv_video_bridge.py against a
-            real HackRF pointed at a 5.8GHz analog FPV channel (e.g. Raceband R1-R8) to
-            populate this panel.
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function StatTile({ label, value, sub, color = "var(--accent-info)", testid }) {
   return (
     <div data-testid={testid} className="tactical-border p-4" style={{ background: "var(--bg-surface)" }}>
@@ -280,8 +197,6 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 space-y-6">
           <Waterfall />
-
-          <FpvVideoPanel />
 
           <div className="tactical-border" style={{ background: "var(--bg-surface)" }}>
             <div className="tactical-border-b px-4 py-3 flex items-center justify-between">

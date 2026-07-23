@@ -1,0 +1,57 @@
+[Unit]
+Description=CEMA cUAS - GUI-triggered analog FPV video capture bridge (RX only, no transmission, polls backend for operator-initiated capture requests -- see fpv_video_bridge.py --poll)
+After=network-online.target docker.service cema-hackrf-rx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as cema-hackrf-rx.service / cema-ml-classify-bridge.service.
+# There is deliberately only ONE copy of this unit in the repo; do not fork
+# per-host copies with hardcoded paths/users baked in. Keep host-specific
+# values out of this file — they belong in the EnvironmentFile below.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# Credentials and console URL are NOT hardcoded here. They are supplied via
+# EnvironmentFile, which must define at minimum:
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+# Optional overrides (see fpv_video_bridge.py --help for full list/defaults):
+#   HACKRF_SERIAL_PRIMARY=<serial, if disambiguating multiple HackRFs>
+#   FPV_FORWARD_URL=<external HTTP POST destination for captured frames, optional>
+# Point this at either the project-root .env or a dedicated field-bridge/.env.
+# This file must be created per-deployment; it is not committed to the repo.
+# Restrict its permissions: chmod 600.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+# --poll mode: this bridge does NOT capture on a fixed timer. It idles,
+# polling GET /api/fpv/capture-request/status every few seconds, and only
+# runs a real HackRF capture+demod+ingest cycle when the operator has clicked
+# "CAPTURE NOW" in the dashboard (POST /api/fpv/capture-request). This is
+# what removes the need for the operator to SSH into this host to trigger a
+# capture — the entire point of this unit. The one-shot/--loop CLI modes
+# documented in fpv_video_bridge.py's module docstring remain available for
+# manual/ad-hoc use; this service intentionally does not use them.
+ExecStart=/usr/bin/python3 -u fpv_video_bridge.py --poll --channel 5800_R1
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/fpv_video_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/fpv_video_bridge.log
+
+[Install]
+WantedBy=multi-user.target
+
+# ---------------------------------------------------------------------------
+# NOT YET INSTALLED / ENABLED. Per project standing rule for this session:
+# code is deployed to field-bridge/ for QA/review, but this systemd unit is
+# intentionally left uninstalled and inactive (no `systemctl enable/start`
+# has been run) pending explicit confirmation this is ready for continuous
+# operation ahead of the demo. See fpv_video_bridge.py's module docstring for
+# the full, load-bearing honesty disclosure (validated_against_live_signal:
+# False, naive AM-envelope/scanline reconstruction, DJI digital video never
+# decoded) that this GUI-trigger mode does not change in any way -- it only
+# removes the need for manual CLI invocation of the same, already-disclosed
+# capture pipeline.
+# ---------------------------------------------------------------------------

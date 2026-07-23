@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Bomb, AlertTriangle, Target as TargetIcon, ShieldCheck, ShieldOff } from "lucide-react";
+import { Bomb, AlertTriangle, Target as TargetIcon, ShieldCheck, ShieldOff, Signal } from "lucide-react";
 import SafetyGate, { SAFETY_GATED } from "@/components/SafetyGate";
 import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
 
@@ -18,6 +18,172 @@ const CAT_LABEL = {
   protocol: "PROTOCOL",
   denial: "DENIAL",
 };
+
+// Analog FPV video bridge panel (field-bridge/fpv_video_bridge.py), relocated
+// here from Dashboard.jsx: FPV capture is an operator-DECIDED action (an
+// explicit "go capture something right now" command), not passive dashboard
+// telemetry that just displays automatically -- so it belongs alongside the
+// other deployable payload capabilities in this file, not on the main
+// Dashboard's live-telemetry surface.
+//
+// HONESTY NOTE: this panel renders exactly what the backend /api/fpv/*
+// endpoints report, including the pipeline's own disclosed limitations --
+// it does NOT imply a validated, continuous video feed. See
+// field-bridge/fpv_video_bridge.py's module docstring for the full
+// disclosure this mirrors: AM-envelope + naive scanline reconstruction,
+// UNTESTED against a live analog FPV transmitter, snapshot-only (not
+// continuous streaming), and DJI digital video is never decoded here.
+function FpvVideoPanel() {
+  const [meta, setMeta] = useState(null);
+  const [imgKey, setImgKey] = useState(0);
+  const [captureState, setCaptureState] = useState("idle"); // idle | pending | timeout
+  const [captureError, setCaptureError] = useState(null);
+
+  const load = async () => {
+    try {
+      const { data } = await api.get("/fpv/latest-frame");
+      setMeta((prev) => {
+        // Real completion signal: a genuinely new captured_at timestamp
+        // after a capture was requested -- no fake instant "success".
+        if (captureState === "pending" && data.available &&
+            data.captured_at && data.captured_at !== prev?.captured_at) {
+          setCaptureState("idle");
+        }
+        return data;
+      });
+      setImgKey((k) => k + 1);
+    } catch { /* silent */ }
+  };
+
+  useEffect(() => {
+    load();
+    const id = setInterval(load, 5000);
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captureState]);
+
+  // While a capture is pending, poll faster so the operator sees the real
+  // result land as soon as the field bridge's --poll mode picks up the
+  // request and finishes one capture+demod+ingest cycle.
+  useEffect(() => {
+    if (captureState !== "pending") return undefined;
+    const fastId = setInterval(load, 2000);
+    // Give up waiting after 90s (capture is a multi-second real HackRF
+    // RX + demod cycle, plus bridge poll latency) -- honestly report
+    // "not confirmed yet" rather than spinning forever.
+    const timeoutId = setTimeout(() => setCaptureState((s) => (s === "pending" ? "timeout" : s)), 90000);
+    return () => { clearInterval(fastId); clearTimeout(timeoutId); };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captureState]);
+
+  const triggerCapture = async () => {
+    setCaptureError(null);
+    setCaptureState("pending");
+    try {
+      await api.post("/fpv/capture-request", {});
+      toast.success("Capture requested", {
+        description: "Waiting for the field bridge to run one real HackRF capture+demod cycle.",
+      });
+    } catch (e) {
+      setCaptureState("idle");
+      setCaptureError(formatApiError(e));
+      toast.error("Failed to request capture", { description: formatApiError(e) });
+    }
+  };
+
+  const available = meta?.available;
+
+  return (
+    <div data-testid="fpv-video-panel" className="tactical-border" style={{ background: "var(--bg-surface)" }}>
+      <div className="tactical-border-b px-4 py-3 flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <Signal size={14} strokeWidth={1.5} style={{ color: "var(--accent-warning)" }} />
+          <span className="font-mono text-xs uppercase tracking-widest">FPV Video Capture (RX-only, prototype)</span>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            data-testid="fpv-capture-now-btn"
+            onClick={triggerCapture}
+            disabled={captureState === "pending"}
+            className="px-3 py-1 font-mono text-[10px] font-bold uppercase tracking-widest tactical-border"
+            style={{
+              color: captureState === "pending" ? "var(--accent-warning)" : "var(--accent-info)",
+              borderColor: captureState === "pending" ? "var(--accent-warning)" : "var(--accent-info)",
+              cursor: captureState === "pending" ? "wait" : "pointer",
+              background: "transparent",
+            }}
+          >
+            {captureState === "pending" ? "◌ CAPTURING…" : "▶ CAPTURE NOW"}
+          </button>
+          <span
+            className="px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-widest tactical-border"
+            style={{
+              color: available ? "var(--accent-success)" : "var(--accent-warning)",
+              borderColor: available ? "var(--accent-success)" : "var(--accent-warning)",
+            }}
+          >
+            {available ? "● FRAME CAPTURED" : "◌ NO CAPTURE YET"}
+          </span>
+        </div>
+      </div>
+      <div className="p-4 space-y-3">
+        {captureState === "pending" && (
+          <div className="font-mono text-[10px] p-2 tactical-border"
+               style={{ color: "var(--accent-info)", borderColor: "var(--accent-info)" }}>
+            Capture requested — waiting for the field bridge (fpv_video_bridge.py --poll)
+            to pick it up and run one real capture+demod cycle. This panel updates only
+            when a genuinely new frame timestamp is confirmed, not on a fixed timer.
+          </div>
+        )}
+        {captureState === "timeout" && (
+          <div className="font-mono text-[10px] p-2 tactical-border"
+               style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}>
+            No new frame confirmed within 90s. The field bridge may not be running in
+            --poll mode, or the HackRF is unavailable. Check field-bridge logs.
+            <button onClick={() => setCaptureState("idle")}
+                    className="ml-2 underline" style={{ color: "var(--accent-critical)" }}>
+              dismiss
+            </button>
+          </div>
+        )}
+        {captureError && (
+          <div className="font-mono text-[10px] text-red-400">{captureError}</div>
+        )}
+        {available ? (
+          <>
+            <img
+              key={imgKey}
+              src={`${api.defaults.baseURL}/fpv/latest-frame.png?_=${imgKey}`}
+              alt="Reconstructed AM-envelope snapshot from analog FPV capture"
+              className="w-full tactical-border"
+              style={{ background: "#000", imageRendering: "pixelated" }}
+              onError={(e) => { e.currentTarget.style.display = "none"; }}
+            />
+            <div className="grid grid-cols-2 gap-2 font-mono text-[10px] text-slate-400">
+              <div>Channel: <span className="text-slate-200">{meta.channel}</span></div>
+              <div>Freq: <span className="text-slate-200">{(meta.center_freq_hz / 1e6).toFixed(3)} MHz</span></div>
+              <div>Captured: <span className="text-slate-200">{meta.captured_at}</span></div>
+              <div>Demod: <span className="text-slate-200">{meta.demod_method}</span></div>
+            </div>
+            <div
+              className="font-mono text-[10px] p-2 tactical-border"
+              style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}
+            >
+              {meta.note || "Snapshot pipeline, not continuous video. AM-envelope reconstruction, not validated against a live analog FPV transmitter."}
+              {" "}DJI digital video is never decoded — energy presence only.
+            </div>
+          </>
+        ) : (
+          <div className="font-mono text-[10px] text-slate-500">
+            No FPV capture ingested yet. Run field-bridge/fpv_video_bridge.py against a
+            real HackRF pointed at a 5.8GHz analog FPV channel (e.g. Raceband R1-R8) to
+            populate this panel.
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
 export default function Payloads() {
   const [payloads, setPayloads] = useState([]);
@@ -173,6 +339,8 @@ export default function Payloads() {
           kinetic/logical attack. Evaluation build only.
         </div>
       </div>
+
+      <FpvVideoPanel />
 
       <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-0 tactical-border">
         {payloads.map((p, i) => (

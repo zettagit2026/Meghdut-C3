@@ -1246,6 +1246,62 @@ class DetectionIngestBody(BaseModel):
 _last_fpv_frame: Optional[Dict] = None
 _last_fpv_frame_png: Optional[bytes] = None
 
+# ---------------------------------------------------------------------------
+# GUI-only capture trigger. Standing rule for tomorrow's demo: the operator
+# must never need SSH/manual CLI access to trigger an FPV capture. This is a
+# simple in-memory request record -- same pattern as _arm_tokens/
+# _range_authorization above -- that field-bridge/fpv_video_bridge.py's new
+# --poll mode consumes. RX-only/non-destructive (it only asks the bridge to
+# do one more real HackRF RX capture+demod+ingest cycle, identical to what an
+# operator would otherwise SSH in and run by hand), so it uses the same
+# get_current_user dependency as /fpv/ingest and /fpv/latest-frame -- no
+# stricter RBAC gate is warranted than what already guards those routes.
+_fpv_capture_request: Optional[Dict] = None
+
+
+class FpvCaptureRequestBody(BaseModel):
+    channel: Optional[str] = None
+
+
+@api.post("/fpv/capture-request")
+async def fpv_capture_request(body: FpvCaptureRequestBody,
+                               user: Dict = Depends(get_current_user)):
+    """Record an operator request for one more FPV capture cycle. The
+    field bridge (in --poll mode) picks this up via GET
+    /fpv/capture-request/status, performs ONE real capture+demod+ingest
+    cycle, then the request is cleared. This is the entire mechanism that
+    removes the need for an operator to SSH into the bridge host to
+    trigger a capture -- it is a request/consume queue of depth 1, not a
+    job scheduler."""
+    global _fpv_capture_request
+    _fpv_capture_request = {
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "requested_by": user["email"],
+        "channel": body.channel,
+        "consumed": False,
+    }
+    await log_event(
+        "FPV_CAPTURE_REQUESTED",
+        f"FPV capture requested via GUI, channel={body.channel or 'default'}",
+        actor=user["email"],
+    )
+    return {"ok": True, "queued": True, **_fpv_capture_request}
+
+
+@api.get("/fpv/capture-request/status")
+async def fpv_capture_request_status(user: Dict = Depends(get_current_user)):
+    """Polled by fpv_video_bridge.py --poll. Returns the pending request
+    (if any) and marks it consumed so it is only ever acted on once. No
+    synthetic/fabricated request is ever returned -- pending=False means
+    honestly nothing is queued."""
+    global _fpv_capture_request
+    if _fpv_capture_request is None or _fpv_capture_request.get("consumed"):
+        return {"pending": False}
+    req = _fpv_capture_request
+    _fpv_capture_request = {**req, "consumed": True}
+    return {"pending": True, "channel": req.get("channel"),
+            "requested_at": req.get("requested_at")}
+
 
 @api.post("/fpv/ingest")
 async def fpv_ingest(
