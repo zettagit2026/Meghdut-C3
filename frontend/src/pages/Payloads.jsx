@@ -169,15 +169,12 @@ function FpvVideoPanel() {
               className="font-mono text-[10px] p-2 tactical-border"
               style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}
             >
-              {meta.note || "Snapshot pipeline, not continuous video. AM-envelope reconstruction, not validated against a live analog FPV transmitter."}
-              {" "}DJI digital video is never decoded — energy presence only.
+              Prototype snapshot, not live video. DJI digital video is never decoded.
             </div>
           </>
         ) : (
           <div className="font-mono text-[10px] text-slate-500">
-            No FPV capture ingested yet. Run field-bridge/fpv_video_bridge.py against a
-            real HackRF pointed at a 5.8GHz analog FPV channel (e.g. Raceband R1-R8) to
-            populate this panel.
+            No capture yet — click CAPTURE NOW.
           </div>
         )}
       </div>
