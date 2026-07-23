@@ -122,6 +122,22 @@ from gamutrf_infer import GamutRFClassifier, load_sigmf
 
 DEFAULT_CHECKPOINT = "/tmp/resnet18_leesburg_split_0.02_1_current.pt"
 
+# OUT-OF-DOMAIN BAND EXCLUSION (2026-07-23): the deployed checkpoint
+# (resnet18_leesburg_split_0.02_1_current.pt) is a CLOSED-WORLD 3-class
+# model trained ONLY on {drone, wifi_2_4, wifi_5} -- i.e. DJI-style
+# OcuSync/Wi-Fi-band drone video-link energy. It has never seen 915MHz
+# ISM / SiK-radio / MAVLink telemetry energy and has no "none of the
+# above" class, so feeding it "SiK-915" IQ produces a confident-looking
+# but MEANINGLESS softmax score (observed: 98.37% "drone" on real
+# 915MHz energy that was actually SiK/MAVLink telemetry, not a drone
+# video downlink). That is out-of-domain input, not a real
+# classification, and must never reach this ML pass. hackrf_rx.py's
+# existing RSSI/persistence heuristic already covers SiK-915 detection
+# and is untouched by this exclusion -- only this classifier's own
+# target list is narrowed.
+ML_EXCLUDED_BANDS = {"SiK-915"}
+ML_BANDS_MHZ = [b for b in BANDS_MHZ if b[0] not in ML_EXCLUDED_BANDS]
+
 # MULTI-DEVICE NOTE (2026-07): optional pin to one specific physical HackRF
 # for both this bridge's gate-check sweeps (sweep_band(), imported above)
 # and its gated IQ captures (capture_iq(), below). Unset/empty (default) =
@@ -208,13 +224,14 @@ def main() -> None:
 
     token = login(args.console_url, args.email, args.password)
     headers = {"Authorization": f"Bearer {token}"}
-    print(f"[ml_classify_bridge] logged in. Gate-checking {len(BANDS_MHZ)} bands every "
-          f"{args.interval_s}s. RX ONLY -- no transmission.")
+    print(f"[ml_classify_bridge] logged in. Gate-checking {len(ML_BANDS_MHZ)} bands every "
+          f"{args.interval_s}s (excluded from ML pass, out-of-domain: "
+          f"{sorted(ML_EXCLUDED_BANDS)}). RX ONLY -- no transmission.")
 
     i = 0
     with tempfile.TemporaryDirectory(prefix="cema_ml_bridge_") as tmp_dir:
         while args.iterations == 0 or i < args.iterations:
-            for name, low, high, label in BANDS_MHZ:
+            for name, low, high, label in ML_BANDS_MHZ:
                 powers, center_mhz, is_real_data = sweep_band(name, low, high, serial=HACKRF_SERIAL)
                 if not is_real_data:
                     continue  # wedged/fallback filler cycle -- nothing genuine to gate on
