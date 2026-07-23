@@ -138,6 +138,19 @@ except ImportError:
     _HAVE_REQUESTS = False
 
 
+def login(console_url: str, email: str, password: str) -> str:
+    """Log in against this project's own backend and return a fresh bearer
+    token. Identical to the login() implemented in hackrf_rx.py /
+    ml_classify_bridge.py / droneid_decode_bridge.py / mavlink_sniffer.py --
+    duplicated here on purpose (no shared auth module exists in this
+    codebase yet; every sibling bridge duplicates this same small function
+    rather than import one another), so this stays consistent with the
+    established convention instead of inventing a new pattern."""
+    r = requests.post(f"{console_url}/api/auth/login", json={"email": email, "password": password}, timeout=10)
+    r.raise_for_status()
+    return r.json()["token"]
+
+
 # --- Standard analog FPV channel tables (public, industry-standard) --------
 # 5.8GHz "Raceband" (RB1-RB8), the most common analog-FPV plan today.
 FPV_5800_RACEBAND_MHZ = {
@@ -444,7 +457,21 @@ def main() -> None:
                     help="this project's own backend, to populate /api/fpv/latest-frame "
                          "(env: CEMA_API_URL)")
     ap.add_argument("--token", default=os.environ.get("CEMA_TOKEN"),
-                    help="bearer token for --console-url, if auth required")
+                    help="bearer token for --console-url, if auth required. Optional "
+                         "fallback/override for manual debug use -- if set, used directly "
+                         "and login via --email/--password is skipped. Normally leave this "
+                         "unset and let --email/--password (or CEMA_EMAIL/CEMA_PASSWORD) "
+                         "obtain a fresh token instead, matching the other bridges (a "
+                         "static pre-obtained token would eventually expire with no way to "
+                         "refresh it).")
+    ap.add_argument("--email", default=os.environ.get("CEMA_EMAIL"),
+                    help="operator login email (env: CEMA_EMAIL) -- used to obtain a fresh "
+                         "bearer token via POST /api/auth/login, same as hackrf_rx.py/"
+                         "ml_classify_bridge.py/droneid_decode_bridge.py/mavlink_sniffer.py. "
+                         "Ignored if --token/CEMA_TOKEN is explicitly supplied.")
+    ap.add_argument("--password", default=os.environ.get("CEMA_PASSWORD"),
+                    help="operator login password (env: CEMA_PASSWORD). Ignored if "
+                         "--token/CEMA_TOKEN is explicitly supplied.")
     ap.add_argument("--loop", action="store_true",
                     help="repeat capture indefinitely (still one snapshot per iteration, "
                          "NOT continuous streaming -- see module docstring)")
@@ -474,7 +501,36 @@ def main() -> None:
                   f"{sorted(ALL_FPV_CHANNELS_MHZ.keys())}", file=sys.stderr)
             sys.exit(2)
 
-    headers = {"Authorization": f"Bearer {args.token}"} if args.token else {}
+    # Auth: an explicitly-supplied --token/CEMA_TOKEN wins (manual debug override,
+    # used as-is, no login performed). Otherwise, if CEMA_EMAIL/CEMA_PASSWORD are
+    # set, log in now and obtain a fresh token ourselves -- same login() flow and
+    # same env var names as hackrf_rx.py/ml_classify_bridge.py/
+    # droneid_decode_bridge.py/mavlink_sniffer.py, so the existing field-bridge/.env
+    # (which already has these set for the other bridges) works here unchanged.
+    # A single login at startup is sufficient: the backend's JWT is valid for 12h
+    # (create_access_token() in backend/server.py), and none of the sibling
+    # long-running bridges re-login/refresh mid-run either -- this matches that
+    # same established pattern rather than inventing a refresh mechanism.
+    token = args.token
+    if not token and args.email and args.password:
+        if not args.console_url:
+            print("[fpv_video_bridge] --email/--password given but no "
+                  "--console-url/CEMA_API_URL to log in against", file=sys.stderr)
+            sys.exit(2)
+        if not _HAVE_REQUESTS:
+            print("[fpv_video_bridge] `requests` not installed -- cannot log in",
+                  file=sys.stderr)
+            sys.exit(1)
+        token = login(args.console_url, args.email, args.password)
+        print(f"[fpv_video_bridge] logged in as {args.email}", file=sys.stderr)
+    if not token:
+        print("[fpv_video_bridge] no auth available -- supply --token/CEMA_TOKEN "
+              "or --email+--password/CEMA_EMAIL+CEMA_PASSWORD. Refusing to proceed "
+              "unauthenticated (matches hackrf_rx.py/ml_classify_bridge.py/"
+              "droneid_decode_bridge.py/mavlink_sniffer.py's hard-fail convention).",
+              file=sys.stderr)
+        sys.exit(2)
+    headers = {"Authorization": f"Bearer {token}"}
 
     if args.poll:
         run_poll_mode(
