@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { History } from "lucide-react";
@@ -47,12 +47,97 @@ function formatRelativeTime(isoString, now) {
   return `${diffDay}d ago`;
 }
 
+// Cadence panel: fetches /detections/{id}/cadence on demand and renders it
+// plainly, labeled with the real sample size backing each number so it never
+// reads as a definitive classification. All numbers here come straight from
+// the backend's statistics on real re-confirmation/session timestamps -- no
+// value here is fabricated or defaulted to a guess.
+function CadencePanel({ detectionId }) {
+  const [data, setData] = useState(null);
+  const [error, setError] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api
+      .get(`/detections/${detectionId}/cadence`)
+      .then(({ data }) => { if (!cancelled) setData(data); })
+      .catch((e) => { if (!cancelled) setError(formatApiError(e)); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [detectionId]);
+
+  if (loading) return <div className="p-3 text-slate-500">loading cadence<span className="term-caret" /></div>;
+  if (error) return <div className="p-3 text-[var(--accent-critical)]">{error}</div>;
+  if (!data) return null;
+
+  const { session, cross_session } = data;
+  const sStats = session.interval_stats;
+  const gStats = cross_session.gap_stats;
+
+  return (
+    <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-4 bg-[#0B111D]">
+      <div>
+        <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">
+          Re-confirmation cadence (this contact)
+        </div>
+        <div className="text-slate-300">
+          {session.reconfirm_count} re-confirmation{session.reconfirm_count === 1 ? "" : "s"}
+          {session.observation_span_s != null && (
+            <> over {(session.observation_span_s / 60).toFixed(1)}m observation window</>
+          )}
+        </div>
+        {sStats ? (
+          <div className="mt-1 text-slate-400">
+            <div>mean interval: {sStats.mean_interval_s}s (n={sStats.sample_count} interval{sStats.sample_count === 1 ? "" : "s"})</div>
+            <div>range: {sStats.min_interval_s}s – {sStats.max_interval_s}s</div>
+            {sStats.stddev_interval_s != null ? (
+              <div>stddev: {sStats.stddev_interval_s}s (CV {sStats.coefficient_of_variation})</div>
+            ) : (
+              <div className="text-slate-600">stddev not shown — fewer than 3 events, not enough to say</div>
+            )}
+          </div>
+        ) : (
+          <div className="mt-1 text-slate-600">Not enough re-confirmations yet to compute an interval.</div>
+        )}
+        <div className="mt-2 text-[10px] text-slate-600 italic">{session.note}</div>
+      </div>
+      <div>
+        <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">
+          Reappearance regularity (same source/model/protocol, across sessions)
+        </div>
+        <div className="text-slate-300">
+          {cross_session.session_count} session{cross_session.session_count === 1 ? "" : "s"} seen,{" "}
+          {cross_session.gap_count} silence gap{cross_session.gap_count === 1 ? "" : "s"} measured
+        </div>
+        {gStats ? (
+          <div className="mt-1 text-slate-400">
+            <div>mean gap: {gStats.mean_gap_s}s (n={gStats.sample_count})</div>
+            <div>range: {gStats.min_gap_s}s – {gStats.max_gap_s}s</div>
+            {gStats.stddev_gap_s != null ? (
+              <div>stddev: {gStats.stddev_gap_s}s (CV {gStats.coefficient_of_variation})</div>
+            ) : (
+              <div className="text-slate-600">stddev not shown — fewer than 2 gaps, not enough to say</div>
+            )}
+          </div>
+        ) : (
+          <div className="mt-1 text-slate-600">Not enough distinct sessions yet to measure a reappearance gap.</div>
+        )}
+        <div className="mt-2 text-[10px] text-slate-600 italic">{cross_session.note}</div>
+      </div>
+    </div>
+  );
+}
+
 export default function DetectionHistory() {
   const [detections, setDetections] = useState([]);
   const [loading, setLoading] = useState(true);
   const [now, setNow] = useState(() => Date.now());
   const [statusFilter, setStatusFilter] = useState("ALL");
   const [visibleCount, setVisibleCount] = useState(ROW_CAP);
+  const [expandedId, setExpandedId] = useState(null);
 
   const load = async () => {
     try {
@@ -172,9 +257,12 @@ export default function DetectionHistory() {
               {visible.map((d) => {
                 const src = d.source || "UNKNOWN";
                 const statusStyle = STATUS_STYLE[d.status] || { color: "var(--text-muted)", label: d.status || "—" };
+                const isExpanded = expandedId === d.id;
                 return (
-                  <tr key={d.id} data-testid={`hist-row-${d.id}`}
-                      className="tactical-border-b hover:bg-[#0F1626] transition-colors">
+                  <Fragment key={d.id}>
+                  <tr data-testid={`hist-row-${d.id}`}
+                      onClick={() => setExpandedId(isExpanded ? null : d.id)}
+                      className="tactical-border-b hover:bg-[#0F1626] transition-colors cursor-pointer">
                     <td className="p-2">
                       <span data-testid={`hist-status-${d.id}`}
                             className="px-2 py-0.5 tactical-border font-bold text-[9px]"
@@ -218,6 +306,14 @@ export default function DetectionHistory() {
                       {d.status === "NEUTRALIZED" ? "DEFEAT" : d.kill_chain_stage}
                     </td>
                   </tr>
+                  {isExpanded && (
+                    <tr className="tactical-border-b">
+                      <td colSpan={12} className="p-0">
+                        <CadencePanel detectionId={d.id} />
+                      </td>
+                    </tr>
+                  )}
+                  </Fragment>
                 );
               })}
             </tbody>
