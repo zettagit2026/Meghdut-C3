@@ -3,7 +3,7 @@ import { ClassificationBanner } from "@/components/ClassificationBanner";
 import EmergencyAbort from "@/components/EmergencyAbort";
 import { useAuth } from "@/context/AuthContext";
 import {
-  Radar, Waves, Radio, Bomb, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History,
+  Radar, Waves, Radio, Bomb, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History, MapPin,
 } from "lucide-react";
 
 const NAV = [
@@ -14,6 +14,7 @@ const NAV = [
   { to: "/jamming",     label: "RF BARRAGE JAM",   icon: Zap,       testid: "nav-jamming" },
   { to: "/killchain",   label: "KILL CHAIN",       icon: Crosshair, testid: "nav-killchain" },
   { to: "/history",     label: "DETECTION HISTORY",icon: History,   testid: "nav-history" },
+  { to: "/map",         label: "TACTICAL MAP",     icon: MapPin,    testid: "nav-map" },
   { to: "/logs",        label: "MISSION LOG",      icon: ScrollText,testid: "nav-logs" },
 ];
 

@@ -11,6 +11,7 @@ import Jamming from "@/pages/Jamming";
 import KillChain from "@/pages/KillChain";
 import DetectionHistory from "@/pages/DetectionHistory";
 import MissionLog from "@/pages/MissionLog";
+import MapView from "@/pages/Map";
 import "@/App.css";
 
 function Protected({ children }) {
@@ -40,6 +41,7 @@ export default function App() {
             <Route path="jamming"   element={<Jamming />} />
             <Route path="killchain" element={<KillChain />} />
             <Route path="history"   element={<DetectionHistory />} />
+            <Route path="map"       element={<MapView />} />
             <Route path="logs"      element={<MissionLog />} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />

@@ -736,6 +736,49 @@ async def _expire_stale_detections() -> None:
     )
 
 
+# --- Sensor (HackRF RX site) fixed position ---------------------------------
+# This is the ONLY geolocation we can honestly claim: the sensor's own fixed
+# ground position, configured via env vars. It is NOT a detection position.
+# We cannot compute a detection's absolute lat/lon because bearing_deg is
+# always a 0.0 placeholder in field-bridge/hackrf_rx.py (no direction-finding
+# antenna array exists on this hardware) -- see DetectionIngestBody.bearing_deg
+# and hackrf_rx.py's detection dicts. distance_m/distance_estimated is a
+# coarse RSSI path-loss estimate at best, with no bearing to pair it with.
+# So the map can show "sensor here, contact at ~Xm, direction unknown" but
+# must never plot a fabricated pin for the drone itself.
+# SENSOR_LAT/SENSOR_LON default to None (not a fake real-world coordinate) so
+# the frontend can render an explicit "sensor position not configured" state
+# instead of silently plotting null-island or some other misleading default.
+def _parse_optional_float(name: str) -> Optional[float]:
+    val = os.environ.get(name, "").strip()
+    if not val:
+        return None
+    try:
+        return float(val)
+    except ValueError:
+        return None
+
+
+SENSOR_LAT = _parse_optional_float("SENSOR_LAT")
+SENSOR_LON = _parse_optional_float("SENSOR_LON")
+SENSOR_LABEL = os.environ.get("SENSOR_LABEL", "RX-1")
+
+
+@api.get("/sensor/position")
+async def get_sensor_position(user: Dict = Depends(get_current_user)):
+    configured = SENSOR_LAT is not None and SENSOR_LON is not None
+    return {
+        "configured": configured,
+        "lat": SENSOR_LAT,
+        "lon": SENSOR_LON,
+        "label": SENSOR_LABEL,
+        # Honesty flag surfaced to the frontend: bearing is never a real
+        # measurement today, so detections can only be shown as range-only
+        # (distance known, direction unknown), never as absolute pins.
+        "bearing_available": False,
+    }
+
+
 @api.get("/detections")
 async def list_detections(user: Dict = Depends(get_current_user)):
     await _expire_stale_detections()
