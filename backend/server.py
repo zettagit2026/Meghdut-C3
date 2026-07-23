@@ -1221,7 +1221,11 @@ class DetectionIngestBody(BaseModel):
     # a persistence heuristic, and a presence-only advisory are not
     # comparable on one 0-1 scale, and this field deliberately does not try
     # to force them onto one. One of: "heuristic_binary", "ml_probability",
-    # "protocol_verified", "advisory_only". Optional/None for any source not
+    # "protocol_verified", "advisory_only", "unclassified_signal" (real
+    # energy-gated RF whose ML top-class confidence was too weak to trust
+    # any of the classifier's 3 known classes -- see
+    # field-bridge/ml_classify_bridge.py UNCLASSIFIED_MAX_CONFIDENCE).
+    # Optional/None for any source not
     # yet updated to set it -- absence means "render as before" (backward
     # compatible), same pattern as distance_estimated/protocol_confirmed above.
     confidence_type: Optional[str] = None
@@ -1449,6 +1453,33 @@ def _ml_wifi_reclassification(ml_label: Optional[str], ml_confidence: Optional[f
     return ML_WIFI_RECLASSIFY_DISPLAY[ml_label]
 
 
+# UNCLASSIFIED-SIGNAL DISPLAY OVERRIDE (2026-07-23): mirrors
+# ML_WIFI_RECLASSIFY_DISPLAY above. field-bridge/ml_classify_bridge.py
+# deliberately sends the plain heuristic-consistent model/protocol/
+# threat_level ("DJI Mini (candidate)"/"OcuSync/Wi-Fi"/MEDIUM, etc.) over
+# the wire for confidence_type=="unclassified_signal" ingests too -- NOT
+# "Unclassified emitter (candidate)"/"Unknown"/LOW -- because those fields
+# are also the merge-match key backend/server.py's detection_ingest uses to
+# find the existing ACTIVE record created by hackrf_rx.py. If the wire
+# values changed for the unclassified case, they would stop matching that
+# existing record and this ingest would spawn a second, duplicate ACTIVE
+# detection for the same physical contact instead of merging into it (see
+# ml_classify_bridge.py's det-dict comment for the full incident this
+# fixes). So the honest "unclassified" display the operator actually sees
+# is computed HERE, server-side, off confidence_type -- exactly the same
+# division of responsibility as the wifi-reclassification path above.
+UNCLASSIFIED_DISPLAY = ("Unclassified emitter (candidate)", "Unknown")
+
+
+def _ml_unclassified_display(confidence_type: Optional[str]):
+    """Returns (display_model, display_protocol) if this ingest's
+    confidence_type says the ML classifier could not confidently place the
+    signal in any of its 3 known classes, else None."""
+    if confidence_type != "unclassified_signal":
+        return None
+    return UNCLASSIFIED_DISPLAY
+
+
 @api.post("/detections/ingest")
 async def detection_ingest(body: DetectionIngestBody,
                            user: Dict = Depends(get_current_user)):
@@ -1479,7 +1510,19 @@ async def detection_ingest(body: DetectionIngestBody,
         # confidence_type when it is decisive: it actually reclassified the
         # display (wifi_display truthy) or it confirms the drone guess
         # (ml_label == "drone").
-        ml_is_decisive = wifi_display is not None or body.ml_label == "drone"
+        # unclassified_signal is also a decisive (i.e. deliberate, non-stale)
+        # ML read -- ml_classify_bridge.py sends it precisely when the top
+        # softmax class's confidence was too weak to trust ANY of the 3
+        # known classes, regardless of which class happened to be on top.
+        # Without this, a weak top-class of "wifi_2_4"/"wifi_5" (which
+        # doesn't satisfy the wifi_display path above, and isn't "drone")
+        # would silently fail to ever apply confidence_type=
+        # "unclassified_signal" on a merge into an existing record.
+        ml_is_decisive = (
+            wifi_display is not None
+            or body.ml_label == "drone"
+            or body.confidence_type == "unclassified_signal"
+        )
         updates = {
             "threat_level": body.threat_level,
             "rssi_dbm": body.rssi_dbm,
@@ -1512,6 +1555,7 @@ async def detection_ingest(body: DetectionIngestBody,
             "confidence_type": body.confidence_type if (body.ml_label is not None and ml_is_decisive) else existing.get("confidence_type"),
             "last_seen": datetime.now(timezone.utc).isoformat(),
         }
+        unclassified_display = _ml_unclassified_display(body.confidence_type) if ml_is_decisive else None
         if wifi_display:
             # Preserve the FIRST-ever RSSI-heuristic guess only -- don't
             # clobber it on a second/third consecutive reclassified update
@@ -1524,6 +1568,17 @@ async def detection_ingest(body: DetectionIngestBody,
             # The ML result is now the operative classification for this
             # record, not the stale RSSI heuristic guess.
             updates["confidence_type"] = "ml_probability"
+        elif unclassified_display:
+            # Same display-override pattern as wifi_display above: the wire
+            # payload keeps model/protocol byte-identical to the RSSI
+            # heuristic guess (see _ml_unclassified_display docstring) so the
+            # merge-match above works; the honest "unclassified" identity is
+            # substituted into the DISPLAYED fields only, here.
+            updates["original_model"] = existing.get("original_model") or existing.get("model")
+            updates["original_protocol"] = existing.get("original_protocol") or existing.get("protocol")
+            updates["model"], updates["protocol"] = unclassified_display
+            updates["threat_level"] = "LOW"
+            updates["confidence_type"] = "unclassified_signal"
         await db.detections.update_one(
             {"id": existing["id"]},
             {
@@ -1554,6 +1609,7 @@ async def detection_ingest(body: DetectionIngestBody,
     original_model, original_protocol = None, None
     confidence_type = body.confidence_type
     wifi_display = _ml_wifi_reclassification(body.ml_label, body.ml_confidence)
+    unclassified_display = _ml_unclassified_display(body.confidence_type)
     if wifi_display:
         # Same one-directional correction as the merge/update path above,
         # applied on first-ever creation too (the ML bridge can itself be the
@@ -1563,6 +1619,17 @@ async def detection_ingest(body: DetectionIngestBody,
         model, protocol = wifi_display
         threat_level = "LOW"
         confidence_type = "ml_probability"
+    elif unclassified_display:
+        # Same display-override pattern, applied on first-ever creation too
+        # (ml_classify_bridge.py's own gate-check can itself be the first
+        # ingest to create a record, e.g. if it beats hackrf_rx.py's next
+        # cycle within the merge window). Wire model/protocol/threat_level
+        # stay the plain heuristic guess (see _ml_unclassified_display); the
+        # honest "unclassified" identity is substituted here for display.
+        original_model, original_protocol = body.model, body.protocol
+        model, protocol = unclassified_display
+        threat_level = "LOW"
+        confidence_type = "unclassified_signal"
     det.update({
         "callsign": body.callsign or det["callsign"],
         "model": model,

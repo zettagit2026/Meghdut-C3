@@ -36,8 +36,9 @@ renderer* is honest for this row.
 # backend/server.py, DetectionIngestBody
 confidence_type: Optional[str] = None
 # One of: "heuristic_binary", "ml_probability", "protocol_verified",
-# "advisory_only". Optional/None for any source that hasn't been updated yet
-# (backward compatible — absence means "render as before").
+# "advisory_only", "unclassified_signal". Optional/None for any source that
+# hasn't been updated yet (backward compatible — absence means "render as
+# before").
 ```
 
 ### Enum values
@@ -48,6 +49,7 @@ confidence_type: Optional[str] = None
 | `ml_probability` | A real softmax probability from a known-flawed model. | Probability bar/percentage, rendered with muted/secondary styling (never "confirmed" green), same caution as today's `MlClassifierBadge`. |
 | `protocol_verified` | CRC/protocol-level decode succeeded. | Hard checkmark/verified badge, no percentage (there is no probability — it's pass/fail and it passed). Highest-confidence visual treatment. |
 | `advisory_only` | Presence heuristic, explicitly not an identity or threat claim. | Plain neutral "advisory" tag, distinct styling from confirmed detections, no percentage. |
+| `unclassified_signal` | Real, energy-gated RF confirmed present (same gate as `ml_probability`), but the classifier's own winning-class softmax probability was below `CEMA_ML_UNCLASSIFIED_MAX_CONFIDENCE` (default **0.6**, aligned with `ML_RECLASSIFY_MIN_CONFIDENCE` — see coherence note below) — i.e. it could not confidently place the signal in any of its 3 known classes (drone/wifi_2_4/wifi_5). This is cheap, zero-new-dependency logic added directly in `ml_classify_bridge.py`, computed from softmax probabilities the classifier already produces — no new model or OOT dependency (e.g. gr-inspector) required. | Distinct "UNCLASSIFIED" tag (not "flagged", not a trusted probability) showing the weak top-guess percentage for context, distinct styling from `ml_probability`. Also counts as an "unconfirmed" detection for `isUnconfirmedDetection()`/`UnconfirmedTag` (2026-07-23 fix) — an explicit "I don't know" from the classifier is at least as uncertain as `heuristic_binary`, and that function previously only checked for `heuristic_binary`, silently missing this case. |
 
 ### Bridge -> enum mapping
 
@@ -57,6 +59,7 @@ confidence_type: Optional[str] = None
 | `field-bridge/hackrf_rx.py`, Bluetooth `bt_det` | BT advisory block (~line 640) | `"advisory_only"` |
 | `field-bridge/ml_classify_bridge.py`, `det` | after `gated_capture_and_classify` (~line 245) | `"ml_probability"` |
 | `field-bridge/droneid_decode_bridge.py`, `det` | after `payload.check_crc()` passes (~line 257) | `"protocol_verified"` |
+| `field-bridge/ml_classify_bridge.py`, `det` | when winning-class softmax < `UNCLASSIFIED_MAX_CONFIDENCE` (see `is_unclassified` in `gated_capture_and_classify` caller) | `"unclassified_signal"` |
 
 Notes:
 - `field-bridge/mavlink_sniffer.py` (real MAVLink HEARTBEAT decode, sets
@@ -65,8 +68,48 @@ Notes:
   touched — not included in this pass's minimal wiring since it wasn't in
   the B4 scope list, but the mapping is the same rule: CRC/protocol decode
   succeeded => `protocol_verified`.
+- `field-bridge/rf_features.py` (spectral-feature RandomForest classifier,
+  backlog C13, added 2026-07-23) is a FUTURE sixth source and would use a
+  NEW enum value, `"spectral_features_ml"` (a real probability from a
+  different, independent model than the ResNet18 spectrogram classifier —
+  deliberately NOT reusing `ml_probability` so operators/frontend can tell
+  the two model families apart). NOT wired into ingest yet: as of this
+  writing, `rf_features.py` ships feature-extraction + training
+  infrastructure only, with no trained model (no real labeled dataset has
+  been assembled). Do not add `"spectral_features_ml"` to any ingest call
+  site until a model has actually been trained on real labeled data and
+  validated on a held-out split.
 - `distance_estimated`, `protocol_confirmed`, `ml_gated` etc. remain
   independent booleans; `confidence_type` is additive, not a replacement.
+- **Threshold coherence (2026-07-23 fix):** `UNCLASSIFIED_MAX_CONFIDENCE`
+  (in `ml_classify_bridge.py`) and `ML_RECLASSIFY_MIN_CONFIDENCE` (in
+  `backend/server.py`, 0.60) are intentionally kept EQUAL. With two
+  independent cutoffs (previously 0.5 vs 0.60), a wifi_2_4/wifi_5 top-class
+  read in the 50-59% gap between them was too weak to trigger the
+  wifi-reclassification display fix but also too high to be honestly
+  reported as `unclassified_signal` — it silently kept whatever
+  `confidence_type` the record already had, with no informational badge at
+  all reflecting the actual (low) confidence. Equalizing the two closes
+  that gap: anything below `ML_RECLASSIFY_MIN_CONFIDENCE` is now uniformly
+  reported as unclassified rather than falling through unqualified. If
+  these constants are ever tuned independently again, re-derive one from
+  the other rather than letting them drift apart.
+- **Merge-match / display-override split (2026-07-23 fix):**
+  `ml_classify_bridge.py` always sends the plain heuristic-consistent
+  `model`/`protocol`/`threat_level` on the wire (e.g. `"DJI Mini
+  (candidate)"`/`"OcuSync/Wi-Fi"`/`MEDIUM`), even for
+  `confidence_type=="unclassified_signal"` ingests. Those fields double as
+  `backend/server.py`'s merge-match key against `hackrf_rx.py`'s existing
+  ACTIVE record (see `detection_ingest`); sending
+  `"Unclassified emitter (candidate)"`/`"Unknown"` on the wire (as an
+  earlier version of this feature did) would never match that key and
+  would silently spawn a second, duplicate ACTIVE detection for the same
+  physical contact instead of merging into it. The honest "Unclassified
+  emitter (candidate)"/`"Unknown"`/`LOW` DISPLAY the operator sees is now
+  computed server-side in `detection_ingest` via
+  `_ml_unclassified_display()`, off `confidence_type`, using exactly the
+  same split already established for `_ml_wifi_reclassification()` /
+  `ML_WIFI_RECLASSIFY_DISPLAY`.
 
 ### Frontend rendering rule
 
@@ -77,7 +120,43 @@ Do NOT try to render one universal "confidence meter." Branch on
 - `ml_probability` -> probability bar/percentage, muted secondary styling (as `MlClassifierBadge` already does for `ml_label`/`ml_confidence`).
 - `heuristic_binary` -> plain "flagged" tag, no number.
 - `advisory_only` -> plain neutral "advisory" tag, no number.
+- `unclassified_signal` -> distinct "unclassified" tag with the (weak) top-guess percentage for context, never styled as a trusted result.
 - absent/unknown -> fall back to current behavior (just `threat_level`), so older rows or not-yet-wired sources don't break.
+
+### On gr-inspector (evaluated, not integrated)
+
+`~/Desktop/Zettawise/PMO Suraj/tool/gr-inspector` was evaluated as a source
+of blind/unknown-signal detection (its "Signal Detector" energy-detection
+block plus blind OFDM parameter estimation). Findings:
+
+- It is a real GNU Radio 3.8 **OOT module** (`CMakeLists.txt`, `gr_modtool`
+  bindings, C++/Python hybrid blocks) — not a pip-installable library. It
+  requires a full GNU Radio 3.8 build environment plus Qt5 and Qwt 6.1.0,
+  and its own README documents unresolved pybind11/Qt binding issues on
+  some setups. Its TensorFlow-based AMC component is explicitly marked
+  "not on GR 3.8 yet" upstream.
+- This project's field-bridges are plain Python (`subprocess`+`hackrf_transfer`
+  via `iq_capture.py`, PyTorch inference via `gamutrf_infer.py`) with no
+  existing GNU Radio runtime dependency at all. Pulling in gr-inspector
+  would mean building/maintaining an entire OOT module + GR flowgraph
+  runtime as a new deployment dependency, on top of the GamutRF-symlinked
+  GNU Radio the project's other bridges do not use for this purpose.
+- The specific value gr-inspector would add over `unclassified_signal`
+  above is real signal analysis when energy is unclassified — blind OFDM
+  carrier-spacing/symbol-time estimation, not just "no known class fits."
+  That is not something achievable from the ResNet18 classifier's existing
+  softmax output; it would need gr-inspector's (or an equivalent) actual
+  DSP blocks.
+- Recommendation: **defer** the OOT module build. `unclassified_signal` was
+  implemented directly against already-computed softmax probabilities
+  (zero new dependencies, no new build system) and captures most
+  near-term operator value ("there is a real emitter here we don't
+  recognize"). Revisit gr-inspector specifically if/when blind OFDM
+  parameter estimation on unclassified emitters becomes an actual
+  requirement, not just a nice-to-have — at that point the OOT build
+  effort would need to be scoped and tested as its own project (likely on
+  the deploy VM, not the Mac dev copy), separate from this field-bridge
+  Python codebase.
 
 Implemented as `frontend/src/components/ConfidenceTypeBadge.jsx`, rendered
 next to the existing `threat_level` badge and `MlClassifierBadge` in

@@ -122,6 +122,41 @@ from gamutrf_infer import GamutRFClassifier, load_sigmf
 
 DEFAULT_CHECKPOINT = "/tmp/resnet18_leesburg_split_0.02_1_current.pt"
 
+# UNCLASSIFIED-SIGNAL THRESHOLD (2026-07-23): the deployed checkpoint is a
+# closed-world 3-class model {drone, wifi_2_4, wifi_5} with no reject/
+# "none of the above" class -- see module docstring above for the
+# reproduced 99%-confident-on-noise finding. This is the cheap, zero-new-
+# dependency mitigation for that gap: the model's OWN softmax output
+# already tells us when it isn't sure. If the winning class's probability
+# is below this threshold, the energy gate above genuinely found real RF
+# energy (that part is real -- hackrf_sweep peak > noise floor + margin)
+# but the classifier cannot confidently place it in any of its 3 known
+# classes. We report that honestly as "unclassified_signal" instead of
+# forcing the top (weak) softmax guess into ml_label/model, so the
+# operator sees "real energy, unknown type" rather than a fabricated
+# confident-looking label. See CEMA_ML_UNCLASSIFIED_MAX_CONFIDENCE to tune.
+#
+# THRESHOLD COHERENCE WITH backend/server.py's ML_RECLASSIFY_MIN_CONFIDENCE
+# (2026-07-23 fix): this default is intentionally set EQUAL to that
+# threshold (0.60), not an independently-chosen lower value (previously
+# 0.5). With two different cutoffs, any wifi_2_4/wifi_5 top-class read in
+# the gap between them (e.g. 55%) would be too weak to trigger the
+# backend's wifi-reclassification display fix (needs >=0.60) but ALSO too
+# high to be reported honestly as unclassified_signal (needed <0.50) --
+# leaving it silently displayed as the stale drone-candidate heuristic
+# guess with no informational badge at all, the exact "confident-looking
+# but meaningless label" failure mode this feature exists to prevent.
+# Equalizing the thresholds removes that unhandled middle ground: anything
+# below the ML_RECLASSIFY_MIN_CONFIDENCE bar is now honestly reported as
+# unclassified rather than silently falling through as an unqualified
+# heuristic guess. If these two constants are ever tuned independently in
+# the future, re-derive UNCLASSIFIED_MAX_CONFIDENCE from
+# ML_RECLASSIFY_MIN_CONFIDENCE (or vice versa) rather than letting them
+# drift apart again.
+UNCLASSIFIED_MAX_CONFIDENCE = float(
+    os.environ.get("CEMA_ML_UNCLASSIFIED_MAX_CONFIDENCE", "0.6")
+)
+
 # OUT-OF-DOMAIN BAND EXCLUSION (2026-07-23): the deployed checkpoint
 # (resnet18_leesburg_split_0.02_1_current.pt) is a CLOSED-WORLD 3-class
 # model trained ONLY on {drone, wifi_2_4, wifi_5} -- i.e. DJI-style
@@ -256,6 +291,47 @@ def main() -> None:
                       f"all_probs={all_probs}")
 
                 est_distance_m = estimate_distance_m(name, peak)
+                # UNCLASSIFIED-SIGNAL CHECK: this is real, energy-gated RF
+                # (peak already confirmed > noise floor + margin above), but
+                # if the classifier's own winning-class softmax probability
+                # is below UNCLASSIFIED_MAX_CONFIDENCE, none of the 3 known
+                # classes fit confidently. Report that honestly instead of
+                # forcing the band-name heuristic guess ("DJI Mini
+                # (candidate)"/"MAVLink craft (candidate)") -- this is the
+                # one case where we say "energy present, type unknown"
+                # rather than picking a label nobody is confident in.
+                is_unclassified = ml_confidence < UNCLASSIFIED_MAX_CONFIDENCE
+                if is_unclassified:
+                    print(f"[{label}] ML result INCONCLUSIVE (top class "
+                          f"{ml_label} @ {ml_confidence:.4f} < "
+                          f"{UNCLASSIFIED_MAX_CONFIDENCE} threshold) -- "
+                          f"reporting as unclassified_signal, not forcing a label")
+                # MERGE-MATCH INTEGRITY (2026-07-23 fix): backend/server.py's
+                # detection_ingest merges an ingest into an existing ACTIVE
+                # record by an EXACT match on (source, model, protocol) -- see
+                # detectionConfidence.js's isUnconfirmedDetection comment,
+                # which documents this exact same invariant from the frontend
+                # side. hackrf_rx.py always posts model="DJI Mini (candidate)"/
+                # protocol="OcuSync/Wi-Fi" (or "MAVLink craft (candidate)"/
+                # "SiK/MAVLink") for these bands. This bridge's non-
+                # unclassified branch matches those strings byte-for-byte on
+                # purpose so its ML read merges into hackrf_rx.py's record
+                # instead of spawning a competing one (see module docstring).
+                # The unclassified_signal branch MUST follow the same rule:
+                # sending "Unclassified emitter (candidate)"/"Unknown" here
+                # would never match the existing "DJI Mini (candidate)"/
+                # "OcuSync/Wi-Fi" record, silently defeating the merge and
+                # creating a SECOND, duplicate ACTIVE detection for the same
+                # physical contact -- one heuristic-labeled, one
+                # "unclassified", both live at once. So model/protocol/
+                # threat_level sent over the wire always stay the plain
+                # heuristic-consistent guess; the honest "unclassified"
+                # DISPLAY override (what the operator actually sees) is
+                # applied server-side in backend/server.py's detection_ingest,
+                # keyed off confidence_type=="unclassified_signal" -- the same
+                # pattern already used for ML_WIFI_RECLASSIFY_DISPLAY. Only
+                # confidence_type/ml_label/ml_confidence below carry the
+                # "I don't know" signal on the wire.
                 det = {
                     "model": "DJI Mini (candidate)" if "DJI" in name else "MAVLink craft (candidate)",
                     "protocol": "OcuSync/Wi-Fi" if "DJI" in name else "SiK/MAVLink",
@@ -271,7 +347,9 @@ def main() -> None:
                     "ml_label": ml_label,
                     "ml_confidence": round(ml_confidence, 4),
                     "ml_gated": False,
-                    "confidence_type": "ml_probability",  # real softmax prob from a known-flawed closed-world model
+                    # real softmax prob from a known-flawed closed-world model,
+                    # unless it was too weak to trust any class at all
+                    "confidence_type": "unclassified_signal" if is_unclassified else "ml_probability",
                 }
                 try:
                     requests.post(f"{args.console_url}/api/detections/ingest",

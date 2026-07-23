@@ -7,6 +7,9 @@
 // - protocol_verified -> hard verified badge, no percentage (pass/fail, and it passed)
 // - ml_probability    -> muted percentage/probability chip (never "confirmed" styling)
 // - heuristic_binary  -> plain "flagged" tag, no number
+// - unclassified_signal -> real energy-gated RF present, but the 3-class ML
+//   model's winning softmax probability was too weak to trust any of its
+//   known classes -- distinct from ml_probability (a trusted class guess)
 // - advisory_only     -> plain neutral "advisory" tag, no number
 // - absent/unknown    -> render nothing (falls back to existing threat_level display)
 export default function ConfidenceTypeBadge({ detection }) {
@@ -37,6 +40,20 @@ export default function ConfidenceTypeBadge({ detection }) {
           title="Softmax probability from a closed-world classifier -- informational, not a confirmed verdict."
         >
           ML PROB{pct !== null ? ` ${pct}%` : ""}
+        </span>
+      );
+    }
+    case "unclassified_signal": {
+      const pct = Number.isFinite(detection.ml_confidence)
+        ? Math.round(detection.ml_confidence * 100)
+        : null;
+      return (
+        <span
+          className={common}
+          style={{ color: "#C77D3D", borderColor: "#8A5A2C", background: "rgba(138,90,44,0.18)" }}
+          title="Real energy-gated RF detected, but the classifier's top-class confidence was too low to trust any of its 3 known classes (drone/wifi_2_4/wifi_5). Genuine unknown emitter, not a fabricated label."
+        >
+          UNCLASSIFIED{pct !== null ? ` (top guess ${pct}%)` : ""}
         </span>
       );
     }
