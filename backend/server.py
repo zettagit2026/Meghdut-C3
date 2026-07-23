@@ -1105,6 +1105,16 @@ class DetectionIngestBody(BaseModel):
     ml_label: Optional[str] = None
     ml_confidence: Optional[float] = None
     ml_gated: bool = False
+    # --- Unified confidence-type classifier (see backend/CONFIDENCE_MODEL.md) ---
+    # Describes the EPISTEMIC CATEGORY of this detection's confidence, not a
+    # blended numeric score -- a CRC-verified decode, a softmax probability,
+    # a persistence heuristic, and a presence-only advisory are not
+    # comparable on one 0-1 scale, and this field deliberately does not try
+    # to force them onto one. One of: "heuristic_binary", "ml_probability",
+    # "protocol_verified", "advisory_only". Optional/None for any source not
+    # yet updated to set it -- absence means "render as before" (backward
+    # compatible), same pattern as distance_estimated/protocol_confirmed above.
+    confidence_type: Optional[str] = None
 
 
 @api.post("/spectrum/ingest")

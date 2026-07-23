@@ -649,6 +649,7 @@ def main() -> None:
                     "distance_m": 0.0,
                     "distance_estimated": False,  # not a range estimate -- advisory only
                     "source": "HACKRF",
+                    "confidence_type": "advisory_only",  # presence heuristic, not an identity/threat claim
                 }
                 try:
                     requests.post(f"{args.console_url}/api/detections/ingest", json=bt_det,
@@ -676,6 +677,7 @@ def main() -> None:
                     "distance_m": round(est_distance_m, 1),
                     "distance_estimated": True,  # RSSI path-loss model, not a real range measurement
                     "source": "SIK_RADIO" if name == "SiK-915" else "HACKRF",
+                    "confidence_type": "heuristic_binary",  # persistence-confirmed, no real-valued probability
                 }
                 try:
                     requests.post(f"{args.console_url}/api/detections/ingest", json=det, headers=headers, timeout=5)

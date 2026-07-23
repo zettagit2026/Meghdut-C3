@@ -254,6 +254,7 @@ def main() -> None:
                     "ml_label": ml_label,
                     "ml_confidence": round(ml_confidence, 4),
                     "ml_gated": False,
+                    "confidence_type": "ml_probability",  # real softmax prob from a known-flawed closed-world model
                 }
                 try:
                     requests.post(f"{args.console_url}/api/detections/ingest",

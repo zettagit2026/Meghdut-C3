@@ -3,6 +3,7 @@ import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { History } from "lucide-react";
 import MlClassifierBadge from "@/components/MlClassifierBadge";
+import ConfidenceTypeBadge from "@/components/ConfidenceTypeBadge";
 
 const THREAT_COLOR = {
   LOW: "var(--accent-success)",
@@ -286,6 +287,7 @@ export default function DetectionHistory() {
                           {d.threat_level}
                         </span>
                         <MlClassifierBadge detection={d} />
+                        <ConfidenceTypeBadge detection={d} />
                       </div>
                     </td>
                     <td className="p-2 text-right text-slate-300">{d.center_freq_ghz}</td>

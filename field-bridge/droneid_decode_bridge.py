@@ -268,6 +268,7 @@ def sweep_and_ingest(console_url: str, headers: dict, sample_rate_hz: float,
                 "gps_time_ms": r["gps_time"],
                 "distance_estimated": False,
                 "notes": "Protocol-level DroneID CRC-verified decode, not an RF-signature heuristic.",
+                "confidence_type": "protocol_verified",  # CRC check passed -- pass/fail, no probability to report
             }
             try:
                 requests.post(f"{console_url}/api/detections/ingest", json=det,
