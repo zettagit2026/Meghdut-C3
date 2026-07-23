@@ -1,0 +1,61 @@
+[Unit]
+Description=CEMA cUAS - passive CRSF (Crossfire/ExpressLRS) frame listener (RX only, protocol-level CRC-verified ID, no transmission)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as field-bridge/cema-mavlink-sniffer.service.
+# There is deliberately only ONE copy of this unit in the repo; do not fork
+# per-host copies with hardcoded paths/users baked in.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# ==========================================================================
+# HARDWARE STATUS — DO NOT ENABLE THIS UNIT UNTIL THIS IS RESOLVED
+# ==========================================================================
+# This bridge requires a REAL CRSF-capable serial device: a TBS Crossfire or
+# ExpressLRS receiver/TX-module with its UART output wired to a USB-serial
+# adapter (or an FC's spare UART broken out to USB), running at 420000 baud.
+# It is NOT compatible with this project's existing SiK/RFD900 MAVLink
+# telemetry radios (different protocol, different baud rate, different
+# physical hardware) — see field-bridge/crsf_parser.py's module docstring
+# for the full explanation of why CRSF is a wired-serial protocol, not
+# something an SDR receives over the air.
+#
+# No such hardware was available as of this unit's creation. Do NOT enable
+# this service against a placeholder/wrong serial device — with no real
+# CRSF traffic present it will simply see garbage and post nothing (by
+# design, no synthetic fallback), but pointing it at the wrong physical
+# port (e.g. a SiK radio already owned by mavlink_sniffer.py) will conflict
+# over serial-port exclusivity for no benefit.
+#
+# Before enabling: verify with `--self-test` that the parser logic itself
+# is intact (`python3 crsf_parser.py --self-test`), then confirm the real
+# CRSF hardware is wired up and the serial device path below is correct.
+# ==========================================================================
+
+# Credentials and console URL are NOT hardcoded here. They are supplied via
+# EnvironmentFile, which must define at minimum:
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+#   CRSF_SNIFF_SERIAL=/dev/ttyUSB2   (the REAL CRSF receiver/TX-module UART,
+#                                     wired via USB-serial adapter — must be
+#                                     a dedicated port, not shared with any
+#                                     other bridge)
+#   CRSF_SNIFF_BAUD=420000
+# Point this at either the project-root .env or a dedicated field-bridge/.env.
+# This file must be created per-deployment; it is not committed to the repo.
+# Restrict its permissions: chmod 600.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+ExecStart=/usr/bin/python3 -u crsf_parser.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/crsf_parser.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/crsf_parser.log
+
+[Install]
+WantedBy=multi-user.target
