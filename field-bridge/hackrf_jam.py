@@ -32,12 +32,42 @@ SAMPLE_RATE_HZ = 20_000_000  # 20 Msps, matches /CEMA/drone-kit/dronev5/cema/cem
 
 # Center frequencies from /CEMA/drone-kit/dronev5/cema/cema_{433,915,24,58}.py
 # (already field-validated on this rig), exposed here as --band shortcuts.
+#
+# GNSS L1-band presets (RFI item, OPERATIONAL REQUIREMENTS.md): these target
+# satellite navigation reception rather than the drone's comms/video link.
+# All four are civil L1 signals clustered ~1561-1602 MHz:
+#   - gps_l1:      GPS L1 C/A,      1575.42 MHz
+#   - galileo_e1:  Galileo E1,      1575.42 MHz (co-located with GPS L1 —
+#                  same center frequency, different modulation/PRN codes;
+#                  a barrage-noise burst at this freq denies both at once,
+#                  which is why they share one number here)
+#   - beidou_b1:   BeiDou B1I,      1561.098 MHz
+#   - glonass_l1:  GLONASS L1OF,    1602.0 MHz — this is the BASE frequency
+#                  only. GLONASS (unlike GPS/Galileo/BeiDou) is FDMA: each
+#                  satellite transmits on its own channel k in roughly
+#                  [-7, +6], spaced 0.5625 MHz apart from this base
+#                  (f_k = 1602.0 + k * 0.5625 MHz), so real GLONASS energy
+#                  spans ~1598-1606 MHz, not a single line. A barrage burst
+#                  centered here with bandwidth_khz widened accordingly
+#                  covers the channel spread; this preset intentionally does
+#                  not attempt per-satellite channel targeting.
 BAND_PRESETS_MHZ = {
     "433": 435.0,
     "915": 915.0,
     "2g4": 2450.0,
     "5g8": 5800.0,
+    "gps_l1": 1575.42,
+    "galileo_e1": 1575.42,
+    "beidou_b1": 1561.098,
+    "glonass_l1": 1602.0,
 }
+
+# Bands that deny satellite navigation reception rather than a comms/video
+# link. Used by jam_bridge.py/backend/server.py purely for logging/labeling
+# clarity — carries NO safety-gate weight of its own; the extra GNSS warning
+# text lives in the frontend (frontend/src/pages/Jamming.jsx) as additional
+# copy inside the SAME SafetyGate confirm flow, not a new gate.
+GNSS_BANDS = frozenset({"gps_l1", "galileo_e1", "beidou_b1", "glonass_l1"})
 
 
 def check_authorized(confirmed_flag: bool) -> None:

@@ -9,7 +9,17 @@ const BANDS = [
   { value: "915", label: "915 MHz (SiK ISM)" },
   { value: "2g4", label: "2.4 GHz (DJI video/control)" },
   { value: "5g8", label: "5.8 GHz (DJI video)" },
+  { value: "gps_l1", label: "GPS L1 (1575.42 MHz, GNSS nav-denial)", gnss: true },
+  { value: "galileo_e1", label: "Galileo E1 (1575.42 MHz, GNSS nav-denial)", gnss: true },
+  { value: "beidou_b1", label: "BeiDou B1 (1561.098 MHz, GNSS nav-denial)", gnss: true },
+  { value: "glonass_l1", label: "GLONASS L1 (1602 MHz base, GNSS nav-denial)", gnss: true },
 ];
+
+// Mirrors field-bridge/hackrf_jam.py's GNSS_BANDS / backend's JAM_GNSS_BANDS —
+// used ONLY to decide whether to show the extra GNSS warning copy below and
+// add one extra SafetyGate checklist line. Carries no safety-gate weight of
+// its own; it is additional copy inside the SAME confirm flow, not a new gate.
+const GNSS_BANDS = new Set(["gps_l1", "galileo_e1", "beidou_b1", "glonass_l1"]);
 
 const MAX_DURATION_S = 10; // mirrors backend JAM_MAX_DURATION_S / hackrf_jam.py MAX_DURATION_S
 
@@ -42,6 +52,22 @@ export default function Jamming() {
   useEffect(() => { loadStatus(); const id = setInterval(loadStatus, 2000); return () => clearInterval(id); }, []);
 
   const active = sessions.find((s) => s.status === "AWAITING_ACK" || s.status === "JAM_ACTIVE");
+  const isGnssTarget = GNSS_BANDS.has(band);
+
+  // Same JAM_CHECKS the SafetyGate has always used, PLUS one extra line when
+  // the operator has selected a GNSS target — still the ONE SafetyGate
+  // component/flow, just with an added checklist item for this specific
+  // target (no second confirmation mechanism).
+  const gateChecks = isGnssTarget
+    ? [
+        ...JAM_CHECKS,
+        "GNSS TARGET SELECTED: navigation-denial jamming reaches FAR beyond comms jamming " +
+          "at the same TX power — GPS-band signals arrive at only ~-130dBm at the receiver, " +
+          "so even modest transmit power can deny GNSS fixes well outside the intended " +
+          "footprint. Effective denial radius and any risk to non-participating " +
+          "receivers/aircraft/vehicles outside the range has been assessed.",
+      ]
+    : JAM_CHECKS;
 
   const fireJam = async () => {
     setSubmitting(true);
@@ -98,6 +124,23 @@ export default function Jamming() {
           independently, every time.
         </div>
       </div>
+
+      {isGnssTarget && (
+        <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "#1A0A08" }}>
+          <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
+          <div className="font-mono text-xs text-slate-300">
+            <span className="font-bold" style={{ color: "var(--accent-critical)" }}>
+              GNSS TARGET — ADDITIONAL CAUTION:
+            </span>{" "}
+            This is navigation-denial jamming (GPS/Galileo/BeiDou/GLONASS L1), not comms jamming.
+            GNSS signals arrive at the receiver at only about -130 dBm — far weaker than a local
+            WiFi/BT/telemetry link — so the effective denial radius for the SAME transmit power is
+            proportionally much larger and harder to contain to the intended target/range. Confirm
+            the STEAG range clearance and spectrum authorization specifically cover GNSS L1 denial
+            before arming.
+          </div>
+        </div>
+      )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         <div className="tactical-border p-5 space-y-4" style={{ background: "var(--bg-surface)" }}>
@@ -201,7 +244,7 @@ export default function Jamming() {
         open={gateOpen}
         payloadName={`RF BARRAGE JAM (${BANDS.find((b) => b.value === band)?.label || band})`}
         severity="CRITICAL"
-        checks={JAM_CHECKS}
+        checks={gateChecks}
         actionLabel="TRANSMIT"
         irreversibleNote="a real RF transmission — it cannot be recalled once sent"
         onClose={() => setGateOpen(false)}

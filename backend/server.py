@@ -49,6 +49,7 @@ import importlib.util
 import json
 import logging
 import os
+import statistics
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
@@ -560,7 +561,10 @@ class JamRequestBody(BaseModel):
     # from field-bridge/hackrf_jam.py's BAND_PRESETS_MHZ) or an explicit
     # freq_mhz must be given; freq_mhz wins if both are present, same
     # precedence as hackrf_jam.py's own CLI.
-    band: Optional[str] = Field(None, pattern="^(433|915|2g4|5g8)$")
+    # GNSS L1 presets (gps_l1/galileo_e1/beidou_b1/glonass_l1) added per
+    # OPERATIONAL REQUIREMENTS.md — see field-bridge/hackrf_jam.py's
+    # BAND_PRESETS_MHZ comment for exact freqs/GLONASS channelization note.
+    band: Optional[str] = Field(None, pattern="^(433|915|2g4|5g8|gps_l1|galileo_e1|beidou_b1|glonass_l1)$")
     freq_mhz: Optional[float] = None
     bandwidth_khz: float = 500.0
     duration_s: float = 5.0  # server-side clamps to JAM_MAX_DURATION_S regardless
@@ -717,6 +721,15 @@ def _new_detection_skeleton() -> Dict[str, Any]:
         "authorized_target": False,
         "first_seen": now,
         "last_seen": now,
+        # Real re-confirmation event log (bounded, see RECONFIRM_EVENTS_CAP) --
+        # every timestamp at which an ingest matched this SAME id within
+        # DETECTION_MERGE_WINDOW_S. This is the raw data backing cadence
+        # analysis (see /detections/{id}/cadence): it is NOT a synthetic
+        # sampling of presence/absence, only the real moments a re-ingest
+        # actually happened, so it can only support statistics that are
+        # honest about that (event timing/regularity), not an on/off duty
+        # cycle over continuous time.
+        "reconfirm_events": [now],
     }
 
 
@@ -794,6 +807,151 @@ async def get_detection(det_id: str, user: Dict = Depends(get_current_user)):
     if not doc:
         raise HTTPException(404, "Detection not found")
     return doc
+
+
+def _interval_stats(timestamps_iso: List[str]) -> Optional[Dict[str, Any]]:
+    """Given >=2 ISO timestamps (already sorted ascending), compute real
+    inter-event interval statistics. Returns None if there aren't enough
+    events to say anything (need at least 2 events -> 1 interval; stddev
+    needs >=2 intervals -> 3 events). Never fabricates a value: stddev/CV are
+    omitted (None) rather than reported as 0 when sample size is too small
+    to mean anything."""
+    if len(timestamps_iso) < 2:
+        return None
+    times = [datetime.fromisoformat(t) for t in timestamps_iso]
+    deltas_s = [(b - a).total_seconds() for a, b in zip(times, times[1:])]
+    mean_s = statistics.fmean(deltas_s)
+    result: Dict[str, Any] = {
+        "sample_count": len(deltas_s),  # number of intervals, i.e. N events - 1
+        "mean_interval_s": round(mean_s, 2),
+        "min_interval_s": round(min(deltas_s), 2),
+        "max_interval_s": round(max(deltas_s), 2),
+        "stddev_interval_s": None,
+        "coefficient_of_variation": None,
+    }
+    if len(deltas_s) >= 2:
+        stdev_s = statistics.pstdev(deltas_s)
+        result["stddev_interval_s"] = round(stdev_s, 2)
+        # Coefficient of variation (stddev/mean) is a normalized regularity
+        # measure: low CV => intervals cluster tightly around the mean
+        # (regular cadence, e.g. periodic beacon/patrol); high CV => intervals
+        # are scattered (irregular/bursty). This is a descriptive statistic
+        # on real observed gaps, not a classification or confidence score.
+        if mean_s > 0:
+            result["coefficient_of_variation"] = round(stdev_s / mean_s, 3)
+    return result
+
+
+@api.get("/detections/{det_id}/cadence")
+async def get_detection_cadence(det_id: str, user: Dict = Depends(get_current_user)):
+    """Traffic-behavior/cadence analysis (backlog B3) built entirely from
+    real timestamps already captured by the ingest/merge pipeline -- no new
+    hardware, no fabricated scores.
+
+    Two distinct, honestly-scoped analyses are returned:
+
+    1. `session` -- re-confirmation cadence WITHIN this single detection id,
+       derived from `reconfirm_events` (see detection_ingest's $push). Each
+       event is a real moment an ingest matched this id inside
+       DETECTION_MERGE_WINDOW_S. NOTE: this is NOT a continuous on/off duty
+       cycle -- the backend only ever sees "present" events (a re-ingest),
+       never an explicit "absent" sample, so we report interval regularity
+       between confirmations, not a presence percentage.
+
+    2. `cross_session` -- reappearance-interval regularity across DIFFERENT
+       detection ids that share the same (source, model, protocol), ordered
+       by first_seen. Today, detection_ingest's merge query only matches
+       status=ACTIVE records, so once a contact goes LOST and reappears it
+       is created as a NEW id (see DETECTION_MERGE_WINDOW_S/merge query
+       above) -- this endpoint does NOT change that ingest/merge behavior,
+       it only performs a read-time correlation across the resulting
+       sessions to see whether the gaps between them are regular (e.g. a
+       patrol/periodic beacon) or effectively random. This is a real
+       statistic on real first_seen/last_seen timestamps of distinct
+       records, not a claim that the underlying contact identity has been
+       cryptographically re-linked.
+    """
+    doc = await db.detections.find_one({"id": det_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Detection not found")
+
+    events = sorted(doc.get("reconfirm_events") or [doc.get("first_seen"), doc.get("last_seen")])
+    session_stats = _interval_stats(events)
+    first_seen = doc.get("first_seen")
+    last_seen = doc.get("last_seen")
+    observation_span_s = None
+    if first_seen and last_seen:
+        observation_span_s = round(
+            (datetime.fromisoformat(last_seen) - datetime.fromisoformat(first_seen)).total_seconds(), 2
+        )
+
+    session = {
+        "reconfirm_count": len(doc.get("reconfirm_events") or []),
+        "observation_span_s": observation_span_s,
+        "interval_stats": session_stats,
+        "note": (
+            "Based on real re-confirmation timestamps for this detection id. "
+            "Reflects how regularly this contact was RE-CONFIRMED while ACTIVE, "
+            "not a measured on/off duty cycle (no explicit absence samples exist)."
+        ),
+    }
+
+    sibling_docs = await db.detections.find(
+        {"source": doc.get("source"), "model": doc.get("model"), "protocol": doc.get("protocol")},
+        {"_id": 0, "id": 1, "first_seen": 1, "last_seen": 1},
+    ).sort("first_seen", 1).to_list(200)
+
+    # Build non-overlapping sessions ordered by first_seen, then compute the
+    # gap between one session's last_seen and the next session's first_seen.
+    sibling_docs.sort(key=lambda d: d.get("first_seen") or "")
+    gaps_s: List[float] = []
+    for prev, nxt in zip(sibling_docs, sibling_docs[1:]):
+        try:
+            prev_end = datetime.fromisoformat(prev["last_seen"])
+            next_start = datetime.fromisoformat(nxt["first_seen"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        gap_s = (next_start - prev_end).total_seconds()
+        if gap_s >= 0:  # skip overlapping/concurrent sessions (not a real gap)
+            gaps_s.append(round(gap_s, 2))
+
+    cross_session: Dict[str, Any] = {
+        "session_count": len(sibling_docs),
+        "gap_count": len(gaps_s),
+        "gaps_s": gaps_s,
+        "gap_stats": None,
+        "note": (
+            "Correlates DISTINCT detection ids sharing the same source/model/protocol, "
+            "ordered by first_seen, to see if the silence gaps between them are regular. "
+            "This does NOT change ingest/merge identity logic -- it is a read-time "
+            "aggregation only."
+        ),
+    }
+    if len(gaps_s) >= 1:
+        mean_gap = statistics.fmean(gaps_s)
+        gap_stats: Dict[str, Any] = {
+            "sample_count": len(gaps_s),
+            "mean_gap_s": round(mean_gap, 2),
+            "min_gap_s": round(min(gaps_s), 2),
+            "max_gap_s": round(max(gaps_s), 2),
+            "stddev_gap_s": None,
+            "coefficient_of_variation": None,
+        }
+        if len(gaps_s) >= 2:
+            stdev_gap = statistics.pstdev(gaps_s)
+            gap_stats["stddev_gap_s"] = round(stdev_gap, 2)
+            if mean_gap > 0:
+                gap_stats["coefficient_of_variation"] = round(stdev_gap / mean_gap, 3)
+        cross_session["gap_stats"] = gap_stats
+
+    return {
+        "detection_id": det_id,
+        "source": doc.get("source"),
+        "model": doc.get("model"),
+        "protocol": doc.get("protocol"),
+        "session": session,
+        "cross_session": cross_session,
+    }
 
 
 @api.post("/detections/{det_id}/cema-advance")
@@ -969,6 +1127,15 @@ DETECTION_MERGE_WINDOW_S = 20  # re-ingests of the same real contact within this
                                # bridge otherwise floods the log with dozens of
                                # near-duplicate "new" detections per minute.
 
+RECONFIRM_EVENTS_CAP = 50  # bound on detections.reconfirm_events (B3 cadence
+                               # analysis, see /detections/{id}/cadence). This
+                               # is a rolling window of the most recent N
+                               # re-confirmation timestamps for a single
+                               # detection id, not the full history -- kept
+                               # bounded so a long-lived contact's document
+                               # doesn't grow without limit under a fast
+                               # ingest cadence.
+
 DETECTION_STALE_TIMEOUT_S = 600  # (10 min) NOT the same thing as the merge
                                # window above. This is how long a detection
                                # may go without a re-confirmation before it
@@ -1012,8 +1179,28 @@ async def detection_ingest(body: DetectionIngestBody,
             "ml_gated": body.ml_gated,
             "last_seen": datetime.now(timezone.utc).isoformat(),
         }
-        await db.detections.update_one({"id": existing["id"]}, {"$set": updates})
+        await db.detections.update_one(
+            {"id": existing["id"]},
+            {
+                "$set": updates,
+                # Real re-confirmation event log: record the actual moment
+                # this ingest matched the existing id, capped to the most
+                # recent RECONFIRM_EVENTS_CAP entries via $slice so the
+                # document can't grow unbounded under a long-lived/fast-
+                # cadence contact. This is the only place event history is
+                # written -- see _new_detection_skeleton for the initial
+                # entry on creation.
+                "$push": {
+                    "reconfirm_events": {
+                        "$each": [updates["last_seen"]],
+                        "$slice": -RECONFIRM_EVENTS_CAP,
+                    }
+                },
+            },
+        )
         det = {**existing, **updates}
+        det["reconfirm_events"] = (existing.get("reconfirm_events") or []) + [updates["last_seen"]]
+        det["reconfirm_events"] = det["reconfirm_events"][-RECONFIRM_EVENTS_CAP:]
         det.pop("_id", None)
         return det
 
@@ -1345,7 +1532,16 @@ async def deploy_payload(body: DeployPayloadBody,
 # duplicated here (rather than imported) because the backend and the field
 # bridge are separate deployable processes/hosts; kept as the same values by
 # convention. If hackrf_jam.py's presets ever change, update this dict too.
-JAM_BAND_PRESETS_MHZ = {"433": 435.0, "915": 915.0, "2g4": 2450.0, "5g8": 5800.0}
+JAM_BAND_PRESETS_MHZ = {
+    "433": 435.0, "915": 915.0, "2g4": 2450.0, "5g8": 5800.0,
+    # GNSS L1 targets — see field-bridge/hackrf_jam.py's BAND_PRESETS_MHZ
+    # comment for exact freqs and the GLONASS FDMA-channelization caveat.
+    "gps_l1": 1575.42, "galileo_e1": 1575.42, "beidou_b1": 1561.098, "glonass_l1": 1602.0,
+}
+# Bands that deny satellite navigation rather than a comms/video link — used
+# only to decide whether /payloads/jam logs the extra GNSS caveat below.
+# Mirrors field-bridge/hackrf_jam.py's GNSS_BANDS.
+JAM_GNSS_BANDS = {"gps_l1", "galileo_e1", "beidou_b1", "glonass_l1"}
 JAM_MAX_DURATION_S = 10.0  # matches field-bridge/hackrf_jam.py's MAX_DURATION_S
 
 
@@ -1387,10 +1583,22 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
 
     freq_mhz = body.freq_mhz if body.freq_mhz is not None else JAM_BAND_PRESETS_MHZ.get(body.band)
     if not freq_mhz:
-        raise HTTPException(400, "Provide either `band` (433|915|2g4|5g8) or an explicit `freq_mhz`.")
+        raise HTTPException(400, "Provide either `band` (433|915|2g4|5g8|gps_l1|galileo_e1|beidou_b1|"
+                                  "glonass_l1) or an explicit `freq_mhz`.")
     duration_s = min(body.duration_s, JAM_MAX_DURATION_S)
 
     request_id = str(uuid.uuid4())
+
+    if body.band in JAM_GNSS_BANDS:
+        # Logging only — NOT an additional gate. The extra GNSS-denial-radius
+        # warning is surfaced to the operator in the SAME SafetyGate confirm
+        # flow (frontend/src/pages/Jamming.jsx), before arm_token/
+        # jam_confirm_token were ever minted for this request.
+        logger.warning(
+            "GNSS-target jam request %s: band=%s freq=%.3fMHz — GNSS denial has a "
+            "proportionally larger effective radius than comms jamming at the same "
+            "TX power (GPS-band receive levels are ~-130dBm).", request_id, body.band, freq_mhz,
+        )
     _pending_jam[request_id] = {
         "ts": datetime.now(timezone.utc),
         "status": "AWAITING_ACK",
