@@ -36,6 +36,17 @@ cd "$SCRIPT_DIR"
 BACKEND_URL="${PREFLIGHT_BACKEND_URL:-http://localhost:8001}"
 DETECTION_FRESH_WINDOW_S="${PREFLIGHT_FRESH_WINDOW_S:-300}"   # 5 min sanity window
 
+# Heartbeat log freshness window for field-bridge services (section 4). A
+# hung-but-still-"active" process is the specific failure mode this guards
+# against: systemd reports active=running even though the process stopped
+# doing useful work (found and documented this session). Log paths default
+# to the standard field-bridge/ layout relative to the repo root (matches
+# WorkingDirectory in the .service units); override if this host's
+# deployment path or StandardOutput redirect differs.
+HEARTBEAT_MAX_AGE_S="${PREFLIGHT_HEARTBEAT_MAX_AGE_S:-120}"   # ~2 min
+HACKRF_RX_LOG="${PREFLIGHT_HACKRF_RX_LOG:-$SCRIPT_DIR/field-bridge/hackrf_rx.log}"
+ML_CLASSIFY_LOG="${PREFLIGHT_ML_CLASSIFY_LOG:-$SCRIPT_DIR/field-bridge/ml_classify_bridge.log}"
+
 # ---------------------------------------------------------------------------
 # Output helpers — mirrors start.sh's "[X] message" bracket convention,
 # with color when the terminal supports it (start.sh itself is uncolored,
@@ -155,31 +166,73 @@ if [ -n "$LOGIN_TOKEN" ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 4. RX bridge systemd status (informational; passive detection RX)
+# 4. Field-bridge service heartbeats — systemd state ALONE is not enough:
+#    a hung process can report "active" indefinitely while producing no
+#    output (this exact failure mode was found and documented earlier this
+#    session for one of these bridges). Each check therefore requires BOTH
+#    `systemctl is-active` AND a recent write to that service's log file.
 # ---------------------------------------------------------------------------
-section "4. RX bridge service (cema-hackrf-rx.service)"
+section "4. Field-bridge service heartbeats (systemd state + log freshness)"
 
-RX_SVC="cema-hackrf-rx.service"
-if ! need systemctl; then
-  warn "$RX_SVC — systemctl not available on this host, cannot check (skipped)."
-elif ! systemctl list-unit-files "$RX_SVC" 2>/dev/null | grep -q "^$RX_SVC"; then
-  warn "$RX_SVC — unit not found on this host (may not be installed in this deployment). Skipped."
-else
-  RX_STATE="$(systemctl is-active "$RX_SVC" 2>/dev/null || true)"
-  if [ "$RX_STATE" = "active" ]; then
-    pass "$RX_SVC — active (passive spectrum RX running)"
-  else
-    warn "$RX_SVC — state=$RX_STATE (not active). Detections will rely on SiK / manual injects only."
+check_bridge_heartbeat() {
+  # check_bridge_heartbeat <service> <logfile> <role-description>
+  local svc="$1" logfile="$2" role="$3" state age now mtime
+
+  if ! need systemctl; then
+    warn "$svc — systemctl not available on this host, cannot check (skipped)."
+    return
   fi
-fi
+  if ! systemctl list-unit-files "$svc" 2>/dev/null | grep -q "^$svc"; then
+    warn "$svc — unit not found on this host (may not be installed in this deployment). Skipped."
+    return
+  fi
+
+  state="$(systemctl is-active "$svc" 2>/dev/null || true)"
+  if [ "$state" != "active" ]; then
+    warn "$svc — state=$state (not active). $role"
+    return
+  fi
+
+  if [ ! -f "$logfile" ]; then
+    warn "$svc — state=active, but log file not found at $logfile — cannot confirm it is actually producing output (set PREFLIGHT_HACKRF_RX_LOG / PREFLIGHT_ML_CLASSIFY_LOG if this host uses a different path)."
+    return
+  fi
+
+  now="$(date -u +%s)"
+  mtime="$(stat -f %m "$logfile" 2>/dev/null || stat -c %Y "$logfile" 2>/dev/null || echo "")"
+  if [ -z "$mtime" ]; then
+    warn "$svc — state=active, but could not read mtime of $logfile (unsupported stat variant) — cannot confirm heartbeat."
+    return
+  fi
+
+  age=$(( now - mtime ))
+  if [ "$age" -le "$HEARTBEAT_MAX_AGE_S" ]; then
+    pass "$svc — active AND log heartbeat fresh (${logfile##*/} written ${age}s ago, <= ${HEARTBEAT_MAX_AGE_S}s)."
+  else
+    fail "$svc — reports active=running but ${logfile##*/} has NOT been written to in ${age}s (> ${HEARTBEAT_MAX_AGE_S}s window). This is the hung-process failure mode: systemd sees a live PID, but the process is not doing any real work. Restart the service before the demo (this script will not do it for you)."
+  fi
+}
+
+check_bridge_heartbeat "cema-hackrf-rx.service" "$HACKRF_RX_LOG" \
+  "Detections will rely on SiK / manual injects only."
+check_bridge_heartbeat "cema-ml-classify-bridge.service" "$ML_CLASSIFY_LOG" \
+  "ML classification is an additional signal on top of hackrf_rx.py's RSSI heuristics, not a replacement — inactive is a known/expected state on hosts where it has not yet been enabled for continuous operation, not itself a demo blocker."
 
 # ---------------------------------------------------------------------------
-# 5. Live-data freshness sanity check (WARN-only, never FAIL)
+# 5. One dry-run frame: live-data / detection freshness check (WARN-only,
+#    never FAIL). This is the "prove the whole real pipeline actually
+#    worked recently" check — SDR -> field bridge -> backend -> /api/detections
+#    — using the SAME commander login as section 3. It is intentionally a
+#    real end-to-end call, not a mock: it proves at least one genuine
+#    detection has landed within the window, not merely that the services
+#    report "up". Kept WARN-only (not FAIL) because a stale/absent detection
+#    can legitimately mean "no drone happens to be in range right now" —
+#    that's an environment fact, not a system defect.
 # ---------------------------------------------------------------------------
-section "5. Detection data freshness (sanity check, not a failure gate)"
+section "5. Detection data freshness / one dry-run frame (sanity check, not a failure gate)"
 
 if [ -z "$LOGIN_TOKEN" ]; then
-  warn "No login token available — skipping freshness check (see section 3)."
+  warn "No login token available — skipping freshness/dry-run check (see section 3)."
 else
   DET_RESP="$(curl -s --max-time 5 -H "Authorization: Bearer $LOGIN_TOKEN" "$BACKEND_URL/api/detections" 2>/dev/null || true)"
   now_epoch="$(date -u +%s)"
@@ -205,12 +258,12 @@ else
 
   if [ "$freshest_age" != "-1" ]; then
     if [ "$freshest_age" -le "$DETECTION_FRESH_WINDOW_S" ]; then
-      pass "Most recent detection last_seen is ${freshest_age}s old (<= ${DETECTION_FRESH_WINDOW_S}s window) — live data flowing."
+      pass "Dry-run frame confirmed — most recent detection last_seen is ${freshest_age}s old (<= ${DETECTION_FRESH_WINDOW_S}s window). Full real pipeline (SDR -> field bridge -> backend -> /api/detections) produced at least one genuine detection recently."
     else
-      warn "No detection with last_seen within ${DETECTION_FRESH_WINDOW_S}s (freshest is ${freshest_age}s old). This is NOT a system failure — there may legitimately be no drones in range right now — but confirm this is expected before the demo starts."
+      warn "No detection with last_seen within ${DETECTION_FRESH_WINDOW_S}s (freshest is ${freshest_age}s old) — no recent dry-run frame confirmed. This is NOT a system failure — there may legitimately be no drones in range right now — but confirm this is expected before the demo starts."
     fi
   elif [ "$HAVE_JQ" -eq 1 ]; then
-    warn "No detections with a parseable last_seen returned by /api/detections — no live-data sanity signal available. Not a failure by itself."
+    warn "No detections with a parseable last_seen returned by /api/detections — no dry-run frame / live-data sanity signal available. Not a failure by itself."
   fi
 fi
 
