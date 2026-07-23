@@ -13,9 +13,18 @@ const ML_LABEL_TEXT = {
   wifi_5: "wifi 5",
 };
 
+// Suppressed when ConfidenceTypeBadge already renders this same ML
+// label+confidence as its primary badge (ml_probability, unclassified_signal)
+// -- showing both would duplicate identical info in the same row. Still
+// rendered as supplementary context for the other confidence_type values
+// (heuristic_binary, protocol_verified, advisory_only) where a weak/unused
+// ml_label may be attached but isn't otherwise surfaced.
+const SUPPRESSED_BY_CONFIDENCE_TYPE = new Set(["ml_probability", "unclassified_signal"]);
+
 export default function MlClassifierBadge({ detection }) {
   const label = detection?.ml_label;
   if (!label || detection?.ml_gated) return null;
+  if (SUPPRESSED_BY_CONFIDENCE_TYPE.has(detection?.confidence_type)) return null;
 
   const pct = Number.isFinite(detection.ml_confidence)
     ? Math.round(detection.ml_confidence * 100)
