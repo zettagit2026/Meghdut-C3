@@ -740,7 +740,7 @@ async def _expire_stale_detections() -> None:
 async def list_detections(user: Dict = Depends(get_current_user)):
     await _expire_stale_detections()
     await _expire_pending_acks()
-    docs = await db.detections.find({}, {"_id": 0}).to_list(500)
+    docs = await db.detections.find({}, {"_id": 0}).sort("last_seen", -1).to_list(500)
     return docs
 
 
