@@ -23,7 +23,7 @@ export const JAM_CHECKS = [
   "No friendly/non-participating RF equipment operating in-band within range.",
   "Physical safety perimeter established; personnel clear of the TX antenna.",
   "Burst duration and frequency reviewed — this is a REAL RF transmission, not a preview.",
-  "This bridge host's CEMA_AUTHORIZED_RANGE has been deliberately set for this session.",
+  "Range Authorization is armed for this effect via the GUI toggle (see banner) for this session.",
 ];
 
 export default function SafetyGate({

@@ -1,5 +1,6 @@
 import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { ClassificationBanner } from "@/components/ClassificationBanner";
+import RangeAuthorizationBanner from "@/components/RangeAuthorizationBanner";
 import EmergencyAbort from "@/components/EmergencyAbort";
 import { useAuth } from "@/context/AuthContext";
 import {
@@ -24,6 +25,7 @@ export default function Layout() {
 
   return (
     <div className="min-h-screen flex flex-col" style={{ background: "var(--bg-base)" }}>
+      <RangeAuthorizationBanner />
       <ClassificationBanner position="top" />
 
       <div className="flex-1 flex">

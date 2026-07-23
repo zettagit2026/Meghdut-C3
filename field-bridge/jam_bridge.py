@@ -48,15 +48,23 @@ which must pass before a single byte reaches hackrf_transfer:
           jam requests same as any other TX.
 
   3. THIS BRIDGE, independently of everything above:
-       a. CEMA_AUTHORIZED_RANGE=1 must be set in THIS PROCESS'S OWN
-          environment. This is a deliberately SEPARATE gate from the app-side
+       a. A LIVE GET /api/range-authorization/status?effect=jam call to the
+          backend, made at the moment of transmission (see
+          is_range_authorized() below and
+          backend/RANGE_AUTHORIZATION_REDESIGN.md for the full threat model).
+          This replaces the former static CEMA_AUTHORIZED_RANGE=1 bridge-host
+          env var: it is still a deliberately SEPARATE gate from the app-side
           arm-token/UI-confirmation chain above — the app approving a jam
-          request is necessary but not sufficient. Whoever configures the
-          physical bridge host must ALSO have made an explicit, distinct,
-          per-deployment decision that this specific host, at this specific
-          time, is sitting at an authorized RF range (STEAG) under Army
-          Signals spectrum authorization. See cema-jam-bridge.service: the
-          unit file deliberately does NOT set this by default.
+          request (arm_token + jam_confirm_token) is necessary but not
+          sufficient; the range-authorization lease must ALSO be currently
+          armed (an explicit, GUI-driven, auto-expiring 15-minute decision an
+          operator makes from the app, per RANGE_AUTHORIZATION_REDESIGN.md).
+          This bridge does NOT trust any authorization value embedded in the
+          jam_request message itself — it makes its own independent call
+          every time, so a stale/replayed WS message can't carry forward an
+          authorization that has since expired or been disabled. Fails
+          closed (treated as NOT authorized) on any network/auth error
+          reaching the backend.
        b. jam_confirm_token shape check (non-trivial, non-guessable-length
           string) — defense in depth in case (2c) is ever bypassed upstream.
        c. tx_halted (EMERGENCY ABORT) is also honored locally: if an abort
@@ -68,7 +76,7 @@ which must pass before a single byte reaches hackrf_transfer:
 
 None of these gates replace any other — they are independent and ALL must
 pass. Removing any one of them (frontend checklist, arm_token,
-jam_confirm_token, or this bridge's own CEMA_AUTHORIZED_RANGE) is a
+jam_confirm_token, or this bridge's own live range-authorization check) is a
 regression and must not be done to make testing "more convenient".
 
 =============================================================================
@@ -147,13 +155,12 @@ class JamBridge:
         self._active_stop_event: Optional[threading.Event] = None
         self._active_lock = threading.Lock()
 
-        if os.environ.get("CEMA_AUTHORIZED_RANGE") != "1":
-            log.warning(
-                "CEMA_AUTHORIZED_RANGE is NOT set to 1 in this bridge's environment. "
-                "This bridge will connect and ACK requests as refused, but will NOT "
-                "transmit any RF until this host is deliberately configured for "
-                "authorized-range operation (see cema-jam-bridge.service)."
-            )
+        log.info(
+            "Range authorization for effect=jam is now checked LIVE against the "
+            "backend (GET /api/range-authorization/status?effect=jam) at the moment "
+            "of each transmission, not via a static env var — an operator must arm "
+            "it from the app before this bridge will transmit any RF."
+        )
 
     # ---- auth --------------------------------------------------------
     def login(self) -> str:
@@ -167,6 +174,43 @@ class JamBridge:
 
     def ensure_token(self) -> str:
         return self.token or self.login()
+
+    # ---- range authorization (replaces the old static CEMA_AUTHORIZED_RANGE
+    # bridge-host env var — see backend/RANGE_AUTHORIZATION_REDESIGN.md) ----
+    def is_range_authorized(self, effect: str = "jam") -> bool:
+        """Live GET /api/range-authorization/status?effect=jam check made at
+        the moment of transmission — NOT trusting anything embedded in the
+        jam_request WS message itself (a stale/replayed message must not be
+        able to carry stale authorization forward past an expiry/disable
+        that happened in between). FAILS CLOSED (returns False) on ANY
+        network/auth error — unreachable backend, timeout, 401/403,
+        malformed response — identical in spirit to the old
+        `CEMA_AUTHORIZED_RANGE != "1"` fail-closed behavior. Never raises."""
+        try:
+            r = requests.get(
+                f"{self.api_url}/api/range-authorization/status",
+                params={"effect": effect},
+                headers={"Authorization": f"Bearer {self.ensure_token()}"},
+                timeout=10,
+            )
+            if r.status_code == 401:
+                # Token may have expired — refresh once and retry, same
+                # retry-on-401 convention as rf-bridge/common.py.
+                self.token = None
+                r = requests.get(
+                    f"{self.api_url}/api/range-authorization/status",
+                    params={"effect": effect},
+                    headers={"Authorization": f"Bearer {self.ensure_token()}"},
+                    timeout=10,
+                )
+            r.raise_for_status()
+            return bool(r.json().get("enabled") is True)
+        except Exception as e:
+            log.warning(
+                "range-authorization status check FAILED for effect=%s (%s) — "
+                "treating as NOT authorized (fail closed).", effect, e,
+            )
+            return False
 
     # ---- ack helper ----------------------------------------------------
     def _send_jam_ack(self, ws, request_id: str, phase: str,
@@ -192,19 +236,24 @@ class JamBridge:
         request_id = data.get("request_id")
         actor = data.get("actor", "?")
 
-        # ---- Gate A: this bridge's OWN authorized-range env var. ----------
-        # Independent of anything the app already checked. Necessary but not
-        # sufficient on its own — see module docstring.
-        if os.environ.get("CEMA_AUTHORIZED_RANGE") != "1":
+        # ---- Gate A: live range-authorization check against the backend. --
+        # Independent of anything the app already checked/forwarded in this
+        # very message — a fresh GET at the moment of transmission, not a
+        # value trusted from this WS payload. Replaces the old static
+        # CEMA_AUTHORIZED_RANGE bridge-host env var (see
+        # backend/RANGE_AUTHORIZATION_REDESIGN.md). Fails closed on any
+        # network/auth error (is_range_authorized never raises).
+        if not self.is_range_authorized("jam"):
             log.error(
-                "REFUSING jam_request %s from %s: CEMA_AUTHORIZED_RANGE is not set to 1 "
-                "in this bridge's own environment. The app approved this request, but "
-                "this physical bridge host has not been deliberately configured for "
-                "authorized-range RF TX. See cema-jam-bridge.service.",
+                "REFUSING jam_request %s from %s: range authorization for effect=jam "
+                "is not enabled (or could not be verified) via GET "
+                "/api/range-authorization/status. The app approved the arm/confirm "
+                "tokens for this request, but the range-authorization lease is not "
+                "currently armed — an operator must enable it from the app first.",
                 request_id, actor,
             )
             self._send_jam_ack(ws, request_id, "failed", ok=False,
-                              error="bridge refused: CEMA_AUTHORIZED_RANGE not set on this host "
+                              error="bridge refused: range-authorization (effect=jam) not enabled "
                                     "(independent bridge-level gate, separate from the app's arm-token check)")
             return
 

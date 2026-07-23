@@ -86,3 +86,38 @@ class CemaClient:
                 self.log.warning("POST %s failed (%s); retrying", path, e)
                 time.sleep(1.0)
         return {}
+
+    def get(self, path: str, params: Optional[dict] = None, retries: int = 1) -> dict:
+        for attempt in range(retries + 1):
+            try:
+                r = requests.get(f"{self.base}{path}", params=params,
+                                 headers=self._headers(), timeout=10)
+                if r.status_code == 401 and attempt < retries:
+                    self.log.warning("401 — refreshing token and retrying")
+                    self.token = None
+                    continue
+                r.raise_for_status()
+                return r.json()
+            except requests.RequestException as e:
+                if attempt == retries:
+                    raise
+                self.log.warning("GET %s failed (%s); retrying", path, e)
+                time.sleep(1.0)
+        return {}
+
+    def is_range_authorized(self, effect: str) -> bool:
+        """Live check against GET /api/range-authorization/status?effect=...
+        — replaces the old static CEMA_AUTHORIZED_RANGE env var (see
+        backend/RANGE_AUTHORIZATION_REDESIGN.md). FAILS CLOSED (returns
+        False) on ANY error talking to the backend — unreachable, timeout,
+        401/403, malformed response — exactly mirroring the old
+        `CEMA_AUTHORIZED_RANGE != "1"` fail-closed behavior. Never raises."""
+        try:
+            resp = self.get("/api/range-authorization/status", params={"effect": effect}, retries=1)
+            return bool(resp.get("enabled") is True)
+        except Exception as e:
+            self.log.warning(
+                "range-authorization status check FAILED for effect=%s (%s) — "
+                "treating as NOT authorized (fail closed).", effect, e,
+            )
+            return False

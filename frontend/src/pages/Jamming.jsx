@@ -3,6 +3,7 @@ import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { Radio, AlertTriangle } from "lucide-react";
 import SafetyGate, { JAM_CHECKS } from "@/components/SafetyGate";
+import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
 
 const BANDS = [
   { value: "433", label: "433 MHz (SiK ISM lower)" },
@@ -120,10 +121,12 @@ export default function Jamming() {
           This transmits REAL RF via a HackRF, band-limited noise for a hard-capped, bounded burst
           (max {MAX_DURATION_S}s per request — never continuous/unattended). Requires commander role, a
           fresh arm token, a jam confirmation token minted at the instant you complete the checklist
-          below, AND the physical bridge host's own CEMA_AUTHORIZED_RANGE=1 environment gate — all four
-          independently, every time.
+          below, AND a live Range Authorization lease for this effect (armed via the control below,
+          re-checked by the bridge at the moment of transmission) — all four independently, every time.
         </div>
       </div>
+
+      <RangeAuthorizationControl effect="jam" label="RF JAMMING" />
 
       {isGnssTarget && (
         <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "#1A0A08" }}>

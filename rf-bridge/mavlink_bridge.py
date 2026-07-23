@@ -10,6 +10,18 @@ RX path  : reads MAVLink frames coming FROM the drone through the same radio.
            in the app via POST /api/detections/ingest so it shows up on the
            Command Center dashboard.
 
+RANGE AUTHORIZATION: before forwarding ANY frame to the serial radio, this
+bridge makes its own independent, live GET /api/range-authorization/status
+?effect=mavlink call to the backend (see common.CemaClient.is_range_authorized
+and backend/RANGE_AUTHORIZATION_REDESIGN.md) and refuses to transmit if that
+lease is not currently enabled. This replaces the previous static
+CEMA_AUTHORIZED_RANGE=1 bridge-host env var with a GUI-armed, auto-expiring
+(15 min) lease controlled from the app. It is an ADDITIONAL, independent
+check — it does not replace require_commander, arm_token, or the
+tx_halted/EMERGENCY-ABORT handling below, all of which are unchanged. Fails
+closed (treats as NOT authorized) on any network/auth error talking to the
+backend.
+
 Requires: pyserial, pymavlink, websocket-client.
 """
 from __future__ import annotations
@@ -136,6 +148,26 @@ class MavlinkBridge:
             if self.tx_halted:
                 log.warning("TX suppressed: EMERGENCY ABORT in effect — dropping frame, not forwarding to serial.")
                 _send_tx_ack(_ws, request_id, False, "tx halted (EMERGENCY ABORT in effect on bridge)")
+                return
+
+            # ---- Range-authorization gate (replaces the old static
+            # CEMA_AUTHORIZED_RANGE env var — see
+            # backend/RANGE_AUTHORIZATION_REDESIGN.md). Independent,
+            # additional check made at the moment of transmission, live
+            # against the backend — NOT trusting any value embedded in this
+            # WS message itself, so a stale/replayed packet can't carry
+            # stale authorization forward past an expiry/disable that
+            # happened in between. Fails closed on any network/auth error.
+            if not self.client.is_range_authorized("mavlink"):
+                log.error(
+                    "REFUSING to forward frame for request_id=%s: range authorization "
+                    "for effect=mavlink is not enabled (or could not be verified) via "
+                    "GET /api/range-authorization/status. An operator must arm it from "
+                    "the app before this bridge will transmit to serial.",
+                    request_id,
+                )
+                _send_tx_ack(_ws, request_id, False,
+                            "bridge refused: range-authorization (effect=mavlink) not enabled")
                 return
 
             hex_str = pkt.get("hex")

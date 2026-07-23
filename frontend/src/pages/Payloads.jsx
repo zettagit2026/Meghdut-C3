@@ -3,6 +3,7 @@ import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { Bomb, AlertTriangle, Target as TargetIcon } from "lucide-react";
 import SafetyGate, { SAFETY_GATED } from "@/components/SafetyGate";
+import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
 
 const SEV_COLOR = {
   LOW: "var(--accent-success)",
@@ -96,6 +97,8 @@ export default function Payloads() {
           </select>
         </div>
       </div>
+
+      <RangeAuthorizationControl effect="mavlink" label="MAVLINK PAYLOAD DEPLOY" />
 
       <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "#1A0A08" }}>
         <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />

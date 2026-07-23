@@ -112,13 +112,17 @@ def transmit_burst(
         argparse time, then still makes the operator type 'TRANSMIT' at the
         terminal before ever reaching a transmit call.
       * field-bridge/jam_bridge.py (WS-driven bridge, no terminal available):
-        checks its OWN env var CEMA_AUTHORIZED_RANGE (independently of any
-        app-side check) AND requires the incoming WS request to carry a
-        jam_confirm_token that the backend only mints at the exact moment an
-        operator completes the app UI's two-step SafetyGate-style confirm
-        (checklist + ARM & FIRE -> CONFIRM FIRE). That token is the digital
-        equivalent of physically typing 'TRANSMIT' — it cannot exist unless a
-        human deliberately went through the real confirmation flow.
+        makes its own LIVE GET /api/range-authorization/status?effect=jam
+        call to the backend at the moment of transmission (independently of
+        any app-side check already performed; see
+        backend/RANGE_AUTHORIZATION_REDESIGN.md — this replaced an older
+        static CEMA_AUTHORIZED_RANGE bridge-host env var) AND requires the
+        incoming WS request to carry a jam_confirm_token that the backend
+        only mints at the exact moment an operator completes the app UI's
+        two-step SafetyGate-style confirm (checklist + ARM & FIRE -> CONFIRM
+        FIRE). That token is the digital equivalent of physically typing
+        'TRANSMIT' — it cannot exist unless a human deliberately went through
+        the real confirmation flow.
 
     Duration is hard-capped at MAX_DURATION_S regardless of what is
     requested, same as the CLI path.
