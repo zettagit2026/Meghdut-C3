@@ -121,6 +121,7 @@ from hackrf_rx import (  # gate math reused verbatim from the live energy-detect
     _post_with_reauth,  # shared 401-retry-once helper -- see hackrf_rx.py for rationale
 )
 from gamutrf_infer import GamutRFClassifier, load_sigmf
+from ml_calibration import load_calibration, is_ood
 
 DEFAULT_CHECKPOINT = "/tmp/resnet18_leesburg_split_0.02_1_current.pt"
 
@@ -158,6 +159,26 @@ DEFAULT_CHECKPOINT = "/tmp/resnet18_leesburg_split_0.02_1_current.pt"
 UNCLASSIFIED_MAX_CONFIDENCE = float(
     os.environ.get("CEMA_ML_UNCLASSIFIED_MAX_CONFIDENCE", "0.6")
 )
+
+# CALIBRATION LAYER (2026-07-24): see ml_calibration.py's module docstring
+# for the full rationale. In short -- UNCLASSIFIED_MAX_CONFIDENCE above is a
+# fixed, reasoned-through default that is NOT informed by this specific
+# site's actual RF noise floor. ml_calibration.load_calibration() loads real
+# (never fabricated) softmax statistics collected by the companion
+# collect_noise_calibration.py script during moments this system's OWN
+# energy gate already independently labeled "noise floor, not a contact".
+# If no calibration file exists yet (the common case until
+# collect_noise_calibration.py has been run in the field), this is a no-op:
+# the effective threshold stays exactly UNCLASSIFIED_MAX_CONFIDENCE and no
+# entropy check beyond the existing behavior is silently added -- see
+# ml_calibration.effective_confidence_threshold(), which can only raise the
+# bar above the default, never lower it. This module also adds a
+# softmax-entropy check (inspired by rf-signal-intelligence's OOD-rejection
+# approach, cleared for non-commercial-only use in this project) that fires
+# independently of the confidence threshold: a near-uniform 3-class
+# distribution is reported unclassified even if the top class happens to
+# clear the confidence bar.
+NOISE_CALIBRATION_STATS = load_calibration()
 
 # OUT-OF-DOMAIN BAND EXCLUSION (2026-07-23): the deployed checkpoint
 # (resnet18_leesburg_split_0.02_1_current.pt) is a CLOSED-WORLD 3-class
@@ -269,6 +290,17 @@ def main() -> None:
           f"sample_secs={classifier.sample_secs} nfft={classifier.nfft} device={classifier.device}")
     print("[ml_classify_bridge] KNOWN LIMITATION: closed-world 3-class model, no "
           "idle/noise/other class -- energy gate below is the mitigation (see module docstring).")
+    if NOISE_CALIBRATION_STATS.n > 0:
+        print(f"[ml_classify_bridge] loaded REAL noise-floor calibration: "
+              f"n={NOISE_CALIBRATION_STATS.n} samples, "
+              f"mean_confidence={NOISE_CALIBRATION_STATS.mean_confidence:.4f}, "
+              f"std={NOISE_CALIBRATION_STATS.std_confidence:.4f} -- "
+              f"effective unclassified threshold will adapt accordingly "
+              f"(see ml_calibration.py)")
+    else:
+        print("[ml_classify_bridge] no noise-floor calibration file found -- "
+              f"using fixed UNCLASSIFIED_MAX_CONFIDENCE={UNCLASSIFIED_MAX_CONFIDENCE} only "
+              "(run collect_noise_calibration.py on this hardware to build one)")
 
     token = login(args.console_url, args.email, args.password)
     headers = {"Authorization": f"Bearer {token}"}
@@ -329,11 +361,18 @@ def main() -> None:
                 # (candidate)"/"MAVLink craft (candidate)") -- this is the
                 # one case where we say "energy present, type unknown"
                 # rather than picking a label nobody is confident in.
-                is_unclassified = ml_confidence < UNCLASSIFIED_MAX_CONFIDENCE
+                ood = is_ood(
+                    ml_confidence, all_probs, NOISE_CALIBRATION_STATS,
+                    default_confidence_threshold=UNCLASSIFIED_MAX_CONFIDENCE,
+                )
+                is_unclassified = ood["unclassified"]
                 if is_unclassified:
                     print(f"[{label}] ML result INCONCLUSIVE (top class "
-                          f"{ml_label} @ {ml_confidence:.4f} < "
-                          f"{UNCLASSIFIED_MAX_CONFIDENCE} threshold) -- "
+                          f"{ml_label} @ {ml_confidence:.4f}, reason={ood['reason']}, "
+                          f"effective_threshold={ood['effective_confidence_threshold']:.4f}, "
+                          f"normalized_entropy={ood['normalized_entropy']:.4f}, "
+                          f"calibration_source={ood['calibration_source']} "
+                          f"n={ood['calibration_n']}) -- "
                           f"reporting as unclassified_signal, not forcing a label")
                 # MERGE-MATCH INTEGRITY (2026-07-23 fix): backend/server.py's
                 # detection_ingest merges an ingest into an existing ACTIVE
@@ -379,6 +418,13 @@ def main() -> None:
                     # real softmax prob from a known-flawed closed-world model,
                     # unless it was too weak to trust any class at all
                     "confidence_type": "unclassified_signal" if is_unclassified else "ml_probability",
+                    # calibration/OOD metadata (see ml_calibration.py) -- purely
+                    # informational, does not change confidence_type/model/
+                    # protocol merge-match behavior above
+                    "ml_ood_reason": ood["reason"],
+                    "ml_ood_threshold": round(ood["effective_confidence_threshold"], 4),
+                    "ml_ood_entropy": round(ood["normalized_entropy"], 4),
+                    "ml_ood_calibration_n": ood["calibration_n"],
                 }
                 try:
                     _post_with_reauth(args.console_url, "/api/detections/ingest", det,
