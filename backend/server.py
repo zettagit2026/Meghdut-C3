@@ -1480,16 +1480,88 @@ def _ml_unclassified_display(confidence_type: Optional[str]):
     return UNCLASSIFIED_DISPLAY
 
 
+# HEURISTIC-BINARY GENERIC-DISPLAY OVERRIDE (2026-07-24, B5): mirrors
+# _ml_wifi_reclassification() / _ml_unclassified_display() above. Operator
+# complaint: the dashboard's PRIMARY label showed a specific manufacturer
+# name ("DJI Mini (candidate)") for detections that are, and may remain for
+# their entire lifetime, backed by nothing but a bare RSSI/persistence
+# heuristic in hackrf_rx.py (no ML opinion, no protocol decode ever
+# arrived). A small muted "(unconfirmed)" tag next to a big confident-
+# looking manufacturer name does not fix that confusion -- the primary
+# label itself must not assert an identity that was never earned. See
+# backend/DETECTION_DISPLAY_MODEL.md for the full design rationale.
+#
+# Same wire/display split as the two overrides above: hackrf_rx.py's
+# heuristic ingest still POSTS "DJI Mini (candidate)" / "MAVLink craft
+# (candidate)" on the wire (those exact strings are the merge-match key in
+# detection_ingest's initial find_one() query -- changing them breaks
+# re-confirmation merging). The honest generic category name is substituted
+# into the DISPLAYED model/protocol fields here, server-side, with the raw
+# heuristic guess preserved in original_model/original_protocol (the same
+# field the frontend already renders as a muted secondary line).
+HEURISTIC_GENERIC_DISPLAY = {
+    "DJI Mini (candidate)": ("Unidentified 2.4GHz Emitter", "Unconfirmed (RF heuristic)"),
+    "MAVLink craft (candidate)": ("Unidentified RF Emitter — SiK/MAVLink band", "Unconfirmed (RF heuristic)"),
+}
+
+
+def _heuristic_display(model: Optional[str], confidence_type: Optional[str]):
+    """Returns (display_model, display_protocol) when this detection has
+    ONLY a bare RSSI/persistence heuristic behind it -- no ML opinion, no
+    protocol decode -- else None. Only fires for confidence_type ==
+    "heuristic_binary"; never overrides a display that a real ML or
+    protocol signal already earned (those branches take precedence and are
+    checked first at each call site -- see detection_ingest)."""
+    if confidence_type != "heuristic_binary":
+        return None
+    return HEURISTIC_GENERIC_DISPLAY.get(model)
+
+
 @api.post("/detections/ingest")
 async def detection_ingest(body: DetectionIngestBody,
                            user: Dict = Depends(get_current_user)):
     since = (datetime.now(timezone.utc) - timedelta(seconds=DETECTION_MERGE_WINDOW_S)).isoformat()
+    # MERGE-MATCH ROOT-CAUSE FIX (2026-07-24): match on the immutable
+    # match_model/match_protocol fields, NEVER on the currently-DISPLAYED
+    # model/protocol fields. Field-bridge scripts (hackrf_rx.py,
+    # ml_classify_bridge.py) always POST the same raw literal on every
+    # re-confirmation cycle (e.g. "DJI Mini (candidate)"), but model/
+    # protocol get overwritten to a display value by any of THREE
+    # independent override paths below (_ml_wifi_reclassification,
+    # _ml_unclassified_display, _heuristic_display). Matching the raw
+    # incoming body.model/body.protocol against the STORED (possibly
+    # already-overridden) model/protocol meant the very next re-
+    # confirmation cycle after ANY override applied would fail to find
+    # the existing record and silently spawn a duplicate ACTIVE
+    # detection -- forever, every cycle, for that contact. match_model/
+    # match_protocol are populated ONCE from the raw ingest at document
+    # creation (see the creation branch below) and are never touched by
+    # any override path, so they always equal exactly what the field-
+    # bridge script sends on the wire, regardless of how many times the
+    # displayed model/protocol have been overridden in between.
+    #
+    # The second $or branch is a backward-compat fallback for documents
+    # created before this fix (no match_model field yet): it matches on
+    # model/protocol as before, which still works for any such legacy
+    # document that has never been display-overridden. Legacy documents
+    # that WERE already overridden before this fix shipped may already be
+    # duplicated in the live database -- that pre-existing data is a
+    # separate cleanup, not something this query can retroactively repair.
+    # Any legacy document found via the fallback branch gets match_model/
+    # match_protocol backfilled below so it self-heals onto the primary
+    # match path from this point forward.
     existing = await db.detections.find_one({
         "source": body.source,
-        "model": body.model,
-        "protocol": body.protocol,
         "status": "ACTIVE",
         "last_seen": {"$gt": since},
+        "$or": [
+            {"match_model": body.model, "match_protocol": body.protocol},
+            {
+                "match_model": {"$exists": False},
+                "model": body.model,
+                "protocol": body.protocol,
+            },
+        ],
     })
 
     if existing:
@@ -1554,6 +1626,13 @@ async def detection_ingest(body: DetectionIngestBody,
             "ml_gated": body.ml_gated if body.ml_label is not None else existing.get("ml_gated", False),
             "confidence_type": body.confidence_type if (body.ml_label is not None and ml_is_decisive) else existing.get("confidence_type"),
             "last_seen": datetime.now(timezone.utc).isoformat(),
+            # Self-heal: backfill the immutable match key for legacy
+            # documents (pre-dating this fix) found via the fallback $or
+            # branch above. Once set, match_model/match_protocol are never
+            # overwritten again by any later ingest -- see the three
+            # override branches below, none of which touch these fields.
+            "match_model": existing.get("match_model") or body.model,
+            "match_protocol": existing.get("match_protocol") or body.protocol,
         }
         unclassified_display = _ml_unclassified_display(body.confidence_type) if ml_is_decisive else None
         if wifi_display:
@@ -1579,6 +1658,24 @@ async def detection_ingest(body: DetectionIngestBody,
             updates["model"], updates["protocol"] = unclassified_display
             updates["threat_level"] = "LOW"
             updates["confidence_type"] = "unclassified_signal"
+        else:
+            # Neither a decisive ML reclassification nor an unclassified
+            # read fired on this ingest. If the record is (still) purely
+            # heuristic_binary -- i.e. nothing has ever confirmed it --
+            # re-apply the generic-display override on every re-confirmation
+            # re-post, using the record's OWN raw model as the lookup key
+            # (existing.get("original_model") if already overridden on a
+            # prior cycle, else existing.get("model") on the very first
+            # re-confirmation after creation) so hackrf_rx.py's ~3s
+            # heartbeat re-posts don't clobber the generic display back to
+            # the raw manufacturer guess.
+            resolved_ct = updates.get("confidence_type") or existing.get("confidence_type")
+            raw_model = existing.get("original_model") or existing.get("model")
+            heuristic_display = _heuristic_display(raw_model, resolved_ct)
+            if heuristic_display:
+                updates["original_model"] = existing.get("original_model") or existing.get("model")
+                updates["original_protocol"] = existing.get("original_protocol") or existing.get("protocol")
+                updates["model"], updates["protocol"] = heuristic_display
         await db.detections.update_one(
             {"id": existing["id"]},
             {
@@ -1630,12 +1727,31 @@ async def detection_ingest(body: DetectionIngestBody,
         model, protocol = unclassified_display
         threat_level = "LOW"
         confidence_type = "unclassified_signal"
+    else:
+        # First-ever creation of a purely heuristic_binary detection (the
+        # common case: hackrf_rx.py's own ingest is almost always the first
+        # ingest for a new contact). Apply the generic-display override from
+        # the moment the record is created, not just on later re-confirmation.
+        heuristic_display = _heuristic_display(body.model, body.confidence_type)
+        if heuristic_display:
+            original_model, original_protocol = body.model, body.protocol
+            model, protocol = heuristic_display
     det.update({
         "callsign": body.callsign or det["callsign"],
         "model": model,
         "protocol": protocol,
         "original_model": original_model,
         "original_protocol": original_protocol,
+        # Immutable merge-match key (2026-07-24 fix): captured ONCE here,
+        # from the raw incoming body.model/body.protocol, BEFORE any
+        # display override is applied above. Never overwritten by any
+        # later ingest/update -- see detection_ingest's merge query and the
+        # self-heal comment in the update-existing branch above. This is
+        # what lets subsequent re-confirmation cycles (which always POST
+        # the same raw literal) keep finding this exact document no matter
+        # how many times its displayed model/protocol get overridden.
+        "match_model": body.model,
+        "match_protocol": body.protocol,
         "threat_level": threat_level,
         "center_freq_ghz": body.center_freq_ghz,
         "bandwidth_mhz": body.bandwidth_mhz,
