@@ -29,6 +29,7 @@ mitigation, not a change to this model's behavior.
 from __future__ import annotations
 
 import json
+import os
 from typing import Dict, Tuple
 
 import numpy as np
@@ -38,6 +39,18 @@ from scipy import signal
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+
+from event_gating import gate_spectrogram_freq_bins
+
+# EVENT/BURST GATING (2026-07-24): see event_gating.py's module docstring for
+# full provenance (ported technique from MULT-25-607-ML-for-RF-Sprectrum-
+# sensing) and how this is a DIFFERENT, complementary layer from
+# ml_calibration.py's post-classification OOD rejection. This gates the
+# spectrogram ITSELF (input hygiene) before the ResNet18 forward pass, rather
+# than gating the classifier's output. Default ON; settable via env var so a
+# Reality Checker A/B pass can compare gated vs. ungated behavior before this
+# is signed off for deployment.
+EVENT_GATE_ENABLED = os.environ.get("CEMA_ML_EVENT_GATE", "1") not in ("0", "false", "False")
 
 
 SIGMF_DTYPE_MAP = {
@@ -118,8 +131,13 @@ def build_model(checkpoint: dict, device: "torch.device"):
     return model
 
 
-def make_spectrogram_image(samples: np.ndarray, sample_rate: float, nfft: int):
-    """Exact reimplementation of GamutRFDataset.__getitem__ feat='spec' path."""
+def make_spectrogram_image(samples: np.ndarray, sample_rate: float, nfft: int,
+                            event_gate: bool = None):
+    """Exact reimplementation of GamutRFDataset.__getitem__ feat='spec' path,
+    plus an optional event/burst-gating pass (see event_gating.py) applied to
+    the dB spectrogram BEFORE normalization/colorization -- i.e. before the
+    ResNet18 classifier ever sees it. `event_gate=None` (default) defers to
+    the module-level EVENT_GATE_ENABLED toggle (env CEMA_ML_EVENT_GATE)."""
     f, t, S = signal.spectrogram(
         samples, sample_rate,
         window=signal.windows.hann(nfft, sym=False),
@@ -129,6 +147,15 @@ def make_spectrogram_image(samples: np.ndarray, sample_rate: float, nfft: int):
     )
     S = np.fft.fftshift(S, axes=0)
     S = 10 * np.log10(S + 1e-20)  # dB scale (epsilon guards log(0) on real low-energy bins)
+
+    if event_gate is None:
+        event_gate = EVENT_GATE_ENABLED
+    if event_gate:
+        # Replace frequency bins that never carry burst/event energy
+        # anywhere in this capture window with their own measured noise
+        # floor, BEFORE normalization -- see event_gating.py module
+        # docstring for the MULT-25-607-ported technique this implements.
+        S, _events, _floor = gate_spectrogram_freq_bins(S)
 
     S_norm = (S - np.min(S)) / (np.max(S) - np.min(S))
 
@@ -162,9 +189,17 @@ class GamutRFClassifier:
     def min_window_samples(self, sample_rate_hz: float) -> int:
         return int(sample_rate_hz * self.sample_secs)
 
-    def classify_window(self, samples: np.ndarray, sample_rate_hz: float
+    def classify_window(self, samples: np.ndarray, sample_rate_hz: float,
+                         event_gate: bool = None
                          ) -> Tuple[str, float, Dict[str, float]]:
         """Run real inference on a window of REAL IQ samples.
+
+        `event_gate` (default None -> module-level EVENT_GATE_ENABLED /
+        CEMA_ML_EVENT_GATE env toggle): whether to apply the burst/event
+        gating pass (event_gating.py) to the spectrogram before it is fed to
+        the model. This is upstream INPUT hygiene, separate from and
+        complementary to ml_calibration.py's post-classification OOD
+        rejection -- see event_gating.py's module docstring.
 
         Returns (predicted_label, confidence, all_class_probs). Caller is
         responsible for having already energy-gated this call (see module
@@ -178,7 +213,7 @@ class GamutRFClassifier:
                 f"least {window_n} ({self.sample_secs}s @ {sample_rate_hz} Hz)"
             )
         window = samples[:window_n]
-        data = make_spectrogram_image(window, sample_rate_hz, self.nfft)
+        data = make_spectrogram_image(window, sample_rate_hz, self.nfft, event_gate=event_gate)
         data = data.unsqueeze(0).to(self.device)
 
         with torch.no_grad():

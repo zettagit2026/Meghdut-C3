@@ -6,6 +6,7 @@
 
 requests==2.32.3
 numpy>=1.26.0
+scipy>=1.11.0  # gamutrf_infer.py (signal.spectrogram) and event_gating.py (find_peaks/peak_widths burst gating, 2026-07-24) — was already a de facto dependency of gamutrf_infer.py's spectrogram path; now pinned explicitly since event_gating.py depends on it directly
 pyserial==3.5
 pymavlink==2.4.41
 websocket-client==1.8.0  # jam_bridge.py — WS client to backend/server.py's /api/ws/mavlink
