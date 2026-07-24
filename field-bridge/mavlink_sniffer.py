@@ -104,6 +104,9 @@ def _post_with_reauth(console_url: str, path: str, json_body: dict, headers: dic
     every ingest past the backend's 12h JWT TTL (create_access_token() in
     backend/server.py) until manually restarted -- the exact bug this fixes."""
     url = f"{console_url}{path}"
+    # Identifies this bridge in the backend's ingest_health tracking (task
+    # #74) -- see GET /api/health's ingest_sources / preflight.sh.
+    headers.setdefault("X-Bridge-Name", "mavlink_sniffer")
     r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
     if r.status_code == 401:
         print(f"[auth] 401 from POST {path} -- token expired, re-authenticating as {email}",

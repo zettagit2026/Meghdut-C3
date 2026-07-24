@@ -273,7 +273,8 @@ def sweep_and_ingest(console_url: str, headers: dict, sample_rate_hz: float,
             }
             try:
                 _post_with_reauth(console_url, "/api/detections/ingest", det,
-                                  headers, email, password, timeout=10)
+                                  headers, email, password, timeout=10,
+                                  bridge_name="droneid_decode_bridge")
             except requests.RequestException as e:
                 print(f"[droneid_decode_bridge] ingest failed: {e}", file=sys.stderr)
 

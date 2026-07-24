@@ -354,7 +354,8 @@ def main() -> None:
                 }
                 try:
                     _post_with_reauth(args.console_url, "/api/detections/ingest", det,
-                                       headers, args.email, args.password, timeout=10)
+                                       headers, args.email, args.password, timeout=10,
+                                       bridge_name="ml_classify_bridge")
                 except requests.RequestException as e:
                     print(f"[{label}] ingest failed: {e}", file=sys.stderr)
 

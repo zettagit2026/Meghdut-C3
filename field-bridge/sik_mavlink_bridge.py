@@ -67,6 +67,9 @@ def _post_with_reauth(console_url: str, path: str, json_body: dict, headers: dic
     while an operator was staring at the TRANSMIT prompt -- cheap to guard
     against for consistency with every other bridge in this repo."""
     url = f"{console_url}{path}"
+    # Identifies this bridge in the backend's ingest_health tracking (task
+    # #74) -- see GET /api/health's ingest_sources / preflight.sh.
+    headers.setdefault("X-Bridge-Name", "sik_mavlink_bridge")
     r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
     if r.status_code == 401:
         print(f"[auth] 401 from POST {path} -- token expired, re-authenticating as {email}",

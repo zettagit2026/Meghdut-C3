@@ -307,8 +307,14 @@ def login(console_url: str, email: str, password: str) -> str:
     return r.json()["token"]
 
 
+# Identifies this bridge in the backend's ingest_health tracking (task #74) --
+# see GET /api/health's ingest_sources / preflight.sh.
+BRIDGE_NAME = "hackrf_rx"
+
+
 def _post_with_reauth(console_url: str, path: str, json_body: dict, headers: dict,
-                       email: str, password: str, timeout: float = 5) -> "requests.Response":
+                       email: str, password: str, timeout: float = 5,
+                       bridge_name: str = None) -> "requests.Response":
     """POST to the backend, auto-recovering from an expired JWT.
 
     The backend's JWT TTL is 12h (create_access_token() in backend/server.py)
@@ -329,6 +335,15 @@ def _post_with_reauth(console_url: str, path: str, json_body: dict, headers: dic
     bridge's main loop.
     """
     url = f"{console_url}{path}"
+    # X-Bridge-Name identifies this bridge to the backend's ingest_health
+    # tracking (task #74) so a recurrence of the silent-401-loop failure
+    # mode this docstring describes shows up in GET /api/health /
+    # preflight.sh instead of going unnoticed for hours again.
+    # bridge_name lets other bridges that import this shared helper directly
+    # (rather than duplicating it) identify themselves correctly instead of
+    # reporting as "hackrf_rx" -- see ml_classify_bridge.py/
+    # droneid_decode_bridge.py callers.
+    headers.setdefault("X-Bridge-Name", bridge_name or BRIDGE_NAME)
     r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
     if r.status_code == 401:
         print(f"[auth] 401 from POST {path} -- token expired, re-authenticating as {email}",

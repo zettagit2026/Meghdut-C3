@@ -377,6 +377,43 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# 6b. Ingest-source auth health (task #74) — closes the gap that let a
+#     recurrence of the silent-401-loop incident (bridges logging in once at
+#     startup, then 401-looping invisibly for hours after the 12h JWT expired)
+#     go undetected for hours: everything above only checks log-file mtime
+#     freshness, never whether ingest POSTs are actually being ACCEPTED by the
+#     backend. Reads .ingest_sources from the SAME /api/health payload
+#     (HEALTH_JSON) already fetched for section 6 — no extra request.
+# ---------------------------------------------------------------------------
+section "6b. Ingest-source auth health (per-bridge, from /api/health)"
+
+if [ -z "$HEALTH_JSON" ]; then
+  warn "No authenticated /api/health payload available (see section 3) — cannot check ingest_sources auth health."
+elif [ "$HAVE_JQ" -ne 1 ]; then
+  warn "jq unavailable — cannot reliably parse ingest_sources; skipping per-bridge auth-health check."
+else
+  ingest_count="$(echo "$HEALTH_JSON" | jq -r '(.ingest_sources // []) | length')"
+  if [ -z "$ingest_count" ] || [ "$ingest_count" = "0" ]; then
+    warn "No ingest_sources reported by /api/health — either no ingest bridge has ever posted, or this backend build predates task #74. Not itself a failure, but confirm this is expected."
+  else
+    # process substitution (not a pipe-into-while) so PASS_COUNT/WARN_COUNT/
+    # FAIL_COUNT updates inside the loop are visible to the parent shell —
+    # `... | jq ... | while read` would run the loop in a subshell and the
+    # counts (and therefore the final exit code below) would silently be wrong.
+    while IFS=$'\t' read -r bridge auth_failing last_attempt_age last_success_age consecutive; do
+      [ -z "$bridge" ] && continue
+      if [ "$auth_failing" = "true" ]; then
+        fail "$bridge — auth_failing=true (consecutive_401=$consecutive, last_attempt ${last_attempt_age}s ago). This is the exact silent-401-loop failure mode from task #74 — check this bridge's credentials / JWT re-login path immediately."
+      elif [ "$last_attempt_age" = "null" ]; then
+        warn "$bridge — no ingest attempts recorded yet (idle/unwired). Confirm this bridge is expected to be inactive right now."
+      else
+        pass "$bridge — ingest auth healthy (last_success ${last_success_age}s ago, last_attempt ${last_attempt_age}s ago, consecutive_401=$consecutive)."
+      fi
+    done < <(echo "$HEALTH_JSON" | jq -r '.ingest_sources[] | [.bridge, (.auth_failing|tostring), (.last_attempt_age_s|tostring), (.last_success_age_s|tostring), (.consecutive_401|tostring)] | @tsv')
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 7. TX-capable bridge services — informational only. Either being inactive
 #    is EXPECTED (held back pending range authorization) and must NOT be
 #    treated as a failure. This script never starts them.

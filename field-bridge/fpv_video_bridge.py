@@ -396,6 +396,9 @@ def push_to_backend(result: dict, console_url: str, headers: dict, png_path: Opt
         print("[fpv_video_bridge] `requests` not installed -- cannot push to backend", file=sys.stderr)
         return
     url = console_url.rstrip("/") + "/api/fpv/ingest"
+    # Identifies this bridge in the backend's ingest_health tracking (task
+    # #74) -- see GET /api/health's ingest_sources / preflight.sh.
+    headers.setdefault("X-Bridge-Name", "fpv_video_bridge")
 
     def _open_files() -> dict:
         # Re-opened fresh on every attempt: a previously-opened file handle

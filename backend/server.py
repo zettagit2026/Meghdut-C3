@@ -151,6 +151,17 @@ logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("cema")
 
+# ---- Ingest health tracking (task #74) -------------------------------------
+# Background: field-bridge scripts logged in once at startup; a 12h JWT TTL
+# expiry caused silent, invisible 401-looping for hours before it was caught
+# (fixed separately via _post_with_reauth()/_reauth_once() in every bridge).
+# The gap this closes: preflight.sh / /api/health only checked log-file mtime
+# freshness, never whether ingest writes were actually succeeding server-side.
+# These paths are the full set of bridge->backend ingest endpoints (TX-side
+# jam_bridge.py is deliberately out of scope — see AGENT.md task #74 notes).
+INGEST_PATHS = {"/api/detections/ingest", "/api/spectrum/ingest", "/api/fpv/ingest"}
+AUTH_FAIL_CONSECUTIVE_THRESHOLD = 3
+
 
 # =====================================================================
 # Auth helpers
@@ -584,6 +595,7 @@ async def _handle_tx_ack(msg: Dict[str, Any]) -> None:
 @app.on_event("startup")
 async def startup() -> None:
     await db.users.create_index("email", unique=True)
+    await db.ingest_health.create_index("bridge", unique=True)
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
     if existing is None:
         await db.users.insert_one({
@@ -748,6 +760,70 @@ if not WS_UPGRADE_CAPABLE:
 # quickly. Independent of DETECTION_STALE_TIMEOUT_S (that's about detection
 # liveness, this is about recent TX ack outcomes).
 TX_HEALTH_RECENT_WINDOW_S = 900  # 15 min
+
+# Recency window used by system_health() to distinguish "actively failing
+# auth" from "sensor legitimately idle" — see _record_ingest_outcome/
+# system_health below (task #74).
+INGEST_AUTH_FAIL_RECENT_WINDOW_S = 300  # 5 min
+
+
+async def _record_ingest_outcome(bridge: str, status_code: int) -> None:
+    """Upsert one doc per bridge into db.ingest_health reflecting the outcome
+    of the most recent ingest POST. Never allowed to raise into the request
+    path — callers must wrap this in try/except (see middleware below)."""
+    now = datetime.now(timezone.utc).isoformat()
+    if 200 <= status_code < 300:
+        doc = await db.ingest_health.find_one_and_update(
+            {"bridge": bridge},
+            {
+                "$set": {
+                    "last_success_ts": now,
+                    "last_attempt_ts": now,
+                    "consecutive_failures": 0,
+                },
+                "$setOnInsert": {"bridge": bridge},
+            },
+            upsert=True,
+            return_document=True,
+        )
+        return
+
+    doc = await db.ingest_health.find_one_and_update(
+        {"bridge": bridge},
+        {
+            "$set": {"last_error_ts": now, "last_attempt_ts": now,
+                      "last_error_status": status_code},
+            "$inc": {"consecutive_failures": 1},
+            "$setOnInsert": {"bridge": bridge},
+        },
+        upsert=True,
+        return_document=True,
+    )
+    # Edge-triggered: fire exactly once per failure episode (== not >=), so a
+    # bridge stuck failing doesn't spam the mission log on every subsequent
+    # request.
+    if doc and doc.get("consecutive_failures") == AUTH_FAIL_CONSECUTIVE_THRESHOLD:
+        await log_event(
+            "INGEST_HEALTH",
+            f"Ingest bridge '{bridge}' has failed {AUTH_FAIL_CONSECUTIVE_THRESHOLD} "
+            f"consecutive requests (last status {status_code}) — likely the "
+            f"silent-401-loop failure mode from task #74.",
+            meta={"bridge": bridge, "consecutive_failures": doc.get("consecutive_failures"),
+                  "last_error_status": status_code},
+        )
+
+
+@app.middleware("http")
+async def ingest_health_middleware(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path in INGEST_PATHS:
+        try:
+            bridge = request.headers.get("x-bridge-name") or f"unknown@{request.url.path}"
+            await _record_ingest_outcome(bridge, response.status_code)
+        except Exception:
+            # Never let health bookkeeping fail or delay the actual response.
+            logger.exception("ingest_health_middleware: failed to record outcome")
+    return response
 
 
 # =====================================================================
@@ -2388,6 +2464,39 @@ async def system_health(user: Dict = Depends(get_current_user)):
     tx_recent_total = tx_recent_neutralized + tx_recent_timeout + tx_recent_failed
     tx_path_degraded = tx_recent_total > 0 and tx_recent_neutralized == 0
 
+    # ---- Ingest-side auth/health signals (task #74) ----------------------
+    # Distinguishes "bridge actively failing auth" from "sensor legitimately
+    # idle" — a bridge that has never posted (or hasn't posted in a very long
+    # time) has null/huge ages and auth_failing=False, whereas one stuck in a
+    # 401 loop has a recent last_attempt_ts and a high consecutive_failures.
+    now_utc = datetime.now(timezone.utc)
+    ingest_docs = await db.ingest_health.find({}, {"_id": 0}).to_list(50)
+    ingest_sources = []
+    for d in ingest_docs:
+        def _age_s(ts_str: Optional[str]) -> Optional[float]:
+            if not ts_str:
+                return None
+            try:
+                return (now_utc - datetime.fromisoformat(ts_str)).total_seconds()
+            except ValueError:
+                return None
+
+        last_success_age_s = _age_s(d.get("last_success_ts"))
+        last_attempt_age_s = _age_s(d.get("last_attempt_ts"))
+        consecutive_failures = d.get("consecutive_failures", 0)
+        auth_failing = bool(
+            consecutive_failures >= AUTH_FAIL_CONSECUTIVE_THRESHOLD
+            and last_attempt_age_s is not None
+            and last_attempt_age_s < INGEST_AUTH_FAIL_RECENT_WINDOW_S
+        )
+        ingest_sources.append({
+            "bridge": d.get("bridge"),
+            "last_success_age_s": last_success_age_s,
+            "last_attempt_age_s": last_attempt_age_s,
+            "consecutive_401": consecutive_failures,
+            "auth_failing": auth_failing,
+        })
+
     return {
         "backend": True,
         "mongo": mongo_ok,
@@ -2403,6 +2512,7 @@ async def system_health(user: Dict = Depends(get_current_user)):
         "tx_recent_timeout": tx_recent_timeout,
         "tx_recent_failed": tx_recent_failed,
         "tx_path_degraded": tx_path_degraded,
+        "ingest_sources": ingest_sources,
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
 
