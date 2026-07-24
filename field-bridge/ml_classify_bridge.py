@@ -105,6 +105,7 @@ import tempfile
 import time
 from typing import Optional
 
+import numpy as np
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -188,15 +189,26 @@ def gated_capture_and_classify(
     name: str,
     low_mhz: int,
     high_mhz: int,
-    center_mhz: float,
+    capture_freq_mhz: float,
     sample_rate_hz: float,
     capture_s: float,
     offset_s: float,
     tmp_dir: str,
 ):
-    """Capture a short REAL IQ window at this band's center frequency and run
-    REAL inference on it. Only called after the energy gate has passed."""
-    center_hz = center_mhz * 1e6
+    """Capture a short REAL IQ window centered on `capture_freq_mhz` -- the
+    ACTUAL detected peak frequency from this cycle's gate-check sweep, NOT
+    the band's fixed midpoint -- and run REAL inference on it. Only called
+    after the energy gate has passed.
+
+    BUG FIX (2026-07-24): this used to be called with the band's fixed
+    midpoint ((low_mhz+high_mhz)/2.0 -- e.g. always 2441.5MHz for DJI-2G4),
+    completely decoupled from where the sweep's RSSI peak that triggered the
+    gate actually was. That fixed window happens to sit almost exactly on
+    Wi-Fi channel 6, so the classifier was scoring whatever's on channel 6
+    (ambient WiFi) regardless of where the real drone/candidate signal
+    peaked -- see main()'s peak_freq_mhz computation, which is now threaded
+    through as this parameter instead."""
+    center_hz = capture_freq_mhz * 1e6
     out_path = os.path.join(tmp_dir, f"ml_gate_{name}.sigmf-data")
     meta_path = capture_iq(
         center_freq_hz=center_hz,
@@ -277,11 +289,27 @@ def main() -> None:
                 if not gated_in:
                     continue  # Phase 1 mitigation: do not classify noise-floor energy
 
+                # PEAK-FREQUENCY FIX (2026-07-24): find the actual bin that
+                # triggered this gate, same computation hackrf_rx.py's main()
+                # already does for its Wi-Fi/Bluetooth exclusion heuristics
+                # (bin_width_mhz = 1.0 matches sweep_band's default
+                # bin_width_khz=1000). Previously this bridge captured IQ
+                # centered on the band's fixed midpoint (center_mhz, always
+                # 2441.5MHz for DJI-2G4) instead of wherever the RSSI peak
+                # actually was -- decoupling the classifier's IQ window from
+                # the detected signal entirely. peak_freq_mhz is the real
+                # peak location and is what gets threaded into the capture
+                # below, NOT center_mhz.
+                bin_width_mhz = 1.0
+                peak_idx = int(np.argmax(powers))
+                peak_freq_mhz = low + (peak_idx + 0.5) * bin_width_mhz
+
                 print(f"[{label}] energy gate PASSED: peak {peak:.1f} dBm "
-                      f"({peak - floor:.1f} dB above floor) -- running real ML inference")
+                      f"({peak - floor:.1f} dB above floor) at {peak_freq_mhz:.1f}MHz -- "
+                      f"running real ML inference")
                 try:
                     ml_label, ml_confidence, all_probs = gated_capture_and_classify(
-                        classifier, name, low, high, center_mhz,
+                        classifier, name, low, high, peak_freq_mhz,
                         args.sample_rate_hz, args.capture_s, args.offset_s, tmp_dir,
                     )
                 except Exception as e:
