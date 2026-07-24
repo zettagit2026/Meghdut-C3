@@ -50,6 +50,17 @@ services:
       JWT_SECRET: "${JWT_SECRET}"
       ADMIN_EMAIL: "${ADMIN_EMAIL}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
+      # Optional -- real surveyed sensor GPS coordinates for the Map page.
+      # Unset by default (server.py treats missing/empty as "not configured"
+      # and reports that honestly rather than falling back to a fake
+      # coordinate). Compose does NOT auto-inject top-level .env values into
+      # a container; they must be explicitly listed here to reach the app --
+      # a real deploy incident where this line was missing meant .env alone
+      # never actually took effect no matter how many times the container
+      # was restarted.
+      SENSOR_LAT: "${SENSOR_LAT:-}"
+      SENSOR_LON: "${SENSOR_LON:-}"
+      SENSOR_LABEL: "${SENSOR_LABEL:-}"
     ports:
       # Bind host defaults to all interfaces (unchanged behavior). Set
       # BIND_HOST in .env to this host's specific LAN/management IP for
