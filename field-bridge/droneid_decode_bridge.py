@@ -115,7 +115,7 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from iq_capture import capture_iq  # real hackrf_transfer capture, RX only -- reused, not duplicated
-from hackrf_rx import login
+from hackrf_rx import login, _post_with_reauth  # shared 401-retry-once helper
 from gamutrf_infer import load_sigmf  # generic SigMF -> complex64 loader, reused not duplicated
 
 # Candidate center frequencies, taken verbatim from DroneSecurity's
@@ -214,7 +214,8 @@ def decode_capture(samples: np.ndarray, sample_rate_hz: float, modules, legacy: 
 
 
 def sweep_and_ingest(console_url: str, headers: dict, sample_rate_hz: float,
-                      capture_s: float, modules, tmp_dir: str):
+                      capture_s: float, modules, tmp_dir: str,
+                      email: str, password: str):
     any_decoded = False
     for freq_mhz in CANDIDATE_FREQS_MHZ:
         center_hz = freq_mhz * 1e6
@@ -271,8 +272,8 @@ def sweep_and_ingest(console_url: str, headers: dict, sample_rate_hz: float,
                 "confidence_type": "protocol_verified",  # CRC check passed -- pass/fail, no probability to report
             }
             try:
-                requests.post(f"{console_url}/api/detections/ingest", json=det,
-                               headers=headers, timeout=10)
+                _post_with_reauth(console_url, "/api/detections/ingest", det,
+                                  headers, email, password, timeout=10)
             except requests.RequestException as e:
                 print(f"[droneid_decode_bridge] ingest failed: {e}", file=sys.stderr)
 
@@ -323,7 +324,8 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="cema_droneid_bridge_") as tmp_dir:
         while args.iterations == 0 or i < args.iterations:
             found = sweep_and_ingest(args.console_url, headers, args.sample_rate_hz,
-                                      args.capture_s, modules, tmp_dir)
+                                      args.capture_s, modules, tmp_dir,
+                                      args.email, args.password)
             if not found:
                 print("[droneid_decode_bridge] sweep complete: no CRC-valid DroneID "
                       "frame decoded this cycle (expected/honest result if no real "

@@ -56,6 +56,34 @@ def login(console_url: str, email: str, password: str) -> str:
     return r.json()["token"]
 
 
+def _post_with_reauth(console_url: str, path: str, json_body: dict, headers: dict,
+                       email: str, password: str, timeout: float = 5) -> "requests.Response":
+    """POST to the backend, auto-recovering from an expired JWT by re-login
+    ONCE and retrying. Duplicated per-file (same convention as login() above);
+    canonical copy + full rationale lives in hackrf_rx.py. This script is
+    one-shot (requires an interactive TRANSMIT confirmation per run) so an
+    expired token is far less likely here than in the long-running bridges,
+    but the mirror-to-console POST below can still race a token that expired
+    while an operator was staring at the TRANSMIT prompt -- cheap to guard
+    against for consistency with every other bridge in this repo."""
+    url = f"{console_url}{path}"
+    r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
+    if r.status_code == 401:
+        print(f"[auth] 401 from POST {path} -- token expired, re-authenticating as {email}",
+              file=sys.stderr)
+        try:
+            headers["Authorization"] = f"Bearer {login(console_url, email, password)}"
+        except requests.RequestException as e:
+            print(f"[auth] re-login failed ({e})", file=sys.stderr)
+            return r
+        r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
+        if r.status_code == 401:
+            print(f"[auth] still 401 for POST {path} after re-authenticating -- real auth "
+                  f"problem (check credentials for {email}), not just an expired token.",
+                  file=sys.stderr)
+    return r
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--port", required=True, help="Serial device for the SiK radio, e.g. /dev/ttyUSB0")
@@ -107,7 +135,8 @@ def main() -> None:
         "command": 0,
     }
     try:
-        requests.post(f"{args.console_url}/api/mavlink/broadcast", json=body, headers=headers, timeout=5)
+        _post_with_reauth(args.console_url, "/api/mavlink/broadcast", body,
+                           headers, args.email, args.password, timeout=5)
         print("Mirrored event to console.")
     except requests.RequestException as e:
         print(f"console mirror failed (transmission already happened): {e}", file=sys.stderr)

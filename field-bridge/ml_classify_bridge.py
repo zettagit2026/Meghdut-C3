@@ -117,6 +117,7 @@ from hackrf_rx import (  # gate math reused verbatim from the live energy-detect
     estimate_distance_m,
     login,
     sweep_band,
+    _post_with_reauth,  # shared 401-retry-once helper -- see hackrf_rx.py for rationale
 )
 from gamutrf_infer import GamutRFClassifier, load_sigmf
 
@@ -352,8 +353,8 @@ def main() -> None:
                     "confidence_type": "unclassified_signal" if is_unclassified else "ml_probability",
                 }
                 try:
-                    requests.post(f"{args.console_url}/api/detections/ingest",
-                                  json=det, headers=headers, timeout=10)
+                    _post_with_reauth(args.console_url, "/api/detections/ingest", det,
+                                       headers, args.email, args.password, timeout=10)
                 except requests.RequestException as e:
                     print(f"[{label}] ingest failed: {e}", file=sys.stderr)
 

@@ -307,6 +307,47 @@ def login(console_url: str, email: str, password: str) -> str:
     return r.json()["token"]
 
 
+def _post_with_reauth(console_url: str, path: str, json_body: dict, headers: dict,
+                       email: str, password: str, timeout: float = 5) -> "requests.Response":
+    """POST to the backend, auto-recovering from an expired JWT.
+
+    The backend's JWT TTL is 12h (create_access_token() in backend/server.py)
+    and this bridge is meant to run forever under systemd Restart=always, so
+    a token obtained once at startup WILL expire mid-run. Before this helper
+    existed, that produced a silent, PERMANENT 401 on every subsequent
+    ingest call until someone noticed and restarted the service by hand --
+    this is exactly the bug that hit hackrf_rx.py/ml_classify_bridge.py/
+    fpv_video_bridge.py in production (real detections computed, never
+    ingested, only a 401 buried in each service's own log).
+
+    On a 401, re-login ONCE and retry the same request. `headers` is
+    mutated in place (same dict object the caller holds), so the caller's
+    cached token is transparently refreshed for all future calls too. If
+    the retry ALSO 401s, that's a real auth problem (bad/rotated
+    credentials), not just an expired token -- log it clearly and return
+    the failing response rather than looping forever or crashing the
+    bridge's main loop.
+    """
+    url = f"{console_url}{path}"
+    r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
+    if r.status_code == 401:
+        print(f"[auth] 401 from POST {path} -- token expired, re-authenticating as {email}",
+              file=sys.stderr)
+        try:
+            headers["Authorization"] = f"Bearer {login(console_url, email, password)}"
+        except requests.RequestException as e:
+            print(f"[auth] re-login failed ({e}) -- leaving stale token in place, "
+                  f"will retry re-login on the next call", file=sys.stderr)
+            return r
+        r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
+        if r.status_code == 401:
+            print(f"[auth] still 401 for POST {path} after re-authenticating -- this is a "
+                  f"real auth problem (check credentials for {email}), not just an expired "
+                  f"token. Continuing the normal loop rather than retrying forever.",
+                  file=sys.stderr)
+    return r
+
+
 SWEEP_TIMEOUT_S = 8.0  # a healthy hackrf_sweep -1 pass completes in well under 1s;
                         # this generous ceiling exists purely to detect a wedged/hung
                         # device, not because sweeps are expected to take this long.
@@ -481,10 +522,10 @@ def main() -> None:
             # a full 3-band sweep can take well over the console's "is HackRF live"
             # freshness window otherwise.
             try:
-                requests.post(
-                    f"{args.console_url}/api/spectrum/ingest",
-                    json={"bins": len(powers), "rows": [powers]},
-                    headers=headers, timeout=5,
+                _post_with_reauth(
+                    args.console_url, "/api/spectrum/ingest",
+                    {"bins": len(powers), "rows": [powers]},
+                    headers, args.email, args.password, timeout=5,
                 )
             except requests.RequestException as e:
                 print(f"spectrum ingest failed: {e}", file=sys.stderr)
@@ -652,8 +693,8 @@ def main() -> None:
                     "confidence_type": "advisory_only",  # presence heuristic, not an identity/threat claim
                 }
                 try:
-                    requests.post(f"{args.console_url}/api/detections/ingest", json=bt_det,
-                                  headers=headers, timeout=5)
+                    _post_with_reauth(args.console_url, "/api/detections/ingest", bt_det,
+                                       headers, args.email, args.password, timeout=5)
                     print(f"[{label}] posted low-severity Bluetooth advisory at "
                           f"{peak_freq_mhz:.1f}MHz ({bt_track['moving_cycles']} non-persistent cycles)")
                 except requests.RequestException as e:
@@ -680,7 +721,8 @@ def main() -> None:
                     "confidence_type": "heuristic_binary",  # persistence-confirmed, no real-valued probability
                 }
                 try:
-                    requests.post(f"{args.console_url}/api/detections/ingest", json=det, headers=headers, timeout=5)
+                    _post_with_reauth(args.console_url, "/api/detections/ingest", det,
+                                       headers, args.email, args.password, timeout=5)
                     print(f"[{label}] CONFIRMED contact: peak {peak:.1f} dBm ({peak - floor:.1f} dB above floor, "
                           f"{consecutive_hits[name]} consecutive cycles)")
                 except requests.RequestException as e:

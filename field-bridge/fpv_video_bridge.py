@@ -151,6 +151,42 @@ def login(console_url: str, email: str, password: str) -> str:
     return r.json()["token"]
 
 
+def _reauth_once(console_url: str, headers: dict, email: Optional[str], password: Optional[str]) -> bool:
+    """Shared retry-on-401 recovery step, used by both the multipart POST
+    (push_to_backend) and GET (run_poll_mode's status poll) call sites below.
+
+    2026-07-24 FIX: this bridge previously logged in exactly once at startup
+    and cached that token forever (see the old --email help text: "A single
+    login at startup is sufficient ... none of the sibling long-running
+    bridges re-login/refresh mid-run either"). That reasoning was wrong for
+    any bridge meant to run indefinitely under systemd Restart=always: the
+    backend's JWT TTL is 12h (create_access_token() in backend/server.py),
+    so any run past 12h uptime silently and PERMANENTLY 401s on every push/
+    poll call until manually restarted -- this is the exact bug that hit
+    this bridge (and hackrf_rx.py/ml_classify_bridge.py) in production.
+
+    Mutates `headers` in place with a fresh token and returns True if a
+    retry should be attempted. Returns False (no retry) if no email/password
+    were supplied to re-login with -- e.g. when the operator passed a static
+    --token/CEMA_TOKEN override with no credentials behind it, in which case
+    an expired token is a real, unrecoverable auth problem here, not
+    something this bridge can fix on its own."""
+    if not email or not password:
+        print("[fpv_video_bridge] 401 from backend but no --email/--password "
+              "(CEMA_EMAIL/CEMA_PASSWORD) available to re-authenticate -- "
+              "a static --token/CEMA_TOKEN override cannot self-refresh. "
+              "Fix credentials/token manually.", file=sys.stderr)
+        return False
+    print("[fpv_video_bridge] 401 from backend -- token expired, re-authenticating "
+          f"as {email}", file=sys.stderr)
+    try:
+        headers["Authorization"] = f"Bearer {login(console_url, email, password)}"
+        return True
+    except requests.RequestException as e:
+        print(f"[fpv_video_bridge] re-login failed: {e}", file=sys.stderr)
+        return False
+
+
 # --- Standard analog FPV channel tables (public, industry-standard) --------
 # 5.8GHz "Raceband" (RB1-RB8), the most common analog-FPV plan today.
 FPV_5800_RACEBAND_MHZ = {
@@ -346,25 +382,37 @@ def forward_result(result: dict, forward_url: str, png_path: Optional[str]) -> N
         print(f"[fpv_video_bridge] forward to {forward_url} failed: {e}", file=sys.stderr)
 
 
-def push_to_backend(result: dict, console_url: str, headers: dict, png_path: Optional[str]) -> None:
+def push_to_backend(result: dict, console_url: str, headers: dict, png_path: Optional[str],
+                     email: Optional[str] = None, password: Optional[str] = None) -> None:
     """POST the capture result (and PNG if produced) to this project's own
     backend so /api/fpv/latest-frame can serve it to the in-tool dashboard
     panel. Mirrors the ingest pattern droneid_decode_bridge.py already uses
-    against /api/detections/ingest (same console_url/headers convention)."""
+    against /api/detections/ingest (same console_url/headers convention).
+
+    Retries ONCE on a 401 (expired JWT) via _reauth_once -- see that
+    function's docstring for why a single login-at-startup was not enough
+    for a bridge meant to run forever."""
     if not _HAVE_REQUESTS:
         print("[fpv_video_bridge] `requests` not installed -- cannot push to backend", file=sys.stderr)
         return
-    try:
-        files = {}
+    url = console_url.rstrip("/") + "/api/fpv/ingest"
+
+    def _open_files() -> dict:
+        # Re-opened fresh on every attempt: a previously-opened file handle
+        # would already be exhausted/at EOF if we tried to reuse it on retry.
         if png_path and os.path.isfile(png_path):
-            files["frame"] = ("frame.png", open(png_path, "rb"), "image/png")
-        resp = requests.post(
-            console_url.rstrip("/") + "/api/fpv/ingest",
-            data={"metadata": json.dumps(result)},
-            files=files or None,
-            headers=headers,
-            timeout=10,
-        )
+            return {"frame": ("frame.png", open(png_path, "rb"), "image/png")}
+        return {}
+
+    try:
+        resp = requests.post(url, data={"metadata": json.dumps(result)},
+                              files=_open_files() or None, headers=headers, timeout=10)
+        if resp.status_code == 401 and _reauth_once(console_url, headers, email, password):
+            resp = requests.post(url, data={"metadata": json.dumps(result)},
+                                  files=_open_files() or None, headers=headers, timeout=10)
+            if resp.status_code == 401:
+                print("[fpv_video_bridge] still 401 after re-authenticating -- real auth "
+                      "problem, not just an expired token.", file=sys.stderr)
         print(f"[fpv_video_bridge] pushed to backend {console_url}: HTTP {resp.status_code}",
               file=sys.stderr)
     except Exception as e:
@@ -383,6 +431,8 @@ def run_poll_mode(
     headers: dict,
     forward_url: Optional[str],
     poll_interval_s: float,
+    email: Optional[str] = None,
+    password: Optional[str] = None,
 ) -> None:
     """GUI-trigger poll loop. Polls the backend's
     GET /api/fpv/capture-request/status; when the operator clicks
@@ -409,6 +459,12 @@ def run_poll_mode(
     while True:
         try:
             resp = requests.get(status_url, headers=headers, timeout=10)
+            if resp.status_code == 401 and _reauth_once(console_url, headers, email, password):
+                resp = requests.get(status_url, headers=headers, timeout=10)
+                if resp.status_code == 401:
+                    print("[fpv_video_bridge] still 401 polling capture-request status "
+                          "after re-authenticating -- real auth problem, not just an "
+                          "expired token.", file=sys.stderr)
             if resp.status_code == 200 and resp.json().get("pending"):
                 requested = resp.json()
                 req_channel = requested.get("channel") or channel_name
@@ -429,7 +485,8 @@ def run_poll_mode(
                     print(json.dumps(result, indent=2))
                     if forward_url:
                         forward_result(result, forward_url, result.get("png_path"))
-                    push_to_backend(result, console_url, headers, result.get("png_path"))
+                    push_to_backend(result, console_url, headers, result.get("png_path"),
+                                     email=email, password=password)
                 except Exception as e:
                     print(f"[fpv_video_bridge] requested capture/demod cycle failed: {e}",
                           file=sys.stderr)
@@ -507,10 +564,19 @@ def main() -> None:
     # same env var names as hackrf_rx.py/ml_classify_bridge.py/
     # droneid_decode_bridge.py/mavlink_sniffer.py, so the existing field-bridge/.env
     # (which already has these set for the other bridges) works here unchanged.
-    # A single login at startup is sufficient: the backend's JWT is valid for 12h
-    # (create_access_token() in backend/server.py), and none of the sibling
-    # long-running bridges re-login/refresh mid-run either -- this matches that
-    # same established pattern rather than inventing a refresh mechanism.
+    #
+    # 2026-07-24 CORRECTION: this comment used to claim "a single login at
+    # startup is sufficient ... none of the sibling long-running bridges
+    # re-login/refresh mid-run either." That was wrong -- the backend's JWT
+    # is only valid for 12h (create_access_token() in backend/server.py),
+    # and this bridge (like its siblings) runs forever under systemd
+    # Restart=always. A token cached once at startup WILL expire mid-run,
+    # and every push_to_backend()/run_poll_mode() status-poll call after
+    # that would silently and PERMANENTLY 401 until someone noticed and
+    # restarted the service by hand. push_to_backend() and run_poll_mode()
+    # now retry ONCE via _reauth_once() on a 401, re-logging in with
+    # args.email/args.password (if available) and updating `headers` in
+    # place -- see _reauth_once()'s docstring.
     token = args.token
     if not token and args.email and args.password:
         if not args.console_url:
@@ -544,6 +610,8 @@ def main() -> None:
             headers=headers,
             forward_url=args.forward_url,
             poll_interval_s=args.poll_interval,
+            email=args.email,
+            password=args.password,
         )
         return
 
@@ -562,7 +630,8 @@ def main() -> None:
             if args.forward_url:
                 forward_result(result, args.forward_url, result.get("png_path"))
             if args.console_url:
-                push_to_backend(result, args.console_url, headers, result.get("png_path"))
+                push_to_backend(result, args.console_url, headers, result.get("png_path"),
+                                 email=args.email, password=args.password)
         except Exception as e:
             print(f"[fpv_video_bridge] capture/demod cycle failed: {e}", file=sys.stderr)
 
