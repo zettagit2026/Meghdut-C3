@@ -14,7 +14,8 @@ Pillow>=10.0.0  # fpv_video_bridge.py — grayscale PNG reconstruction from AM e
 scikit-learn>=1.4.0  # rf_features.py — spectral-feature classifier INFRASTRUCTURE (untrained, no shipped model; see rf_features.py docstring)
 joblib>=1.3.0  # rf_features.py — model (de)serialization once a real trained model exists
 canopen>=2.0  # canopen_parser.py — CANopen/CiA301 NMT decode INFRASTRUCTURE (HARDWARE-BLOCKED: needs a real CAN adapter, e.g. PEAK PCAN-USB or CANable; see canopen_parser.py docstring)
-python-can>=4.0  # canopen_parser.py — transport dependency of canopen (SocketCAN/pcan/gs_usb/slcan backends)
+python-can==4.2.0  # canopen_parser.py + dronecan_parser.py — transport dependency of both canopen and dronecan (SocketCAN/pcan/gs_usb/slcan backends). Pinned exactly (not just >=4.0) because dronecan_parser.py's --self-test uses python-can's bustype="virtual" transport, and python-can>=4.6's VirtualBus.flush_tx_buffer() raises NotImplementedError, which crashes dronecan's bundled PythonCAN driver writer thread; 4.2.0's VirtualBus still implements it as a genuine no-op. See dronecan_parser.py docstring for full detail. Real hardware backends (socketcan/pcan/gs_usb) are unaffected by this pin either way.
+dronecan  # dronecan_parser.py — DroneCAN/UAVCANv0 NodeStatus+Fix2 decode INFRASTRUCTURE (HARDWARE-BLOCKED: needs a real CAN adapter, same as canopen_parser.py; see dronecan_parser.py docstring)
 # spectrogram_similarity_bridge.py — Classidyne-style spectrogram k-NN similarity
 # classifier INFRASTRUCTURE (DATA-BLOCKED: no real, multi-class reference
 # library exists yet; see spectrogram_similarity_bridge.py docstring). Not

@@ -1,0 +1,70 @@
+[Unit]
+Description=CEMA cUAS - passive DroneCAN (UAVCAN v0) bus listener (RX only, protocol-level NodeStatus/Fix2 decode, no transmission, no active node-ID allocation)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as field-bridge/cema-crsf-parser.service and
+# field-bridge/cema-mavlink-sniffer.service.
+# There is deliberately only ONE copy of this unit in the repo; do not fork
+# per-host copies with hardcoded paths/users baked in.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# ==========================================================================
+# HARDWARE STATUS — DO NOT ENABLE THIS UNIT UNTIL THIS IS RESOLVED
+# ==========================================================================
+# This bridge requires a REAL CAN-capable interface wired to a real DroneCAN
+# bus (ISO 11898 electrical CAN, typically 1 Mbit/s for DroneCAN peripherals
+# such as GPS/compass/ESC/airspeed modules on ArduPilot/PX4 airframes):
+#   - SocketCAN on Linux ("can0"/etc.), e.g. via an MCP2515 SPI-CAN hat
+#   - A PEAK-System PCAN-USB (~$180-200) — python-can interface="pcan"
+#   - A CANable 2.0 (candleLight firmware, ~$30-40) — interface="gs_usb"
+# This is the SAME class of hardware blocker already tracked for
+# field-bridge/canopen_parser.py (CANopen and DroneCAN are both CAN-bus
+# fieldbus protocols and share the identical python-can transport layer).
+#
+# This project's hardware inventory (per project_cema_hardware_and_capabilities
+# memory note) is HackRF/SDR + MAVLink-class serial radios for the RF/SIGINT
+# mission. There is NO CAN adapter of any kind on hand as of this unit's
+# creation. Do NOT enable this service without a real CAN adapter connected
+# to a real DroneCAN bus segment — with no such hardware present,
+# dronecan.make_node() will simply fail to open the interface (there is no
+# synthetic/virtual fallback in the live-run path; --bustype=virtual is
+# explicitly rejected by dronecan_parser.py's own argument validation and is
+# reserved for --self-test only).
+#
+# Before enabling: verify with `--self-test` that the parser/decode logic
+# itself is intact (`python3 dronecan_parser.py --self-test`, requires
+# python-can==4.2.0 exactly — see dronecan_parser.py docstring), then confirm
+# the real CAN adapter + DroneCAN bus wiring and the interface/channel values
+# below are correct for this deployment.
+# ==========================================================================
+
+# Credentials and console URL are NOT hardcoded here. They are supplied via
+# EnvironmentFile, which must define at minimum:
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+#   DRONECAN_BUSTYPE=socketcan        (or pcan / gs_usb / slcan — REAL CAN
+#                                      hardware only; never "virtual" here)
+#   DRONECAN_CHANNEL=can0             (or the pcan/gs_usb device string)
+#   DRONECAN_BITRATE=1000000          (verify against the actual bus; 1 Mbit/s
+#                                      is the common DroneCAN default)
+#   DRONECAN_LISTEN_NODE_ID=127       (must not collide with a real device's
+#                                      node ID on the bus)
+# Point this at either the project-root .env or a dedicated field-bridge/.env.
+# This file must be created per-deployment; it is not committed to the repo.
+# Restrict its permissions: chmod 600.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+ExecStart=/usr/bin/python3 -u dronecan_parser.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/dronecan_parser.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/dronecan_parser.log
+
+[Install]
+WantedBy=multi-user.target
