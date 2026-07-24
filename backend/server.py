@@ -2411,6 +2411,7 @@ async def system_health(user: Dict = Depends(get_current_user)):
     since = datetime.now(timezone.utc) - timedelta(seconds=60)
     sik_count = await db.detections.count_documents({
         "source": "SIK_RADIO",
+        "protocol_confirmed": True,
         "last_seen": {"$gt": since.isoformat()},
     })
 

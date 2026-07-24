@@ -90,7 +90,7 @@ DEFAULT_CALIBRATION_FILE = os.environ.get(
 # trusted at all. Below this, statistics are too noisy to act on -- fall back
 # to the fixed default entirely. This is a floor on SAMPLE COUNT, not a
 # fabricated value substituting for real data.
-MIN_CALIBRATION_SAMPLES = 20
+MIN_CALIBRATION_SAMPLES = int(os.environ.get("CEMA_ML_MIN_CALIBRATION_SAMPLES", "20"))
 
 # How many standard deviations above the mean noise-floor confidence to set
 # the adaptive threshold at, i.e. "reject anything that looks like what we've

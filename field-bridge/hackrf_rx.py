@@ -732,7 +732,7 @@ def main() -> None:
                     "bearing_deg": 0.0,
                     "distance_m": round(est_distance_m, 1),
                     "distance_estimated": True,  # RSSI path-loss model, not a real range measurement
-                    "source": "SIK_RADIO" if name == "SiK-915" else "HACKRF",
+                    "source": "SIK_RF_HEURISTIC" if name == "SiK-915" else "HACKRF",
                     "confidence_type": "heuristic_binary",  # persistence-confirmed, no real-valued probability
                 }
                 try:

@@ -49,7 +49,7 @@ export default function SpectrumScope() {
         const now = Date.now();
         const recent = (data || []).filter((d) => {
           const age = now - new Date(d.last_seen).getTime();
-          return (d.source === "HACKRF" || d.source === "SIK_RADIO") && age < 10000;
+          return (d.source === "HACKRF" || d.source === "SIK_RADIO" || d.source === "SIK_RF_HEURISTIC") && age < 10000;
         });
         if (recent.length) {
           const peak = Math.max(...recent.map((d) => d.rssi_dbm));
