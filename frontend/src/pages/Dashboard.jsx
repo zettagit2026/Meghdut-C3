@@ -7,7 +7,7 @@ import SystemHealth from "@/components/SystemHealth";
 import MlClassifierBadge from "@/components/MlClassifierBadge";
 import ConfidenceTypeBadge from "@/components/ConfidenceTypeBadge";
 import UnconfirmedTag from "@/components/UnconfirmedTag";
-import { isUnconfirmedDetection } from "@/lib/detectionConfidence";
+import { isUnconfirmedDetection, shouldShowUnconfirmedTag, getOriginalModelAnnotation } from "@/lib/detectionConfidence";
 
 const THREAT_COLOR = {
   LOW: "var(--accent-success)",
@@ -244,6 +244,8 @@ export default function Dashboard() {
                   {active.map((d) => {
                     const src = d.source || "UNKNOWN";
                     const unconfirmed = isUnconfirmedDetection(d);
+                    const showUnconfirmedTag = shouldShowUnconfirmedTag(d);
+                    const originalModelAnnotation = getOriginalModelAnnotation(d);
                     return (
                       <tr key={d.id} data-testid={`row-${d.id}`}
                           className="tactical-border-b hover:bg-[#0F1626] transition-colors">
@@ -257,17 +259,16 @@ export default function Dashboard() {
                         <td className="p-2 text-white">{d.callsign}</td>
                         <td className="p-2 text-slate-300">
                           {d.model}
-                          {unconfirmed && <UnconfirmedTag />}
-                          {d.original_model && d.original_model !== d.model && (
-                            <div className="text-[9px] text-slate-600"
-                                 title="Original RSSI-heuristic guess, superseded by ML reclassification">
-                              was: {d.original_model}
+                          {showUnconfirmedTag && <UnconfirmedTag />}
+                          {originalModelAnnotation && (
+                            <div className="text-[9px] text-slate-600" title={originalModelAnnotation.title}>
+                              {originalModelAnnotation.label}: {d.original_model}
                             </div>
                           )}
                         </td>
                         <td className="p-2 text-slate-400">
                           {d.protocol}
-                          {unconfirmed && <UnconfirmedTag />}
+                          {showUnconfirmedTag && <UnconfirmedTag />}
                         </td>
                         <td className="p-2">
                           <div className="flex flex-col items-start gap-0.5">
@@ -344,6 +345,8 @@ export default function Dashboard() {
               .slice(0, 6)
               .map((d) => {
                 const unconfirmed = isUnconfirmedDetection(d);
+                const showUnconfirmedTag = shouldShowUnconfirmedTag(d);
+                const originalModelAnnotation = getOriginalModelAnnotation(d);
                 return (
                 <div key={d.id} className="tactical-border p-3">
                   <div className="flex items-center justify-between mb-2">
@@ -363,10 +366,10 @@ export default function Dashboard() {
                   <div className="font-mono text-[10px] text-slate-500 space-y-0.5">
                     <div>
                       MODEL: <span className="text-slate-300">{d.model}</span>
-                      {unconfirmed && <UnconfirmedTag />}
-                      {d.original_model && d.original_model !== d.model && (
-                        <span className="ml-1 text-slate-600" title="Original RSSI-heuristic guess, superseded by ML reclassification">
-                          (was: {d.original_model})
+                      {showUnconfirmedTag && <UnconfirmedTag />}
+                      {originalModelAnnotation && (
+                        <span className="ml-1 text-slate-600" title={originalModelAnnotation.title}>
+                          ({originalModelAnnotation.label}: {d.original_model})
                         </span>
                       )}
                     </div>

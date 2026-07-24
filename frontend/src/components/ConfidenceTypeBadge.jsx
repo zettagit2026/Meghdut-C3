@@ -39,7 +39,7 @@ export default function ConfidenceTypeBadge({ detection }) {
           style={{ color: "#94A8C7", borderColor: "#3D5273", background: "rgba(61,82,115,0.22)" }}
           title="Softmax probability from a closed-world classifier -- informational, not a confirmed verdict."
         >
-          ML PROB{pct !== null ? ` ${pct}%` : ""}
+          Classification Confidence{pct !== null ? ` ${pct}%` : ""}
         </span>
       );
     }

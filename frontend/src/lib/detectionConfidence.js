@@ -42,3 +42,64 @@ export function isUnconfirmedDetection(d) {
   const protocolConfirmed = d.protocol_confirmed === true;
   return !mlConfirmsDrone && !protocolConfirmed;
 }
+
+// Render-time-only helper: whether the small "(unconfirmed)" tag should
+// still be shown next to the model/protocol text.
+//
+// For heuristic_binary, the backend (see backend/DETECTION_DISPLAY_MODEL.md,
+// `_heuristic_display()`) overrides the PRIMARY label to an honest generic
+// category name -- e.g. "Unidentified 2.4GHz Emitter" -- instead of a
+// specific manufacturer guess, but ONLY for the two exact raw model strings
+// listed in `HEURISTIC_GENERIC_DISPLAY` (a plain dict.get with no fallback).
+// For any OTHER heuristic_binary model string, the override never fires:
+// `model`/`protocol` stay as the field-bridge's original specific-sounding
+// guess, and `original_model` is never populated either (it's only set
+// inside the branch where the override DID apply). So confidence_type alone
+// cannot tell us whether the primary label is actually the honest generic
+// text or still a confident-looking raw guess -- use `original_model`'s
+// presence as the real signal for "did the override apply", falling back to
+// showing the tag (the safe default) whenever it didn't.
+//
+// unclassified_signal's primary label is "Unclassified emitter (candidate)",
+// where "candidate" alone reads ambiguous (candidate for what?) -- the
+// explicit tag still earns its place there.
+export function shouldShowUnconfirmedTag(d) {
+  if (!isUnconfirmedDetection(d)) return false;
+  if (d.confidence_type === "heuristic_binary") {
+    // Tag only genuinely redundant when the generic-display override
+    // actually replaced the primary label -- proxied by original_model
+    // having been populated (only happens inside that same branch).
+    return !d.original_model;
+  }
+  return true;
+}
+
+// Render-time-only helper: how to caption the muted secondary line showing
+// `d.original_model`/`d.original_protocol` when it differs from the
+// (possibly display-overridden) primary `d.model`/`d.protocol`.
+//
+// "was: X" (past tense) is accurate for the true reclassification cases --
+// ml_probability's wifi-reclassification and unclassified_signal -- where
+// the record's classification genuinely changed from the heuristic's guess
+// to something else over time (see DETECTION_DISPLAY_MODEL.md).
+//
+// It is NOT accurate for heuristic_binary: there, `original_model` was
+// NEVER a confirmed prior state that got corrected -- it's simply the raw
+// RSSI-heuristic's pattern-matched guess, demoted straight to secondary at
+// creation time. "was:" implies a correction that never happened. Use
+// "possible match:" instead, which honestly frames it as an unconfirmed
+// guess rather than a superseded fact.
+export function getOriginalModelAnnotation(d) {
+  if (!d || !d.original_model || d.original_model === d.model) return null;
+  if (d.confidence_type === "heuristic_binary") {
+    return {
+      label: "possible match",
+      title:
+        "Unconfirmed RF pattern match only -- the RSSI/persistence heuristic guessed this specific model, but no ML classification or protocol decode confirms it. Could be any in-band emitter.",
+    };
+  }
+  return {
+    label: "was",
+    title: "Original RSSI-heuristic guess, superseded by ML reclassification",
+  };
+}
