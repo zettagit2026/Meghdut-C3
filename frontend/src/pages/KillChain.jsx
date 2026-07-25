@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Crosshair, ChevronRight } from "lucide-react";
+import { Crosshair, ChevronRight, CheckCircle2, Circle, Loader2, Skull } from "lucide-react";
 
 const CHAIN = ["DETECT", "TRACK", "IDENTIFY", "DECIDE", "DEFEAT"];
 
@@ -124,25 +124,41 @@ export default function KillChain() {
                   const done = defeated ? true : i < idx;
                   const active = !defeated && i === idx;
                   const isDefeat = i === 4 && defeated;
+                  const pending = !isDefeat && !done && !active;
+                  // WCAG 1.4.1 (Use of Color): each kill-chain node state is
+                  // conveyed by icon shape + text label in addition to color,
+                  // so colorblind operators aren't relying on hue alone to
+                  // read stage progression. "pending" uses a lighter muted
+                  // tone (#94A3B8-equivalent) than --text-muted, which fails
+                  // the 3:1 UI-component contrast minimum against this bg.
+                  const nodeColor = isDefeat ? "var(--accent-critical)"
+                    : done ? "var(--accent-success)"
+                    : active ? "var(--accent-info)" : "#94A3B8";
+                  const NodeIcon = isDefeat ? Skull : done ? CheckCircle2 : active ? Loader2 : Circle;
+                  const stateLabel = isDefeat ? "NEUTRALIZED" : done ? "COMPLETE" : active ? "IN PROGRESS" : "PENDING";
                   return (
                     <div
                       key={step}
                       className={`p-4 kc-node text-center tactical-border-r last:border-r-0 ${
                         isDefeat ? "defeat" : done ? "done" : active ? "active" : ""
                       }`}
-                      style={{
-                        color: isDefeat ? "var(--accent-critical)"
-                             : done ? "var(--accent-success)"
-                             : active ? "var(--accent-info)" : "var(--text-muted)",
-                      }}
+                      style={{ color: nodeColor }}
                     >
                       <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 mb-1">
                         STAGE {i + 1}
                       </div>
-                      <div className="font-heading font-black text-lg tracking-tighter uppercase">{step}</div>
-                      {active && (
-                        <div className="font-mono text-[10px] mt-1 blink">● IN PROGRESS</div>
-                      )}
+                      <div className="flex items-center justify-center gap-1.5 mb-1">
+                        <NodeIcon
+                          size={14}
+                          strokeWidth={2}
+                          className={active ? "animate-spin" : ""}
+                          aria-hidden="true"
+                        />
+                        <div className="font-heading font-black text-lg tracking-tighter uppercase">{step}</div>
+                      </div>
+                      <div className={`font-mono text-[9px] uppercase tracking-widest ${active ? "blink" : ""}`}>
+                        {stateLabel}
+                      </div>
                     </div>
                   );
                 })}
