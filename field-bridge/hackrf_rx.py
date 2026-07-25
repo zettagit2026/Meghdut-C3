@@ -893,6 +893,17 @@ def main() -> None:
             except requests.RequestException as e:
                 print(f"spectrum ingest failed: {e}", file=sys.stderr)
             peak = max(powers)
+            # Real per-detection peak frequency (bin_width_mhz = 1.0 matches
+            # sweep_band's default bin width of 1000 kHz), computed once per
+            # band per cycle, unconditionally -- this is what actually gets
+            # threaded into every detection-ingest payload below (as
+            # center_freq_ghz), NOT the fixed band midpoint center_mhz. See
+            # ml_classify_bridge.py's peak_freq_mhz fix (task #77) for the
+            # same rationale. Previously this was only computed inside the
+            # Wi-Fi/Bluetooth exclusion branches below (task #99 fix).
+            bin_width_mhz = 1.0
+            peak_idx = int(np.argmax(powers)) if powers else 0
+            peak_freq_mhz = low + (peak_idx + 0.5) * bin_width_mhz
             floor = BAND_NOISE_FLOOR_DBM.get(name, DEFAULT_NOISE_FLOOR_DBM)
             if peak > floor + DETECT_THRESHOLD_DB:
                 consecutive_hits[name] += 1
@@ -914,9 +925,7 @@ def main() -> None:
                     channel_centers = WIFI_5G_CHANNEL_CENTERS_MHZ
 
                 if peak > floor + DETECT_THRESHOLD_DB and powers:
-                    bin_width_mhz = 1.0  # matches sweep_band's default bin width (1000 kHz)
-                    peak_idx = int(np.argmax(powers))
-                    peak_freq_mhz = low + (peak_idx + 0.5) * bin_width_mhz
+                    # peak_freq_mhz/bin_width_mhz computed unconditionally above.
                     nearest = _nearest_wifi_channel(peak_freq_mhz, tol_mhz=bin_width_mhz,
                                                      channel_centers=channel_centers)
                     prev_freq = persist_state["freq_mhz"]
@@ -951,9 +960,7 @@ def main() -> None:
             likely_bluetooth = False
             if name == "DJI-2G4":
                 if peak > floor + DETECT_THRESHOLD_DB and powers:
-                    bin_width_mhz = 1.0
-                    peak_idx = int(np.argmax(powers))
-                    peak_freq_mhz = low + (peak_idx + 0.5) * bin_width_mhz
+                    # peak_freq_mhz/bin_width_mhz computed unconditionally above.
                     # crude occupied-bandwidth estimate: width of the contiguous
                     # run of bins within DETECT_THRESHOLD_DB/2 of the peak, centered
                     # on peak_idx. Coarse by design -- no real spectral-mask analysis.
@@ -1060,7 +1067,7 @@ def main() -> None:
                     "model": "Bluetooth device (advisory)",
                     "protocol": "Bluetooth (2.4GHz ISM, rapid-hop signature)",
                     "threat_level": "LOW",
-                    "center_freq_ghz": center_mhz / 1000.0,
+                    "center_freq_ghz": peak_freq_mhz / 1000.0,
                     "bandwidth_mhz": occupied_bw_mhz,
                     "rssi_dbm": peak,
                     "snr_db": peak - floor,
@@ -1089,7 +1096,7 @@ def main() -> None:
                     "model": meta["model"],
                     "protocol": meta["protocol"],
                     "threat_level": "MEDIUM",
-                    "center_freq_ghz": center_mhz / 1000.0,
+                    "center_freq_ghz": peak_freq_mhz / 1000.0,
                     "bandwidth_mhz": high - low,
                     "rssi_dbm": peak,
                     "snr_db": peak - floor,
