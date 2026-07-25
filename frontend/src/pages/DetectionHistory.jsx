@@ -7,6 +7,8 @@ import MlClassifierBadge from "@/components/MlClassifierBadge";
 import ConfidenceTypeBadge from "@/components/ConfidenceTypeBadge";
 import UnconfirmedTag from "@/components/UnconfirmedTag";
 import { isUnconfirmedDetection, shouldShowUnconfirmedTag, getOriginalModelAnnotation } from "@/lib/detectionConfidence";
+import { isStaticCritical } from "@/lib/threatSalience";
+import { AlertTriangle } from "lucide-react";
 
 const THREAT_COLOR = {
   LOW: "var(--accent-success)",
@@ -265,11 +267,12 @@ export default function DetectionHistory() {
                 const unconfirmed = isUnconfirmedDetection(d);
                 const showUnconfirmedTag = shouldShowUnconfirmedTag(d);
                 const originalModelAnnotation = getOriginalModelAnnotation(d);
+                const staticCritical = isStaticCritical(d);
                 return (
                   <Fragment key={d.id}>
                   <tr data-testid={`hist-row-${d.id}`}
                       onClick={() => setExpandedId(isExpanded ? null : d.id)}
-                      className="tactical-border-b hover:bg-[#0F1626] transition-colors cursor-pointer">
+                      className={`tactical-border-b hover:bg-[#0F1626] transition-colors cursor-pointer ${staticCritical ? "threat-critical-static" : ""}`}>
                     <td className="p-2">
                       <span data-testid={`hist-status-${d.id}`}
                             className="px-2 py-0.5 tactical-border font-bold text-[9px]"
@@ -308,6 +311,9 @@ export default function DetectionHistory() {
                               title={unconfirmed && d.threat_level === "MEDIUM"
                                 ? "Softened: threat level based on an unconfirmed RSSI/persistence heuristic only, no ML classification or protocol decode."
                                 : undefined}>
+                          {staticCritical && (
+                            <AlertTriangle size={10} strokeWidth={2} className="inline mr-1 -mt-0.5" />
+                          )}
                           {d.threat_level}
                         </span>
                         <MlClassifierBadge detection={d} />

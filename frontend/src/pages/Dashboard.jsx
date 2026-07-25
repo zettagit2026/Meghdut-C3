@@ -2,12 +2,14 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Radar, Skull, Activity, Signal, TrendingUp } from "lucide-react";
+import { Radar, Skull, Activity, Signal, TrendingUp, AlertTriangle, Volume2, VolumeX } from "lucide-react";
 import SystemHealth from "@/components/SystemHealth";
 import MlClassifierBadge from "@/components/MlClassifierBadge";
 import ConfidenceTypeBadge from "@/components/ConfidenceTypeBadge";
 import UnconfirmedTag from "@/components/UnconfirmedTag";
 import { isUnconfirmedDetection, shouldShowUnconfirmedTag, getOriginalModelAnnotation } from "@/lib/detectionConfidence";
+import { isRecentCritical, isStaticCritical } from "@/lib/threatSalience";
+import { announceNewCriticalContacts, isCriticalAlertMuted, setCriticalAlertMuted } from "@/lib/criticalAlertSound";
 
 const THREAT_COLOR = {
   LOW: "var(--accent-success)",
@@ -120,6 +122,7 @@ export default function Dashboard() {
   const [detections, setDetections] = useState([]);
   const [loading, setLoading] = useState(true);
   const [now, setNow] = useState(() => Date.now());
+  const [alertMuted, setAlertMuted] = useState(() => isCriticalAlertMuted());
 
   const load = async () => {
     try {
@@ -137,6 +140,23 @@ export default function Dashboard() {
     const id = setInterval(load, 60000);
     return () => clearInterval(id);
   }, []);
+
+  // Salience escalation (Task #38 / C5): fire the one-shot audio cue for any
+  // CRITICAL contact that is brand-new on this data load. announceNewCriticalContacts
+  // itself de-dupes per detection id forever, so this is safe to call on every
+  // load/poll without re-announcing a contact the operator has already heard.
+  useEffect(() => {
+    const criticalIds = detections
+      .filter((d) => d.status === "ACTIVE" && d.threat_level === "CRITICAL")
+      .map((d) => d.id);
+    announceNewCriticalContacts(criticalIds);
+  }, [detections]);
+
+  const toggleAlertMute = () => {
+    const next = !alertMuted;
+    setAlertMuted(next);
+    setCriticalAlertMuted(next);
+  };
 
   // Ticks once a second purely to keep the "LAST SEEN" relative-time column
   // live without needing to re-fetch detections.
@@ -179,6 +199,18 @@ export default function Dashboard() {
             Tactical Overview
           </h1>
         </div>
+        <button
+          type="button"
+          data-testid="critical-alert-mute-toggle"
+          onClick={toggleAlertMute}
+          title={alertMuted
+            ? "Critical-contact audio cue is muted. Click to unmute."
+            : "Audio cue plays once per newly-detected CRITICAL contact. Click to mute."}
+          className="tactical-border px-2.5 py-1.5 flex items-center gap-2 font-mono text-[10px] uppercase tracking-widest text-slate-400 hover:text-white transition-colors"
+        >
+          {alertMuted ? <VolumeX size={13} strokeWidth={1.5} /> : <Volume2 size={13} strokeWidth={1.5} />}
+          Critical Alert Tone {alertMuted ? "Muted" : "On"}
+        </button>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-0 tactical-border">
@@ -246,9 +278,11 @@ export default function Dashboard() {
                     const unconfirmed = isUnconfirmedDetection(d);
                     const showUnconfirmedTag = shouldShowUnconfirmedTag(d);
                     const originalModelAnnotation = getOriginalModelAnnotation(d);
+                    const recentCritical = isRecentCritical(d, now);
+                    const staticCritical = isStaticCritical(d);
                     return (
                       <tr key={d.id} data-testid={`row-${d.id}`}
-                          className="tactical-border-b hover:bg-[#0F1626] transition-colors">
+                          className={`tactical-border-b hover:bg-[#0F1626] transition-colors ${staticCritical ? "threat-critical-static" : ""} ${recentCritical ? "threat-critical-flash" : ""}`}>
                         <td className="p-2">
                           <span data-testid={`src-${d.id}`}
                                 className="px-1.5 py-0.5 tactical-border font-bold text-[9px]"
@@ -281,6 +315,9 @@ export default function Dashboard() {
                                   title={unconfirmed && d.threat_level === "MEDIUM"
                                     ? "Softened: threat level based on an unconfirmed RSSI/persistence heuristic only, no ML classification or protocol decode."
                                     : undefined}>
+                              {staticCritical && (
+                                <AlertTriangle size={10} strokeWidth={2} className="inline mr-1 -mt-0.5" />
+                              )}
                               {d.threat_level}
                             </span>
                             <MlClassifierBadge detection={d} />
@@ -347,8 +384,11 @@ export default function Dashboard() {
                 const unconfirmed = isUnconfirmedDetection(d);
                 const showUnconfirmedTag = shouldShowUnconfirmedTag(d);
                 const originalModelAnnotation = getOriginalModelAnnotation(d);
+                const recentCritical = isRecentCritical(d, now);
+                const staticCritical = isStaticCritical(d);
                 return (
-                <div key={d.id} className="tactical-border p-3">
+                <div key={d.id}
+                     className={`tactical-border p-3 ${staticCritical ? "threat-critical-static" : ""} ${recentCritical ? "threat-critical-flash" : ""}`}>
                   <div className="flex items-center justify-between mb-2">
                     <span className="font-mono text-xs text-white">{d.callsign}</span>
                     <span className="px-2 py-0.5 tactical-border font-mono font-bold text-[10px]"
@@ -360,6 +400,9 @@ export default function Dashboard() {
                           title={unconfirmed && d.threat_level === "MEDIUM"
                             ? "Softened: threat level based on an unconfirmed RSSI/persistence heuristic only, no ML classification or protocol decode."
                             : undefined}>
+                      {staticCritical && (
+                        <AlertTriangle size={10} strokeWidth={2} className="inline mr-1 -mt-0.5" />
+                      )}
                       {d.threat_level}
                     </span>
                   </div>
