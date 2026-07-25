@@ -1,0 +1,74 @@
+[Unit]
+Description=CEMA cUAS - passive LTM (Lightweight Telemetry) frame listener (RX only, protocol-level checksum-verified ID, no transmission)
+After=network-online.target docker.service
+Wants=network-online.target
+# Restart-limit hardening (same rationale as cema-crsf-parser.service / task
+# #80): RX-only, no TX, nothing else depends on this holding a lock, so
+# "keep retrying forever" through transient USB-serial hiccups is the
+# correct posture. Default StartLimitBurst=5/StartLimitIntervalSec=10s can
+# trip permanently, requiring a manual reset-failed. Widen the window/burst
+# and disable give-up behavior. (Unit is currently not enabled pending real
+# LTM hardware -- see note below -- but hardened now so it's correct the
+# moment it is.)
+StartLimitIntervalSec=300
+StartLimitBurst=20
+StartLimitAction=none
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as field-bridge/cema-crsf-parser.service.
+# There is deliberately only ONE copy of this unit in the repo; do not fork
+# per-host copies with hardcoded paths/users baked in.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# ==========================================================================
+# HARDWARE STATUS — DO NOT ENABLE THIS UNIT UNTIL THIS IS RESOLVED
+# ==========================================================================
+# This bridge requires a REAL LTM-emitting serial source: an iNav/
+# Cleanflight/ArduPilot flight controller with a telemetry UART configured
+# to output LTM (ArduPilot: SERIALx_PROTOCOL=25), or an OpenHD ground unit
+# emitting LTM, with its UART wired to a USB-serial adapter — typically
+# 2400 baud (some OpenHD-class links run higher). It is NOT compatible with
+# this project's existing SiK/RFD900 MAVLink telemetry radios (different
+# protocol entirely — see field-bridge/ltm_parser.py's module docstring)
+# nor with a CRSF receiver (also a different protocol/baud, already staged
+# in cema-crsf-parser.service).
+#
+# No such hardware was available as of this unit's creation. Do NOT enable
+# this service against a placeholder/wrong serial device — with no real LTM
+# traffic present it will simply see garbage and post nothing (by design,
+# no synthetic fallback), but pointing it at the wrong physical port (e.g.
+# a SiK radio already owned by mavlink_sniffer.py, or a CRSF receiver
+# already owned by crsf_parser.py) will conflict over serial-port
+# exclusivity for no benefit.
+#
+# Before enabling: verify with `--self-test` that the parser logic itself
+# is intact (`python3 ltm_parser.py --self-test`), then confirm the real
+# LTM hardware is wired up and the serial device path below is correct.
+# ==========================================================================
+
+# Credentials and console URL are NOT hardcoded here. They are supplied via
+# EnvironmentFile, which must define at minimum:
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+#   LTM_SNIFF_SERIAL=/dev/ttyUSB3   (the REAL LTM-emitting FC/ground-unit
+#                                    UART, wired via USB-serial adapter —
+#                                    must be a dedicated port, not shared
+#                                    with any other bridge)
+#   LTM_SNIFF_BAUD=2400
+# Point this at either the project-root .env or a dedicated field-bridge/.env.
+# This file must be created per-deployment; it is not committed to the repo.
+# Restrict its permissions: chmod 600.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+ExecStart=/usr/bin/python3 -u ltm_parser.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/ltm_parser.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/ltm_parser.log
+
+[Install]
+WantedBy=multi-user.target
