@@ -121,10 +121,12 @@ from __future__ import annotations
 
 import argparse
 import os
+import statistics
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Deque, Dict, List, Optional
 
 import requests
 
@@ -217,6 +219,39 @@ def is_extended_frame_type(frame_type: int) -> bool:
 
 
 # =============================================================================
+# Cadence-reference constants (task #96) -- taken verbatim from Betaflight's
+# reference CRSF implementation, NOT re-derived or guessed. Verified directly
+# against the source in this session:
+#
+#   CRSF_TIME_BETWEEN_FRAMES_US   = 6667   -- src/main/rx/crsf.c:57
+#       "At fastest, frames are sent by the transmitter every 6.667
+#       milliseconds, 150 Hz" -- the minimum legal inter-RC-frame spacing.
+#   CRSF_LINK_STATUS_UPDATE_TIMEOUT_US = 250000 -- src/main/rx/crsf.c:64
+#       "250ms, 4 Hz mode 1 telemetry" -- also independently defined as
+#       CRSF_LINK_TYPE_CHECK_US = 250000 in src/main/telemetry/crsf.c:117
+#       ("250 ms"), confirming the two sources agree on this cadence for
+#       LINK_STATISTICS telemetry.
+#   CRSF_CYCLETIME_US             = 100000 -- src/main/telemetry/crsf.c:80
+#       "100ms, 10 Hz -- all telemetry frames are inserted in this
+#       timeslice" -- the outer round-robin cycle telemetry frame TYPES
+#       (battery, GPS, attitude, ...) are scheduled within.
+#   CRSF_TELEMETRY_FRAME_INTERVAL_MAX_US = 20000 -- src/main/telemetry/crsf.c:114
+#       "20ms" -- the minimum spacing Betaflight enforces between any two
+#       telemetry frames going out (a rate ceiling, not a target).
+#   CRSF_ELRS_DISLAYPORT_CHUNK_INTERVAL_US = 75000 -- src/main/telemetry/crsf.c:118
+#       "75 ms" -- ELRS displayport (OSD-over-CRSF) chunk pacing; not used
+#       as a cadence-tracker bucket below because this parser has no
+#       displayport frame decoder, but retained here for completeness/audit.
+# =============================================================================
+
+CRSF_TIME_BETWEEN_FRAMES_US = 6667
+CRSF_LINK_STATUS_UPDATE_TIMEOUT_US = 250000
+CRSF_CYCLETIME_US = 100000
+CRSF_TELEMETRY_FRAME_INTERVAL_MAX_US = 20000
+CRSF_ELRS_DISLAYPORT_CHUNK_INTERVAL_US = 75000
+
+
+# =============================================================================
 # CRC8 — two independent implementations, cross-checked in self_test().
 # =============================================================================
 
@@ -289,6 +324,14 @@ class CRSFFrame:
     dest_addr: Optional[int] = None
     orig_addr: Optional[int] = None
     raw: bytes = b""
+    # Wall-clock time (seconds, time.time()-style float) at which this frame
+    # was fully extracted from the byte stream. Populated by
+    # CRSFParser.feed_bytes() below -- used only by CRSFCadenceTracker for
+    # inter-arrival-time analysis (see that class for the honest epistemic
+    # framing of what this can/cannot conclude). This is a NEW field added
+    # for task #96; it does not affect CRC validation or any existing
+    # self-test behavior above.
+    timestamp: Optional[float] = None
 
 
 class CRSFParser:
@@ -301,13 +344,29 @@ class CRSFParser:
     def __init__(self) -> None:
         self._buf = bytearray()
 
-    def feed_bytes(self, data: bytes) -> List[CRSFFrame]:
+    def feed_bytes(self, data: bytes, timestamp: Optional[float] = None) -> List[CRSFFrame]:
+        """Feed raw bytes; returns any complete, CRC-valid frames extracted.
+
+        `timestamp`: wall-clock time (time.time()-style float, seconds) to
+        stamp onto every frame extracted from THIS call. Defaults to
+        time.time() at call time if not given. When a live serial reader
+        calls feed_bytes() once per read() chunk (the real usage pattern in
+        CRSFSerialBridge.run_forever below), every frame decoded out of that
+        chunk shares one timestamp -- that is a real limitation (multiple
+        frames arriving in one buffered read are indistinguishable in time
+        at sub-chunk resolution) and is the reason CRSFCadenceTracker's
+        interval statistics are documented as approximate, not precise
+        oscilloscope-grade timing.
+        """
+        if timestamp is None:
+            timestamp = time.time()
         self._buf.extend(data)
         frames: List[CRSFFrame] = []
         while True:
             frame = self._try_extract_one()
             if frame is None:
                 break
+            frame.timestamp = timestamp
             frames.append(frame)
         return frames
 
@@ -411,6 +470,209 @@ def parse_battery_sensor(payload: bytes) -> dict:
     remaining = payload[7]
     return {"voltage_v": voltage, "current_a": current,
             "capacity_mah": capacity, "remaining_pct": remaining}
+
+
+# =============================================================================
+# Cadence-anomaly heuristic (task #96)
+# =============================================================================
+#
+# WHAT THIS IS: CRSF is a continuous serial link, not a sweep-cycle scanner
+# like hackrf_rx.py -- there is no "cycle" to gate persistence across the way
+# hackrf_rx.py's CONFIRM_CYCLES pattern does for RF sweeps. What IS analogous
+# is tracking inter-arrival-time (the gap between one decoded frame and the
+# next, of the same rough category) over a rolling window of the live
+# decoded stream, and comparing that against Betaflight's own reference
+# timing constants (verified above). This is INTER-FRAME-ARRIVAL-TIME
+# statistics on a live stream, a different shape of tracker than
+# hackrf_rx.py's per-sweep-cycle persistence gate, because CRSF has no
+# sweep cycles at all.
+#
+# WHAT THIS CAN CONCLUDE: whether the observed frame-to-frame timing on THIS
+# link is broadly consistent with the timing envelope a genuine
+# Betaflight-class CRSF receiver/telemetry stack would produce, per the
+# constants above.
+#
+# WHAT THIS CANNOT CONCLUDE (read before trusting any "anomalous" label):
+#   - This checks timing against ONE reference implementation's (Betaflight)
+#     typical behavior. Other legitimate stacks (e.g. different ELRS
+#     firmware branches, ArduPilot's CRSF driver, custom RC frame rates
+#     configured by a user, or receivers running non-default packet rates)
+#     may legitimately produce different-but-still-genuine cadences. A
+#     "cadence_anomalous" verdict is NOT proof of spoofing, replay, or a
+#     non-standard transmitter -- it is evidence worth flagging for further
+#     investigation, exactly like this project's other heuristics (see
+#     hackrf_rx.py task #88 hop-tracking notes for the same honest framing).
+#   - False positives are expected under: USB-serial/OS scheduling jitter on
+#     the CAPTURING side (this tracker measures time-of-decode on the
+#     listener's clock, not the transmitter's clock -- added latency here
+#     looks identical to added latency on the link itself), brief link
+#     dropouts/re-syncs, and the first few frames after connecting (handled
+#     by requiring a minimum sample count before classifying at all --
+#     "insufficient_data" rather than guessing).
+#   - False negatives are expected under: a spoofed/replayed stream built
+#     from real captured Betaflight-cadence traffic (this checks TIMING
+#     consistency only, not authenticity of frame CONTENT -- a byte-perfect
+#     replay at the right cadence looks identical to genuine traffic here).
+#
+# TOLERANCE BAND REASONING: real links have jitter from UART buffering,
+# scheduler timing, and (for this listener specifically) OS-level read()
+# batching -- so this uses a wide MULTIPLICATIVE tolerance band around each
+# reference constant rather than a tight statistical (std-dev) test. The
+# band is deliberately generous (roughly 2x on the fast side, 3x on the
+# slow side of the reference values) so that normal jitter never triggers a
+# false "anomalous" verdict; only intervals that are grossly (multiple-x)
+# faster than the fastest documented rate, or grossly slower than the
+# slowest documented periodic cadence, are flagged. This trades sensitivity
+# for a low false-positive rate, matching this project's stated design goal
+# ("an anomaly is evidence worth flagging, not a hard confirm/deny").
+#
+# BUCKETS TRACKED:
+#   - RC_CHANNELS_PACKED (0x16): the actual RC control stream. Reference
+#     band is [CRSF_TIME_BETWEEN_FRAMES_US, CRSF_LINK_STATUS_UPDATE_TIMEOUT_US]
+#     i.e. [6.667ms, 250ms] -- 150Hz is the fastest documented RC rate, and
+#     250ms/4Hz is the slowest documented periodic cadence anywhere in these
+#     constants, used here as a generous slow-side backstop (a live control
+#     link idling slower than 4Hz for a sustained window is atypical).
+#   - LINK_STATISTICS (0x14): reference is CRSF_LINK_STATUS_UPDATE_TIMEOUT_US
+#     (250ms, 4Hz mode-1 telemetry), the one constant Betaflight ties
+#     directly to this specific frame type.
+#   - Other telemetry-class frames (BATTERY_SENSOR, GPS, ATTITUDE, HEARTBEAT,
+#     DEVICE_PING/INFO, VIDEO_TRANSMITTER): reference is CRSF_CYCLETIME_US
+#     (100ms, 10Hz) as the round-robin telemetry-insertion cycle, with
+#     CRSF_TELEMETRY_FRAME_INTERVAL_MAX_US (20ms) as the enforced minimum
+#     spacing floor -- intervals persistently tighter than 20ms are not
+#     achievable by a spec-conformant Betaflight-class scheduler and are
+#     flagged regardless of the multiplicative band.
+
+CADENCE_WINDOW = 20            # rolling window size (intervals), per bucket
+CADENCE_MIN_SAMPLES = 5         # minimum intervals before classifying at all
+_FAST_TOLERANCE = 0.5           # allow down to 0.5x the fastest reference bound
+_SLOW_TOLERANCE = 3.0           # allow up to 3x the slowest reference bound
+
+# (bucket_name, reference_min_us, reference_max_us)
+_RC_BAND = ("rc_channels", CRSF_TIME_BETWEEN_FRAMES_US, CRSF_LINK_STATUS_UPDATE_TIMEOUT_US)
+_LINK_STATS_BAND = ("link_statistics",
+                     CRSF_LINK_STATUS_UPDATE_TIMEOUT_US * 0.5,   # allow up to 2x faster (8Hz) as still-plausible
+                     CRSF_LINK_STATUS_UPDATE_TIMEOUT_US)
+_TELEMETRY_BAND = ("telemetry_other", CRSF_TELEMETRY_FRAME_INTERVAL_MAX_US, CRSF_CYCLETIME_US)
+
+_TELEMETRY_OTHER_TYPES = frozenset({
+    CRSF_FRAMETYPE_GPS, CRSF_FRAMETYPE_BATTERY_SENSOR, CRSF_FRAMETYPE_HEARTBEAT,
+    CRSF_FRAMETYPE_VIDEO_TRANSMITTER, CRSF_FRAMETYPE_ATTITUDE,
+    CRSF_FRAMETYPE_DEVICE_PING, CRSF_FRAMETYPE_DEVICE_INFO,
+})
+
+
+def _bucket_for(frame_type: int) -> Optional[str]:
+    """Map a frame type to a cadence-tracking bucket, or None if this frame
+    type isn't tracked for cadence (no reference cadence defined for it).
+    """
+    if frame_type == CRSF_FRAMETYPE_RC_CHANNELS_PACKED:
+        return "rc_channels"
+    if frame_type == CRSF_FRAMETYPE_LINK_STATISTICS:
+        return "link_statistics"
+    if frame_type in _TELEMETRY_OTHER_TYPES:
+        return "telemetry_other"
+    return None
+
+
+_BAND_BY_BUCKET = {
+    "rc_channels": _RC_BAND,
+    "link_statistics": _LINK_STATS_BAND,
+    "telemetry_other": _TELEMETRY_BAND,
+}
+
+
+class CRSFCadenceTracker:
+    """Rolling inter-arrival-time tracker for a live decoded CRSF frame
+    stream. See the module-level comment block above this class for the
+    full epistemic framing (what this can/cannot conclude) -- read it
+    before wiring this into anything that makes operational decisions.
+
+    Usage: call record(frame_type, timestamp) once per decoded frame (in
+    arrival order; timestamp is any monotonically-nondecreasing float in
+    seconds, e.g. CRSFFrame.timestamp or time.time()). Call classify() at
+    any point to get the current verdict per bucket.
+    """
+
+    def __init__(self, window: int = CADENCE_WINDOW,
+                 min_samples: int = CADENCE_MIN_SAMPLES) -> None:
+        self.window = window
+        self.min_samples = min_samples
+        self._last_ts: Dict[str, float] = {}
+        self._intervals_us: Dict[str, Deque[float]] = {
+            b: deque(maxlen=window) for b in _BAND_BY_BUCKET
+        }
+
+    def record(self, frame_type: int, timestamp: float) -> None:
+        bucket = _bucket_for(frame_type)
+        if bucket is None:
+            return  # no reference cadence defined for this frame type
+        last = self._last_ts.get(bucket)
+        self._last_ts[bucket] = timestamp
+        if last is None:
+            return  # first frame of this bucket -- no interval yet
+        interval_us = (timestamp - last) * 1_000_000.0
+        if interval_us <= 0:
+            return  # out-of-order/duplicate timestamp -- ignore rather than corrupt stats
+        self._intervals_us[bucket].append(interval_us)
+
+    def classify(self, bucket: str) -> dict:
+        """Classify one bucket ('rc_channels' | 'link_statistics' |
+        'telemetry_other'). Returns a dict with 'status' one of
+        'cadence_consistent' / 'cadence_anomalous' / 'insufficient_data',
+        plus supporting stats and an honest 'notes' string.
+        """
+        if bucket not in _BAND_BY_BUCKET:
+            raise ValueError(f"unknown cadence bucket: {bucket}")
+        name, ref_min_us, ref_max_us = _BAND_BY_BUCKET[bucket]
+        samples = list(self._intervals_us[bucket])
+        if len(samples) < self.min_samples:
+            return {
+                "bucket": bucket,
+                "status": "insufficient_data",
+                "sample_count": len(samples),
+                "notes": f"Fewer than {self.min_samples} inter-arrival samples observed "
+                         f"for {name}; not enough data to judge cadence consistency "
+                         f"one way or the other.",
+            }
+        median_us = statistics.median(samples)
+        low_bound = ref_min_us * _FAST_TOLERANCE
+        high_bound = ref_max_us * _SLOW_TOLERANCE
+        consistent = low_bound <= median_us <= high_bound
+        status = "cadence_consistent" if consistent else "cadence_anomalous"
+        notes = (
+            f"Median inter-arrival interval for {name} over last {len(samples)} "
+            f"frame(s) is {median_us:.0f}us; reference band from Betaflight's "
+            f"CRSF implementation is [{ref_min_us:.0f}us, {ref_max_us:.0f}us] "
+            f"with tolerance applied as [{low_bound:.0f}us, {high_bound:.0f}us]. "
+        )
+        if consistent:
+            notes += ("Timing is consistent with a genuine Betaflight-class "
+                      "implementation's typical cadence for this frame type -- "
+                      "this is NOT proof of authenticity, only an absence of "
+                      "gross timing anomaly.")
+        else:
+            notes += ("Timing falls OUTSIDE the tolerance band -- worth "
+                      "flagging as evidence of a non-standard transmitter, "
+                      "possible spoofed/replayed traffic, or a degraded link. "
+                      "This is NOT a confirmed detection: other legitimate "
+                      "CRSF/ELRS configurations can have different, still-"
+                      "valid timing (see module docstring for false-positive "
+                      "risk).")
+        return {
+            "bucket": bucket,
+            "status": status,
+            "sample_count": len(samples),
+            "median_interval_us": median_us,
+            "reference_band_us": [ref_min_us, ref_max_us],
+            "tolerance_band_us": [low_bound, high_bound],
+            "confidence_type": "timing_heuristic",  # explicitly NOT protocol_verified -- this is statistical, not a CRC/spec fact
+            "notes": notes,
+        }
+
+    def classify_all(self) -> Dict[str, dict]:
+        return {bucket: self.classify(bucket) for bucket in _BAND_BY_BUCKET}
 
 
 # =============================================================================
@@ -601,6 +863,7 @@ class CRSFSerialBridge:
         self.baud = baud
         self.repost_interval_s = repost_interval_s
         self.parser = CRSFParser()
+        self.cadence = CRSFCadenceTracker()
         self._last_posted = 0.0
 
     def _open_serial(self):
@@ -616,10 +879,26 @@ class CRSFSerialBridge:
         return serial.Serial(self.serial_device, self.baud, timeout=1)
 
     def _ingest(self, frame: CRSFFrame) -> None:
+        # Cadence tracking runs on every CRC-valid frame regardless of the
+        # repost-interval gate below, so the rolling window reflects the
+        # true frame stream, not just the (rate-limited) posted subset.
+        self.cadence.record(frame.frame_type, frame.timestamp or time.time())
+
         now = time.time()
         if now - self._last_posted < self.repost_interval_s:
             return
         type_name = FRAME_TYPE_NAMES.get(frame.frame_type, f"0x{frame.frame_type:02X}")
+
+        notes = ("Protocol-level CRSF CRC8-verified frame decode, not an "
+                  "RF-signature heuristic.")
+        cadence_anomaly = False
+        bucket = _bucket_for(frame.frame_type)
+        if bucket is not None:
+            verdict = self.cadence.classify(bucket)
+            if verdict["status"] != "insufficient_data":
+                cadence_anomaly = verdict["status"] == "cadence_anomalous"
+                notes += " | Cadence check (" + bucket + "): " + verdict["notes"]
+
         detection = {
             "callsign": f"CRSF-{self.serial_device}",
             "model": "CRSF/ExpressLRS receiver (protocol-confirmed)",
@@ -631,9 +910,13 @@ class CRSFSerialBridge:
             "encrypted": False,
             "source": "CRSF_SERIAL",
             "frame_type": type_name,
-            "notes": "Protocol-level CRSF CRC8-verified frame decode, not an "
-                     "RF-signature heuristic.",
+            "notes": notes,
             "confidence_type": "protocol_verified",  # CRC check passed -- pass/fail, no probability to report
+            # cadence_anomaly is a SEPARATE, weaker signal than the CRC-based
+            # confidence_type above -- see CRSFCadenceTracker's module-level
+            # docstring for what it can/cannot conclude. False by default
+            # when there isn't enough data yet to judge either way.
+            "cadence_anomaly": cadence_anomaly,
         }
         try:
             r = requests.post(f"{self.console_url}/api/detections/ingest",
