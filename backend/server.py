@@ -333,6 +333,31 @@ def _record_range_auth_failure(key: str) -> None:
     _range_auth_failures.setdefault(key, []).append(datetime.now(timezone.utc))
 
 
+# ---- Basic in-memory throttle on failed /auth/login attempts (OWASP gap
+# analysis #84) — same spirit and same constants/style as the
+# range-authorization throttle above: without this, /login is a low-cost
+# credential-stuffing/brute-force oracle against any known email. Simple
+# N-failures-per-window lockout, keyed by the attempted account email (the
+# same "key the thing being attacked" convention as _range_auth_failures,
+# which keys by the commander's email — there is no authenticated user yet
+# at /login, but the attempted email is the account under attack).
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCKOUT_WINDOW_S = 60
+_login_failures: Dict[str, List[datetime]] = {}
+
+
+def _login_locked_out(key: str) -> bool:
+    now = datetime.now(timezone.utc)
+    attempts = [t for t in _login_failures.get(key, [])
+                if (now - t).total_seconds() <= LOGIN_LOCKOUT_WINDOW_S]
+    _login_failures[key] = attempts
+    return len(attempts) >= LOGIN_MAX_FAILURES
+
+
+def _record_login_failure(key: str) -> None:
+    _login_failures.setdefault(key, []).append(datetime.now(timezone.utc))
+
+
 def _range_auth_status(effect: str) -> Dict[str, Any]:
     lease = _range_authorization[effect]
     expires_at = lease["expires_at"]
@@ -848,8 +873,24 @@ async def log_event(kind: str, message: str, meta: Optional[Dict] = None,
 # =====================================================================
 @api.post("/auth/login")
 async def login(body: LoginBody):
-    user = await db.users.find_one({"email": body.email.lower()})
+    login_key = body.email.lower()
+    if _login_locked_out(login_key):
+        await log_event(
+            "AUTH_LOGIN_FAILED",
+            f"Login for {login_key} REFUSED: too many recent failed attempts "
+            f"(locked out {LOGIN_LOCKOUT_WINDOW_S}s)",
+            meta={"email": login_key, "reason": "locked_out"},
+        )
+        raise HTTPException(429, "Too many failed login attempts — try again shortly.")
+
+    user = await db.users.find_one({"email": login_key})
     if not user or not verify_password(body.password, user["password_hash"]):
+        _record_login_failure(login_key)
+        await log_event(
+            "AUTH_LOGIN_FAILED",
+            f"Login for {login_key} REFUSED: invalid credentials",
+            meta={"email": login_key, "reason": "bad_credentials"},
+        )
         raise HTTPException(401, "Invalid credentials")
     token = create_access_token(user["id"], user["email"])
     await log_event("AUTH", f"Operator login: {user['email']}", actor=user["email"])
