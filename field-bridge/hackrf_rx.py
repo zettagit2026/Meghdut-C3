@@ -51,6 +51,7 @@ import numpy as np
 import requests
 
 from hackrf_device_lock import HackrfDeviceBusy, hackrf_device_lock
+from consumer_iot_signatures import consumer_iot_annotation
 
 # See MULTI-DEVICE NOTE above. Empty/unset = backward-compatible default
 # (no device selector passed to hackrf_sweep, first-responding HackRF wins).
@@ -1129,6 +1130,33 @@ def main() -> None:
                         "protocol decode and NOT a below-noise-floor detection -- "
                         "circumstantial RF-signature evidence only."
                     )
+                # --- Consumer-IoT (non-drone) signature annotation, LRS-433/
+                # SRD-868 only (task #72). Purely additive/parallel to the
+                # ELRS/Crossfire hop-consistency heuristic directly above --
+                # does not touch hop_consistent/update_hop_track/
+                # classify_hop_interval at all. Only fires when this
+                # detection did NOT show FHSS hop-consistency evidence (i.e.
+                # `not hop_consistent`): a real ELRS/Crossfire-class link
+                # gets its dedicated LRS/telemetry labeling above and is left
+                # alone here to avoid conflicting/double labeling. When
+                # non-hopping, this band is at least as plausibly one of the
+                # catalogued ambient consumer-IoT devices (garage/gate
+                # remotes, weather stations, utility meters, etc.) as a
+                # genuine control link, so it gets annotated/relabeled with
+                # that honest, catalogue-grounded alternative explanation
+                # (see consumer_iot_signatures.py for the full rationale and
+                # its "advisory_only" confidence caveat).
+                if name in HOP_TRACKED_BANDS and not hop_consistent:
+                    iot = consumer_iot_annotation(name)
+                    if iot is not None:
+                        det["consumer_iot_match"] = iot
+                        # Soften the outward-facing label/threat level to
+                        # reflect that this is now flagged as at least as
+                        # likely ordinary ambient IoT traffic as a control
+                        # link -- annotate, don't silently keep calling it an
+                        # "LRS/telemetry craft (candidate)" at MEDIUM threat.
+                        det["model"] = f"{meta['model']} / {iot['label']}"
+                        det["threat_level"] = "LOW"
                 try:
                     _post_with_reauth(args.console_url, "/api/detections/ingest", det,
                                        headers, args.email, args.password, timeout=5)

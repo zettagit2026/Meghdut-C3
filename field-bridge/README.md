@@ -89,6 +89,36 @@ apply to `rf-bridge/cema-rf-bridge.service`, which also runs the MAVLink TX
 bridge and is out of scope here — do not enable/start that unit as part of
 this change.
 
+## kismet_bridge.py — passive WiFi/Bluetooth device-presence layer (task #63/B5)
+
+`kismet_bridge.py` polls a **real Kismet server's** REST API
+(`/devices/all_devices.json` / `/devices/last-time/:timestamp/devices.json`,
+verified against the sibling `../kismet` checkout's own source) and forwards
+detected WiFi/Bluetooth device presence into `/api/detections/ingest`. It is
+a translation/situational-awareness layer, not a drone classifier — see the
+module docstring for the full scope, the `confidence_type` split
+(`heuristic_binary` for drone-manufacturer-OUI MAC matches vs `advisory_only`
+for everything else), and the drone-OUI list caveats.
+
+**RECEIVE ONLY. HARDWARE-BLOCKED — no live systemd unit is included.** This
+bridge requires a running Kismet server with a real monitor-mode WiFi and/or
+Bluetooth datasource attached (same WiFi-adapter gap as task #70 — no
+Alfa-class monitor-mode NIC on primary as of this session). It has only been
+run against `--use-test-fixture` (an offline payload matching Kismet's real
+documented device-JSON schema), never against a live Kismet server. Do not
+enable it in production until real hardware exists and it has been manually
+smoke-tested against a real Kismet instance.
+
+```bash
+# Offline logic test, no Kismet server or console needed:
+python3 kismet_bridge.py --use-test-fixture --forward-all-devices
+
+# Real usage (once Kismet + a monitor-mode adapter exist):
+python3 kismet_bridge.py --console-url http://<console-host>:8001 \
+  --email operator@meghaduta.mil --password <current-admin-password> \
+  --kismet-url http://127.0.0.1:2501 --kismet-apikey <kismet apikey>
+```
+
 ## Frequency notes for tomorrow's demo
 
 - **SiK radio (your telemetry link)**: 915MHz ISM, FHSS, ~20-64 channels depending on firmware config. `sik_mavlink_bridge.py` talks to it over serial (AT commands / transparent passthrough) — the radio itself does the RF modulation, you're just pushing MAVLink bytes through it, same as MAVProxy would.
