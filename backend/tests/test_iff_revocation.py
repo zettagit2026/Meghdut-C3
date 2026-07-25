@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import random
+import secrets
 from pathlib import Path
 
 import pytest
@@ -33,7 +34,15 @@ API = f"{BASE_URL}/api"
 # The seeded admin account is provisioned with role="commander" (see
 # backend/server.py startup()) -- same account test_new_endpoints.py uses.
 ADMIN_EMAIL = "operator@cema.mil"
-ADMIN_PASSWORD = "cema@2026"
+# Task #127: never hardcode a real password here -- server.py's
+# _PLACEHOLDER_SECRETS blocklist refuses to boot with known placeholder
+# values (the old "cema@2026" literal that used to live here included), so a
+# fixed test constant can never authenticate against a correctly-configured
+# backend. Reuse whatever ADMIN_PASSWORD the backend was actually booted
+# with (same env var, set once per test session by the harness/docker-compose
+# invocation) and only fall back to a random session-only value -- generated
+# fresh each run, never written to disk -- if the harness didn't export one.
+ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or secrets.token_urlsafe(16)
 
 
 @pytest.fixture(scope="module")
