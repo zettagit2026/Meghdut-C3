@@ -72,8 +72,10 @@ TESTED, with real logic (no real hardware needed for this part):
     streams — exercised in self_test() against frames built from real
     on-the-wire layouts (crsf_protocol.h struct definitions): RC_CHANNELS_
     PACKED (16x 11-bit channels, exact bit-packing per crsf_channels_t),
-    LINK_STATISTICS, BATTERY_SENSOR, HEARTBEAT, and a corrupted/bit-flipped
-    frame (must be rejected).
+    LINK_STATISTICS, BATTERY_SENSOR, HEARTBEAT, VIDEO_TRANSMITTER (0x0F --
+    recognized/named/dispatched only, no field-level decoder; see the long
+    comment at CRSF_FRAMETYPE_VIDEO_TRANSMITTER's definition for why), and a
+    corrupted/bit-flipped frame (must be rejected).
   - RC channel unpacking (unpack_rc_channels): bit-for-bit reimplementation
     of AlfredoCRSF's crsf_channels_t bitfield layout (11 bits/channel,
     little-endian bit order), round-tripped against known channel values in
@@ -151,6 +153,37 @@ CRSF_NUM_CHANNELS = 16
 CRSF_FRAMETYPE_GPS = 0x02
 CRSF_FRAMETYPE_BATTERY_SENSOR = 0x08
 CRSF_FRAMETYPE_HEARTBEAT = 0x0B
+# VIDEO_TRANSMITTER (0x0F): a real, on-the-wire CRSF frame type -- confirmed
+# by THREE independent sources: (1) AlessioMorale/crsf_parser (construct-
+# based Python CRSF decoder)'s crsf_parser/payloads.py, which registers
+# `PacketsTypes.VIDEO_TRANSMITTER = 0x0F` with `PAYLOADS_SIZE[...] = 6`
+# (6-byte payload); (2) AlfredoCRSF's src/crsf_protocol.h, which lists
+# `CRSF_FRAMETYPE_VIDEO_TRANSMITTER = 0x0F` (commented out with "no need to
+# support? (rev07)" -- i.e. acknowledged as a real legacy frame type, just
+# not wired up in that library); (3) the current officially-maintained TBS
+# spec (github.com/tbs-fpv/tbs-crsf-spec, crsf.md) lists "0x0F Discontinued"
+# in its frame-type table -- confirming 0x0F is a real, reserved frame-type
+# ID (its successor, the still-used VTX telemetry frame, was reassigned to
+# 0x10 with a documented field layout: origin_address/power_dBm/
+# frequency_MHz/pit_mode bits -- that is a DIFFERENT frame type, 0x10, not
+# in scope here).
+#
+# IMPORTANT -- what is and is NOT implemented here, and why: none of the
+# three sources above defines a byte-for-byte field layout for 0x0F's
+# 6-byte payload that this project could verify and reproduce without
+# guessing. AlessioMorale/crsf_parser itself never defines a construct
+# Struct for it (only registers the type ID + total size, unlike its
+# payload_battery_sensor / payload_link_statistics / payload_rc_channels_
+# packed Structs, which DO have field-level definitions); AlfredoCRSF never
+# implemented it at all; and the current TBS spec has retired the type
+# without republishing its legacy field layout. Per this project's standing
+# "no synthetic/fallback data, ever" rule, this parser therefore recognizes,
+# names, dispatches, and CRC-validates VIDEO_TRANSMITTER frames -- exactly
+# like GPS/HEARTBEAT/ATTITUDE/DEVICE_PING/DEVICE_INFO below, none of which
+# have a field-level payload decoder either -- but does NOT ship a
+# parse_video_transmitter() that would have to invent field semantics no
+# accessible source actually defines.
+CRSF_FRAMETYPE_VIDEO_TRANSMITTER = 0x0F
 CRSF_FRAMETYPE_LINK_STATISTICS = 0x14
 CRSF_FRAMETYPE_RC_CHANNELS_PACKED = 0x16
 CRSF_FRAMETYPE_ATTITUDE = 0x1E
@@ -159,10 +192,17 @@ CRSF_FRAMETYPE_DEVICE_INFO = 0x29
 CRSF_FRAMETYPE_EXT_FIRST = 0x28
 CRSF_FRAMETYPE_EXT_LAST = 0x96
 
+# Payload size (type+payload+crc's payload portion only) for frame types
+# whose length is fixed but that don't (yet) have a field-level decoder --
+# used only for self-test frame construction, per AlessioMorale/crsf_parser's
+# PAYLOADS_SIZE dict.
+CRSF_VIDEO_TRANSMITTER_PAYLOAD_LEN = 6
+
 FRAME_TYPE_NAMES: Dict[int, str] = {
     CRSF_FRAMETYPE_GPS: "GPS",
     CRSF_FRAMETYPE_BATTERY_SENSOR: "BATTERY_SENSOR",
     CRSF_FRAMETYPE_HEARTBEAT: "HEARTBEAT",
+    CRSF_FRAMETYPE_VIDEO_TRANSMITTER: "VIDEO_TRANSMITTER",
     CRSF_FRAMETYPE_LINK_STATISTICS: "LINK_STATISTICS",
     CRSF_FRAMETYPE_RC_CHANNELS_PACKED: "RC_CHANNELS_PACKED",
     CRSF_FRAMETYPE_ATTITUDE: "ATTITUDE",
@@ -414,6 +454,30 @@ def self_test() -> None:
     check("HEARTBEAT frame parses to exactly 1 frame", len(frames) == 1)
     if frames:
         check("HEARTBEAT frame type decoded correctly", frames[0].frame_type == CRSF_FRAMETYPE_HEARTBEAT)
+
+    # VIDEO_TRANSMITTER (0x0F): recognized/named/dispatched only -- no field-
+    # level payload decoder exists for this frame in this project (see the
+    # long comment at CRSF_FRAMETYPE_VIDEO_TRANSMITTER's definition above for
+    # why: none of the three cross-checked sources -- AlessioMorale/
+    # crsf_parser, AlfredoCRSF, or the current TBS spec -- publishes a
+    # verifiable byte-level field layout for this now-"Discontinued" type).
+    # This test only proves the frame-type ID, dispatch, and CRC8 path work
+    # for it, using the real 6-byte payload size registered by
+    # AlessioMorale/crsf_parser's PAYLOADS_SIZE[VIDEO_TRANSMITTER].
+    vtx_payload = bytes([0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+    check("VIDEO_TRANSMITTER payload size matches AlessioMorale/crsf_parser's "
+          "PAYLOADS_SIZE[VIDEO_TRANSMITTER]=6",
+          len(vtx_payload) == CRSF_VIDEO_TRANSMITTER_PAYLOAD_LEN)
+    vtx = build_frame(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_VIDEO_TRANSMITTER, vtx_payload)
+    frames = CRSFParser().feed_bytes(vtx)
+    check("VIDEO_TRANSMITTER frame parses to exactly 1 frame", len(frames) == 1)
+    if frames:
+        check("VIDEO_TRANSMITTER frame type decoded correctly",
+              frames[0].frame_type == CRSF_FRAMETYPE_VIDEO_TRANSMITTER)
+        check("VIDEO_TRANSMITTER frame type name resolves via FRAME_TYPE_NAMES",
+              FRAME_TYPE_NAMES.get(frames[0].frame_type) == "VIDEO_TRANSMITTER")
+        check("VIDEO_TRANSMITTER payload round-trips intact (no field decoder "
+              "to mangle it)", frames[0].payload == vtx_payload)
 
     # RC_CHANNELS_PACKED (0x16): 16 channels, all at CRSF_CHANNEL_VALUE_MID=992,
     # per crsf_protocol.h's documented center value -- pack manually per the
