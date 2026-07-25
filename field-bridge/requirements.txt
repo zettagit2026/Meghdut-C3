@@ -23,6 +23,15 @@ dronecan==1.0.27  # dronecan_parser.py — DroneCAN/UAVCANv0 NodeStatus+Fix2 dec
 # gamutrf_infer.py; timm/chromadb are new for this module only.
 timm>=1.0.0
 chromadb>=0.5.0
+# thermal_radiometric.py (task #64/#83 close-out, FLIR R-JPEG per-pixel
+# radiometric temperature extraction via Planck's law) — NO new pip
+# dependency: numpy/Pillow are already required above. Requires the
+# separate `exiftool` CLI on PATH (e.g. `brew install exiftool` /
+# `apt install libimage-exiftool-perl`) to read FLIR's proprietary binary
+# calibration-constant + raw-thermal-plane metadata segment; this is an
+# external system tool invocation (subprocess), not a linked code
+# dependency, and is NOT installed on this Mac dev copy (verified via
+# `which exiftool`) — see thermal_radiometric.py docstring.
 # iff_crypto.py / iff_beacon_bridge.py (task #60, IFF LoRa beacon w/
 # environmental-entropy key generation) — deliberately add NO new dependency
 # here: the whole crypto construction (HKDF-SHA256, HMAC-SHA256) is built
