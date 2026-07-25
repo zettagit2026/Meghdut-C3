@@ -13,9 +13,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt ./
-# Strip Emergent-internal packages that are not resolvable outside the
-# Emergent PyPI index. This app does not import them.
-RUN sed -i -E '/^(emergentintegrations)([<>=~!].*)?$/d' requirements.txt
 RUN pip install --upgrade pip && pip install -r requirements.txt
 
 COPY . .
