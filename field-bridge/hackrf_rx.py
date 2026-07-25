@@ -267,6 +267,180 @@ PATH_LOSS_EXPONENT = {
     "FPV-1G3": 2.5,
 }
 
+# --- ELRS/Crossfire-class FHSS hop-interval-consistency heuristic ----------
+# ADDED 2026-07-25 (task #88), per Software Architect design review that
+# REJECTED an earlier naive approach (fixed -75dBm global threshold +
+# unique_freqs/time_span "hop_rate" formula flagging anything > 0.4). That
+# was rejected because it conflates ordinary frequency diversity (e.g. a
+# few stray Wi-Fi APs on different channels) with real hopping behavior,
+# uses an arbitrary constant instead of real protocol timing, and repeats
+# the site-calibration mistake already fixed elsewhere in this file (a
+# single global dBm floor over-triggers -- SiK-915 alone runs ~10dB hotter
+# here than the other bands; see BAND_NOISE_FLOOR_DBM above).
+#
+# This heuristic applies ONLY to LRS-433 and SRD-868 (task #51's new
+# sub-1GHz LRS/telemetry bands) -- it does not touch DJI-2.4GHz/SiK-915/
+# DJI-5.8GHz or FPV-1G3's existing detection behavior in any way.
+#
+# ELRS_HOP_RATE_RANGE_HZ derivation (verified directly against the real
+# ExpressLRS firmware source, not assumed):
+#   ~/Desktop/Zettawise/PMO Suraj/tool/ExpressLRS/src/include/common.h
+#     line 169: "uint8_t FHSShopInterval; // every X packets we hop to a
+#     new frequency."
+#   ~/Desktop/Zettawise/PMO Suraj/tool/ExpressLRS/src/src/common.cpp
+#     air_rate_config tables (SX127x/LR11XX/SX1280), each row encoding
+#     (..., TLM_RATIO, FHSShopInterval, interval_us, PayloadLength, numOfSends).
+#     packet_rate_hz = 1e6 / interval_us; hop_rate_hz = packet_rate_hz / FHSShopInterval.
+#   Sub-1GHz (RATE_LORA_900_*) rows, the band class LRS-433/SRD-868 are
+#   modeled on:
+#     900_200HZ:  interval=5000us  (200Hz), FHSShopInterval=4  -> 50.0 Hz
+#     900_100HZ:  interval=10000us (100Hz), FHSShopInterval=4  -> 25.0 Hz
+#     900_100HZ_8CH: interval=10000us (100Hz), FHSShopInterval=4 -> 25.0 Hz
+#     900_50HZ:   interval=20000us (50Hz),  FHSShopInterval=4  -> 12.5 Hz
+#     900_25HZ:   interval=40000us (25Hz),  FHSShopInterval=2  -> 12.5 Hz
+#   2.4GHz (RATE_LORA_2G4_*, both LR11XX and SX1280 tables) rows, included
+#   here because "ELRS/Crossfire-class" hop timing is a property of the
+#   protocol's packet-rate/FHSShopInterval design, not the specific ISM
+#   band, and the task explicitly asked for ELRS's full supported hop-rate
+#   span, not just its sub-1GHz subset:
+#     2G4_500HZ:  interval=2000us  (500Hz), FHSShopInterval=4  -> 125.0 Hz
+#     2G4_250HZ:  interval=4000us  (250Hz), FHSShopInterval=4  -> 62.5 Hz
+#     2G4_200HZ:  interval=5000us  (200Hz), FHSShopInterval=4  -> 50.0 Hz
+#     2G4_150HZ:  interval=6666us  (~150Hz), FHSShopInterval=4 -> 37.5 Hz
+#     2G4_100HZ:  interval=10000us (100Hz), FHSShopInterval=4  -> 25.0 Hz
+#     2G4_50HZ:   interval=20000us (50Hz),  FHSShopInterval=2  -> 25.0 Hz
+#   So the real, source-derived hop-rate span across ELRS's air rates is
+#   12.5 Hz (900_50HZ/900_25HZ) to 125.0 Hz (2G4_500HZ) -- confirming, not
+#   just assuming, the "roughly 12.5-125 hops/sec" figure from today's
+#   design review. TBS Crossfire (CRSF) uses a comparable order-of-magnitude
+#   hop scheme but its firmware source was not available locally to verify
+#   line-by-line, so "ELRS/Crossfire-class" here means "consistent with
+#   this family of LRS hop timing," not a Crossfire-specific verified figure.
+ELRS_HOP_RATE_RANGE_HZ: Tuple[float, float] = (12.5, 125.0)
+
+# A rate far above ELRS_HOP_RATE_RANGE_HZ's upper bound is the same class of
+# signature the existing Bluetooth non-persistence heuristic targets (BLE/
+# classic BT hops ~1600 times/sec -- see BT_NONPERSIST_CYCLES block above).
+# Anything whose *implied* reappearance rate is at/above this is treated as
+# "BT-like" for routing purposes (per design step 4: route it away from an
+# ELRS conclusion instead of double-flagging), not as new evidence of ELRS.
+ELRS_BT_LIKE_MIN_HZ = 500.0  # well below real BT's ~1600Hz, well above ELRS's 125Hz max
+
+# HOP_FREQ_TOL_MHZ / HOP_POWER_TOL_DB: how close a reappearing peak's
+# frequency/power has to be to the PREVIOUS hit to count as "the same
+# emitter reappearing" rather than an unrelated new signal. Frequency
+# tolerance is loose (a hopping link legitimately lands at a different
+# in-band frequency each time) -- what actually gets compared here is
+# POWER (a real emitter at a stable range/orientation should reappear at
+# roughly the same RSSI) and TIMING (the interval since it last appeared).
+HOP_POWER_TOL_DB = 8.0
+HOP_CONFIRM_CYCLES = 3  # require this many consecutive real-data reappearances
+                         # classified "elrs_consistent" before treating the
+                         # hop-interval pattern as corroborating evidence --
+                         # same CONFIRM_CYCLES-style gating used elsewhere in
+                         # this file, so a one-off spike/coincidental timing
+                         # match can never trigger this on its own.
+HOP_TRACKED_BANDS = ("LRS-433", "SRD-868")  # additive only -- see module docstring
+
+
+def classify_hop_interval(interval_s: Optional[float],
+                           hop_range_hz: Tuple[float, float] = ELRS_HOP_RATE_RANGE_HZ,
+                           bt_like_min_hz: float = ELRS_BT_LIKE_MIN_HZ) -> str:
+    """Classify an observed peak-reappearance interval (seconds, wall-clock
+    time since the same-power peak last appeared in-band) against ELRS's
+    real hop-rate span.
+
+    Returns one of:
+      "insufficient"    -- no prior sample to compare against yet.
+      "bt_like"         -- implied rate is far faster than any ELRS air rate
+                           (>= bt_like_min_hz) -- consistent with the existing
+                           Bluetooth non-persistence signature, NOT ELRS; the
+                           caller must not flag this as ELRS-consistent so as
+                           not to double-flag the same underlying pattern.
+      "elrs_consistent" -- implied rate falls within hop_range_hz.
+      "no_match"         -- implied rate is outside both of the above (e.g. a
+                           stationary/non-hopping signal, whose reappearance
+                           interval is dominated by this bridge's own several-
+                           second sweep cadence rather than any real hopping).
+
+    Pure function, deliberately hardware/timing-source agnostic, so it can be
+    unit-tested with synthetic interval sequences without a real HackRF.
+    """
+    if interval_s is None or interval_s <= 0:
+        return "insufficient"
+    rate_hz = 1.0 / interval_s
+    if rate_hz >= bt_like_min_hz:
+        return "bt_like"
+    lo, hi = hop_range_hz
+    if lo <= rate_hz <= hi:
+        return "elrs_consistent"
+    return "no_match"
+
+
+def update_hop_track(track: Dict, now: float, peak_dbm: float, is_hit: bool,
+                      is_real_data: bool) -> Tuple[bool, Optional[float]]:
+    """Update a per-band ELRS hop-interval-consistency tracker in place (same
+    shape/pattern as wifi_persist/bt_track/sik_hit_window above) and return
+    (hop_consistent, last_rate_hz).
+
+    `track` keys: last_time (float|None), last_power_dbm (float|None),
+    consistent_cycles (int).
+
+    Only called for HOP_TRACKED_BANDS (LRS-433/SRD-868). Only real-data hit
+    cycles (is_real_data and is_hit) advance/verify the pattern -- a wedge/
+    fallback filler cycle leaves the tracker untouched (same is_real_data-
+    aware convention as the Wi-Fi/Bluetooth/LoRa trackers above), and a
+    real-data cycle with no hit resets the pattern (nothing reappeared).
+
+    IMPORTANT, stated plainly: this bridge's sweep cadence (several seconds
+    per full band cycle -- see args.interval_s / SWEEPS_PER_CYCLE) is far
+    coarser than the true ELRS hop period (8-80ms, per ELRS_HOP_RATE_RANGE_HZ
+    above). This function computes what it can actually observe -- the
+    wall-clock interval between this bridge's own successive detections of a
+    similar-power peak in-band -- and classifies THAT against ELRS's real
+    hop-rate span. It is a power-spectrum-sweep heuristic, not a hop-rate
+    measurement in the strict sense: a genuinely continuous/non-hopping
+    emitter will reappear at roughly this bridge's own sweep cadence, which
+    is far below ELRS_HOP_RATE_RANGE_HZ and will correctly classify as
+    "no_match", not "elrs_consistent". See classify_hop_interval()'s
+    docstring for the full classification contract.
+    """
+    if not is_real_data:
+        return track["consistent_cycles"] >= HOP_CONFIRM_CYCLES, track.get("last_rate_hz")
+
+    if not is_hit:
+        track["last_time"] = None
+        track["last_power_dbm"] = None
+        track["consistent_cycles"] = 0
+        track["last_rate_hz"] = None
+        return False, None
+
+    prev_time = track.get("last_time")
+    prev_power = track.get("last_power_dbm")
+    classification = "insufficient"
+    rate_hz = None
+    if prev_time is not None and prev_power is not None:
+        interval_s = now - prev_time
+        if abs(peak_dbm - prev_power) <= HOP_POWER_TOL_DB:
+            classification = classify_hop_interval(interval_s)
+            if classification == "elrs_consistent":
+                rate_hz = 1.0 / interval_s if interval_s > 0 else None
+        else:
+            classification = "no_match"  # power jumped too much -- likely a different emitter
+
+    if classification == "elrs_consistent":
+        track["consistent_cycles"] = track.get("consistent_cycles", 0) + 1
+        track["last_rate_hz"] = rate_hz
+    else:
+        track["consistent_cycles"] = 0
+        track["last_rate_hz"] = None
+
+    track["last_time"] = now
+    track["last_power_dbm"] = peak_dbm
+
+    return track["consistent_cycles"] >= HOP_CONFIRM_CYCLES, track.get("last_rate_hz")
+
+
 DISTANCE_MIN_M = 1.0      # clamp floor — RSSI-based estimates are meaningless
 DISTANCE_MAX_M = 5000.0   # clamp ceiling — well beyond this, noise-floor RSSI
                           # differences are dominated by measurement error, not range
@@ -695,6 +869,11 @@ def main() -> None:
     # comment block above. Only real-data cycles (is_real_data) are pushed into this
     # deque; wedge/filler cycles are skipped entirely, same pattern as the Wi-Fi fix.
     sik_hit_window: "collections.deque[bool]" = collections.deque(maxlen=LORA_WINDOW_CYCLES)
+    # ELRS/Crossfire-class hop-interval-consistency trackers, LRS-433/SRD-868
+    # only -- see update_hop_track()/classify_hop_interval() above (task #88).
+    hop_track = {name: {"last_time": None, "last_power_dbm": None,
+                         "consistent_cycles": 0, "last_rate_hz": None}
+                 for name in HOP_TRACKED_BANDS}
     i = 0
     while args.iterations == 0 or i < args.iterations:
         rows = []
@@ -833,6 +1012,21 @@ def main() -> None:
             # "silence" and doesn't dilute the real-data duty-cycle estimate --
             # same is_real_data-aware pattern as the Wi-Fi/Bluetooth checks above.
 
+            # --- ELRS/Crossfire-class hop-interval-consistency heuristic
+            # (LRS-433/SRD-868 only) -- see update_hop_track()/
+            # classify_hop_interval()/ELRS_HOP_RATE_RANGE_HZ above (task #88).
+            # This is NOT an exclusion filter like the three checks above --
+            # it's supporting evidence attached to the existing LRS/telemetry
+            # detection for these two bands when it fires, gated by its own
+            # HOP_CONFIRM_CYCLES so a one-off timing coincidence never
+            # triggers it alone.
+            hop_consistent = False
+            hop_rate_hz = None
+            if name in HOP_TRACKED_BANDS:
+                is_hit = peak > floor + DETECT_THRESHOLD_DB
+                hop_consistent, hop_rate_hz = update_hop_track(
+                    hop_track[name], time.time(), peak, is_hit, is_real_data)
+
             likely_excluded = likely_wifi_ap or likely_bluetooth or likely_low_duty_cycle_device
 
             # --- Bluetooth advisory ingest (NOT a threat detection) ----------------
@@ -904,6 +1098,37 @@ def main() -> None:
                     "source": meta["source"],
                     "confidence_type": "heuristic_binary",  # persistence-confirmed, no real-valued probability
                 }
+                # ELRS/Crossfire-class hop-interval-consistency evidence, LRS-433/
+                # SRD-868 only (task #88) -- attached ONLY when HOP_CONFIRM_CYCLES
+                # consecutive reappearances classified as "elrs_consistent" (see
+                # update_hop_track() above). Labeled honestly per the design
+                # review: rf_signature_only marks this as power-spectrum-sweep
+                # evidence, NOT a protocol decode and NOT below-noise-floor
+                # detection (that would require real IQ-level LoRa correlation,
+                # out of scope -- see ELRS_HOP_RATE_RANGE_HZ comment block).
+                if name in HOP_TRACKED_BANDS and hop_consistent:
+                    det["rf_signature_only"] = True
+                    det["hop_rate_hz"] = round(hop_rate_hz, 1) if hop_rate_hz is not None else None
+                    det["notes"] = (
+                        "Hop-interval-consistency heuristic from power-spectrum sweeps: "
+                        f"this band's peak reappeared at a consistent power (within "
+                        f"{HOP_POWER_TOL_DB}dB) at an interval implying a "
+                        f"~{hop_rate_hz:.1f}Hz reappearance rate, within ELRS/Crossfire-"
+                        f"class LRS's real supported hop-rate span "
+                        f"({ELRS_HOP_RATE_RANGE_HZ[0]}-{ELRS_HOP_RATE_RANGE_HZ[1]}Hz, "
+                        "derived from ExpressLRS firmware source, see hackrf_rx.py "
+                        "comments). This is NOT a protocol decode (no CRSF/ELRS packet "
+                        "was demodulated or parsed) and NOT a below-noise-floor "
+                        "detection (no IQ-level LoRa correlation was performed) -- it "
+                        "is circumstantial RF-signature evidence only, from energy "
+                        "detection across sweep cycles."
+                    ) if hop_rate_hz is not None else (
+                        "Hop-interval-consistency heuristic from power-spectrum sweeps "
+                        "flagged this band's peak-reappearance pattern as consistent "
+                        "with ELRS/Crossfire-class LRS hop timing. This is NOT a "
+                        "protocol decode and NOT a below-noise-floor detection -- "
+                        "circumstantial RF-signature evidence only."
+                    )
                 try:
                     _post_with_reauth(args.console_url, "/api/detections/ingest", det,
                                        headers, args.email, args.password, timeout=5)
