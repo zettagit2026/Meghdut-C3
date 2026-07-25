@@ -36,9 +36,13 @@ renderer* is honest for this row.
 # backend/server.py, DetectionIngestBody
 confidence_type: Optional[str] = None
 # One of: "heuristic_binary", "ml_probability", "protocol_verified",
-# "advisory_only", "unclassified_signal". Optional/None for any source that
-# hasn't been updated yet (backward compatible — absence means "render as
-# before").
+# "advisory_only", "unclassified_signal", "bistatic_radar_detection".
+# Optional/None for any source that hasn't been updated yet (backward
+# compatible — absence means "render as before"). `source: str` and
+# `confidence_type: Optional[str]` have no enum constraint at the Pydantic
+# level, so adding a new value here is a documentation-only change; no
+# backend/server.py code change is required for `DetectionIngestBody` to
+# accept it (confirmed by reading its current definition).
 ```
 
 ### Enum values
@@ -50,6 +54,7 @@ confidence_type: Optional[str] = None
 | `protocol_verified` | CRC/protocol-level decode succeeded. | Hard checkmark/verified badge, no percentage (there is no probability — it's pass/fail and it passed). Highest-confidence visual treatment. |
 | `advisory_only` | Presence heuristic, explicitly not an identity or threat claim. | Plain neutral "advisory" tag, distinct styling from confirmed detections, no percentage. |
 | `unclassified_signal` | Real, energy-gated RF confirmed present (same gate as `ml_probability`), but the classifier's own winning-class softmax probability was below `CEMA_ML_UNCLASSIFIED_MAX_CONFIDENCE` (default **0.6**, aligned with `ML_RECLASSIFY_MIN_CONFIDENCE` — see coherence note below) — i.e. it could not confidently place the signal in any of its 3 known classes (drone/wifi_2_4/wifi_5). This is cheap, zero-new-dependency logic added directly in `ml_classify_bridge.py`, computed from softmax probabilities the classifier already produces — no new model or OOT dependency (e.g. gr-inspector) required. | Distinct "UNCLASSIFIED" tag (not "flagged", not a trusted probability) showing the weak top-guess percentage for context, distinct styling from `ml_probability`. Also counts as an "unconfirmed" detection for `isUnconfirmedDetection()`/`UnconfirmedTag` (2026-07-23 fix) — an explicit "I don't know" from the classifier is at least as uncertain as `heuristic_binary`, and that function previously only checked for `heuristic_binary`, silently missing this case. |
+| `bistatic_radar_detection` | A CFAR-thresholded cross-ambiguity-function (CAF) peak from `field-bridge/passive_radar_bridge.py` (task #43, C10) — a real physical-layer detection statistic derived from bistatic range-Doppler processing against an illuminator of opportunity (broadcast TV/FM/cellular), not an RSSI heuristic, not an ML softmax, not a protocol decode. Its own distinct epistemic category; see `field-bridge/PASSIVE_RADAR_ARCHITECTURE.md` §4 for the full field mapping (`distance_m`/`distance_estimated=False` since it's a genuine time-of-flight-derived range, `bearing_deg` from antenna boresight only, `speed_ms` from the CAF's Doppler bin, `rssi_dbm`/`snr_db` repurposed as CAF peak SNR). | Distinct "bistatic radar" tag/badge, showing peak SNR, with an explicit bearing-accuracy caveat (boresight-only until a rotator or antenna array exists, task #57+) — never conflated with `ml_probability`'s bar or `protocol_verified`'s checkmark. |
 
 ### Bridge -> enum mapping
 
@@ -60,6 +65,7 @@ confidence_type: Optional[str] = None
 | `field-bridge/ml_classify_bridge.py`, `det` | after `gated_capture_and_classify` (~line 245) | `"ml_probability"` |
 | `field-bridge/droneid_decode_bridge.py`, `det` | after `payload.check_crc()` passes (~line 257) | `"protocol_verified"` |
 | `field-bridge/ml_classify_bridge.py`, `det` | when winning-class softmax < `UNCLASSIFIED_MAX_CONFIDENCE` (see `is_unclassified` in `gated_capture_and_classify` caller) | `"unclassified_signal"` |
+| `field-bridge/passive_radar_bridge.py`, `det` | after CFAR/top-K peak-picking (`detector.py`) over the CAF range-Doppler map | `"bistatic_radar_detection"` |
 
 Notes:
 - `field-bridge/mavlink_sniffer.py` (real MAVLink HEARTBEAT decode, sets
