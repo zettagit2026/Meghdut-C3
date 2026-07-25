@@ -2,6 +2,22 @@
 Description=CEMA cUAS - passive MAVLink HEARTBEAT sniffer (RX only, real protocol-level ArduPilot ID, no transmission)
 After=network-online.target docker.service
 Wants=network-online.target
+# Restart-limit hardening: this is an RX-only sniffer with no TX capability
+# and no locks/state other services depend on, so "keep retrying forever" is
+# the correct failure posture -- there is no downside to it staying in a
+# restart loop through a transient hardware hiccup (e.g. VMware USB
+# passthrough glitch on the SiK adapter dropping /dev/ttyUSB*). Without this,
+# systemd's default StartLimitBurst=5 within StartLimitIntervalSec=10s trips
+# on a handful of quick USB re-enumeration attempts and the unit goes
+# `inactive (dead)` permanently, requiring a manual
+# `systemctl reset-failed && systemctl start` to recover (see task #80).
+# Widening the counting window and raising the burst means the limit is
+# effectively never hit for this class of transient blip, while
+# StartLimitAction=none makes explicit that we never want systemd to give up
+# and disable the unit on our behalf.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+StartLimitAction=none
 
 [Service]
 Type=simple
@@ -34,7 +50,7 @@ EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
 ExecStart=/usr/bin/python3 -u mavlink_sniffer.py
 Restart=always
-RestartSec=3
+RestartSec=5
 StandardOutput=append:/CEMA/joydipdemo/field-bridge/mavlink_sniffer.log
 StandardError=append:/CEMA/joydipdemo/field-bridge/mavlink_sniffer.log
 

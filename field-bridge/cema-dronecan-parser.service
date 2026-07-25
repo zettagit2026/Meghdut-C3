@@ -2,6 +2,17 @@
 Description=CEMA cUAS - passive DroneCAN (UAVCAN v0) bus listener (RX only, protocol-level NodeStatus/Fix2 decode, no transmission, no active node-ID allocation)
 After=network-online.target docker.service
 Wants=network-online.target
+# Restart-limit hardening (same rationale as cema-mavlink-sniffer.service,
+# task #80): RX-only, no TX, nothing else depends on this holding a lock, so
+# "keep retrying forever" through transient CAN-adapter hiccups is the
+# correct posture. Default StartLimitBurst=5/StartLimitIntervalSec=10s can
+# trip permanently, requiring a manual reset-failed. Widen the window/burst
+# and disable give-up behavior. (Unit is currently not enabled pending real
+# CAN hardware -- see note below -- but hardened now so it's correct the
+# moment it is.)
+StartLimitIntervalSec=300
+StartLimitBurst=20
+StartLimitAction=none
 
 [Service]
 Type=simple
@@ -62,7 +73,7 @@ EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
 ExecStart=/usr/bin/python3 -u dronecan_parser.py
 Restart=always
-RestartSec=3
+RestartSec=5
 StandardOutput=append:/CEMA/joydipdemo/field-bridge/dronecan_parser.log
 StandardError=append:/CEMA/joydipdemo/field-bridge/dronecan_parser.log
 

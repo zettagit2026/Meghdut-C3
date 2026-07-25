@@ -2,6 +2,15 @@
 Description=CEMA cUAS - passive HackRF/SiK detection bridge (RX only, no transmission)
 After=network-online.target docker.service
 Wants=network-online.target
+# Restart-limit hardening (same rationale as cema-mavlink-sniffer.service,
+# task #80): RX-only, no TX, nothing else depends on this holding a lock, so
+# "keep retrying forever" through transient USB/SDR hiccups is the correct
+# posture. Default StartLimitBurst=5/StartLimitIntervalSec=10s can trip
+# permanently on a burst of quick HackRF re-enumeration attempts, requiring a
+# manual reset-failed. Widen the window/burst and disable give-up behavior.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+StartLimitAction=none
 
 [Service]
 Type=simple
@@ -28,7 +37,7 @@ EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
 ExecStart=/usr/bin/python3 -u hackrf_rx.py --interval-s 3
 Restart=always
-RestartSec=3
+RestartSec=5
 StandardOutput=append:/CEMA/joydipdemo/field-bridge/hackrf_rx.log
 StandardError=append:/CEMA/joydipdemo/field-bridge/hackrf_rx.log
 
