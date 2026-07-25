@@ -144,8 +144,8 @@ requests to this project's own /api/detections/ingest. It never writes to
 Kismet, never transmits RF, and never controls any datasource.
 
 =============================================================================
-TASK #105 -- DroneBridge WifiBroadcast RAW-FRAME SIGNATURE (WHY IT LIVES
-HERE, AND WHY IT IS NOT WIRED INTO THE LIVE poll_once() PATH)
+TASK #105/#116 -- DroneBridge WifiBroadcast RAW-FRAME SIGNATURE, AND ITS
+PCAPNG-STREAM WIRING INTO poll_once()
 =============================================================================
 DroneBridge's raw-injection protocol (~/Desktop/.../tool/DroneBridge,
 Apache-2.0 core; common/db_protocol.h) is a distinctive, associationless,
@@ -177,29 +177,77 @@ script's simple JSON device-list polling, and per-BSSID (DroneBridge's
 associationless injection has no real BSSID/association to key a stream
 off of in the first place, which is itself part of the signature).
 
-CONCLUSION: this bridge's OWN polling path (fetch_kismet_devices/to_detection
-/poll_once) genuinely cannot see raw frame bytes today, so the signature
-match below is NOT wired into poll_once()'s live loop -- doing so honestly
-would require a separate pcapng-stream consumer, which is out of scope for
-this task (tracked as a TODO below, not silently skipped). What IS added
-here is the actual, testable signature-matching function
-(detect_db_raw_v2_signature()) plus its detection-ingest builder
-(build_wifibroadcast_detection()), operating on raw frame bytes IF/WHEN a
-caller has them (e.g. a future pcapng-stream bridge, or a raw
-monitor-mode-socket reader) -- kept in this file because the detection
-DOMAIN (associationless raw-802.11-injection signatures) belongs with this
-script's Kismet-side situational-awareness layer, not with hackrf_rx.py's
-power-spectrum-level SDR sweep (hackrf_rx.py never sees individual 802.11
-frames at all, only RF energy/occupancy).
+TASK #116 UPDATE (this session): task #105 left the above genuinely unwired
+because fetch_kismet_devices()'s JSON device API cannot see raw frame
+bytes. This session re-read the local Kismet checkout's real source
+(../kismet/phy_80211.cc:1016-1041, ../kismet/pcapng_stream_futurebuf.h) to
+confirm the actual pcapng-streaming route's real behaviour, then built and
+wired a real consumer for it:
 
-TODO (not implemented, HONESTY not silent scope-narrowing): wiring this to
-a REAL live feed needs one of (a) a pcapng-stream consumer against Kismet's
-/phy/phy80211/pcap/by-bssid/:mac/packets.pcapng (requires a real BSSID to
-key off -- awkward for an associationless protocol, may need a broader
-"all packets" stream if Kismet exposes one), or (b) a raw AF_PACKET monitor-
-mode socket read of this bridge's own, independent of Kismet entirely. Both
-are HARDWARE-BLOCKED the same way the rest of this file is (task #70, no
-monitor-mode NIC on primary) and are not attempted here.
+  Route (../kismet/phy_80211.cc:1016):
+    GET /phy/phy80211/pcap/by-bssid/:mac/packets.pcapng
+  registered with httpd->register_route(..., {"GET"}, httpd->RO_ROLE,
+  {"pcapng"}, ...) -- RO_ROLE means it uses the SAME apikey/session-cookie
+  auth as the JSON device endpoints (kis_net_beast_httpd::AUTH_COOKIE), not
+  a separate scheme.
+
+  Behaviour (verified by reading phy_80211.cc:1024-1040, not assumed): this
+  is a LIVE, OPEN-ENDED HTTP STREAM, not a one-shot capture window or a
+  bounded file download. The handler constructs a
+  pcapng_stream_packetchain<pcapng_phy80211_accept_ftor, ...> bound directly
+  to con->response_stream(), calls pcapng->start_stream(), then
+  pcapng->block_until_stream_done() -- i.e. the HTTP response body is written
+  to incrementally, in real pcapng block framing, for as long as the
+  connection stays open and packets matching pcapng_phy80211_accept_ftor(mac)
+  (phy_80211.h:690-691, a per-BSSID filter) keep arriving from Kismet's
+  packetchain. The stream only ends when the client closes the connection
+  (con->set_closure_cb(...) calls stop_stream()) or the server does. There is
+  no documented "all packets" / unfiltered variant of this route -- it is
+  always by-BSSID, which is the awkwardness task #105 already flagged for
+  DroneBridge's associationless protocol (no real association/BSSID to key
+  off of). This bridge resolves that by keying off the BSSID/MAC that its
+  OWN existing metadata poll (fetch_kismet_devices) already flagged as
+  interesting (a drone-OUI match), NOT by inventing a fake "all packets" mode
+  Kismet doesn't actually expose.
+
+  Wire format: LINKFRAME datachunks selected by pcapng_stream_select_ftor
+  (phy_80211.cc / pcapng_stream_futurebuf.h) are written as real IETF pcapng
+  Enhanced Packet Blocks -- Section Header Block, Interface Description
+  Block(s), then a live sequence of Enhanced Packet Blocks, one per matching
+  raw 802.11 frame (including its leading radiotap header, since the
+  linkframe payload for an IEEE802.11 phy datasource is the raw
+  DLT_IEEE802_11_RADIO capture, radiotap-prefixed). This is a real,
+  publicly-documented format (IETF pcapng draft, tcpdump.org/pcapng/), so
+  this bridge parses it with a small stdlib-only reader
+  (iter_pcapng_frames() below), NOT scapy: scapy's rdpcap/pcapng reader is
+  GPL-2.0-only, and this project's standing OSI-permissive-only policy on
+  new dependencies (reject non-permissive/copyleft additions where a
+  reasonable stdlib alternative exists) rules it out here -- the pcapng
+  block-length framing itself is simple, bounds-checked, fixed-width-field
+  parsing, not "fragile hand-rolled binary parsing" in the sense that
+  caution is meant to warn against.
+
+  Because the real stream is open-ended, fetch_pcapng_frames() below reads
+  it BOUNDED (a max-frames and max-seconds cutoff, then explicitly closes
+  the HTTP connection) rather than blocking poll_once()'s synchronous poll
+  loop forever on one BSSID -- this is a deliberate, documented design
+  choice (a short per-candidate-BSSID burst read, triggered right after the
+  metadata poll flags that BSSID as interesting), not a misunderstanding of
+  the endpoint's real (unbounded) behaviour.
+
+CONCLUSION: poll_once() now calls check_wifibroadcast_signature() for each
+drone-OUI-matched IEEE802.11 device it already sees via the existing
+metadata poll, which opens a bounded pcapng stream for that MAC, parses real
+pcapng framing, and runs the EXISTING detect_db_raw_v2_signature() (verbatim,
+not reimplemented) against each extracted raw frame. A signature match is
+posted via build_wifibroadcast_detection() (also existing/unchanged) through
+the same _post_with_reauth() ingest path everything else in this file uses.
+This is genuinely wired now, not just theoretically ready -- see
+--check-wifibroadcast-signature below. It remains HARDWARE-BLOCKED for LIVE
+execution the same way the rest of this file is (task #70: no monitor-mode
+NIC, so no real Kismet server with real 802.11 capture exists to point this
+at yet) -- tested here only against a recorded/mocked pcapng byte stream
+matching the real format described above.
 
 SIGNATURE DEFINITION (verified directly against DroneBridge's real source,
 common/db_protocol.h and common/db_raw_send_receive.c -- NOT copied, only
@@ -260,6 +308,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import struct
 import sys
 import time
 from typing import Dict, List, Optional
@@ -418,6 +467,166 @@ def build_wifibroadcast_detection(match: Dict, mac: Optional[str] = None) -> Dic
         "protocol_confirmed": False,  # a byte-pattern structural match, not a CRC-verified decode
         "confidence_type": "heuristic_binary" if is_strong_match else "advisory_only",
     }
+
+
+# ---------------------------------------------------------------------------
+# Task #116: minimal, stdlib-only pcapng block reader for Kismet's real
+# /phy/phy80211/pcap/by-bssid/:mac/packets.pcapng stream (see module
+# docstring's TASK #116 UPDATE section for full sourcing/rationale for not
+# using scapy here). Implements just enough of the IETF pcapng format
+# (Section Header Block, Interface Description Block, Enhanced Packet
+# Block -- https://www.tcpdump.org/pcapng/, the same document Wireshark's
+# own pcapng dissector is built from) to recover raw frame bytes; unknown
+# block types are skipped by their own declared length rather than
+# rejected, since this reader only needs the packet payload, not full
+# semantic coverage of every optional block type.
+# ---------------------------------------------------------------------------
+PCAPNG_BLOCK_SHB = 0x0A0D0D0A   # Section Header Block
+PCAPNG_BLOCK_IDB = 0x00000001   # Interface Description Block
+PCAPNG_BLOCK_EPB = 0x00000006   # Enhanced Packet Block (what Kismet emits)
+PCAPNG_BLOCK_SPB = 0x00000003   # Simple Packet Block (older/simpler form)
+
+
+def iter_pcapng_frames(byte_chunks) -> "List[bytes]":
+    """Consume an iterable of byte chunks (e.g. requests' resp.iter_content())
+    containing a real pcapng byte stream and yield each Enhanced/Simple
+    Packet Block's raw captured frame bytes, in order.
+
+    This is a streaming, incremental parser: pcapng blocks are self-
+    delimiting (each starts with a 4-byte block type and a 4-byte total
+    block length, little-endian, and repeats that same length at the very
+    end of the block -- see tcpdump.org/pcapng's "General Block Structure"),
+    so this function buffers chunks until at least one full block is
+    available, yields its packet bytes (if it is an EPB/SPB; SHB/IDB and any
+    other/unknown block type are skipped by length, not parsed further),
+    then continues. Never raises on malformed/truncated trailing bytes at
+    stream end -- it simply stops yielding once no further complete block
+    fits in the remaining buffer.
+
+    Assumes little-endian block encoding (the byte-order magic in the
+    Section Header Block's body would normally be checked to select
+    endianness per the spec; Kismet, the only real-world source this
+    project targets, always writes little-endian pcapng on the
+    little-endian x86/ARM hosts this project runs on -- documented
+    assumption, not silently ignored).
+    """
+    buf = bytearray()
+    for chunk in byte_chunks:
+        if not chunk:
+            continue
+        buf.extend(chunk)
+        while True:
+            if len(buf) < 8:
+                break
+            block_type, block_total_length = struct.unpack_from("<II", buf, 0)
+            if block_total_length < 12 or len(buf) < block_total_length:
+                break  # incomplete block still arriving, wait for more chunks
+            body = bytes(buf[8:block_total_length - 4])
+            del buf[:block_total_length]
+
+            if block_type in (PCAPNG_BLOCK_EPB,):
+                # EPB body: interface_id(4) ts_high(4) ts_low(4) captured_len(4)
+                # packet_len(4) packet_data(captured_len, padded to 4 bytes) options...
+                if len(body) < 20:
+                    continue
+                captured_len = struct.unpack_from("<I", body, 12)[0]
+                packet_start = 20
+                packet_end = packet_start + captured_len
+                if packet_end > len(body):
+                    continue  # declared captured_len longer than actual body; skip
+                yield bytes(body[packet_start:packet_end])
+            elif block_type in (PCAPNG_BLOCK_SPB,):
+                # SPB body: packet_len(4) packet_data(rest, padded)
+                if len(body) < 4:
+                    continue
+                packet_len = struct.unpack_from("<I", body, 0)[0]
+                yield bytes(body[4:4 + packet_len])
+            # SHB/IDB/anything else: no packet payload to extract, skip.
+
+
+def radiotap_header_length(frame_bytes: bytes) -> Optional[int]:
+    """Real 802.11 radiotap headers start with version(1) + pad(1) +
+    length(2, little-endian) -- the length field IS the full radiotap
+    header length (this project's own kismet_bridge.py docstring already
+    cites this as "the radiotap header's own bytes[2:4]"; see
+    detect_db_raw_v2_signature()'s docstring). Returns None if frame_bytes
+    is too short to even contain that 4-byte prefix."""
+    if len(frame_bytes) < 4:
+        return None
+    return struct.unpack_from("<H", frame_bytes, 2)[0]
+
+
+def fetch_pcapng_frames(kismet_url: str, mac: str, apikey: Optional[str],
+                        max_frames: int = 25, max_seconds: float = 3.0,
+                        timeout: float = 5.0) -> List[bytes]:
+    """Open Kismet's REAL, verified pcapng-by-BSSID stream
+    (/phy/phy80211/pcap/by-bssid/:mac/packets.pcapng, phy_80211.cc:1016 --
+    see module docstring's TASK #116 UPDATE section) for one candidate MAC
+    and return up to max_frames raw frame byte-strings, reading for at most
+    max_seconds before explicitly closing the connection.
+
+    This endpoint is a genuinely LIVE, OPEN-ENDED stream (confirmed by
+    reading phy_80211.cc's block_until_stream_done() call) -- it does NOT
+    stop on its own. Bounding the read here (rather than looping forever)
+    is this bridge's own deliberate choice for fitting a per-candidate-BSSID
+    check into poll_once()'s synchronous poll cycle; it is not a
+    misunderstanding of the endpoint's real behaviour (documented above).
+    """
+    params = {}
+    if apikey:
+        params["KISMET"] = apikey
+    path = f"/phy/phy80211/pcap/by-bssid/{mac}/packets.pcapng"
+    frames: List[bytes] = []
+    deadline = time.time() + max_seconds
+    resp = requests.get(f"{kismet_url}{path}", params=params, stream=True, timeout=timeout)
+    try:
+        resp.raise_for_status()
+
+        def _bounded_chunks():
+            for chunk in resp.iter_content(chunk_size=4096):
+                yield chunk
+                if len(frames) >= max_frames or time.time() >= deadline:
+                    return
+
+        for frame in iter_pcapng_frames(_bounded_chunks()):
+            frames.append(frame)
+            if len(frames) >= max_frames or time.time() >= deadline:
+                break
+    finally:
+        resp.close()  # explicit: this stream never ends on its own server-side
+    return frames
+
+
+def check_wifibroadcast_signature(kismet_url: str, mac: str, apikey: Optional[str],
+                                  max_frames: int = 25, max_seconds: float = 3.0,
+                                  timeout: float = 5.0) -> Optional[Dict]:
+    """Open a bounded pcapng stream for one candidate MAC (see
+    fetch_pcapng_frames()) and run the EXISTING, unmodified
+    detect_db_raw_v2_signature() against each extracted raw frame. Returns
+    the FIRST match found (Dict, as returned by detect_db_raw_v2_signature),
+    or None if no frame in the bounded read matched or the stream/request
+    itself failed (network errors are swallowed here and logged, matching
+    this file's existing WARN-and-continue convention for Kismet REST
+    fetch failures in main()'s poll loop -- one candidate BSSID's pcapng
+    check failing should never crash the whole poll cycle).
+    """
+    try:
+        frames = fetch_pcapng_frames(kismet_url, mac, apikey, max_frames, max_seconds, timeout)
+    except requests.RequestException as e:
+        print(f"WARN: pcapng fetch for {mac} failed: {e}", file=sys.stderr)
+        return None
+
+    for frame_bytes in frames:
+        rt_len = radiotap_header_length(frame_bytes)
+        if rt_len is None:
+            continue
+        # associationless=None (unknown): this consumer does not track
+        # 802.11 association state for the BSSID, same honesty caveat
+        # detect_db_raw_v2_signature()'s own docstring already documents.
+        match = detect_db_raw_v2_signature(frame_bytes, rt_len, associationless=None)
+        if match is not None:
+            return match
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -590,7 +799,9 @@ def to_detection(device: Dict, drone_manuf: Optional[str]) -> Dict:
 
 def poll_once(console_url: str, headers: Dict, email: str, password: str,
              devices: List[Dict], forward_all: bool, seen_macs: Dict[str, float],
-             repost_interval_s: float) -> int:
+             repost_interval_s: float, check_wifibroadcast: bool = False,
+             kismet_url: Optional[str] = None, kismet_apikey: Optional[str] = None,
+             pcapng_max_frames: int = 25, pcapng_max_seconds: float = 3.0) -> int:
     posted = 0
     now = time.time()
     for device in devices:
@@ -613,6 +824,34 @@ def poll_once(console_url: str, headers: Dict, email: str, password: str,
                   f"{mac} ({detection['model']}) -> {r.json().get('callsign')}")
         except requests.RequestException as e:
             print(f"detection ingest failed for {mac}: {e}", file=sys.stderr)
+
+        # Task #116: for a drone-OUI-matched IEEE802.11 device already flagged
+        # by the metadata poll above, optionally also open a bounded pcapng
+        # stream for its BSSID and check for DroneBridge's WifiBroadcast
+        # raw-v2 signature (see module docstring's TASK #116 UPDATE section
+        # for why this is keyed off metadata-poll-flagged MACs rather than an
+        # "all packets" mode Kismet does not actually expose). Opt-in
+        # (--check-wifibroadcast-signature) since it is an extra HTTP
+        # round-trip per candidate device, on top of the existing JSON poll.
+        if (check_wifibroadcast and kismet_url is not None
+                and drone_manuf is not None
+                and device.get("kismet.device.base.phyname") == "IEEE802.11"):
+            match = check_wifibroadcast_signature(kismet_url, mac, kismet_apikey,
+                                                  max_frames=pcapng_max_frames,
+                                                  max_seconds=pcapng_max_seconds)
+            if match is not None:
+                wb_detection = build_wifibroadcast_detection(match, mac=mac)
+                try:
+                    r = _post_with_reauth(console_url, "/api/detections/ingest",
+                                          wb_detection, headers, email, password, timeout=5)
+                    r.raise_for_status()
+                    posted += 1
+                    print(f"[kismet_bridge] posted {wb_detection['confidence_type']} "
+                          f"WifiBroadcast-signature detection for {mac} -> "
+                          f"{r.json().get('callsign')}")
+                except requests.RequestException as e:
+                    print(f"wifibroadcast detection ingest failed for {mac}: {e}",
+                          file=sys.stderr)
     return posted
 
 
@@ -636,6 +875,20 @@ def main() -> int:
     ap.add_argument("--forward-all-devices", action="store_true",
                     help="Forward every Kismet-seen device as an advisory_only "
                          "detection, not just drone-OUI matches. Expect high volume.")
+    ap.add_argument("--check-wifibroadcast-signature", action="store_true",
+                    help="Task #116: for each drone-OUI-matched IEEE802.11 device, also "
+                         "open a bounded live pcapng stream from Kismet's real "
+                         "/phy/phy80211/pcap/by-bssid/:mac/packets.pcapng route for that "
+                         "BSSID and check its raw frames against "
+                         "detect_db_raw_v2_signature() (DroneBridge WifiBroadcast raw-v2 "
+                         "protocol match). Adds one extra HTTP round-trip per candidate "
+                         "device per poll cycle -- opt-in, off by default.")
+    ap.add_argument("--pcapng-max-frames", type=int, default=25,
+                    help="Max raw frames to read per bounded pcapng check (see "
+                         "--check-wifibroadcast-signature).")
+    ap.add_argument("--pcapng-max-seconds", type=float, default=3.0,
+                    help="Max seconds to keep a bounded pcapng stream open per candidate "
+                         "BSSID (see --check-wifibroadcast-signature).")
     ap.add_argument("--use-test-fixture", action="store_true",
                     help="Run against build_test_fixture()'s hardcoded offline payload "
                          "instead of a real Kismet server -- for testing this bridge's "
@@ -684,7 +937,11 @@ def main() -> int:
             continue
 
         poll_once(args.console_url, headers, args.email, args.password,
-                 devices, args.forward_all_devices, seen_macs, args.repost_interval_s)
+                 devices, args.forward_all_devices, seen_macs, args.repost_interval_s,
+                 check_wifibroadcast=args.check_wifibroadcast_signature,
+                 kismet_url=args.kismet_url, kismet_apikey=args.kismet_apikey,
+                 pcapng_max_frames=args.pcapng_max_frames,
+                 pcapng_max_seconds=args.pcapng_max_seconds)
 
         last_times = [d.get("kismet.device.base.last_time") for d in devices
                      if d.get("kismet.device.base.last_time")]

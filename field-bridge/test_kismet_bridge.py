@@ -265,5 +265,217 @@ class KismetRestClientTests(unittest.TestCase):
         self.assertEqual(kwargs["params"], {})
 
 
+# ---------------------------------------------------------------------------
+# Task #116: pcapng-stream consumer tests. Builds a REALISTIC mocked pcapng
+# byte stream matching the IETF pcapng block format (Section Header Block +
+# Interface Description Block + Enhanced Packet Blocks) that Kismet's real
+# /phy/phy80211/pcap/by-bssid/:mac/packets.pcapng route emits (per
+# phy_80211.cc/pcapng_stream_futurebuf.h, see kismet_bridge.py's module
+# docstring) -- not a fabricated ad-hoc byte layout.
+# ---------------------------------------------------------------------------
+import struct
+
+
+def _pcapng_block(block_type: int, body: bytes) -> bytes:
+    total_len = 12 + len(body)
+    return (struct.pack("<II", block_type, total_len) + body +
+           struct.pack("<I", total_len))
+
+
+def _shb() -> bytes:
+    # byte-order-magic(4) + major(2) + minor(2) + section_length(8, -1 = unknown)
+    body = struct.pack("<IHHq", 0x1A2B3C4D, 1, 0, -1)
+    return _pcapng_block(kismet_bridge.PCAPNG_BLOCK_SHB, body)
+
+
+def _idb(linktype: int = 127) -> bytes:
+    # linktype(2) + reserved(2) + snaplen(4); 127 = DLT_IEEE802_11_RADIO
+    body = struct.pack("<HHI", linktype, 0, 262144)
+    return _pcapng_block(kismet_bridge.PCAPNG_BLOCK_IDB, body)
+
+
+def _epb(packet_data: bytes, interface_id: int = 0) -> bytes:
+    captured_len = len(packet_data)
+    pad = (-captured_len) % 4
+    body = (struct.pack("<IIIII", interface_id, 0, 0, captured_len, captured_len) +
+           packet_data + b"\x00" * pad)
+    return _pcapng_block(kismet_bridge.PCAPNG_BLOCK_EPB, body)
+
+
+def _wifibroadcast_frame(radiotap_len: int = 13) -> bytes:
+    """A raw 802.11 frame (radiotap header + DroneBridge db_raw_v2_header_t)
+    matching detect_db_raw_v2_signature()'s real, existing signature check."""
+    # radiotap header: version(1) pad(1) length(2, LE) + rest padding
+    radiotap = struct.pack("<BBH", 0, 0, radiotap_len) + b"\x00" * (radiotap_len - 4)
+    db_header = (kismet_bridge.DB_FCF_DURATION_DATA +
+                bytes([kismet_bridge.DB_DIREC_DRONE, 0xC8, 0x03]) +
+                (100).to_bytes(2, "little") + bytes([7]))
+    return radiotap + db_header + b"\x00" * 10  # trailing payload bytes
+
+
+class PcapngStreamParserTests(unittest.TestCase):
+    def test_extracts_frames_skipping_shb_and_idb(self):
+        frame1 = b"\xAA" * 30
+        frame2 = b"\xBB" * 40
+        stream = _shb() + _idb() + _epb(frame1) + _epb(frame2)
+        frames = list(kismet_bridge.iter_pcapng_frames([stream]))
+        self.assertEqual(frames, [frame1, frame2])
+
+    def test_handles_chunked_delivery_mid_block(self):
+        frame = b"\xCC" * 50
+        stream = _shb() + _idb() + _epb(frame)
+        # split into small chunks, including mid-block splits
+        chunks = [stream[i:i + 7] for i in range(0, len(stream), 7)]
+        frames = list(kismet_bridge.iter_pcapng_frames(chunks))
+        self.assertEqual(frames, [frame])
+
+    def test_ignores_incomplete_trailing_block(self):
+        frame = b"\xDD" * 20
+        stream = _shb() + _idb() + _epb(frame)
+        truncated = stream[:-5]  # cut off mid-final-block
+        frames = list(kismet_bridge.iter_pcapng_frames([truncated]))
+        self.assertEqual(frames, [])  # incomplete EPB never yielded
+
+    def test_real_wifibroadcast_frame_round_trips_through_pcapng(self):
+        frame = _wifibroadcast_frame()
+        stream = _shb() + _idb() + _epb(frame)
+        frames = list(kismet_bridge.iter_pcapng_frames([stream]))
+        self.assertEqual(len(frames), 1)
+        rt_len = kismet_bridge.radiotap_header_length(frames[0])
+        self.assertEqual(rt_len, 13)
+        match = kismet_bridge.detect_db_raw_v2_signature(frames[0], rt_len)
+        self.assertIsNotNone(match)
+        self.assertEqual(match["direction"], "drone")
+
+
+class RadiotapHeaderLengthTests(unittest.TestCase):
+    def test_reads_length_field(self):
+        frame = struct.pack("<BBH", 0, 0, 18) + b"\x00" * 20
+        self.assertEqual(kismet_bridge.radiotap_header_length(frame), 18)
+
+    def test_none_when_too_short(self):
+        self.assertIsNone(kismet_bridge.radiotap_header_length(b"\x00\x00"))
+
+
+class FetchPcapngFramesTests(unittest.TestCase):
+    def test_hits_real_by_bssid_route_with_apikey_param(self):
+        frame = _wifibroadcast_frame()
+        stream = _shb() + _idb() + _epb(frame)
+        fake = mock.Mock()
+        fake.raise_for_status.return_value = None
+        fake.iter_content.return_value = [stream]
+        fake.close.return_value = None
+        with mock.patch.object(kismet_bridge.requests, "get", return_value=fake) as get:
+            frames = kismet_bridge.fetch_pcapng_frames(
+                "http://kismet:2501", "AA:BB:CC:DD:EE:FF", "key123")
+        args, kwargs = get.call_args
+        self.assertEqual(args[0],
+                        "http://kismet:2501/phy/phy80211/pcap/by-bssid/"
+                        "AA:BB:CC:DD:EE:FF/packets.pcapng")
+        self.assertEqual(kwargs["params"], {"KISMET": "key123"})
+        self.assertTrue(kwargs["stream"])
+        self.assertEqual(len(frames), 1)
+        fake.close.assert_called_once()  # bounded read must explicitly close the live stream
+
+    def test_stops_at_max_frames(self):
+        frame = _wifibroadcast_frame()
+        stream = _shb() + _idb() + _epb(frame) + _epb(frame) + _epb(frame)
+        fake = mock.Mock()
+        fake.raise_for_status.return_value = None
+        fake.iter_content.return_value = [stream]
+        fake.close.return_value = None
+        with mock.patch.object(kismet_bridge.requests, "get", return_value=fake):
+            frames = kismet_bridge.fetch_pcapng_frames(
+                "http://kismet:2501", "AA:BB:CC:DD:EE:FF", None, max_frames=2)
+        self.assertLessEqual(len(frames), 2)
+
+
+class CheckWifibroadcastSignatureTests(unittest.TestCase):
+    def test_returns_match_when_signature_present(self):
+        frame = _wifibroadcast_frame()
+        stream = _shb() + _idb() + _epb(frame)
+        with mock.patch.object(kismet_bridge, "fetch_pcapng_frames",
+                               return_value=[frame]):
+            match = kismet_bridge.check_wifibroadcast_signature(
+                "http://kismet:2501", "AA:BB:CC:DD:EE:FF", None)
+        self.assertIsNotNone(match)
+        self.assertEqual(match["direction"], "drone")
+        self.assertIsNone(match["associationless"])
+
+    def test_returns_none_when_no_signature_present(self):
+        non_matching = b"\x00" * 4 + b"\x00" * 40  # no valid radiotap/db header pattern
+        with mock.patch.object(kismet_bridge, "fetch_pcapng_frames",
+                               return_value=[non_matching]):
+            match = kismet_bridge.check_wifibroadcast_signature(
+                "http://kismet:2501", "AA:BB:CC:DD:EE:FF", None)
+        self.assertIsNone(match)
+
+    def test_swallows_request_exception_and_returns_none(self):
+        with mock.patch.object(kismet_bridge, "fetch_pcapng_frames",
+                               side_effect=kismet_bridge.requests.RequestException("boom")):
+            match = kismet_bridge.check_wifibroadcast_signature(
+                "http://kismet:2501", "AA:BB:CC:DD:EE:FF", None)
+        self.assertIsNone(match)
+
+
+class PollOnceWifibroadcastWiringTests(unittest.TestCase):
+    """Confirms poll_once() genuinely reaches /api/detections/ingest with a
+    WifiBroadcast-signature detection when --check-wifibroadcast-signature
+    is enabled and a match is found for a drone-OUI-matched IEEE802.11
+    device -- the actual task #116 wiring, not just the pieces in isolation."""
+
+    def _drone_device(self):
+        return {
+            "kismet.device.base.macaddr": "60:60:1F:44:55:66",
+            "kismet.device.base.phyname": "IEEE802.11",
+            "kismet.device.base.name": "",
+            "kismet.device.base.type": "Wi-Fi AP",
+            "kismet.device.base.manuf": "Dji Innovations",
+            "kismet.device.base.first_time": 1000,
+            "kismet.device.base.last_time": 1001,
+            "kismet.device.base.channel": "149",
+            "kismet.device.base.frequency": 5745000,
+            "kismet.device.base.signal": {"kismet.common.signal.last_signal": -55},
+        }
+
+    def test_posts_wifibroadcast_detection_when_match_found(self):
+        match = {"frame_kind": "data", "direction": "drone", "comm_id": 0xC8,
+                "port": 3, "payload_length": 100, "seq_num": 7, "associationless": None}
+        fake_resp = mock.Mock()
+        fake_resp.raise_for_status.return_value = None
+        fake_resp.json.return_value = {"callsign": "WIFIBROADCAST-60:60:1F:44:55:66"}
+        fake_resp.status_code = 200
+        with mock.patch.object(kismet_bridge, "check_wifibroadcast_signature",
+                              return_value=match) as check_fn, \
+             mock.patch.object(kismet_bridge.requests, "post",
+                              return_value=fake_resp) as post:
+            posted = kismet_bridge.poll_once(
+                "http://console", {}, "a@b.com", "pw",
+                [self._drone_device()], forward_all=False, seen_macs={},
+                repost_interval_s=60.0, check_wifibroadcast=True,
+                kismet_url="http://kismet:2501", kismet_apikey="key123")
+        check_fn.assert_called_once()
+        self.assertEqual(posted, 2)  # the OUI-match detection AND the wifibroadcast one
+        posted_bodies = [c.kwargs["json"] for c in post.call_args_list]
+        confidence_types = [b["confidence_type"] for b in posted_bodies]
+        self.assertIn("heuristic_binary", confidence_types)
+        wb_bodies = [b for b in posted_bodies if "WIFIBROADCAST" in b.get("callsign", "")]
+        self.assertEqual(len(wb_bodies), 1)
+
+    def test_no_extra_post_when_check_disabled(self):
+        fake_resp = mock.Mock()
+        fake_resp.raise_for_status.return_value = None
+        fake_resp.json.return_value = {"callsign": "KISMET-60:60:1F:44:55:66"}
+        fake_resp.status_code = 200
+        with mock.patch.object(kismet_bridge, "check_wifibroadcast_signature") as check_fn, \
+             mock.patch.object(kismet_bridge.requests, "post", return_value=fake_resp):
+            posted = kismet_bridge.poll_once(
+                "http://console", {}, "a@b.com", "pw",
+                [self._drone_device()], forward_all=False, seen_macs={},
+                repost_interval_s=60.0, check_wifibroadcast=False)
+        check_fn.assert_not_called()
+        self.assertEqual(posted, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
