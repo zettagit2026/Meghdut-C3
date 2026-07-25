@@ -95,25 +95,86 @@ A SYSTEMD SERVICE FOR THIS UNTIL HARDWARE EXISTS.
 =============================================================================
 Per project_cema_hardware_and_capabilities / task #70: this project has no
 monitor-mode-capable Wi-Fi adapter (the same blocker that stalled the earlier
-WiFi MAC-OUI drone-detection evaluation), and no Bluetooth 5 Long Range /
-Extended Advertising capture path either. Remote ID over Wi-Fi is carried in
-802.11 Beacon frames or the Neighbor Awareness Networking (NAN) Service
-Discovery Frame (see opendroneid-core-c's libopendroneid/odid_wifi.h /
-wifi.c, which build/parse those frames but still require a monitor-mode NIC
-to actually capture them off the air); Remote ID over Bluetooth needs a BLE
-scanner capable of Bluetooth 4 Legacy Advertising or Bluetooth 5 Long Range
-Extended Advertising. This project owns neither today.
+WiFi MAC-OUI drone-detection evaluation), AND no BLE scanner capable of
+Bluetooth 4 Legacy Advertising or Bluetooth 5 Long Range / Extended
+Advertising capture. This project owns neither radio front-end today.
+Remote ID over Wi-Fi is carried in 802.11 Beacon frames or the Neighbor
+Awareness Networking (NAN) Service Discovery Frame (see opendroneid-core-c's
+libopendroneid/odid_wifi.h / wifi.c, which build/parse those frames but
+still require a monitor-mode NIC to actually capture them off the air).
 
 This module is therefore STAGED, BUILD-AND-TEST-ONLY, exactly like
 crsf_parser.py/msp_parser.py/canopen_parser.py/dronecan_parser.py before
 their hardware arrived: the decode logic is real, verified, and correct
 against reference-implementation bytes, but there is deliberately NO systemd
 service file for this module and NO live capture integration point wired up.
-When a monitor-mode Wi-Fi adapter or BLE 5 scanner is procured, the missing
-piece is only a capture front-end (scapy/tcpdump on a monitor-mode interface
-for the Wi-Fi Beacon/NAN path, or bleak/bluepy for the BLE path) that hands
-this module raw 25-byte ODID message payloads -- the decode logic itself
-needs no changes.
+When a monitor-mode Wi-Fi adapter is procured, the missing piece is only a
+capture front-end (scapy/tcpdump on a monitor-mode interface for the Wi-Fi
+Beacon/NAN path) that hands this module raw 25-byte ODID message payloads --
+the decode logic itself needs no changes. When a BLE4/BLE5 scanner is
+procured (this project owns none today -- see BLUETOOTH FRAMING section
+below), the missing piece is a capture front-end (bleak/bluepy reading
+raw AD/GAP advertising payloads) feeding parse_bluetooth_ad_frame() below.
+
+=============================================================================
+BLUETOOTH FRAMING -- WHAT'S IN THE LOCAL opendroneid-core-c CHECKOUT, AND
+WHAT ISN'T (task #89 follow-up: added Bluetooth 4/5 support alongside WiFi)
+=============================================================================
+IMPORTANT PROVENANCE NOTE, stated plainly because it differs from the WiFi
+path above: the local opendroneid-core-c checkout at
+`~/Desktop/Zettawise/PMO Suraj/tool/opendroneid-core-c` contains NO
+Bluetooth encode/decode/framing source at all. This was verified by
+grepping the entire tree (excluding the vendored mavlink_c_library_v2) for
+"bluetooth", "BT_", "0xFFFA", "AD_TYPE", "manufacturer", "service.*data" --
+the only hit is a single comment in libopendroneid/opendroneid.h (~line
+333) noting that Bluetooth 4 "does not have built-in FEC in the transmission
+protocol", in the context of the Auth message's optional FEC padding. There
+is no odid_bluetooth.h/.c, no BLE advertising struct, nothing analogous to
+libopendroneid/odid_wifi.h's `ieee80211_vendor_specific` /
+`ODID_service_info` structs for the Wi-Fi path. This checkout only ever
+implemented the Wi-Fi Beacon/NAN transport (wifi/ dir + libopendroneid/
+odid_wifi.h + wifi.c) and the MAVLink<->ODID translation (libmav2odid/).
+
+So, unlike every other constant/struct-offset in this module (all copied
+verbatim from compiled/real C source), the Bluetooth AD framing implemented
+below is NOT derived from this repo -- there is nothing in this repo to
+derive it from. It is instead taken from the public ASTM F3411 standard
+text and the Bluetooth SIG "Assigned Numbers" document, which define the
+outer encapsulation as a standard BLE Advertising Data (AD) structure:
+  - one AD structure of AD Type 0x16 ("Service Data - 16-bit UUID"),
+  - UUID 0xFFFA (little-endian on the wire: bytes 0xFA, 0xFF) -- this
+    16-bit UUID is registered to ASTM International in the Bluetooth SIG
+    16-bit UUID assigned-numbers list, specifically for Open Drone ID,
+  - followed by a 1-byte AppCode, value 0x0D, identifying "ASTM Remote ID"
+    as the Service Data payload's meaning,
+  - followed by the SAME wrapper opendroneid-core-c already defines for
+    Wi-Fi (`struct ODID_service_info` in odid_wifi.h: a 1-byte
+    message_counter, then an ODID_MessagePack_encoded, i.e. the identical
+    MessagePack-or-single-Message payload already decoded above) -- ASTM
+    F3411 deliberately reuses one wire format for the inner Remote ID
+    payload across both Wi-Fi and Bluetooth transports; only the OUTER
+    encapsulation differs (802.11 vendor-specific information element vs.
+    BLE AD Service Data structure).
+Given that, the message-struct decode logic in this module
+(decode_basic_id/decode_location/decode_self_id/decode_system/
+decode_operator_id/decode_message/decode_message_pack) needed ZERO changes
+for Bluetooth -- it was already transport-agnostic, exactly as hypothesized.
+The only new code is parse_bluetooth_ad_frame() below, an outer-framing
+parser that walks a raw BLE AD/GAP byte stream, finds the ASTM Service Data
+AD structure, and hands the inner bytes to the existing, unmodified decode
+functions.
+
+Because there is no compiled-C Bluetooth encoder anywhere in this repo to
+generate byte-exact ground truth from (unlike the WiFi-path message structs,
+which WERE verified against real compiled opendroneid.c output -- see TEST
+VECTORS section above), this module's Bluetooth self-tests do NOT claim to
+be "real reference-implementation output." Instead they construct AD frames
+by hand per the ASTM/Bluetooth-SIG framing described above, wrapping the
+SAME byte-exact TEST_VECTORS_HEX payloads already verified against the real
+C encoder. This tests exactly the new code (the AD-structure walk/strip)
+while re-using already-verified ground truth for the inner payload, and does
+not fabricate a "verified against C" claim the framing has no way to earn
+here.
 
 Requires: nothing beyond the Python standard library (struct). No
 third-party dependency, no compiled extension.
@@ -521,6 +582,107 @@ def decode_message(raw: bytes) -> Dict:
     return decoder(raw)
 
 
+# =============================================================================
+# Bluetooth 4/5 (Legacy Advertising / Long Range Extended Advertising) outer
+# framing -- see module docstring "BLUETOOTH FRAMING" section for exactly
+# where these constants come from (ASTM F3411 text + Bluetooth SIG Assigned
+# Numbers, NOT the local opendroneid-core-c checkout, which has no Bluetooth
+# source at all). This is framing-only: the inner bytes recovered here are
+# handed to the SAME decode_message()/decode_message_pack() above, unchanged.
+# =============================================================================
+BLE_AD_TYPE_SERVICE_DATA_16BIT_UUID = 0x16
+BLE_ODID_SERVICE_UUID = 0xFFFA  # ASTM International, per Bluetooth SIG 16-bit UUID assigned numbers
+BLE_ODID_APPCODE = 0x0D          # "ASTM Remote ID" AD application code
+
+
+class BluetoothFrameError(ValueError):
+    """Raised when a candidate BLE AD/GAP byte stream is malformed or does
+    not contain a recognized ASTM Remote ID Service Data AD structure --
+    never silently coerced into a fabricated result."""
+
+
+def iter_ble_ad_structures(payload: bytes):
+    """Walk a raw BLE Advertising Data (AD) / GAP byte stream, yielding
+    (ad_type, ad_data) for each AD structure. Standard BLE AD structure
+    framing (Bluetooth Core Spec Vol 3, Part C, Section 11): each structure
+    is [Length(1)][AD Type(1)][AD Data(Length-1 bytes)], repeated until the
+    payload is exhausted or a zero-length structure (padding) is hit."""
+    i = 0
+    n = len(payload)
+    while i < n:
+        length = payload[i]
+        if length == 0:
+            break  # zero-length = padding, rest of payload is unused
+        if i + 1 + length > n:
+            raise BluetoothFrameError(
+                f"AD structure at offset {i} claims length {length} but only "
+                f"{n - i - 1} bytes remain"
+            )
+        ad_type = payload[i + 1]
+        ad_data = payload[i + 2:i + 1 + length]
+        yield ad_type, ad_data
+        i += 1 + length
+
+
+def parse_bluetooth_ad_frame(payload: bytes) -> bytes:
+    """Given a raw BLE Legacy Advertising (BT4) or Long Range/Extended
+    Advertising (BT5) AD/GAP payload (e.g. as delivered by a bleak/bluepy
+    scan callback), find the ASTM Remote ID Service Data AD structure
+    (AD Type 0x16, UUID 0xFFFA, AppCode 0x0D) and return the inner bytes
+    that follow the AppCode -- i.e. the same message_counter +
+    ODID_MessagePack_encoded (or single Message) wire format already
+    produced for the Wi-Fi transport by opendroneid-core-c's
+    ODID_service_info struct. Raises BluetoothFrameError if no such AD
+    structure is present; never guesses.
+
+    NOTE: does not itself strip the leading message_counter byte -- callers
+    decoding a single Message vs. a MessagePack should use
+    decode_bluetooth_service_data() below, which does.
+    """
+    for ad_type, ad_data in iter_ble_ad_structures(payload):
+        if ad_type != BLE_AD_TYPE_SERVICE_DATA_16BIT_UUID:
+            continue
+        if len(ad_data) < 3:
+            continue  # too short to hold UUID(2) + AppCode(1)
+        uuid = ad_data[0] | (ad_data[1] << 8)  # little-endian per BLE AD convention
+        if uuid != BLE_ODID_SERVICE_UUID:
+            continue
+        app_code = ad_data[2]
+        if app_code != BLE_ODID_APPCODE:
+            raise BluetoothFrameError(
+                f"Service Data UUID 0xFFFA present but AppCode is "
+                f"0x{app_code:02X}, expected 0x{BLE_ODID_APPCODE:02X} "
+                f"(ASTM Remote ID)"
+            )
+        return ad_data[3:]
+    raise BluetoothFrameError(
+        "no ASTM Remote ID Service Data AD structure (Type 0x16, "
+        "UUID 0xFFFA) found in payload"
+    )
+
+
+def decode_bluetooth_service_data(payload: bytes) -> List[Dict]:
+    """Full Bluetooth 4/5 decode: extract the ASTM Service Data AD structure
+    from a raw BLE advertising payload, strip the 1-byte message_counter
+    (ODID_service_info.message_counter -- identical field to the Wi-Fi
+    path), and decode the remaining bytes as either a single 25-byte ODID
+    Message or an ODID_MessagePack_encoded, using the exact same,
+    unmodified decode_message()/decode_message_pack() functions used for
+    the Wi-Fi transport. Returns a list of decoded message dicts (length 1
+    for a lone Message)."""
+    inner = parse_bluetooth_ad_frame(payload)
+    if len(inner) < 1:
+        raise BluetoothFrameError("ASTM Service Data has no message_counter/payload bytes")
+    message_counter = inner[0]  # noqa: F841 -- not currently surfaced, parsed for completeness
+    body = inner[1:]
+    if not body:
+        raise BluetoothFrameError("ASTM Service Data has message_counter but no message payload")
+    msg_type = peek_message_type(body)
+    if msg_type == MESSAGETYPE_PACKED:
+        return decode_message_pack(body)
+    return [decode_message(body)]
+
+
 def decode_message_pack(raw: bytes) -> List[Dict]:
     """ODID_MessagePack_encoded (opendroneid.h lines ~599+):
     byte0: ProtoVersion:4 MessageType:4 (MessageType must be 0xF/PACKED)
@@ -669,6 +831,64 @@ def self_test() -> None:
     except RemoteIDDecodeError:
         check("wrong-message-type payload raises RemoteIDDecodeError", True)
 
+    print("\n=== Bluetooth AD framing: single message wrapped by hand per ASTM/BT-SIG"
+          " spec (NOT compiled-C output -- see module docstring) ===")
+    basic_id_bytes = bytes.fromhex(TEST_VECTORS_HEX["BasicID"])
+    service_data = bytes([0xFA, 0xFF, BLE_ODID_APPCODE]) + bytes([0x00]) + basic_id_bytes
+    ad_struct = bytes([1 + len(service_data), BLE_AD_TYPE_SERVICE_DATA_16BIT_UUID]) + service_data
+    flags_ad = bytes([0x02, 0x01, 0x06])  # unrelated leading AD structure (Flags), must be skipped
+    ble_payload = flags_ad + ad_struct
+    results = decode_bluetooth_service_data(ble_payload)
+    check("BLE-framed single Basic ID message decodes to exactly 1 result", len(results) == 1)
+    check("BLE-framed Basic ID message_type == BASIC_ID",
+          results and results[0].get("message_type") == "BASIC_ID")
+    check("BLE-framed Basic ID uas_id matches WiFi-path decode of same bytes",
+          results and results[0]["uas_id"] == decode_basic_id(basic_id_bytes)["uas_id"])
+
+    print("\n=== Bluetooth AD framing: full 5-message MessagePack (same bytes as the"
+          " WiFi message-pack test above) ===")
+    pack_body_bt = b"".join(bytes.fromhex(h) for h in (
+        TEST_VECTORS_HEX["BasicID"], TEST_VECTORS_HEX["Location"],
+        TEST_VECTORS_HEX["SelfID"], TEST_VECTORS_HEX["System"],
+        TEST_VECTORS_HEX["OperatorID"],
+    ))
+    pack_header_bt = bytes([0xF0, ODID_MESSAGE_SIZE, 5])
+    service_data_pack = (bytes([0xFA, 0xFF, BLE_ODID_APPCODE]) + bytes([0x00])
+                          + pack_header_bt + pack_body_bt)
+    ad_struct_pack = (bytes([1 + len(service_data_pack), BLE_AD_TYPE_SERVICE_DATA_16BIT_UUID])
+                      + service_data_pack)
+    ble_payload_pack = flags_ad + ad_struct_pack
+    results_pack = decode_bluetooth_service_data(ble_payload_pack)
+    check("BLE-framed message pack decodes exactly 5 embedded messages", len(results_pack) == 5)
+    check("BLE-framed message pack order matches WiFi-path decode of same bytes",
+          [r.get("message_type") for r in results_pack] ==
+          ["BASIC_ID", "LOCATION", "SELF_ID", "SYSTEM", "OPERATOR_ID"])
+
+    print("\n=== Bluetooth AD framing error handling ===")
+    try:
+        parse_bluetooth_ad_frame(flags_ad)  # no Service Data AD structure at all
+        check("payload with no ASTM Service Data AD raises BluetoothFrameError", False)
+    except BluetoothFrameError:
+        check("payload with no ASTM Service Data AD raises BluetoothFrameError", True)
+    try:
+        wrong_uuid = bytes([0x04, 0x16, 0xAB, 0xCD, BLE_ODID_APPCODE])
+        parse_bluetooth_ad_frame(wrong_uuid)
+        check("Service Data AD with wrong UUID raises BluetoothFrameError", False)
+    except BluetoothFrameError:
+        check("Service Data AD with wrong UUID raises BluetoothFrameError", True)
+    try:
+        wrong_appcode = bytes([0x04, 0x16, 0xFA, 0xFF, 0x99])
+        parse_bluetooth_ad_frame(wrong_appcode)
+        check("Service Data AD with wrong AppCode raises BluetoothFrameError", False)
+    except BluetoothFrameError:
+        check("Service Data AD with wrong AppCode raises BluetoothFrameError", True)
+    try:
+        truncated = bytes([0x05, 0x16, 0xFA, 0xFF])  # length says 5 bytes follow but only 2 do
+        parse_bluetooth_ad_frame(truncated)
+        check("truncated AD structure raises BluetoothFrameError", False)
+    except BluetoothFrameError:
+        check("truncated AD structure raises BluetoothFrameError", True)
+
     print(f"\n{'ALL SELF-TESTS PASSED' if not failures else f'{len(failures)} SELF-TEST(S) FAILED'}")
     if failures:
         for f in failures:
@@ -692,6 +912,15 @@ def main() -> int:
                           "string (49-50 hex chars) and print the result. "
                           "Utility for offline analysis of a captured payload; "
                           "does not touch any live radio.")
+    ap.add_argument("--decode-ble-hex", metavar="HEX",
+                     help="Decode a raw BLE Advertising Data (AD/GAP) payload "
+                          "given as a hex string -- finds the ASTM Remote ID "
+                          "Service Data AD structure (Type 0x16, UUID 0xFFFA), "
+                          "strips the message_counter, and decodes the inner "
+                          "Message/MessagePack. Utility for offline analysis of "
+                          "a captured BLE payload (e.g. from a bleak/bluepy "
+                          "scan log); does not touch any live radio -- no BLE "
+                          "scanner exists on this project's hardware yet.")
     args = ap.parse_args()
 
     if args.self_test:
@@ -703,6 +932,15 @@ def main() -> int:
         try:
             print(decode_message(raw))
         except RemoteIDDecodeError as e:
+            print(f"decode error: {e}", file=sys.stderr)
+            return 1
+        return 0
+
+    if args.decode_ble_hex:
+        raw = bytes.fromhex(args.decode_ble_hex)
+        try:
+            print(decode_bluetooth_service_data(raw))
+        except (BluetoothFrameError, RemoteIDDecodeError) as e:
             print(f"decode error: {e}", file=sys.stderr)
             return 1
         return 0
