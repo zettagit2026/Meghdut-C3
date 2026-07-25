@@ -1,0 +1,34 @@
+{
+	# Internal-CA mode: this is a private LAN deployment with no guaranteed
+	# internet/DNS reachability, so a field CEMA system cannot depend on
+	# internet access to obtain or renew a public ACME certificate. Caddy
+	# mints its own internal root CA and per-host leaf certs instead.
+	local_certs
+
+	# Browsers/curl never send SNI when connecting to a bare IP literal
+	# (RFC 6066 forbids IP addresses in the SNI server_name field). Since
+	# operators will mostly type https://172.16.16.196 directly, ClientHellos
+	# will arrive with an empty SNI. Without a default, Caddy can't pick
+	# which certificate to present for an unrecognized/empty SNI and the
+	# handshake fails with a TLS internal_error alert. This pins the IP as
+	# the fallback identity for name-less connections.
+	default_sni 172.16.16.196
+}
+
+:80 {
+	redir https://{host}{uri} permanent
+}
+
+172.16.16.196, localhost, 127.0.0.1 {
+	tls internal
+
+	reverse_proxy frontend:3000
+
+	header {
+		# Short max-age during initial rollout (see SECURITY_TLS_NOTE.md /
+		# task #100 design note): extend once HTTPS-only cutover is
+		# confirmed stable across all operator machines. Do not set a long
+		# max-age or preload while HTTP is still served in parallel.
+		Strict-Transport-Security "max-age=300; includeSubDomains"
+	}
+}

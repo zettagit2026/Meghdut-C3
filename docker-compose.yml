@@ -87,5 +87,27 @@ services:
     ports:
       - "${BIND_HOST:-0.0.0.0}:3000:3000"
 
+  caddy:
+    image: caddy:2-alpine
+    container_name: cema-caddy
+    restart: unless-stopped
+    depends_on:
+      - frontend
+    ports:
+      # 443 = HTTPS via Caddy's internal CA (tls internal in Caddyfile).
+      # 80   = redirect-only to https, per Caddyfile.
+      - "${BIND_HOST:-0.0.0.0}:443:443"
+      - "${BIND_HOST:-0.0.0.0}:80:80"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      # cema_caddy_data holds the internal CA root + issued leaf certs.
+      # This MUST persist across container recreation -- regenerating the
+      # root would invalidate any copies already distributed to operator
+      # machines. Never remove this volume as part of routine cleanup.
+      - cema_caddy_data:/data
+      - cema_caddy_config:/config
+
 volumes:
   cema_mongo_data:
+  cema_caddy_data:
+  cema_caddy_config:
