@@ -897,7 +897,7 @@ class JamRequestBody(BaseModel):
     # GNSS L1 presets (gps_l1/galileo_e1/beidou_b1/glonass_l1) added per
     # OPERATIONAL REQUIREMENTS.md — see field-bridge/hackrf_jam.py's
     # BAND_PRESETS_MHZ comment for exact freqs/GLONASS channelization note.
-    band: Optional[str] = Field(None, pattern="^(433|915|2g4|5g8|gps_l1|galileo_e1|beidou_b1|glonass_l1)$")
+    band: Optional[str] = Field(None, pattern="^(433|915|2g4|bt_2g4|5g8|gps_l1|galileo_e1|beidou_b1|glonass_l1)$")
     freq_mhz: Optional[float] = None
     bandwidth_khz: float = 500.0
     duration_s: float = 5.0  # server-side clamps to JAM_MAX_DURATION_S regardless
@@ -2615,7 +2615,13 @@ async def deploy_payload(body: DeployPayloadBody,
 # bridge are separate deployable processes/hosts; kept as the same values by
 # convention. If hackrf_jam.py's presets ever change, update this dict too.
 JAM_BAND_PRESETS_MHZ = {
-    "433": 435.0, "915": 915.0, "2g4": 2450.0, "5g8": 5800.0,
+    "433": 435.0, "915": 915.0, "2g4": 2450.0,
+    # Bluetooth Classic/BLE — see field-bridge/hackrf_jam.py's BAND_PRESETS_MHZ
+    # comment: this is the SAME shared 2.4-2.4835GHz ISM band "2g4" already
+    # targets, just an explicitly-labeled preset for operator clarity. Not a
+    # distinct hop-following jammer.
+    "bt_2g4": 2442.0,
+    "5g8": 5800.0,
     # GNSS L1 targets — see field-bridge/hackrf_jam.py's BAND_PRESETS_MHZ
     # comment for exact freqs and the GLONASS FDMA-channelization caveat.
     "gps_l1": 1575.42, "galileo_e1": 1575.42, "beidou_b1": 1561.098, "glonass_l1": 1602.0,
@@ -2665,7 +2671,7 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
 
     freq_mhz = body.freq_mhz if body.freq_mhz is not None else JAM_BAND_PRESETS_MHZ.get(body.band)
     if not freq_mhz:
-        raise HTTPException(400, "Provide either `band` (433|915|2g4|5g8|gps_l1|galileo_e1|beidou_b1|"
+        raise HTTPException(400, "Provide either `band` (433|915|2g4|bt_2g4|5g8|gps_l1|galileo_e1|beidou_b1|"
                                   "glonass_l1) or an explicit `freq_mhz`.")
     duration_s = min(body.duration_s, JAM_MAX_DURATION_S)
 

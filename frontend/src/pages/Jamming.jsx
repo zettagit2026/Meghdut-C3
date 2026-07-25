@@ -9,6 +9,15 @@ const BANDS = [
   { value: "433", label: "433 MHz (SiK ISM lower)" },
   { value: "915", label: "915 MHz (SiK ISM)" },
   { value: "2g4", label: "2.4 GHz (DJI video/control)" },
+  // Same shared 2.4-2.4835GHz ISM band as "2g4" above — Bluetooth Classic
+  // (79ch) and BLE (40ch) frequency-hop WITHIN that range, they do not
+  // occupy separate spectrum. This is a broad-band noise burst, not a
+  // hop-following jammer: it denies Bluetooth as a side effect of covering
+  // the same ISM band DJI/Wi-Fi already shares, which is why it's listed
+  // here as its own explicitly-labeled target rather than new RF logic.
+  // Widen the Bandwidth (kHz) field below toward ~83500 kHz for the best
+  // chance of covering Bluetooth's full hop range.
+  { value: "bt_2g4", label: "Bluetooth (2.4GHz ISM, Classic+BLE — broad-band noise, not hop-following)" },
   { value: "5g8", label: "5.8 GHz (DJI video)" },
   { value: "gps_l1", label: "GPS L1 (1575.42 MHz, GNSS nav-denial)", gnss: true },
   { value: "galileo_e1", label: "Galileo E1 (1575.42 MHz, GNSS nav-denial)", gnss: true },

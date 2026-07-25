@@ -62,16 +62,42 @@ GNSS_SPOOF_MAX_DURATION_S = 3.0
 #                  centered here with bandwidth_khz widened accordingly
 #                  covers the channel spread; this preset intentionally does
 #                  not attempt per-satellite channel targeting.
+#   - bt_2g4: Bluetooth Classic/BLE, 2442.0 MHz — center of the shared
+#             2.4-2.4835 GHz ISM band. Bluetooth Classic frequency-hops
+#             across 79x 1MHz channels and BLE across 40x 2MHz channels
+#             WITHIN that same range that "2g4" (DJI video/control) already
+#             targets — it is NOT a separate slice of spectrum. A barrage-
+#             noise burst here is the same broad-band-noise-vs-hopper
+#             approach already used for "2g4"/DJI (DJI OcuSync/Wi-Fi also
+#             hops/spreads within 2.4-2.4835GHz); it denies Bluetooth by
+#             raising the noise floor across the band it hops within, NOT by
+#             tracking/following each hop in real time. This preset exists
+#             for OPERATOR CLARITY (an explicit, correctly-labeled Bluetooth
+#             target in the UI) — it is not new signal-generation logic, and
+#             widening `bandwidth_khz` (already an operator-controlled
+#             parameter) toward the ~83.5MHz full ISM-band width is what
+#             actually improves odds of hitting a hopping Bluetooth link, not
+#             this preset's center frequency alone. See jam_bridge.py /
+#             frontend/src/pages/Jamming.jsx for how this label is surfaced.
 BAND_PRESETS_MHZ = {
     "433": 435.0,
     "915": 915.0,
     "2g4": 2450.0,
+    "bt_2g4": 2442.0,
     "5g8": 5800.0,
     "gps_l1": 1575.42,
     "galileo_e1": 1575.42,
     "beidou_b1": 1561.098,
     "glonass_l1": 1602.0,
 }
+
+# Full width of the shared 2.4GHz ISM band Bluetooth Classic/BLE hops within
+# (2400.0-2483.5 MHz). Exposed as a named constant purely so callers/UI copy
+# can recommend a bandwidth_khz value that plausibly covers the whole hop
+# range, rather than the default 500kHz (which covers neither Bluetooth's
+# hop spread nor DJI's) — NOT an enforced minimum; bandwidth_khz remains a
+# free operator parameter, same as every other band.
+BLUETOOTH_ISM_FULL_WIDTH_KHZ = 83_500.0
 
 # Bands that deny satellite navigation reception rather than a comms/video
 # link. Used by jam_bridge.py/backend/server.py purely for logging/labeling

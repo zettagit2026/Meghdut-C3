@@ -23,7 +23,7 @@ import sys
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 MAVLINK_ACTIONS = ["land", "rth", "disarm", "flight_termination", "propeller_stop", "reboot", "gnss_denial"]
-JAM_BANDS = ["433", "915", "2g4", "5g8", "gps_l1", "galileo_e1", "beidou_b1", "glonass_l1"]
+JAM_BANDS = ["433", "915", "2g4", "bt_2g4", "5g8", "gps_l1", "galileo_e1", "beidou_b1", "glonass_l1"]
 
 
 def check_authorized() -> bool:
