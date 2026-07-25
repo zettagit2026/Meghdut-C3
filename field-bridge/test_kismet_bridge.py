@@ -145,6 +145,89 @@ class PollOnceFilteringTests(unittest.TestCase):
         self.assertEqual(post.call_count, 3)  # only from the first poll
 
 
+class DbRawV2SignatureTests(unittest.TestCase):
+    """Task #105: DroneBridge WifiBroadcast raw-v2 protocol signature match,
+    per kismet_bridge.detect_db_raw_v2_signature()'s module-docstring-cited
+    field layout (db_protocol.h / db_raw_send_receive.c, Apache-2.0,
+    constants only -- see module docstring)."""
+
+    def _build_frame(self, radiotap_len=13, fcf=kismet_bridge.DB_FCF_DURATION_DATA,
+                     direction=kismet_bridge.DB_DIREC_DRONE, comm_id=0xC8, port=0x03,
+                     payload_length=100, seq_num=42, trailing=b"\x00" * 20):
+        radiotap = b"\x00" * radiotap_len
+        header = (fcf + bytes([direction, comm_id, port]) +
+                 payload_length.to_bytes(2, "little") + bytes([seq_num]))
+        return radiotap + header + trailing
+
+    def test_matches_genuine_data_frame_header(self):
+        frame = self._build_frame()
+        match = kismet_bridge.detect_db_raw_v2_signature(frame, 13)
+        self.assertIsNotNone(match)
+        self.assertEqual(match["frame_kind"], "data")
+        self.assertEqual(match["direction"], "drone")
+        self.assertEqual(match["port"], 0x03)
+        self.assertEqual(match["payload_length"], 100)
+        self.assertEqual(match["seq_num"], 42)
+
+    def test_matches_genuine_rts_frame_header(self):
+        frame = self._build_frame(fcf=kismet_bridge.DB_FCF_DURATION_RTS,
+                                  direction=kismet_bridge.DB_DIREC_GROUND)
+        match = kismet_bridge.detect_db_raw_v2_signature(frame, 13)
+        self.assertIsNotNone(match)
+        self.assertEqual(match["frame_kind"], "rts")
+        self.assertEqual(match["direction"], "ground")
+
+    def test_rejects_non_matching_fcf(self):
+        frame = self._build_frame(fcf=bytes([0x80, 0x00, 0x00, 0x00]))  # beacon FCF, not data/RTS
+        self.assertIsNone(kismet_bridge.detect_db_raw_v2_signature(frame, 13))
+
+    def test_rejects_invalid_direction(self):
+        frame = self._build_frame(direction=0x02)  # not DRONE(1) or GROUND(3)
+        self.assertIsNone(kismet_bridge.detect_db_raw_v2_signature(frame, 13))
+
+    def test_rejects_out_of_range_port(self):
+        frame = self._build_frame(port=0x09)  # DB_PORT_MAX is 0x07
+        self.assertIsNone(kismet_bridge.detect_db_raw_v2_signature(frame, 13))
+
+    def test_rejects_truncated_frame(self):
+        frame = self._build_frame()[:15]  # cut off mid-header
+        self.assertIsNone(kismet_bridge.detect_db_raw_v2_signature(frame, 13))
+
+    def test_variable_radiotap_length_honored(self):
+        frame = self._build_frame(radiotap_len=24)
+        self.assertIsNone(kismet_bridge.detect_db_raw_v2_signature(frame, 13))  # wrong offset
+        match = kismet_bridge.detect_db_raw_v2_signature(frame, 24)
+        self.assertIsNotNone(match)
+
+
+class BuildWifibroadcastDetectionTests(unittest.TestCase):
+    def test_associationless_true_is_heuristic_binary(self):
+        match = {"frame_kind": "data", "direction": "drone", "comm_id": 0xC8,
+                "port": 3, "payload_length": 100, "seq_num": 1, "associationless": True}
+        d = kismet_bridge.build_wifibroadcast_detection(match)
+        self.assertEqual(d["confidence_type"], "heuristic_binary")
+        self.assertEqual(d["threat_level"], "MEDIUM")
+        self.assertIn("WifiBroadcast", d["model"])
+
+    def test_associationless_unknown_is_still_heuristic_binary(self):
+        match = {"frame_kind": "data", "direction": "drone", "comm_id": 0xC8,
+                "port": 3, "payload_length": 100, "seq_num": 1, "associationless": None}
+        d = kismet_bridge.build_wifibroadcast_detection(match)
+        self.assertEqual(d["confidence_type"], "heuristic_binary")
+
+    def test_associationless_false_downgrades_to_advisory_only(self):
+        match = {"frame_kind": "data", "direction": "drone", "comm_id": 0xC8,
+                "port": 3, "payload_length": 100, "seq_num": 1, "associationless": False}
+        d = kismet_bridge.build_wifibroadcast_detection(match)
+        self.assertEqual(d["confidence_type"], "advisory_only")
+
+    def test_callsign_uses_mac_when_given(self):
+        match = {"frame_kind": "data", "direction": "drone", "comm_id": 0xC8,
+                "port": 3, "payload_length": 100, "seq_num": 1, "associationless": True}
+        d = kismet_bridge.build_wifibroadcast_detection(match, mac="AA:BB:CC:DD:EE:FF")
+        self.assertIn("AA:BB:CC:DD:EE:FF", d["callsign"])
+
+
 class KismetRestClientTests(unittest.TestCase):
     """Verifies the Kismet REST client hits the real, documented endpoint
     paths (devicetracker.cc:335/:378) and passes the apikey the way

@@ -142,6 +142,119 @@ pattern (same as CRSF/MSP/CANopen/DroneCAN).
 RX-ONLY: this script only issues GET requests to the Kismet server and POST
 requests to this project's own /api/detections/ingest. It never writes to
 Kismet, never transmits RF, and never controls any datasource.
+
+=============================================================================
+TASK #105 -- DroneBridge WifiBroadcast RAW-FRAME SIGNATURE (WHY IT LIVES
+HERE, AND WHY IT IS NOT WIRED INTO THE LIVE poll_once() PATH)
+=============================================================================
+DroneBridge's raw-injection protocol (~/Desktop/.../tool/DroneBridge,
+Apache-2.0 core; common/db_protocol.h) is a distinctive, associationless,
+raw-802.11-injection long-range link -- a real signature worth detecting.
+Per this project's "cite constants as reference, don't copy source" pattern
+(same as ExpressLRS/Betaflight timing constants elsewhere this session),
+only the numeric constants/field offsets below are reproduced, not any
+DroneBridge source code.
+
+ARCHITECTURAL QUESTION THIS SECTION ANSWERS: does this bridge's existing
+Kismet REST polling (fetch_kismet_devices(), /devices/all_devices.json /
+/devices/last-time/.../devices.json, per devicetracker.cc:335,:378) expose
+raw 802.11 frame payload bytes, or only per-device metadata?
+
+VERIFIED ANSWER (by reading the real Kismet source checkout, not assumed):
+NO -- devicetracker.cc's registered per-device fields (kismet.device.base.*,
+see the field-name table above) are device-level metadata (MAC, phy, name,
+type, manuf, channel, frequency, last-seen signal) built up by Kismet's own
+internal dissectors; the JSON device objects returned by
+/devices/all_devices.json never contain a raw frame/payload byte array.
+Kismet DOES expose raw frames, but through a COMPLETELY DIFFERENT endpoint
+and wire format: ../kismet/phy_80211.cc:1016 registers
+  GET /phy/phy80211/pcap/by-bssid/:mac/packets.pcapng
+which streams a live pcapng capture (binary, not JSON) of packets for a
+given BSSID, via pcapng_stream_packetchain (phy_80211.cc:1024-1038). That is
+a fundamentally different integration (binary pcapng framing over a
+streaming HTTP response, requiring a pcapng/link-layer parser) from this
+script's simple JSON device-list polling, and per-BSSID (DroneBridge's
+associationless injection has no real BSSID/association to key a stream
+off of in the first place, which is itself part of the signature).
+
+CONCLUSION: this bridge's OWN polling path (fetch_kismet_devices/to_detection
+/poll_once) genuinely cannot see raw frame bytes today, so the signature
+match below is NOT wired into poll_once()'s live loop -- doing so honestly
+would require a separate pcapng-stream consumer, which is out of scope for
+this task (tracked as a TODO below, not silently skipped). What IS added
+here is the actual, testable signature-matching function
+(detect_db_raw_v2_signature()) plus its detection-ingest builder
+(build_wifibroadcast_detection()), operating on raw frame bytes IF/WHEN a
+caller has them (e.g. a future pcapng-stream bridge, or a raw
+monitor-mode-socket reader) -- kept in this file because the detection
+DOMAIN (associationless raw-802.11-injection signatures) belongs with this
+script's Kismet-side situational-awareness layer, not with hackrf_rx.py's
+power-spectrum-level SDR sweep (hackrf_rx.py never sees individual 802.11
+frames at all, only RF energy/occupancy).
+
+TODO (not implemented, HONESTY not silent scope-narrowing): wiring this to
+a REAL live feed needs one of (a) a pcapng-stream consumer against Kismet's
+/phy/phy80211/pcap/by-bssid/:mac/packets.pcapng (requires a real BSSID to
+key off -- awkward for an associationless protocol, may need a broader
+"all packets" stream if Kismet exposes one), or (b) a raw AF_PACKET monitor-
+mode socket read of this bridge's own, independent of Kismet entirely. Both
+are HARDWARE-BLOCKED the same way the rest of this file is (task #70, no
+monitor-mode NIC on primary) and are not attempted here.
+
+SIGNATURE DEFINITION (verified directly against DroneBridge's real source,
+common/db_protocol.h and common/db_raw_send_receive.c -- NOT copied, only
+the constants/offsets below are reproduced):
+  - db_raw_v2_header_t sits immediately after the radiotap header (whose
+    length is a variable, per-driver value carried in the radiotap header's
+    own bytes[2:4] -- see get_db_payload() in db_raw_receive.c) and is
+    exactly DB_RAW_V2_HEADER_LENGTH=10 bytes:
+      [0:4]  fcf_duration   -- a fake 802.11 Frame-Control+Duration prefix.
+                               DroneBridge only ever sends two values here
+                               (db_raw_send_receive.c's frame_control_pre_*
+                               tables): 0x08,0x00,0x00,0x00 for DATA frames,
+                               or 0xB4,0x00,0x00,0x00 for RTS frames.
+      [4]    direction      -- DB_DIREC_DRONE=0x01 or DB_DIREC_GROUND=0x03
+      [5]    comm_id        -- arbitrary per-link ID, any byte value
+      [6]    port           -- DB_PORT_* enum, valid range 0x01-0x07
+      [7:9]  payload_length -- little-endian uint16 (receive_buffer[off+7] |
+                               receive_buffer[off+8]<<8, per get_db_payload())
+      [9]    seq_num        -- rolling sequence number, any byte value
+  - IMPORTANT CORRECTION vs this task's original brief: the brief described
+    an "ETHER_TYPE 0x88ab carried inside the fake 802.11 data frame
+    payload". Reading db_raw_send_receive.c/db_raw_receive.c directly shows
+    this is NOT accurate for DroneBridge's primary monitor-mode raw-v2
+    protocol: ETHER_TYPE (0x88ab, db_protocol.h:52) is used ONLY as the
+    sll_protocol value when bind()-ing an AF_PACKET socket in DroneBridge's
+    separate, legacy "wifi" mode (db_raw_receive.c:110, `if (the_mode ==
+    'w') sll.sll_protocol = htons(ETHER_TYPE);` vs `:112` which uses
+    ETH_P_802_2 for monitor mode) -- it is an OS socket-filter value, not a
+    literal byte sequence appearing at a fixed offset in the over-the-air
+    monitor-mode frame. The literal, verifiable, over-the-air signature for
+    the actual raw-v2 protocol is the db_raw_v2_header_t fixed-offset field
+    pattern above (fcf_duration + direction + port range), which is what
+    detect_db_raw_v2_signature() below actually checks -- flagging this
+    discrepancy explicitly rather than silently matching bytes that would
+    never really appear on the wire.
+  - Associationless: DroneBridge's raw-v2 protocol is injected directly via
+    a monitor-mode raw socket, with no 802.11 association/4-way-handshake
+    ever performed (db_raw_send_receive.c's open_db_socket() only ever
+    configures a monitor-mode AF_PACKET socket, never an association state
+    machine) -- a caller with 802.11 state tracking (e.g. a future Kismet
+    pcapng consumer, which WOULD have per-BSSID association state) can pass
+    associationless=True/False/None; this function does not attempt to
+    derive it itself since it has no frame-sequence/state context.
+
+CONFIDENCE_TYPE CHOSEN: "heuristic_binary" (the same enum value used for
+this file's OUI match above) when the full db_raw_v2_header_t field pattern
+matches AND associationless is True or unknown (None) -- this is a genuine,
+deterministic structural match against a real, documented protocol layout
+(fcf_duration in {DATA, RTS} AND direction in {DRONE, GROUND} AND port in
+1-7), not a probabilistic guess, so it earns the stronger existing category
+per this project's confidence-model conventions (CONFIDENCE_MODEL.md). It
+is explicitly NOT "protocol_verified" (no CRC/checksum exists in this header
+to cryptographically confirm it, unlike CRSF/DroneID's CRC-gated frames) --
+a coincidental byte pattern from unrelated traffic, though unlikely given
+the port-range + direction-enum constraints, cannot be fully ruled out.
 """
 from __future__ import annotations
 
@@ -190,6 +303,121 @@ def mac_oui(mac: str) -> str:
 
 def match_drone_oui(mac: str) -> Optional[str]:
     return DRONE_MANUFACTURER_OUIS.get(mac_oui(mac))
+
+
+# ---------------------------------------------------------------------------
+# Task #105: DroneBridge WifiBroadcast-style raw-v2 protocol signature.
+# See the module docstring's "TASK #105" section above for full sourcing,
+# the ETHER_TYPE-usage correction, and why this is NOT wired into
+# poll_once()'s live path (Kismet's JSON device API has no raw frame bytes).
+# Constants below are reproduced from DroneBridge's common/db_protocol.h /
+# common/db_raw_send_receive.c (Apache-2.0) -- citing the numeric layout
+# only, not copying source, per this project's standing citation pattern.
+# ---------------------------------------------------------------------------
+DB_RAW_V2_HEADER_LENGTH = 10  # db_protocol.h: DB_RAW_V2_HEADER_LENGTH
+DB_FCF_DURATION_DATA = bytes([0x08, 0x00, 0x00, 0x00])  # frame_control_pre_data
+DB_FCF_DURATION_RTS = bytes([0xB4, 0x00, 0x00, 0x00])   # frame_control_pre_rts
+DB_DIREC_DRONE = 0x01
+DB_DIREC_GROUND = 0x03
+DB_VALID_DIRECTIONS = frozenset({DB_DIREC_DRONE, DB_DIREC_GROUND})
+DB_PORT_MIN = 0x01  # DB_PORT_CONTROLLER
+DB_PORT_MAX = 0x07  # DB_PORT_RC
+DB_WIFIBROADCAST_ETHER_TYPE = 0x88AB  # db_protocol.h ETHER_TYPE -- see module
+# docstring correction: only used as an AF_PACKET sll_protocol value in
+# DroneBridge's legacy "wifi" bind mode, NOT a literal over-the-air byte
+# sequence for the raw-v2 monitor-mode protocol this function matches.
+
+
+def detect_db_raw_v2_signature(frame_bytes: bytes, radiotap_length: int,
+                                associationless: Optional[bool] = None) -> Optional[Dict]:
+    """Check whether bytes immediately following a radiotap header match
+    DroneBridge's db_raw_v2_header_t fixed-offset layout (see module
+    docstring's SIGNATURE DEFINITION for full sourcing).
+
+    Args:
+      frame_bytes: the full raw 802.11 frame, INCLUDING its leading radiotap
+        header (this function does not fetch/parse radiotap itself -- a
+        caller with real Kismet pcapng frames, or a raw monitor-mode socket,
+        is expected to hand over radiotap_length already known/parsed).
+      radiotap_length: length in bytes of the radiotap header prefix.
+      associationless: True/False if the caller has 802.11 association
+        state for this transmitter, None if unknown/not tracked. This
+        function has no state-machine context of its own so it never
+        derives this itself -- it only uses it as an input for the
+        confidence_type decision in build_wifibroadcast_detection().
+
+    Returns None if the byte pattern does not match. Returns a dict of the
+    matched fields (never raises) if it does -- this is a pure, offline-
+    testable function with no I/O.
+    """
+    header_start = radiotap_length
+    header_end = header_start + DB_RAW_V2_HEADER_LENGTH
+    if radiotap_length < 0 or len(frame_bytes) < header_end:
+        return None
+
+    fcf_duration = bytes(frame_bytes[header_start:header_start + 4])
+    if fcf_duration == DB_FCF_DURATION_DATA:
+        frame_kind = "data"
+    elif fcf_duration == DB_FCF_DURATION_RTS:
+        frame_kind = "rts"
+    else:
+        return None  # not one of DroneBridge's two documented fcf_duration values
+
+    direction = frame_bytes[header_start + 4]
+    if direction not in DB_VALID_DIRECTIONS:
+        return None
+
+    port = frame_bytes[header_start + 6]
+    if not (DB_PORT_MIN <= port <= DB_PORT_MAX):
+        return None
+
+    payload_length = frame_bytes[header_start + 7] | (frame_bytes[header_start + 8] << 8)
+    seq_num = frame_bytes[header_start + 9]
+    comm_id = frame_bytes[header_start + 5]
+
+    return {
+        "frame_kind": frame_kind,
+        "direction": "drone" if direction == DB_DIREC_DRONE else "ground",
+        "comm_id": comm_id,
+        "port": port,
+        "payload_length": payload_length,
+        "seq_num": seq_num,
+        "associationless": associationless,
+    }
+
+
+def build_wifibroadcast_detection(match: Dict, mac: Optional[str] = None) -> Dict:
+    """Translate a detect_db_raw_v2_signature() match into this project's
+    /api/detections/ingest body. See module docstring's CONFIDENCE_TYPE
+    CHOSEN section for the heuristic_binary-vs-advisory_only reasoning.
+
+    confidence_type is "heuristic_binary" when associationless is True or
+    None (unknown -- a structural field-pattern match on its own is already
+    a genuine, deterministic fact about the bytes, per the same reasoning
+    this file already applies to OUI matches), and "advisory_only" only if
+    the caller has POSITIVELY confirmed a real 802.11 association exists
+    for this transmitter (associationless is False) -- which would
+    contradict DroneBridge's associationless design and make this a much
+    weaker, likely-coincidental match.
+    """
+    is_strong_match = match.get("associationless") is not False
+    callsign_suffix = mac or f"comm{match['comm_id']}-{match['direction']}"
+    return {
+        "callsign": f"WIFIBROADCAST-{callsign_suffix}",
+        "model": f"Likely WifiBroadcast-style long-range link "
+                 f"(DroneBridge raw-v2 {match['frame_kind']} frame, "
+                 f"direction={match['direction']}, port={match['port']})",
+        "protocol": "IEEE802.11",
+        "threat_level": "MEDIUM",
+        "center_freq_ghz": 2.437,  # not measured by this function -- see caller for real value
+        "bandwidth_mhz": 20.0,
+        "rssi_dbm": -90.0,  # not measured here -- caller should override with real radiotap RSSI
+        "snr_db": 0.0,
+        "encrypted": False,
+        "source": "KISMET",
+        "protocol_confirmed": False,  # a byte-pattern structural match, not a CRC-verified decode
+        "confidence_type": "heuristic_binary" if is_strong_match else "advisory_only",
+    }
 
 
 # ---------------------------------------------------------------------------
