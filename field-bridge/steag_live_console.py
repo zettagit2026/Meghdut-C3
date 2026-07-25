@@ -55,9 +55,16 @@ def inject_mavlink() -> None:
         return
     port = input("SiK serial port [/dev/ttyUSB0]: ").strip() or "/dev/ttyUSB0"
     target_sys = input("target system id [1]: ").strip() or "1"
-    console_url = input("console URL [http://localhost:8001]: ").strip() or "http://localhost:8001"
+    default_url = os.environ.get("CEMA_API_URL", "http://localhost:8001")
+    console_url = input(f"console URL [{default_url}]: ").strip() or default_url
     email = input("console email [operator@cema.mil]: ").strip() or "operator@cema.mil"
-    password = input("console password [cema@2026]: ").strip() or "cema@2026"
+    password = os.environ.get("CEMA_PASSWORD", "").strip()
+    if password:
+        print("console password: using CEMA_PASSWORD from environment")
+    while not password:
+        password = input("console password (required; set CEMA_PASSWORD to skip this prompt): ").strip()
+        if not password:
+            print("Password cannot be empty. Try again.")
     cmd = [
         sys.executable, os.path.join(HERE, "sik_mavlink_bridge.py"),
         "--port", port, "--action", action, "--target-sys", target_sys,
