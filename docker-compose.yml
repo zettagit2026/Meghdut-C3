@@ -61,14 +61,16 @@ services:
       SENSOR_LAT: "${SENSOR_LAT:-}"
       SENSOR_LON: "${SENSOR_LON:-}"
       SENSOR_LABEL: "${SENSOR_LABEL:-}"
-    expose:
-      # TLS cutover (task #95): host port publishing removed. backend is no
-      # longer directly reachable from the LAN — only from other containers
-      # on this compose's docker network (i.e. caddy, which reverse-proxies
-      # /api/* to it via the frontend's Nginx). All external access must go
-      # through Caddy on 443. This closes the direct backend:8001 exposure
-      # gap identified in the original TLS design.
-      - "8001"
+    ports:
+      # Hotfix (task #95 regression): TLS cutover changed this from a
+      # published port to `expose: 8001`, which closed backend:8001 to the
+      # LAN (intended) but also broke the 4 bare-systemd field-bridge
+      # services (hackrf_rx, ml_classify_bridge, fpv_video_bridge,
+      # mavlink_sniffer) that run on the HOST and POST to
+      # http://localhost:8001 via CEMA_API_URL. Binding to 127.0.0.1 only
+      # restores host-local connectivity while keeping the port genuinely
+      # unreachable from the LAN — mirrors the cema_mongo pattern below.
+      - "127.0.0.1:8001:8001"
 
   frontend:
     build:
