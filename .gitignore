@@ -93,3 +93,6 @@ android-sdk/
 credentials.json
 *.key
 .credentials
+
+# Environment-specific generated TLS artifacts (task #95/#100)
+caddy/*.crt
