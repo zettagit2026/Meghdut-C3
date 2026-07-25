@@ -404,7 +404,18 @@ def main() -> None:
                     "model": "DJI Mini (candidate)" if "DJI" in name else "MAVLink craft (candidate)",
                     "protocol": "OcuSync/Wi-Fi" if "DJI" in name else "SiK/MAVLink",
                     "threat_level": "MEDIUM",
-                    "center_freq_ghz": center_mhz / 1000.0,
+                    # DISPLAY-FREQUENCY FIX (task #77, 2026-07-25): this used to
+                    # send center_mhz (the band's fixed midpoint, e.g. always
+                    # 2441.5MHz/2.4415GHz for DJI-2G4) here -- the exact same bug
+                    # the 2026-07-24 targeting fix above (task #76) already fixed
+                    # for the ML capture itself. That fix threaded peak_freq_mhz
+                    # into gated_capture_and_classify() but this dict, which is
+                    # what actually gets displayed on the Dashboard/DetectionHistory
+                    # frequency column, was never updated and kept sending the
+                    # stale band-constant. Send the real per-detection peak
+                    # frequency instead so the displayed value matches what was
+                    # actually captured and classified.
+                    "center_freq_ghz": peak_freq_mhz / 1000.0,
                     "bandwidth_mhz": high - low,
                     "rssi_dbm": peak,
                     "snr_db": peak - floor,
