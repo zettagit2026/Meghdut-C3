@@ -188,6 +188,41 @@ CRSF_FRAMETYPE_HEARTBEAT = 0x0B
 CRSF_FRAMETYPE_VIDEO_TRANSMITTER = 0x0F
 CRSF_FRAMETYPE_LINK_STATISTICS = 0x14
 CRSF_FRAMETYPE_RC_CHANNELS_PACKED = 0x16
+# LINK_RX_ID (0x1C) / LINK_TX_ID (0x1D) -- per-antenna/per-radio uplink and
+# downlink link-quality frames, distinct from the combined LINK_STATISTICS
+# (0x14) frame above (task #106). Frame-ID confirmation and field layout
+# were verified against TWO independent sources, and one important honesty
+# note about a THIRD:
+#   1. terseCRSF (MIT; ~/Desktop/.../tool/terseCRSF, src/terseCRSF.h:71-72)
+#      defines `LINK_RX_ID 0x1C` / `LINK_TX_ID 0x1D` and recognizes both in
+#      its switch dispatch (src/terseCRSF.cpp:425,431) -- but, verified by
+#      reading that dispatch directly, terseCRSF does NOT decode any fields
+#      for either frame; both cases are `#if defined SHOW_CRSF_LINK_RX/TX`
+#      guarded `printBytes()` raw dumps only (same "recognized, not
+#      decoded" treatment this file already gives VIDEO_TRANSMITTER above).
+#      So terseCRSF confirms the frame IDs are real and on-the-wire, but is
+#      NOT itself the source of the field layout below.
+#   2. AlfredoCRSF (GPLv3, already cited above for CRC8/frame layouts;
+#      ~/Desktop/.../tool/AlfredoCRSF/CRSF_PROTOCOL.md, "### LINK_RX_ID
+#      (0x1C)" / "### LINK_TX_ID (0x1D)" sections) DOES publish a genuine
+#      field-level table for both:
+#        LINK_RX_ID  (0x1C): rxRssiPercent (uint8, percent), rxRfPower
+#                            (uint8, power index)
+#        LINK_TX_ID  (0x1D): txRssiPercent (uint8, percent), txRfPower
+#                            (uint8, power index), txFps (uint8, fps/10)
+#      This is the actual source for parse_link_rx()/parse_link_tx() below.
+#   3. AlfredoCRSF's src/crsf_protocol.h itself has both IDs commented out
+#      ("// CRSF_FRAMETYPE_LINK_RX_ID = 0x1C, //no need to support?"),
+#      i.e. that library's C++ enum never wires them up either -- consistent
+#      with 0x1C/0x1D being real, spec-documented, but rarely-implemented
+#      telemetry frame types.
+# Unlike VIDEO_TRANSMITTER (0x0F, task #90), which correctly shipped with NO
+# field decoder because no source defined one, AlfredoCRSF's protocol doc
+# above IS a real, citable field layout -- so, per this project's "no
+# synthetic data, but also no false modesty when a real spec exists" stance,
+# genuine field-level decode is implemented below.
+CRSF_FRAMETYPE_LINK_RX = 0x1C
+CRSF_FRAMETYPE_LINK_TX = 0x1D
 CRSF_FRAMETYPE_ATTITUDE = 0x1E
 CRSF_FRAMETYPE_DEVICE_PING = 0x28
 CRSF_FRAMETYPE_DEVICE_INFO = 0x29
@@ -207,6 +242,8 @@ FRAME_TYPE_NAMES: Dict[int, str] = {
     CRSF_FRAMETYPE_VIDEO_TRANSMITTER: "VIDEO_TRANSMITTER",
     CRSF_FRAMETYPE_LINK_STATISTICS: "LINK_STATISTICS",
     CRSF_FRAMETYPE_RC_CHANNELS_PACKED: "RC_CHANNELS_PACKED",
+    CRSF_FRAMETYPE_LINK_RX: "LINK_RX",
+    CRSF_FRAMETYPE_LINK_TX: "LINK_TX",
     CRSF_FRAMETYPE_ATTITUDE: "ATTITUDE",
     CRSF_FRAMETYPE_DEVICE_PING: "DEVICE_PING",
     CRSF_FRAMETYPE_DEVICE_INFO: "DEVICE_INFO",
@@ -455,6 +492,34 @@ def parse_link_statistics(payload: bytes) -> dict:
         "downlink_rssi": payload[7],
         "downlink_link_quality": payload[8],
         "downlink_snr": s8(payload[9]),
+    }
+
+
+def parse_link_rx(payload: bytes) -> dict:
+    """LINK_RX_ID (0x1C) -- per-antenna RX-side link stats, 2-byte payload.
+    Field layout per AlfredoCRSF's CRSF_PROTOCOL.md "### LINK_RX_ID (0x1C)"
+    table (see CRSF_FRAMETYPE_LINK_RX's definition above for full sourcing
+    and the terseCRSF-recognizes-but-doesn't-decode caveat)."""
+    if len(payload) < 2:
+        raise ValueError(f"LINK_RX payload too short: {len(payload)} bytes (need 2)")
+    return {
+        "rx_rssi_percent": payload[0],
+        "rx_rf_power_index": payload[1],
+    }
+
+
+def parse_link_tx(payload: bytes) -> dict:
+    """LINK_TX_ID (0x1D) -- per-antenna TX-side link stats, 3-byte payload.
+    Field layout per AlfredoCRSF's CRSF_PROTOCOL.md "### LINK_TX_ID (0x1D)"
+    table: txFps is documented as "frames per second / 10", i.e. the raw
+    byte holds fps*10 -- divided back out below into actual fps (see
+    CRSF_FRAMETYPE_LINK_TX's definition above for full sourcing)."""
+    if len(payload) < 3:
+        raise ValueError(f"LINK_TX payload too short: {len(payload)} bytes (need 3)")
+    return {
+        "tx_rssi_percent": payload[0],
+        "tx_rf_power_index": payload[1],
+        "tx_fps": payload[2] / 10.0,
     }
 
 
@@ -802,6 +867,49 @@ def self_test() -> None:
         check("BATTERY_SENSOR current decoded (3.2A)", abs(batt["current_a"] - 3.2) < 1e-9)
         check("BATTERY_SENSOR capacity decoded (1500mAh)", batt["capacity_mah"] == 1500)
         check("BATTERY_SENSOR remaining decoded (77%)", batt["remaining_pct"] == 77)
+
+    # LINK_RX_ID (0x1C): 88% RX RSSI, RF power index 3.
+    link_rx_payload = bytes([88, 3])
+    lrx = build_frame(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_LINK_RX, link_rx_payload)
+    frames = CRSFParser().feed_bytes(lrx)
+    check("LINK_RX frame parses to exactly 1 frame", len(frames) == 1)
+    if frames:
+        check("LINK_RX frame type decoded correctly",
+              frames[0].frame_type == CRSF_FRAMETYPE_LINK_RX)
+        check("LINK_RX frame type name resolves via FRAME_TYPE_NAMES",
+              FRAME_TYPE_NAMES.get(frames[0].frame_type) == "LINK_RX")
+        link_rx = parse_link_rx(frames[0].payload)
+        check("LINK_RX rx_rssi_percent decoded (88%)", link_rx["rx_rssi_percent"] == 88)
+        check("LINK_RX rx_rf_power_index decoded (3)", link_rx["rx_rf_power_index"] == 3)
+
+    # LINK_TX_ID (0x1D): 91% TX RSSI, RF power index 2, 15.0 fps (raw=150).
+    link_tx_payload = bytes([91, 2, 150])
+    ltx = build_frame(CRSF_SYNC_BYTE, CRSF_FRAMETYPE_LINK_TX, link_tx_payload)
+    frames = CRSFParser().feed_bytes(ltx)
+    check("LINK_TX frame parses to exactly 1 frame", len(frames) == 1)
+    if frames:
+        check("LINK_TX frame type decoded correctly",
+              frames[0].frame_type == CRSF_FRAMETYPE_LINK_TX)
+        check("LINK_TX frame type name resolves via FRAME_TYPE_NAMES",
+              FRAME_TYPE_NAMES.get(frames[0].frame_type) == "LINK_TX")
+        link_tx = parse_link_tx(frames[0].payload)
+        check("LINK_TX tx_rssi_percent decoded (91%)", link_tx["tx_rssi_percent"] == 91)
+        check("LINK_TX tx_rf_power_index decoded (2)", link_tx["tx_rf_power_index"] == 2)
+        check("LINK_TX tx_fps decoded (15.0 fps from raw 150)",
+              abs(link_tx["tx_fps"] - 15.0) < 1e-9)
+
+    # Short-payload rejection: parse_link_rx()/parse_link_tx() must raise
+    # ValueError on truncated payloads rather than silently misreading bytes.
+    try:
+        parse_link_rx(bytes([1]))
+        check("parse_link_rx raises ValueError on 1-byte (too short) payload", False)
+    except ValueError:
+        check("parse_link_rx raises ValueError on 1-byte (too short) payload", True)
+    try:
+        parse_link_tx(bytes([1, 2]))
+        check("parse_link_tx raises ValueError on 2-byte (too short) payload", False)
+    except ValueError:
+        check("parse_link_tx raises ValueError on 2-byte (too short) payload", True)
 
     print("\n=== Corruption / resync handling ===")
     corrupted = bytearray(hb)
