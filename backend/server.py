@@ -3,6 +3,8 @@
 Endpoints (all under /api):
   auth: /login /logout /me
   detections: /detections /detections/ingest /detections/{id}/cema-advance /detections/{id}/killchain-advance /detections/{id}/authorize-target /detections/{id}
+  iff: /iff/beacons/ingest (from field-bridge/iff_beacon_bridge.py, already HMAC-verified bridge-side)
+       /iff/friendlies (current fresh friendly-asset roster; task #103 attestation gate consumer)
   spectrum: /spectrum/waterfall
   mavlink: /mavlink/craft (preview-only) /mavlink/broadcast (commander-only, transmits) /mavlink/packets  (ws /ws/mavlink)
   payloads: /payloads /payloads/deploy (commander-only + arm-token for CRITICAL/broadcast)
@@ -57,6 +59,7 @@ import binascii
 import importlib.util
 import json
 import logging
+import math
 import os
 import statistics
 import uuid
@@ -289,6 +292,126 @@ def _consume_jam_confirm_token(token: Optional[str]) -> None:
                                   "confirmation sequence in the Jamming UI.")
 
 
+# ---- GNSS-spoof-confirm token (Task #103) — DELIBERATELY a SEPARATE token
+# type from jam_confirm_token, NOT a shared token mechanism with an `effect`
+# discriminator. Rationale (see field-bridge/GNSS_SPOOF_ARCHITECTURE.md §4):
+# jam_bridge.py's confirm-token shape check
+# (_looks_like_real_confirm_token) is deliberately dumb/shape-only, trusting
+# that the backend already did the real single-use validation. If jam and
+# spoof shared one token type, a caller bug that forwarded a valid
+# jam_confirm_token where a spoof confirm was expected would be silently
+# accepted by that shape check. Distinct token types make that class of bug
+# a hard 422/403 at the backend instead of a silent cross-effect
+# authorization leak — this is a deliberate defense-in-depth property, not
+# an oversight to "simplify" later.
+GNSS_SPOOF_CONFIRM_TTL_S = 30  # mirrors JAM_CONFIRM_TTL_S
+_gnss_spoof_confirm_tokens: Dict[str, datetime] = {}
+
+# Binds the exact friendly-asset-attestation text to the confirm token that
+# was minted for it, so /payloads/gnss-spoof can verify the text resubmitted
+# at fire-time matches what was attested at confirm-time (see §5a of the
+# architecture doc) — closes the gap where a checkbox "vanishes" after being
+# ticked once with no lasting record.
+_gnss_spoof_confirm_attestations: Dict[str, str] = {}
+
+# Minimum length for a friendly-asset attestation to be accepted as a real,
+# actively-typed statement rather than a trivially fabricated placeholder —
+# same "reject trivially fabricated values" posture as
+# jam_bridge._looks_like_real_confirm_token's length floor.
+MIN_FRIENDLY_ASSET_ATTESTATION_LEN = 20
+_TRIVIAL_ATTESTATION_VALUES = {"n/a", "na", "none", "confirmed", "yes", "ok", "test"}
+
+
+def _looks_like_real_attestation(text: Optional[str]) -> bool:
+    if not text or not isinstance(text, str):
+        return False
+    stripped = text.strip()
+    if len(stripped) < MIN_FRIENDLY_ASSET_ATTESTATION_LEN:
+        return False
+    if stripped.lower() in _TRIVIAL_ATTESTATION_VALUES:
+        return False
+    return True
+
+
+def _issue_gnss_spoof_confirm_token(attestation: str) -> Dict[str, Any]:
+    token = str(uuid.uuid4())
+    _gnss_spoof_confirm_tokens[token] = datetime.now(timezone.utc) + timedelta(seconds=GNSS_SPOOF_CONFIRM_TTL_S)
+    _gnss_spoof_confirm_attestations[token] = attestation
+    return {"gnss_spoof_confirm_token": token, "expires_in_s": GNSS_SPOOF_CONFIRM_TTL_S}
+
+
+def _consume_gnss_spoof_confirm_token(token: Optional[str], attestation: str) -> None:
+    """Validates AND pops the token, and additionally checks that the
+    attestation text resubmitted at fire-time matches the text that was
+    attested at /gnss-spoof/confirm time for THIS token — see
+    _gnss_spoof_confirm_attestations above."""
+    if not token:
+        raise HTTPException(
+            403,
+            "GNSS-spoof confirmation token required: complete the SafetyGate checklist "
+            "and ARM & FIRE -> CONFIRM FIRE sequence in the GNSS Spoof UI, which requests "
+            "a fresh POST /api/gnss-spoof/confirm at the moment of confirmation. This "
+            "token is NOT interchangeable with jam_confirm_token.",
+        )
+    expiry = _gnss_spoof_confirm_tokens.pop(token, None)
+    attested_text = _gnss_spoof_confirm_attestations.pop(token, None)
+    if not expiry or datetime.now(timezone.utc) > expiry:
+        raise HTTPException(403, "GNSS-spoof confirmation token invalid or expired — re-run the "
+                                  "confirmation sequence in the GNSS Spoof UI.")
+    if attested_text != attestation:
+        raise HTTPException(
+            400,
+            "friendly_asset_attestation does not match the text attested at "
+            "/gnss-spoof/confirm time for this token — the attestation must be "
+            "identical between the confirm and fire calls (defense against the "
+            "attestation text being swapped between confirm and fire).",
+        )
+
+
+_EARTH_RADIUS_M = 6371000.0  # mean earth radius, meters — standard spherical-earth approximation
+
+
+def geodesic_destination(lat_deg: float, lon_deg: float, distance_m: float,
+                         bearing_deg: float) -> tuple:
+    """Standard great-circle destination-point formula (spherical earth):
+    given a start lat/lon, a distance in meters, and an initial bearing in
+    degrees (0=N, 90=E, 180=S, 270=W), returns (dest_lat_deg, dest_lon_deg).
+
+    This is the textbook "direct geodesic problem" formula, e.g. as given in
+    Ed Williams' Aviation Formulary / Movable Type Scripts'
+    "Destination point given distance and bearing from start point":
+        phi2 = asin( sin(phi1)*cos(delta) + cos(phi1)*sin(delta)*cos(theta) )
+        lambda2 = lambda1 + atan2( sin(theta)*sin(delta)*cos(phi1),
+                                    cos(delta) - sin(phi1)*sin(phi2) )
+    where delta = distance_m / EARTH_RADIUS_M is the angular distance,
+    theta is the bearing, phi/lambda are lat/lon in radians.
+
+    Verified in backend/tests/test_gnss_spoof.py against a known reference
+    case (see that file for the worked numbers)."""
+    phi1 = math.radians(lat_deg)
+    lambda1 = math.radians(lon_deg)
+    theta = math.radians(bearing_deg)
+    delta = distance_m / _EARTH_RADIUS_M
+
+    phi2 = math.asin(
+        math.sin(phi1) * math.cos(delta) + math.cos(phi1) * math.sin(delta) * math.cos(theta)
+    )
+    lambda2 = lambda1 + math.atan2(
+        math.sin(theta) * math.sin(delta) * math.cos(phi1),
+        math.cos(delta) - math.sin(phi1) * math.sin(phi2),
+    )
+    # normalize longitude to [-180, 180]
+    lambda2 = (lambda2 + 3 * math.pi) % (2 * math.pi) - math.pi
+    return math.degrees(phi2), math.degrees(lambda2)
+
+
+def _bearing_compass(bearing_deg: float) -> str:
+    """8-point compass label for a bearing in degrees, e.g. '047° NE'."""
+    dirs = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    idx = int(((bearing_deg % 360) + 22.5) // 45) % 8
+    return f"{bearing_deg % 360:03.0f}° {dirs[idx]}"
+
+
 # ---- Range authorization (GUI-controlled replacement for the bridge-side
 # CEMA_AUTHORIZED_RANGE env var) — see backend/RANGE_AUTHORIZATION_REDESIGN.md
 # for the full threat model/rationale. Two INDEPENDENT in-memory leases
@@ -302,7 +425,7 @@ def _consume_jam_confirm_token(token: Optional[str]) -> None:
 # `CEMA_AUTHORIZED_RANGE != "1"` behavior.
 RANGE_AUTH_TTL_S = 15 * 60
 RANGE_AUTH_CONFIRM_PHRASE = "AUTHORIZE LIVE RANGE"
-RANGE_AUTH_EFFECTS = ("jam", "mavlink")
+RANGE_AUTH_EFFECTS = ("jam", "mavlink", "gnss_spoof")
 
 # effect -> {"enabled": bool, "expires_at": datetime|None, "enabled_by": str|None,
 #            "enabled_at": datetime|None}
@@ -569,6 +692,83 @@ async def _handle_jam_ack(msg: Dict[str, Any]) -> None:
                                      "error": error})
 
 
+
+# =====================================================================
+# GNSS spoof session tracking — parallel to _pending_jam above, own dict
+# (never shares state with jamming; see architecture doc §1/§3).
+# =====================================================================
+_pending_gnss_spoof: Dict[str, Dict[str, Any]] = {}
+GNSS_SPOOF_ACK_TIMEOUT_S = 8
+GNSS_SPOOF_COMPLETE_MARGIN_S = 15
+
+
+async def _expire_pending_gnss_spoof() -> None:
+    """Lazy/on-read expiry, same pattern as _expire_pending_jam."""
+    now = datetime.now(timezone.utc)
+    to_expire = []
+    for rid, p in _pending_gnss_spoof.items():
+        if p["status"] == "AWAITING_ACK" and (now - p["ts"]).total_seconds() > GNSS_SPOOF_ACK_TIMEOUT_S:
+            to_expire.append(rid)
+        elif p["status"] == "GNSS_SPOOF_ACTIVE" and \
+                (now - p["ts"]).total_seconds() > p.get("duration_s", GNSS_SPOOF_MAX_DURATION_S) + GNSS_SPOOF_COMPLETE_MARGIN_S:
+            to_expire.append(rid)
+    for rid in to_expire:
+        p = _pending_gnss_spoof.get(rid)
+        if not p:
+            continue
+        p["status"] = "TX_TIMEOUT"
+        await log_event(
+            "GNSS_SPOOF",
+            f"No terminal bridge ack for gnss_spoof request {rid} within expected window — "
+            f"marking TX_TIMEOUT (bridge not connected, crashed, or lost mid-burst)",
+            meta={"request_id": rid}, actor="SYSTEM",
+        )
+        await ws_manager.broadcast_json({"type": "gnss_spoof_status", "request_id": rid, "status": "TX_TIMEOUT"})
+
+
+async def _handle_gnss_spoof_ack(msg: Dict[str, Any]) -> None:
+    """Process a real {"type": "gnss_spoof_ack", "phase": ..., ...} message
+    from field-bridge/gnss_spoof_bridge.py. Mirrors _handle_jam_ack exactly,
+    own dict, own log kind."""
+    request_id = msg.get("request_id")
+    phase = msg.get("phase")
+    pending = _pending_gnss_spoof.get(request_id) if request_id else None
+    if not pending:
+        logger.warning("gnss_spoof_ack received for unknown/expired request_id=%s (phase=%s)", request_id, phase)
+        return
+
+    phase_to_status = {
+        "started": "GNSS_SPOOF_ACTIVE",
+        "complete": "GNSS_SPOOF_COMPLETE",
+        "failed": "TX_FAILED",
+        "stopped": "GNSS_SPOOF_STOPPED",
+    }
+    status = phase_to_status.get(phase)
+    if not status:
+        logger.warning("gnss_spoof_ack with unrecognized phase=%s for request_id=%s", phase, request_id)
+        return
+
+    pending["status"] = status
+    pending["ts"] = datetime.now(timezone.utc)
+    error = msg.get("error")
+    if error:
+        pending["error"] = error
+    if status in ("GNSS_SPOOF_COMPLETE", "TX_FAILED", "GNSS_SPOOF_STOPPED"):
+        pending["terminal"] = True
+
+    await log_event(
+        "GNSS_SPOOF_ACK",
+        (f"Bridge CONFIRMED gnss_spoof TX started for request {request_id}") if status == "GNSS_SPOOF_ACTIVE" else
+        (f"GNSS spoof burst complete for request {request_id}") if status == "GNSS_SPOOF_COMPLETE" else
+        (f"GNSS spoof burst STOPPED early (EMERGENCY ABORT) for request {request_id}") if status == "GNSS_SPOOF_STOPPED" else
+        (f"GNSS spoof burst FAILED for request {request_id}: {error or 'no reason given'}"),
+        meta={"request_id": request_id, "status": status, "error": error},
+        actor="BRIDGE",
+    )
+    await ws_manager.broadcast_json({"type": "gnss_spoof_status", "request_id": request_id, "status": status,
+                                     "error": error})
+
+
 async def _handle_tx_ack(msg: Dict[str, Any]) -> None:
     """Process a real {"type": "tx_ack", ...} message received FROM a
     connected bridge client over the mavlink WS — see
@@ -715,11 +915,54 @@ class JamConfirmBody(BaseModel):
 
 
 class RangeAuthorizationBody(BaseModel):
-    effect: str = Field(pattern="^(jam|mavlink)$")
+    effect: str = Field(pattern="^(jam|mavlink|gnss_spoof)$")
     enabled: bool
     # Required (and checked) only when enabled=True — see POST handler.
     password: Optional[str] = None
     confirm_phrase: Optional[str] = None
+
+
+# ---- GNSS L1 civil-signal spoofing ("soft-kill") — Task #103. See
+# field-bridge/GNSS_SPOOF_ARCHITECTURE.md for the full design. This is a
+# STRUCTURALLY DIFFERENT effect from jamming: instead of denying GNSS
+# reception with noise, it transmits a synthesized, structurally valid GPS
+# L1 C/A signal carrying a FABRICATED position. Arming effect=jam does NOT
+# implicitly authorize effect=gnss_spoof — they are independent
+# range-authorization leases (see RANGE_AUTH_EFFECTS above) and use
+# entirely separate, non-interchangeable confirm tokens (see
+# _gnss_spoof_confirm_tokens above vs _jam_confirm_tokens).
+GNSS_SPOOF_MAX_DURATION_S = 3.0  # deliberately shorter than JAM_MAX_DURATION_S (10s) — see
+                                  # architecture doc §2 for why a much shorter cap is correct
+                                  # for a deception effect vs. a denial effect.
+GNSS_SPOOF_DEFAULT_DURATION_S = 2.0
+
+
+class GnssSpoofPreviewBody(BaseModel):
+    """Pure computation input — no tokens involved. See gnss_spoof_preview()."""
+    true_lat: float
+    true_lon: float
+    true_alt_m: float = 0.0
+    fake_offset_m: float
+    fake_bearing_deg: float
+
+
+class GnssSpoofRequestBody(BaseModel):
+    band: str = Field(pattern="^(gps_l1)$")  # only gps_l1 at launch — see architecture doc §4
+    duration_s: float = GNSS_SPOOF_DEFAULT_DURATION_S  # clamped server-side, see below
+    tx_gain: int = 20
+    fake_offset_m: float                     # REQUIRED, no default
+    fake_bearing_deg: float                  # REQUIRED, no default
+    true_lat: float                          # last-known-true position, REQUIRED
+    true_lon: float
+    true_alt_m: float = 0.0
+    friendly_asset_attestation: str          # REQUIRED, logged verbatim, must match /confirm
+    arm_token: str                           # required unconditionally — gnss_spoof is always CRITICAL
+    gnss_spoof_confirm_token: str            # required unconditionally — see /gnss-spoof/confirm
+
+
+class GnssSpoofConfirmBody(BaseModel):
+    friendly_asset_attestation: str  # re-submitted here too — binds the attestation text to
+                                      # THIS specific confirm-token mint (see architecture doc §5a)
 
 
 # =====================================================================
@@ -1272,6 +1515,23 @@ class SpectrumIngestBody(BaseModel):
     span_mhz: Optional[float] = None
 
 
+class IFFBeaconIngestBody(BaseModel):
+    """Body posted by field-bridge/iff_beacon_bridge.py after it has already
+    cryptographically verified a LoRa IFF beacon (HMAC-SHA256 over asset_id/
+    mission_id/timestamp_slot/geocell/counter -- see field-bridge/
+    iff_crypto.py for the full construction). This endpoint trusts that
+    verification already happened bridge-side; it does NOT re-verify any
+    HMAC itself (the mission master secret never leaves the bridge/registry
+    file, by design -- see iff_beacon_bridge.py's AssetRegistry docstring)."""
+    asset_id: int
+    callsign: str
+    mission_id: int
+    geocell: int
+    geocell_known: bool = False
+    bearing_deg: Optional[float] = None
+    distance_m: Optional[float] = None
+
+
 class DetectionIngestBody(BaseModel):
     callsign: Optional[str] = None
     model: str = "Unknown UAV"
@@ -1634,6 +1894,141 @@ def _heuristic_display(model: Optional[str], confidence_type: Optional[str]):
     return HEURISTIC_GENERIC_DISPLAY.get(model)
 
 
+# =====================================================================
+# IFF (Identification Friend-or-Foe) LoRa beacon integration -- task #60.
+#
+# field-bridge/iff_beacon_bridge.py does the actual cryptographic
+# verification (HMAC-SHA256, see field-bridge/iff_crypto.py) of a LoRa
+# beacon from a friendly asset, entirely bridge-side -- the mission master
+# secret never reaches this backend. This backend only ever sees ALREADY-
+# VERIFIED beacons via POST /iff/beacons/ingest, stored in db.iff_friendlies
+# keyed by asset_id (one current record per asset, latest-seen wins, same
+# "upsert current state" pattern as e.g. /jam/status, not an unbounded log).
+#
+# Two consumers of that roster:
+#   (a) detection_ingest() below: suppress/downgrade an RF-heuristic
+#       detection to "FRIENDLY (IFF verified)" when a fresh, bearing-
+#       consistent friendly beacon exists, so a friendly asset's own RF
+#       emissions are not misclassified as a hostile contact.
+#   (b) GET /iff/friendlies: the roster task #103's (GNSS-spoofing) and any
+#       future control-link-injection authorization gate is meant to check
+#       BEFORE authorizing an effect whose footprint could cover a fresh
+#       friendly beacon. See check_no_friendly_in_footprint() below -- the
+#       concrete function #103's authorization code should call.
+# =====================================================================
+
+# A friendly is considered "fresh" (i.e. actually still out there, not a
+# stale roster entry from an asset that departed or lost power) for this
+# many seconds after its last verified beacon. 3x iff_crypto.INTERVAL_S
+# (30s beacon interval) gives a couple of missed beacons' worth of grace
+# before an asset silently drops off the "currently in range" roster,
+# without keeping a departed asset's last-known position around indefinitely.
+IFF_FRESHNESS_S = 90
+
+# Bearing tolerance for correlating an RF-heuristic detection's bearing_deg
+# against a friendly beacon's last-reported bearing_deg (which, per
+# iff_beacon_bridge.py's docstring, is None/absent for a plain omni LoRa
+# receiver with no angle-of-arrival capability -- in which case this
+# correlation simply cannot fire; see _check_iff_friendly_match below).
+# 15 degrees is a deliberately generous window given hackrf_rx.py's own
+# bearing estimate is itself a coarse single-antenna RSSI-based guess, not a
+# precision DF fix -- see DIRECTION_FINDING_NOTES.md. A false SUPPRESS
+# (treating a real hostile as friendly) is the dangerous failure direction
+# here, so this tolerance should stay conservative (tight, not wide) until a
+# real direction-finding capability replaces the single-antenna guess.
+IFF_BEARING_TOLERANCE_DEG = 15.0
+
+
+async def _iff_ingest_beacon(body: "IFFBeaconIngestBody") -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    await db.iff_friendlies.update_one(
+        {"asset_id": body.asset_id},
+        {"$set": {
+            "asset_id": body.asset_id,
+            "callsign": body.callsign,
+            "mission_id": body.mission_id,
+            "geocell": body.geocell,
+            "geocell_known": body.geocell_known,
+            "bearing_deg": body.bearing_deg,
+            "distance_m": body.distance_m,
+            "last_seen": now,
+        }},
+        upsert=True,
+    )
+
+
+async def _fresh_friendlies(freshness_s: int = IFF_FRESHNESS_S) -> List[Dict]:
+    since = (datetime.now(timezone.utc) - timedelta(seconds=freshness_s)).isoformat()
+    cursor = db.iff_friendlies.find({"last_seen": {"$gt": since}})
+    out = []
+    async for doc in cursor:
+        doc.pop("_id", None)
+        out.append(doc)
+    return out
+
+
+async def _check_iff_friendly_match(bearing_deg: Optional[float]) -> Optional[Dict]:
+    """Returns the matching friendly roster entry if a currently-fresh
+    verified friendly beacon's bearing is within IFF_BEARING_TOLERANCE_DEG
+    of `bearing_deg`, else None.
+
+    Deliberately conservative: if the friendly's bearing_deg is None (the
+    normal case for a plain omni LoRa receiver, per iff_beacon_bridge.py's
+    docstring -- no angle-of-arrival hardware exists yet), no match is
+    produced from that record. A friendly asset being IN RANGE (a verified
+    beacon exists) is not, by itself, proof that THIS PARTICULAR RF
+    detection at THIS bearing is that asset -- only a bearing-consistent
+    match is treated as a suppression-worthy correlation. This is a real,
+    stated limitation (see IFF_BEARING_TOLERANCE_DEG comment): until a real
+    bearing/AoA capability exists on the IFF receive side, this check can
+    only fire when hackrf_rx.py's own coarse bearing estimate happens to
+    line up with a friendly's last self-reported position, which is expected
+    to be the uncommon case at least until the asset side also reports a
+    real GPS-derived bearing/position back through the beacon geocell."""
+    if bearing_deg is None:
+        return None
+    for friendly in await _fresh_friendlies():
+        f_bearing = friendly.get("bearing_deg")
+        if f_bearing is None:
+            continue
+        diff = abs(((bearing_deg - f_bearing) + 180) % 360 - 180)
+        if diff <= IFF_BEARING_TOLERANCE_DEG:
+            return friendly
+    return None
+
+
+def check_no_friendly_in_footprint_sync_note() -> None:
+    """Not a real function -- a pointer for readers. The async equivalent an
+    authorization gate should call is `_check_iff_friendly_match(bearing_deg)`
+    (returns the matching friendly dict or None) or `_fresh_friendlies()` (the
+    full current roster) above. Task #103 (GNSS-spoofing attestation) and any
+    future control-link-injection authorization path should import and call
+    one of those two directly from this module rather than re-implementing
+    freshness/bearing-matching logic independently -- see this section's
+    module-level docstring for the full integration contract."""
+
+
+@api.post("/iff/beacons/ingest")
+async def iff_beacon_ingest(body: IFFBeaconIngestBody,
+                            user: Dict = Depends(get_current_user)):
+    """Ingest a single already-HMAC-verified IFF beacon from field-bridge/
+    iff_beacon_bridge.py. See IFFBeaconIngestBody docstring -- this endpoint
+    trusts the bridge's verification and does not re-check any HMAC."""
+    await _iff_ingest_beacon(body)
+    return {"ok": True, "asset_id": body.asset_id, "callsign": body.callsign}
+
+
+@api.get("/iff/friendlies")
+async def iff_friendlies(user: Dict = Depends(get_current_user)):
+    """Current roster of friendly assets with a fresh (within
+    IFF_FRESHNESS_S) IFF-verified LoRa beacon. This is the concrete
+    "known friendly assets currently in range" list task #103's (GNSS-
+    spoofing) authorization gate is meant to check before authorizing an
+    effect -- see check_no_friendly_in_footprint_sync_note() above for the
+    integration contract."""
+    return {"friendlies": await _fresh_friendlies(), "freshness_s": IFF_FRESHNESS_S}
+
+
 @api.post("/detections/ingest")
 async def detection_ingest(body: DetectionIngestBody,
                            user: Dict = Depends(get_current_user)):
@@ -1793,6 +2188,19 @@ async def detection_ingest(body: DetectionIngestBody,
                 updates["original_model"] = existing.get("original_model") or existing.get("model")
                 updates["original_protocol"] = existing.get("original_protocol") or existing.get("protocol")
                 updates["model"], updates["protocol"] = heuristic_display
+
+        # IFF suppression (task #60): a fresh, bearing-consistent verified
+        # friendly beacon downgrades this detection's threat_level rather
+        # than deleting/hiding the record -- see _check_iff_friendly_match
+        # docstring for exactly what "bearing-consistent" requires and why
+        # this deliberately does NOT fire just because some friendly is
+        # somewhere in range.
+        iff_friendly = await _check_iff_friendly_match(updates.get("bearing_deg"))
+        if iff_friendly:
+            updates["threat_level"] = "FRIENDLY (IFF verified)"
+            updates["iff_verified"] = True
+            updates["iff_asset_id"] = iff_friendly["asset_id"]
+            updates["iff_callsign"] = iff_friendly["callsign"]
         await db.detections.update_one(
             {"id": existing["id"]},
             {
@@ -1889,6 +2297,16 @@ async def detection_ingest(body: DetectionIngestBody,
         "ml_gated": body.ml_gated,
         "confidence_type": confidence_type,
     })
+
+    # IFF suppression (task #60) -- see identical comment in the
+    # update-existing branch above for what this does and does not check.
+    iff_friendly = await _check_iff_friendly_match(det.get("bearing_deg"))
+    if iff_friendly:
+        det["threat_level"] = "FRIENDLY (IFF verified)"
+        det["iff_verified"] = True
+        det["iff_asset_id"] = iff_friendly["asset_id"]
+        det["iff_callsign"] = iff_friendly["callsign"]
+
     await db.detections.insert_one(det.copy())
     await log_event("DETECTION",
                     f"[{body.source}] LIVE contact {det['callsign']} @ {body.center_freq_ghz} GHz "
@@ -2040,6 +2458,9 @@ async def ws_mavlink(ws: WebSocket):
                 # From field-bridge/jam_bridge.py, after a real (or refused)
                 # hackrf_transfer attempt — see _handle_jam_ack.
                 await _handle_jam_ack(incoming)
+            elif isinstance(incoming, dict) and incoming.get("type") == "gnss_spoof_ack":
+                # From field-bridge/gnss_spoof_bridge.py — see _handle_gnss_spoof_ack.
+                await _handle_gnss_spoof_ack(incoming)
     except WebSocketDisconnect:
         pass
     finally:
@@ -2314,6 +2735,171 @@ async def jam_status(user: Dict = Depends(get_current_user)):
     sessions = sorted(
         ({"request_id": rid, **{k: v for k, v in p.items() if k != "ts"},
           "ts": p["ts"].isoformat()} for rid, p in _pending_jam.items()),
+        key=lambda s: s["ts"], reverse=True,
+    )
+    return {"sessions": sessions[:20]}
+
+
+# =====================================================================
+# Routes: GNSS L1 civil-signal spoofing ("soft-kill") — Task #103.
+# See field-bridge/GNSS_SPOOF_ARCHITECTURE.md for the full design.
+# =====================================================================
+@api.post("/gnss-spoof/preview")
+async def gnss_spoof_preview(body: GnssSpoofPreviewBody, user: Dict = Depends(require_commander)):
+    """Pure computation, no tokens minted, nothing transmitted. Returns the
+    EXACT fabricated position BEFORE any token is minted, so the frontend's
+    SafetyGate checklist can render the real numbers (not a template) — see
+    architecture doc §5b. Logged only as an INFO-level breadcrumb, NOT part
+    of the authorization audit chain."""
+    fake_lat, fake_lon = geodesic_destination(
+        body.true_lat, body.true_lon, body.fake_offset_m, body.fake_bearing_deg
+    )
+    bearing_compass = _bearing_compass(body.fake_bearing_deg)
+    distance_description = (
+        f"{body.fake_offset_m:.0f} m offset, bearing {bearing_compass} from last-known-true position"
+    )
+    result = {
+        "fake_lat": fake_lat,
+        "fake_lon": fake_lon,
+        "fake_alt_m": body.true_alt_m,
+        "offset_m": body.fake_offset_m,
+        "bearing_deg": body.fake_bearing_deg,
+        "bearing_compass": bearing_compass,
+        "distance_description": distance_description,
+    }
+    await log_event(
+        "gnss_spoof_preview_viewed",
+        f"GNSS spoof preview computed: {distance_description} "
+        f"(fake position {fake_lat:.6f},{fake_lon:.6f})",
+        meta={"true_lat": body.true_lat, "true_lon": body.true_lon,
+              "fake_offset_m": body.fake_offset_m, "fake_bearing_deg": body.fake_bearing_deg,
+              **result},
+        actor=user["email"],
+    )
+    return result
+
+
+@api.post("/gnss-spoof/confirm")
+async def gnss_spoof_confirm(body: GnssSpoofConfirmBody, user: Dict = Depends(require_commander)):
+    """Mints a single-use gnss_spoof_confirm_token. Requires
+    body.friendly_asset_attestation to be non-trivial (reject with 400
+    otherwise) — this is the durable record of WHAT was attested, tied to
+    WHEN the token was minted, logged to mission_log immediately so the
+    attestation survives even if /payloads/gnss-spoof never arrives."""
+    if not _looks_like_real_attestation(body.friendly_asset_attestation):
+        raise HTTPException(
+            400,
+            f"friendly_asset_attestation must be a real, actively-typed statement "
+            f"(minimum {MIN_FRIENDLY_ASSET_ATTESTATION_LEN} chars, not a placeholder "
+            f"like 'n/a'/'none'/'confirmed') — describe the friendly-asset review performed.",
+        )
+    tok = _issue_gnss_spoof_confirm_token(body.friendly_asset_attestation)
+    await log_event(
+        "gnss_spoof_attestation",
+        f"GNSS-spoof friendly-asset attestation recorded (confirm token valid "
+        f"{GNSS_SPOOF_CONFIRM_TTL_S}s): {body.friendly_asset_attestation}",
+        meta={"friendly_asset_attestation": body.friendly_asset_attestation},
+        actor=user["email"],
+    )
+    return tok
+
+
+@api.post("/payloads/gnss-spoof")
+async def deploy_gnss_spoof(body: GnssSpoofRequestBody, user: Dict = Depends(require_commander)):
+    """Requests a real, bounded-duration GPS L1 C/A spoof burst carrying a
+    fabricated position. Layered gates, ALL independently required (mirrors
+    deploy_jam exactly — see field-bridge/gnss_spoof_bridge.py's module
+    docstring for the bridge-side gates this endpoint cannot itself enforce):
+      1. require_commander (above).
+      2. _check_tx_not_halted — EMERGENCY ABORT blocks this like any other TX.
+      3. arm_token — gnss_spoof is unconditionally CRITICAL severity.
+      4. gnss_spoof_confirm_token — proof the SafetyGate two-step confirm
+         happened for THIS request, AND that friendly_asset_attestation
+         matches what was attested at /gnss-spoof/confirm time.
+    """
+    _check_tx_not_halted()
+    _consume_arm_token(body.arm_token)
+    _consume_gnss_spoof_confirm_token(body.gnss_spoof_confirm_token, body.friendly_asset_attestation)
+
+    duration_s = min(body.duration_s, GNSS_SPOOF_MAX_DURATION_S)
+    freq_mhz = JAM_BAND_PRESETS_MHZ["gps_l1"]  # 1575.42 MHz, the only supported band at launch
+
+    fake_lat, fake_lon = geodesic_destination(
+        body.true_lat, body.true_lon, body.fake_offset_m, body.fake_bearing_deg
+    )
+    fake_alt_m = body.true_alt_m
+
+    request_id = str(uuid.uuid4())
+    _pending_gnss_spoof[request_id] = {
+        "ts": datetime.now(timezone.utc),
+        "status": "AWAITING_ACK",
+        "band": body.band,
+        "freq_mhz": freq_mhz,
+        "duration_s": duration_s,
+        "tx_gain": body.tx_gain,
+        "actor": user["email"],
+    }
+
+    # Logged BEFORE the WS message is sent, per architecture doc §6 —
+    # single source of truth for what "the preview showed" vs "what gets
+    # transmitted" (same numbers, computed once, here).
+    await log_event(
+        "gnss_spoof_fired",
+        f"Requested GNSS spoof burst: fake position {fake_lat:.6f},{fake_lon:.6f} "
+        f"(offset {body.fake_offset_m:.0f}m @ {body.fake_bearing_deg:.0f}°) from true "
+        f"{body.true_lat:.6f},{body.true_lon:.6f}, {duration_s}s @ {freq_mhz} MHz, "
+        f"gain={body.tx_gain} — awaiting bridge TX confirmation (request {request_id})",
+        meta={
+            "request_id": request_id, "freq_mhz": freq_mhz, "duration_s": duration_s,
+            "tx_gain": body.tx_gain, "true_lat": body.true_lat, "true_lon": body.true_lon,
+            "true_alt_m": body.true_alt_m, "fake_lat": fake_lat, "fake_lon": fake_lon,
+            "fake_alt_m": fake_alt_m, "offset_m": body.fake_offset_m,
+            "bearing_deg": body.fake_bearing_deg,
+            "friendly_asset_attestation": body.friendly_asset_attestation,
+        },
+        actor=user["email"],
+    )
+
+    await ws_manager.broadcast_json({
+        "type": "gnss_spoof_request",
+        "request_id": request_id,
+        "band": body.band,
+        "freq_mhz": freq_mhz,
+        "duration_s": duration_s,
+        "tx_gain": body.tx_gain,
+        "true_lat": body.true_lat,
+        "true_lon": body.true_lon,
+        "true_alt_m": body.true_alt_m,
+        "fake_lat": fake_lat,
+        "fake_lon": fake_lon,
+        "fake_alt_m": fake_alt_m,
+        # Forwarded AFTER being consumed above — same convention as
+        # jam_request's jam_confirm_token forwarding.
+        "gnss_spoof_confirm_token": body.gnss_spoof_confirm_token,
+        "actor": user["email"],
+    })
+    await ws_manager.broadcast_json({"type": "gnss_spoof_status", "request_id": request_id, "status": "AWAITING_ACK"})
+
+    return {
+        "request_id": request_id,
+        "status": "AWAITING_ACK",
+        "freq_mhz": freq_mhz,
+        "duration_s": duration_s,
+        "tx_gain": body.tx_gain,
+        "fake_lat": fake_lat,
+        "fake_lon": fake_lon,
+        "fake_alt_m": fake_alt_m,
+    }
+
+
+@api.get("/gnss-spoof/status")
+async def gnss_spoof_status(user: Dict = Depends(get_current_user)):
+    """Current/most-recent gnss_spoof session state(s), poll-and-render
+    pattern, mirrors GET /jam/status."""
+    await _expire_pending_gnss_spoof()
+    sessions = sorted(
+        ({"request_id": rid, **{k: v for k, v in p.items() if k != "ts"},
+          "ts": p["ts"].isoformat()} for rid, p in _pending_gnss_spoof.items()),
         key=lambda s: s["ts"], reverse=True,
     )
     return {"sessions": sessions[:20]}

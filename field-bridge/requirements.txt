@@ -23,4 +23,11 @@ dronecan==1.0.27  # dronecan_parser.py — DroneCAN/UAVCANv0 NodeStatus+Fix2 dec
 # gamutrf_infer.py; timm/chromadb are new for this module only.
 timm>=1.0.0
 chromadb>=0.5.0
-
+# iff_crypto.py / iff_beacon_bridge.py (task #60, IFF LoRa beacon w/
+# environmental-entropy key generation) — deliberately add NO new dependency
+# here: the whole crypto construction (HKDF-SHA256, HMAC-SHA256) is built
+# directly on Python's stdlib hmac/hashlib, already a transitive dependency
+# of every bridge that uses requests. A LoRa hardware driver dependency
+# (e.g. pySX127x, or just pyserial if an ESP32/RFM95 front-end is used) will
+# need to be added HERE once real LoRa RX hardware exists — see
+# iff_beacon_bridge.py's HARDWARE STATUS docstring section.

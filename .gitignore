@@ -78,6 +78,13 @@ agenthub/agents/youtube/db
 
 memory/test_credentials.md
 
+# IFF LoRa beacon mission secrets (task #60) — MISSION_MASTER_SECRET must only
+# ever move between field-bridge/iff_beacon_bridge.py's receiver and each
+# provisioned friendly asset via a physical/secure out-of-band channel, never
+# committed to this repo. See field-bridge/iff_beacon_bridge.py's
+# AssetRegistry docstring for the expected file format.
+**/iff_mission_registry*.json
+
 # Mobile development
 android-sdk/
 .env
