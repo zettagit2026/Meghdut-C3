@@ -1,6 +1,38 @@
 #!/usr/bin/env python3
 """Passive MAVLink HEARTBEAT sniffer — REAL protocol-level ArduPilot detection.
 
+TASK #114 EXTENSION (2026-07-25) — ArduPilot-specific protocol layers:
+  In addition to the original HEARTBEAT-only decode described below, this
+  script now also RECOGNIZES (passively, RX-only, log-only — no ingest, no
+  new detection schema) three additional real MAVLink protocol layers that
+  ArduPilot GCS<->vehicle links use constantly:
+    * Parameter protocol   -- PARAM_REQUEST_READ / PARAM_REQUEST_LIST /
+      PARAM_VALUE / PARAM_SET. Seeing this on the link means a real GCS is
+      actively reading or changing a real vehicle's configuration right now.
+    * Mission protocol      -- MISSION_REQUEST(_INT/_LIST), MISSION_ITEM(_INT),
+      MISSION_COUNT, MISSION_ACK, MISSION_CURRENT, MISSION_SET_CURRENT. Seeing
+      this means a real waypoint/mission upload or download sequence is in
+      progress between a real GCS and a real vehicle -- a materially
+      different signal from routine 1Hz heartbeat telemetry (e.g. "adversary
+      is re-tasking this airframe right now").
+    * MAVLink-FTP           -- FILE_TRANSFER_PROTOCOL, ArduPilot's file
+      transfer sub-protocol (used for parameter files, dataflash logs,
+      firmware). This script decodes the well-known MAVFTP payload header
+      (seq/session/opcode/size/req_opcode/offset -- see
+      https://mavlink.io/en/services/ftp.html) directly out of the real,
+      decoded FILE_TRANSFER_PROTOCOL.payload bytes; it does not invent this
+      layout, it's the published ArduPilot/MAVLink FTP wire format.
+  All of this is passive recognition of REAL traffic already on the wire,
+  using pymavlink's own generated message classes for every field access --
+  no new message parsing is reimplemented here. Nothing here transmits,
+  requests, or injects anything (see RX-ONLY / NO TRANSMISSION below, which
+  applies equally to this extension). These messages are printed for
+  operator visibility only; they are deliberately NOT posted to
+  /api/detections/ingest (that endpoint's schema is scoped to platform
+  detections, e.g. the ArduPilot HEARTBEAT confirmation below -- a
+  PARAM_VALUE or MISSION_ITEM sighting isn't a new "platform detected"
+  event, it's link-activity intelligence about an already-identified link).
+
 =============================================================================
 WHAT THIS IS, AND WHY IT IS DIFFERENT FROM hackrf_rx.py
 =============================================================================
@@ -85,6 +117,135 @@ _AUTOPILOT_NAMES: Dict[int, str] = {
     for name in dir(mavutil.mavlink)
     if name.startswith("MAV_AUTOPILOT_")
 }
+
+
+# -----------------------------------------------------------------------
+# Task #114: ArduPilot-specific protocol layer recognition (passive, RX-only)
+# -----------------------------------------------------------------------
+# Message type names as reported by pymavlink's Message.get_type() -- these
+# are the real generated dialect class names, not made up.
+PARAM_PROTOCOL_MSG_TYPES = (
+    "PARAM_REQUEST_READ",
+    "PARAM_REQUEST_LIST",
+    "PARAM_VALUE",
+    "PARAM_SET",
+)
+MISSION_PROTOCOL_MSG_TYPES = (
+    "MISSION_REQUEST",
+    "MISSION_REQUEST_INT",
+    "MISSION_REQUEST_LIST",
+    "MISSION_ITEM",
+    "MISSION_ITEM_INT",
+    "MISSION_COUNT",
+    "MISSION_ACK",
+    "MISSION_CURRENT",
+    "MISSION_SET_CURRENT",
+)
+FTP_PROTOCOL_MSG_TYPES = ("FILE_TRANSFER_PROTOCOL",)
+
+# MAVLink-FTP (MAVFTP) opcode names, per the published ArduPilot/MAVLink FTP
+# spec (https://mavlink.io/en/services/ftp.html) -- this is the real,
+# documented wire layout of FILE_TRANSFER_PROTOCOL.payload, not invented
+# here. Header layout (little-endian): seq_number(u16) session(u8) opcode(u8)
+# size(u8) req_opcode(u8) burst_complete(u8) padding(u8) offset(u32) [data...]
+_MAVFTP_OPCODE_NAMES: Dict[int, str] = {
+    0: "None", 1: "TerminateSession", 2: "ResetSessions", 3: "ListDirectory",
+    4: "OpenFileRO", 5: "ReadFile", 6: "CreateFile", 7: "WriteFile",
+    8: "RemoveFile", 9: "CreateDirectory", 10: "RemoveDirectory",
+    11: "OpenFileWO", 12: "TruncateFile", 13: "Rename", 14: "CalcFileCRC32",
+    15: "BurstReadFile", 128: "Ack", 129: "Nak",
+}
+_MAVFTP_HEADER_LEN = 12  # seq(2)+session(1)+opcode(1)+size(1)+req_opcode(1)+burst(1)+pad(1)+offset(4)
+
+
+def describe_param_activity(m) -> str:
+    """Format a one-line, human-readable summary of a real, decoded
+    parameter-protocol message. Fields are read directly off the pymavlink
+    message object -- no guessing/reimplementation of the wire format."""
+    mtype = m.get_type()
+    sysid, compid = m.get_srcSystem(), m.get_srcComponent()
+    if mtype == "PARAM_VALUE":
+        param_id = getattr(m, "param_id", "")
+        if isinstance(param_id, (bytes, bytearray)):
+            param_id = param_id.split(b"\x00")[0].decode("ascii", "replace")
+        return (f"PARAM protocol: PARAM_VALUE from sysid={sysid} compid={compid} "
+                f"param_id={param_id!r} value={getattr(m, 'param_value', None)} "
+                f"index={getattr(m, 'param_index', None)}/{getattr(m, 'param_count', None)} "
+                f"-- a real GCS<->vehicle parameter is being read/changed right now.")
+    if mtype == "PARAM_REQUEST_READ":
+        param_id = getattr(m, "param_id", "")
+        if isinstance(param_id, (bytes, bytearray)):
+            param_id = param_id.split(b"\x00")[0].decode("ascii", "replace")
+        return (f"PARAM protocol: PARAM_REQUEST_READ from sysid={sysid} compid={compid} "
+                f"target=({getattr(m, 'target_system', None)},{getattr(m, 'target_component', None)}) "
+                f"param_id={param_id!r} param_index={getattr(m, 'param_index', None)}")
+    if mtype == "PARAM_REQUEST_LIST":
+        return (f"PARAM protocol: PARAM_REQUEST_LIST from sysid={sysid} compid={compid} "
+                f"target=({getattr(m, 'target_system', None)},{getattr(m, 'target_component', None)}) "
+                f"-- a full parameter dump is being requested.")
+    if mtype == "PARAM_SET":
+        param_id = getattr(m, "param_id", "")
+        if isinstance(param_id, (bytes, bytearray)):
+            param_id = param_id.split(b"\x00")[0].decode("ascii", "replace")
+        return (f"PARAM protocol: PARAM_SET from sysid={sysid} compid={compid} "
+                f"target=({getattr(m, 'target_system', None)},{getattr(m, 'target_component', None)}) "
+                f"param_id={param_id!r} value={getattr(m, 'param_value', None)}")
+    return f"PARAM protocol: {mtype} from sysid={sysid} compid={compid}"
+
+
+def describe_mission_activity(m) -> str:
+    """Format a one-line summary of a real, decoded mission-protocol
+    message (waypoint upload/download sequence between a real GCS and a
+    real vehicle)."""
+    mtype = m.get_type()
+    sysid, compid = m.get_srcSystem(), m.get_srcComponent()
+    if mtype in ("MISSION_ITEM", "MISSION_ITEM_INT"):
+        return (f"MISSION protocol: {mtype} from sysid={sysid} compid={compid} "
+                f"seq={getattr(m, 'seq', None)} cmd={getattr(m, 'command', None)} "
+                f"frame={getattr(m, 'frame', None)} "
+                f"x={getattr(m, 'x', None)} y={getattr(m, 'y', None)} z={getattr(m, 'z', None)} "
+                f"-- a real waypoint is being uploaded/downloaded right now.")
+    if mtype == "MISSION_COUNT":
+        return (f"MISSION protocol: MISSION_COUNT from sysid={sysid} compid={compid} "
+                f"count={getattr(m, 'count', None)} "
+                f"-- a mission of this many waypoints is about to be transferred.")
+    if mtype in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
+        return (f"MISSION protocol: {mtype} from sysid={sysid} compid={compid} "
+                f"seq={getattr(m, 'seq', None)}")
+    if mtype == "MISSION_REQUEST_LIST":
+        return f"MISSION protocol: MISSION_REQUEST_LIST from sysid={sysid} compid={compid}"
+    if mtype == "MISSION_ACK":
+        return (f"MISSION protocol: MISSION_ACK from sysid={sysid} compid={compid} "
+                f"type={getattr(m, 'type', None)} "
+                f"-- mission transfer sequence completed/acknowledged.")
+    if mtype in ("MISSION_CURRENT", "MISSION_SET_CURRENT"):
+        return (f"MISSION protocol: {mtype} from sysid={sysid} compid={compid} "
+                f"seq={getattr(m, 'seq', None)}")
+    return f"MISSION protocol: {mtype} from sysid={sysid} compid={compid}"
+
+
+def describe_ftp_activity(m) -> str:
+    """Format a one-line summary of a real, decoded FILE_TRANSFER_PROTOCOL
+    message, decoding the MAVFTP header out of the real payload bytes per
+    the published spec (https://mavlink.io/en/services/ftp.html)."""
+    sysid, compid = m.get_srcSystem(), m.get_srcComponent()
+    payload = bytes(getattr(m, "payload", b""))
+    if len(payload) < _MAVFTP_HEADER_LEN:
+        return (f"FTP protocol: FILE_TRANSFER_PROTOCOL from sysid={sysid} compid={compid} "
+                f"(payload too short to decode MAVFTP header: {len(payload)} bytes)")
+    seq = payload[0] | (payload[1] << 8)
+    session = payload[2]
+    opcode = payload[3]
+    size = payload[4]
+    req_opcode = payload[5]
+    offset = int.from_bytes(payload[8:12], "little")
+    opcode_name = _MAVFTP_OPCODE_NAMES.get(opcode, f"UNKNOWN({opcode})")
+    req_opcode_name = _MAVFTP_OPCODE_NAMES.get(req_opcode, f"UNKNOWN({req_opcode})")
+    return (f"FTP protocol: FILE_TRANSFER_PROTOCOL from sysid={sysid} compid={compid} "
+            f"seq={seq} session={session} opcode={opcode_name} size={size} "
+            f"req_opcode={req_opcode_name} offset={offset} "
+            f"-- a real MAVLink-FTP file transfer (firmware/log/parameter file) "
+            f"is in progress on this link.")
 
 
 def login(console_url: str, email: str, password: str) -> str:
@@ -187,9 +348,25 @@ def main() -> int:
             # Genuinely nothing on the link this second. No fallback data —
             # this is expected and correct behaviour absent real traffic.
             continue
-        if m.get_type() in ("BAD_DATA", "UNKNOWN"):
+        mtype = m.get_type()
+        if mtype in ("BAD_DATA", "UNKNOWN"):
             continue
-        if m.get_type() != "HEARTBEAT":
+
+        # Task #114: passive recognition of ArduPilot parameter/mission/FTP
+        # protocol traffic. Log-only -- no ingest, no TX, no injection. See
+        # module docstring for why these are not posted to
+        # /api/detections/ingest.
+        if mtype in PARAM_PROTOCOL_MSG_TYPES:
+            print(describe_param_activity(m))
+            continue
+        if mtype in MISSION_PROTOCOL_MSG_TYPES:
+            print(describe_mission_activity(m))
+            continue
+        if mtype in FTP_PROTOCOL_MSG_TYPES:
+            print(describe_ftp_activity(m))
+            continue
+
+        if mtype != "HEARTBEAT":
             continue
 
         sysid = m.get_srcSystem()
