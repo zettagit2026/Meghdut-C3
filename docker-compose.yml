@@ -61,15 +61,14 @@ services:
       SENSOR_LAT: "${SENSOR_LAT:-}"
       SENSOR_LON: "${SENSOR_LON:-}"
       SENSOR_LABEL: "${SENSOR_LABEL:-}"
-    ports:
-      # Bind host defaults to all interfaces (unchanged behavior). Set
-      # BIND_HOST in .env to this host's specific LAN/management IP for
-      # defense-in-depth if a wireless NIC is ever added to a deploy host
-      # (this platform can jam WiFi itself -- no reason its own C2 ports
-      # should be reachable over that same medium). No current host in
-      # this project has WiFi hardware, so this is optional hardening,
-      # not a fix for an active exposure.
-      - "${BIND_HOST:-0.0.0.0}:8001:8001"
+    expose:
+      # TLS cutover (task #95): host port publishing removed. backend is no
+      # longer directly reachable from the LAN — only from other containers
+      # on this compose's docker network (i.e. caddy, which reverse-proxies
+      # /api/* to it via the frontend's Nginx). All external access must go
+      # through Caddy on 443. This closes the direct backend:8001 exposure
+      # gap identified in the original TLS design.
+      - "8001"
 
   frontend:
     build:
@@ -84,8 +83,11 @@ services:
     restart: unless-stopped
     depends_on:
       - backend
-    ports:
-      - "${BIND_HOST:-0.0.0.0}:3000:3000"
+    expose:
+      # TLS cutover (task #95): host port publishing removed — frontend is
+      # only reachable from other containers on the docker network (caddy
+      # reverse-proxies to it). No longer directly reachable from the LAN.
+      - "3000"
 
   caddy:
     image: caddy:2-alpine
