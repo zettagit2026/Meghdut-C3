@@ -14,7 +14,7 @@
 | 2 | Signed **Mission Report PDF** (SHA-256 hash-chained audit trail) | Mission Log → Export button |
 | 3 | Source code (Docker-runnable) | `zettagit2026/joydipdemo` |
 | 4 | Installation guide (`INSTALL.md`) | Repo root |
-| 5 | RF-bridge deployment guide (`rf-bridge/README.md`) | Repo `rf-bridge/` |
+| 5 | RF-bridge deployment guides (`rf-bridge/README.md` — MAVLink TX/RX; `field-bridge/README.md` — HackRF detection) | Repo `rf-bridge/`, `field-bridge/` |
 | 6 | Requirements-gap alignment note (this document) | `DEMO_PLAYBOOK.md` |
 
 ---
@@ -24,7 +24,7 @@
 **Ground station (operator side):**
 | Item | Model / spec | Purpose |
 |---|---|---|
-| Laptop | Ubuntu 22.04, 16 GB RAM, Docker Desktop | Runs app + rf-bridge |
+| Laptop | Ubuntu 22.04, 16 GB RAM, Docker Desktop | Runs app + rf-bridge (MAVLink) + field-bridge (HackRF) |
 | SDR | HackRF One + telescopic ANT500 | Wide-band RF detection |
 | Optional PA | 370–2700 MHz LNA/PA | RX sensitivity + future GNSS spoof |
 | Telemetry radio | SiK 915 MHz on `/dev/ttyUSB0` | MAVLink TX/RX to drone |
@@ -55,9 +55,12 @@ Run this in order, tick each box before the demo starts. If any check fails, **d
 [  ]  1. Backend docker stack UP
         $ docker compose ps → all 3 containers "Up (healthy)"
 
-[  ]  2. rf-bridge diagnostic passes
-        $ cd rf-bridge && ./run.sh scanner  (or python diagnose.py)
-        Expected: all 9 rows PASS
+[  ]  2. HackRF + MAVLink bridge diagnostics pass
+        (task #36: HackRF scanning/diagnostics moved to field-bridge/;
+        rf-bridge/ now only runs the MAVLink TX/RX bridge)
+        $ cd field-bridge && python hackrf_baseline_test.py
+        $ cd rf-bridge && ./run.sh bridge   (confirm it logs in + connects)
+        Expected: baseline test PASS, mavlink bridge connects without error
 
 [  ]  3. UI accessible at http://drone-lab01:3000
         Login: operator@cema.mil / cema@2026

@@ -8,6 +8,16 @@ ISM band (915MHz), looks for energy above a noise-floor threshold, and
 pushes real waterfall rows + detections into the CEMA console over its
 existing /api/spectrum/ingest and /api/detections/ingest endpoints.
 
+BAND COVERAGE (expanded 2026-07-25, Army directive priority (a) / task #51
+(C18)): by default this also cycles through 433MHz (LRS-433), 868MHz
+(SRD-868), and 1.2/1.3GHz analog FPV video (FPV-1G3) -- see
+EXTRA_BANDS_MHZ/load_bands_config() below for rationale, and set
+HACKRF_EXTRA_BANDS=0 to revert to only the original 3 bands. The full band
+list can also be overridden via HACKRF_BANDS_JSON. This is still a
+prioritized sub-band cycle, not a continuous 400MHz-6GHz sweep -- true
+continuous wideband coverage needs multiple synchronized SDRs / dedicated
+antennas, which is hardware-procurement scope (task #55), not this script.
+
 Requires `hackrf_sweep` (from the `hackrf` package) on PATH.
 
 MULTI-DEVICE NOTE (2026-07): a second physical HackRF now exists (not yet
@@ -29,6 +39,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import json
 import os
 import subprocess
 import sys
@@ -46,21 +57,165 @@ from hackrf_device_lock import HackrfDeviceBusy, hackrf_device_lock
 HACKRF_RX_SERIAL = os.environ.get("HACKRF_RX_SERIAL") or None
 DEVICE_SELECT_FLAG = "-d"  # matches hackrf_transfer's convention (see iq_capture.py)
 
-BANDS_MHZ: List[Tuple[str, int, int, str]] = [
+# --- Band configuration (expanded 2026-07-25, Army directive priority (a) /
+# task #51 (C18): "entire spectrum scan for detection and identification") ---
+#
+# The HackRF One's real tuning range is ~1MHz-6GHz. A single HackRF cannot
+# usefully sweep that ENTIRE range continuously at fine resolution and still
+# revisit each sub-band often enough to catch short/bursty transmissions
+# (frequency-hopping OcuSync, intermittent SiK telemetry, etc.) --  every
+# extra band added to the cycle proportionally lowers the revisit rate for
+# every other band, since sweep_band() runs each configured band in series
+# once per outer while-loop iteration (see main()). So this is NOT literally
+# "scan every MHz from 400M-6G" -- it's a prioritized, evidence-based list of
+# real, narrow ISM/LRS/video sub-bands that actual consumer/DIY drone
+# hardware transmits on, cycled through the same way the original 3 bands
+# were. Anything needing true simultaneous wideband coverage (continuous
+# 400MHz-6GHz, multiple synchronized SDRs, dedicated antennas for the very
+# low/high ends) is hardware-procurement scope -- that's task #55, explicitly
+# NOT attempted here.
+#
+# DEFAULT_BANDS_MHZ: the two original always-on bands. Contents UNCHANGED
+# from before this change -- this is additive, not a rewrite.
+DEFAULT_BANDS_MHZ: List[Tuple[str, int, int, str]] = [
     ("SiK-915", 902, 928, "SiK/ISM 915MHz"),
     ("DJI-2G4", 2400, 2483, "OcuSync/Wi-Fi 2.4GHz"),
     ("DJI-5G8", 5725, 5850, "OcuSync 5.8GHz"),
 ]
 
-# Per-band noise floor, site-calibrated 2026-07-16 via hackrf_baseline_test.py.
-# SiK-915 runs hotter at this site (~-53 to -60dBm quiet) than the 2.4/5.8GHz
-# bands (~-57 to -59dBm quiet) — a single global floor over-triggered on SiK.
+# EXTRA_BANDS_MHZ: additional sub-bands added 2026-07-25 as the software-
+# achievable part of expanding coverage toward 400MHz-6GHz within the
+# existing HackRF One's tuning range (no new hardware). Prioritized by real
+# consumer/DIY drone RF usage, not arbitrary spectrum:
+#   - LRS-433 (420-450MHz): 433MHz ISM/70cm-ham band used by long-range
+#     control links (TBS Crossfire/ExpressLRS-class LRS radios) and generic
+#     telemetry modules, common in India/EU where 915MHz SiK is restricted
+#     or less common than in the US. Already flagged for the separate
+#     consumer-IoT/RF-Protocol-Database signature work (task #72) -- that
+#     task is about protocol/device *fingerprints* in this band; this change
+#     is only about making the band visible to the energy-detection sweep at
+#     all. The two should stay coordinated (same band, different layers of
+#     analysis) but are not merged here.
+#   - SRD-868 (863-870MHz): EU SRD860 ISM band, the EU-region telemetry/LRS
+#     analog of SiK-915 (which is primarily a US ISM allocation) -- covers
+#     LRS/telemetry hardware configured for EU-legal frequencies instead of
+#     915MHz.
+#   - FPV-1G3 (1080-1300MHz): legacy/DIY analog FPV video ("1.2GHz"/"1.3GHz"
+#     band, exact legal sub-range varies by country/hobbyist convention).
+#     This is a genuinely common analog FPV video band on kit-built/racing
+#     drones that predates and coexists with the digital 5.8GHz OcuSync/DJI
+#     video link already covered by DJI-5G8 -- a real, previously-uncovered
+#     gap, not a duplicate of the 5.8GHz band.
+# NOTE: a completely-uncovered major FPV video band, 5.8GHz analog/digital
+# (5725-5850MHz), was flagged as a top candidate in the original task
+# framing -- but DJI-5G8 in DEFAULT_BANDS_MHZ above already covers exactly
+# that range (added in an earlier pass), so no new 5.8GHz band is added here.
+EXTRA_BANDS_MHZ: List[Tuple[str, int, int, str]] = [
+    ("LRS-433", 420, 450, "433MHz ISM/70cm-ham LRS & telemetry (Crossfire/ExpressLRS-class)"),
+    ("SRD-868", 863, 870, "868MHz EU SRD860 ISM LRS/telemetry"),
+    ("FPV-1G3", 1080, 1300, "1.2/1.3GHz analog FPV video (legacy/DIY racing drones)"),
+]
+
+
+def load_bands_config(env: Optional[Dict[str, str]] = None) -> List[Tuple[str, int, int, str]]:
+    """Build the active band list, configurable without code changes so the
+    sweep can be tuned as more bands get added incrementally.
+
+    Priority order:
+      1. HACKRF_BANDS_JSON — a full override, JSON array of
+         [name, low_mhz, high_mhz, label] 4-tuples/lists, e.g.:
+           HACKRF_BANDS_JSON='[["SiK-915",902,928,"SiK"],["LRS-433",420,450,"433"]]'
+         Invalid JSON (malformed, wrong shape, empty list) is logged to
+         stderr and IGNORED -- falls through to the built-in list below
+         rather than crashing the bridge or silently sweeping zero bands.
+      2. HACKRF_EXTRA_BANDS — "0"/"false"/"no"/"off" disables EXTRA_BANDS_MHZ,
+         leaving only DEFAULT_BANDS_MHZ (the original, pre-2026-07-25
+         behavior). Anything else (including unset, the default) enables
+         the extra bands -- opt-out, not opt-in, per the Army directive's
+         priority on expanding coverage now.
+
+    `env` defaults to os.environ; a caller-supplied dict is accepted purely
+    to make this testable without mutating process-global environment state.
+    """
+    env = os.environ if env is None else env
+
+    override = env.get("HACKRF_BANDS_JSON")
+    if override:
+        try:
+            data = json.loads(override)
+            bands = [(str(b[0]), int(b[1]), int(b[2]), str(b[3])) for b in data]
+            if not bands:
+                raise ValueError("HACKRF_BANDS_JSON parsed to an empty list")
+            return bands
+        except (ValueError, TypeError, IndexError, KeyError, json.JSONDecodeError) as e:
+            print(f"WARN: invalid HACKRF_BANDS_JSON ({e}) -- falling back to the "
+                  f"built-in band list instead of crashing or sweeping nothing.",
+                  file=sys.stderr)
+
+    bands = list(DEFAULT_BANDS_MHZ)
+    extra_flag = env.get("HACKRF_EXTRA_BANDS", "1").strip().lower()
+    if extra_flag not in ("0", "false", "no", "off"):
+        bands = bands + list(EXTRA_BANDS_MHZ)
+    return bands
+
+
+BANDS_MHZ: List[Tuple[str, int, int, str]] = load_bands_config()
+
+# Per-band noise floor, site-calibrated 2026-07-16 via hackrf_baseline_test.py
+# for the original 3 bands. SiK-915 runs hotter at this site (~-53 to -60dBm
+# quiet) than the 2.4/5.8GHz bands (~-57 to -59dBm quiet) — a single global
+# floor over-triggered on SiK.
+#
+# The three bands added 2026-07-25 (LRS-433, SRD-868, FPV-1G3) are NOT yet
+# site-calibrated -- they reuse the -58dBm DJI-2G4/5G8 ballpark as a
+# placeholder floor until hackrf_baseline_test.py is actually run against
+# them at the deployment site. Flagged here, not hidden: detections in these
+# bands should be treated as less-tuned than the original 3 until that
+# calibration pass happens.
 BAND_NOISE_FLOOR_DBM = {
     "SiK-915": -50.0,
     "DJI-2G4": -58.0,
     "DJI-5G8": -57.0,
+    "LRS-433": -58.0,  # placeholder, not site-calibrated -- see note above
+    "SRD-868": -58.0,  # placeholder, not site-calibrated -- see note above
+    "FPV-1G3": -58.0,  # placeholder, not site-calibrated -- see note above
 }
+DEFAULT_NOISE_FLOOR_DBM = -58.0  # fallback for any band name not in the table
+                                   # above (e.g. a custom HACKRF_BANDS_JSON
+                                   # entry) so a lookup miss degrades to a
+                                   # reasonable default instead of a KeyError
+                                   # crashing the sweep loop.
 DETECT_THRESHOLD_DB = 15.0  # dB above that band's floor to call it a contact
+
+# --- Per-band detection labeling ---------------------------------------------
+# Previously this was two inline ternaries in main() keyed off `"DJI" in name`
+# / `name == "SiK-915"` -- that worked when there were exactly 3 hardcoded
+# bands, but silently mislabeled anything else as "MAVLink craft (candidate)"
+# / "SiK/MAVLink" once new bands were added (e.g. an FPV-1G3 hit would have
+# been reported as a MAVLink/SiK contact, which is wrong). Generalized to an
+# explicit per-band table instead. Values for SiK-915/DJI-2G4/DJI-5G8 below
+# are UNCHANGED from the original inline logic -- same strings, same output.
+BAND_DETECTION_META = {
+    "SiK-915": {"model": "MAVLink craft (candidate)", "protocol": "SiK/MAVLink",
+                "source": "SIK_RF_HEURISTIC"},
+    "DJI-2G4": {"model": "DJI Mini (candidate)", "protocol": "OcuSync/Wi-Fi",
+                "source": "HACKRF"},
+    "DJI-5G8": {"model": "DJI Mini (candidate)", "protocol": "OcuSync/Wi-Fi",
+                "source": "HACKRF"},
+    # Added 2026-07-25 for the new bands -- see EXTRA_BANDS_MHZ comment above
+    # for the rationale behind each band's real-world association.
+    "LRS-433": {"model": "LRS/telemetry craft (candidate)",
+                "protocol": "433MHz ISM LRS/telemetry", "source": "HACKRF"},
+    "SRD-868": {"model": "LRS/telemetry craft (candidate)",
+                "protocol": "868MHz SRD LRS/telemetry", "source": "HACKRF"},
+    "FPV-1G3": {"model": "Analog FPV video craft (candidate)",
+                "protocol": "1.2/1.3GHz analog FPV video", "source": "HACKRF"},
+}
+# Fallback for any band name not in the table above (e.g. a custom band added
+# only via HACKRF_BANDS_JSON) -- degrades to a generic, honestly-unclassified
+# label instead of a KeyError or a wrong DJI/SiK guess.
+DEFAULT_DETECTION_META = {"model": "Unidentified emitter (candidate)",
+                           "protocol": "unclassified", "source": "HACKRF"}
 
 # --- RSSI -> distance ESTIMATE (log-distance path-loss model) ---------------
 # distance_m = 10 ** ((RSSI_ref_1m - rssi_dbm) / (10 * path_loss_exponent))
@@ -86,6 +241,12 @@ RSSI_REF_1M_DBM = {
     "SiK-915": -32.0,
     "DJI-2G4": -30.0,
     "DJI-5G8": -30.0,
+    # Added 2026-07-25 -- same "no site calibration, documented assumption"
+    # caveat as above; -30dBm@1m is a generic low/mid-power-transmitter
+    # ballpark reused across bands absent per-band survey data.
+    "LRS-433": -30.0,
+    "SRD-868": -30.0,
+    "FPV-1G3": -30.0,
 }
 
 # PATH_LOSS_EXPONENT: environmental attenuation factor. 2.0 = free space,
@@ -97,6 +258,13 @@ PATH_LOSS_EXPONENT = {
     "SiK-915": 2.3,
     "DJI-2G4": 2.5,
     "DJI-5G8": 2.5,
+    # Added 2026-07-25 -- 433/868MHz penetrate/diffract similarly to or
+    # better than 915MHz (lower frequency), so grouped with SiK-915's
+    # exponent; FPV-1G3 (1.2/1.3GHz) sits between SiK-915 and the 2.4/5.8GHz
+    # bands, so it gets the same 2.5 default as the other video-class bands.
+    "LRS-433": 2.3,
+    "SRD-868": 2.3,
+    "FPV-1G3": 2.5,
 }
 
 DISTANCE_MIN_M = 1.0      # clamp floor — RSSI-based estimates are meaningless
@@ -545,7 +713,7 @@ def main() -> None:
             except requests.RequestException as e:
                 print(f"spectrum ingest failed: {e}", file=sys.stderr)
             peak = max(powers)
-            floor = BAND_NOISE_FLOOR_DBM[name]
+            floor = BAND_NOISE_FLOOR_DBM.get(name, DEFAULT_NOISE_FLOOR_DBM)
             if peak > floor + DETECT_THRESHOLD_DB:
                 consecutive_hits[name] += 1
             else:
@@ -721,9 +889,10 @@ def main() -> None:
                 # via distance_estimated so the console/operators know this is not
                 # a precise range measurement.
                 est_distance_m = estimate_distance_m(name, peak)
+                meta = BAND_DETECTION_META.get(name, DEFAULT_DETECTION_META)
                 det = {
-                    "model": "DJI Mini (candidate)" if "DJI" in name else "MAVLink craft (candidate)",
-                    "protocol": "OcuSync/Wi-Fi" if "DJI" in name else "SiK/MAVLink",
+                    "model": meta["model"],
+                    "protocol": meta["protocol"],
                     "threat_level": "MEDIUM",
                     "center_freq_ghz": center_mhz / 1000.0,
                     "bandwidth_mhz": high - low,
@@ -732,7 +901,7 @@ def main() -> None:
                     "bearing_deg": 0.0,
                     "distance_m": round(est_distance_m, 1),
                     "distance_estimated": True,  # RSSI path-loss model, not a real range measurement
-                    "source": "SIK_RF_HEURISTIC" if name == "SiK-915" else "HACKRF",
+                    "source": meta["source"],
                     "confidence_type": "heuristic_binary",  # persistence-confirmed, no real-valued probability
                 }
                 try:

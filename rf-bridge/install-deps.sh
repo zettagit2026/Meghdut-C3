@@ -14,8 +14,13 @@ have()  { command -v "$1" >/dev/null 2>&1; }
 # sudo prefix: empty when running as root (Kali default), else 'sudo'
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 
-APT_PKGS=(hackrf libhackrf-dev libhackrf0 libusb-1.0-0-dev pkg-config
-          python3-venv python3-pip)
+# task #36: HackRF packages (hackrf, libhackrf-dev, libhackrf0,
+# libusb-1.0-0-dev) were removed here — the HackRF scanner that needed them
+# (hackrf_scanner.py) was a duplicate of field-bridge/hackrf_rx.py and has
+# been removed from this directory. This bridge only needs the serial
+# (SiK/RFD900) radio, not the HackRF. If you're installing field-bridge's
+# HackRF tooling, see field-bridge/'s own install steps for those packages.
+APT_PKGS=(pkg-config python3-venv python3-pip)
 
 # --- 1. apt update (best-effort; don't die on 3rd-party repo failure) ---
 echo "==> apt: refreshing package index (best effort)"
@@ -23,7 +28,7 @@ $SUDO apt-get update -o Acquire::AllowInsecureRepositories=true 2>&1 | tail -20 
     yell "  (apt update returned non-zero — probably a broken 3rd-party repo; continuing)"
 
 # --- 2. install packages one by one so a single miss doesn't abort ------
-echo "==> apt: installing HackRF + USB + Python venv"
+echo "==> apt: installing Python venv deps"
 MISSING=()
 for pkg in "${APT_PKGS[@]}"; do
     if dpkg -s "$pkg" >/dev/null 2>&1; then
@@ -82,11 +87,6 @@ fi
 # --- 6. sanity checks ----------------------------------------------------
 echo
 echo "==> Sanity checks"
-if have hackrf_info; then
-    hackrf_info 2>&1 | head -6 || true
-else
-    red "   hackrf_info is NOT on PATH. Install hackrf-tools manually."
-fi
 if [ -e /dev/ttyUSB0 ]; then
     green "   /dev/ttyUSB0 present."
 else
@@ -98,6 +98,6 @@ green "==> DONE."
 echo "    Next steps:"
 echo "      source .venv/bin/activate     # if not already active"
 echo "      cat .env                      # edit CEMA_API_URL etc. if needed"
-echo "      ./run.sh both                 # start scanner + mavlink bridge"
+echo "      ./run.sh                      # start the mavlink bridge"
 echo
 echo "    (Log out and back in if you're a non-root user — new groups need to take effect.)"

@@ -1,8 +1,17 @@
 #!/usr/bin/env bash
-# Start the RF bridge workers.
-#   ./run.sh          → both scanner + mavlink bridge (foreground)
-#   ./run.sh scanner  → only HackRF sweep worker
-#   ./run.sh bridge   → only MAVLink serial bridge
+# Start the MAVLink serial TX/RX bridge (SiK / RFD900 / FPV telemetry radio).
+#
+# NOTE (task #36 consolidation): this directory used to also run a HackRF
+# wide-band scanner (hackrf_scanner.py) alongside this bridge. That scanner
+# was a duplicate, earlier iteration of what field-bridge/hackrf_rx.py does
+# (and does more completely — device serial pinning, re-auth-on-401, RX-only
+# safety framing). It has been removed from this directory; HackRF
+# detection now lives exclusively in field-bridge/. This script only starts
+# the MAVLink bridge, which has no equivalent in field-bridge and remains
+# the live TX path referenced throughout backend/server.py.
+#
+#   ./run.sh          → MAVLink serial bridge (foreground)
+#   ./run.sh bridge   → same, explicit form
 set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
@@ -15,23 +24,14 @@ fi
 # shellcheck disable=SC1091
 source .venv/bin/activate
 
-MODE="${1:-both}"
+MODE="${1:-bridge}"
 
 case "$MODE" in
-    scanner)
-        exec python hackrf_scanner.py
-        ;;
     bridge)
         exec python mavlink_bridge.py
         ;;
-    both)
-        python hackrf_scanner.py & SCANNER_PID=$!
-        python mavlink_bridge.py & BRIDGE_PID=$!
-        trap "kill $SCANNER_PID $BRIDGE_PID 2>/dev/null || true" INT TERM
-        wait
-        ;;
     *)
-        echo "Usage: $0 [scanner|bridge|both]"
+        echo "Usage: $0 [bridge]"
         exit 1
         ;;
 esac

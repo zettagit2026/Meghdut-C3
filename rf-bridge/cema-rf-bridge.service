@@ -1,5 +1,11 @@
 [Unit]
-Description=CEMA cUAS RF Bridge (HackRF scanner + MAVLink serial bridge)
+Description=CEMA cUAS RF Bridge (MAVLink serial TX/RX bridge — SiK/RFD900)
+# task #36: this unit used to run run.sh "both" (HackRF scanner +
+# MAVLink bridge). The HackRF scanner half was a duplicate, earlier
+# iteration of field-bridge/hackrf_rx.py (cema-hackrf-rx.service) and has
+# been removed from this directory; HackRF detection is now exclusively
+# field-bridge's responsibility. This unit now only starts the MAVLink
+# bridge, which has no field-bridge equivalent.
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +14,7 @@ Type=simple
 # Change these to match your deployment:
 User=root
 WorkingDirectory=/opt/cema/rf-bridge
-ExecStart=/opt/cema/rf-bridge/run.sh both
+ExecStart=/opt/cema/rf-bridge/run.sh bridge
 Restart=always
 RestartSec=5
 StandardOutput=journal
