@@ -33,6 +33,16 @@ class OuiMatchTests(unittest.TestCase):
     def test_parrot_oui_matches(self):
         self.assertEqual(kismet_bridge.match_drone_oui("90:3A:E6:01:02:03"), "Parrot")
 
+    def test_autel_oui_matches(self):
+        # task #97: the old "A0:14:3D:00" entry was a malformed 4-octet key
+        # and was silently filtered out, so Autel devices never matched.
+        # EC:5B:CD is a real, verified 3-octet OUI (IEEE MA-M registry:
+        # "Autel Robotics USA LLC") -- confirm it now matches.
+        self.assertEqual(kismet_bridge.match_drone_oui("EC:5B:CD:11:22:33"), "Autel")
+
+    def test_autel_oui_matches_lowercase(self):
+        self.assertEqual(kismet_bridge.match_drone_oui("ec:5b:cd:11:22:33"), "Autel")
+
     def test_non_drone_oui_does_not_match(self):
         self.assertIsNone(kismet_bridge.match_drone_oui("3C:5A:B4:11:22:33"))
 

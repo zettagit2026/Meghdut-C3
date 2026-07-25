@@ -167,7 +167,15 @@ DRONE_MANUFACTURER_OUIS = {
     "48:1C:B9": "DJI",
     "90:3A:E6": "Parrot",
     "00:12:1C": "Parrot",
-    "A0:14:3D:00": "Autel",  # placeholder-length example kept 3-octet below
+    # VERIFIED 2026-07-25 (task #97): the previous "A0:14:3D:00" entry was a
+    # malformed 4-octet key (a real OUI prefix is exactly 3 octets), so it was
+    # silently dropped by the normalization filter below and Autel devices
+    # were NEVER OUI-flagged. Replaced with a real, currently-registered
+    # 3-octet OUI confirmed directly against the IEEE Registration Authority
+    # database (standards-oui.ieee.org/oui28/mam.txt, MA-M/28-bit block):
+    # "EC-5B-CD ... Autel Robotics USA LLC". Verified by fetching that file
+    # directly, not guessed/assumed.
+    "EC:5B:CD": "Autel",
 }
 # Normalize to strict 3-octet keys only (defensive against the placeholder
 # above / any future accidental non-3-octet entry).
