@@ -18,6 +18,42 @@ const THREAT_COLOR = {
   CRITICAL: "var(--accent-critical)",
 };
 
+// Task #117: "Export IQ for RE analysis". Downloads the SigMF .sigmf-data/
+// .sigmf-meta pair (see backend GET /detections/{id}/iq-export) as a zip so
+// an analyst can hand it to URH (Universal Radio Hacker, external tool) for
+// manual signal inspection. This does NOT do any demodulation/decoding
+// itself -- it only fetches bytes the backend already assembled and saves
+// them locally via a blob download (a plain <a href> can't carry the
+// Bearer auth header, so this goes through the authenticated `api` client).
+async function exportIqCapture(detection) {
+  try {
+    const res = await api.get(`/detections/${detection.id}/iq-export`, { responseType: "blob" });
+    const cd = res.headers?.["content-disposition"] || "";
+    const match = /filename="?([^"]+)"?/.exec(cd);
+    const filename = match ? match[1] : `${detection.id}_iq_export.zip`;
+    const url = window.URL.createObjectURL(new Blob([res.data]));
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.URL.revokeObjectURL(url);
+    toast.success(`IQ capture exported: ${filename}`);
+  } catch (e) {
+    // Honest failure surfacing -- most commonly "no capture attached yet"
+    // (404 from the backend), not a fabricated success.
+    let message = formatApiError(e);
+    if (e?.response?.data instanceof Blob) {
+      try {
+        const text = await e.response.data.text();
+        message = formatApiError({ response: { data: JSON.parse(text) } });
+      } catch { /* keep generic message */ }
+    }
+    toast.error(`IQ export failed: ${message}`);
+  }
+}
+
 function Waterfall() {
   const [rows, setRows] = useState([]);
   const [source, setSource] = useState("NONE");
@@ -258,6 +294,7 @@ export default function Dashboard() {
                     <th className="text-left p-2">LAST SEEN</th>
                     <th className="text-left p-2">CEMA</th>
                     <th className="text-left p-2">KC</th>
+                    <th className="text-left p-2">IQ</th>
                   </tr>
                 </thead>
                 <tbody className="font-mono">
@@ -359,6 +396,20 @@ export default function Dashboard() {
                           >
                             {d.status === "NEUTRALIZED" ? "DEFEAT" : d.kill_chain_stage}
                           </Link>
+                        </td>
+                        <td className="p-2 text-[10px]">
+                          {d.confidence_type === "unclassified_signal" && (
+                            <button
+                              type="button"
+                              data-testid={`iq-export-${d.id}`}
+                              onClick={() => exportIqCapture(d)}
+                              title="Export the associated SigMF IQ capture (.sigmf-data + .sigmf-meta) for manual RE analysis in URH -- fails honestly with a 404 if no capture has been attached to this contact yet"
+                              className="px-1.5 py-0.5 tactical-border font-mono uppercase tracking-wide hover:bg-[#1A2436] transition-colors"
+                              style={{ color: "#C77D3D", borderColor: "#8A5A2C" }}
+                            >
+                              Export IQ
+                            </button>
+                          )}
                         </td>
                       </tr>
                     );

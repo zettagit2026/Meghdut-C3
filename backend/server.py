@@ -1476,6 +1476,121 @@ async def authorize_target(det_id: str, body: AuthorizeTargetBody,
     return {"ok": True, "detection_id": det_id, "authorized_target": body.authorized}
 
 
+class AttachIqCaptureBody(BaseModel):
+    basename: str
+
+
+# Task #117 (scoped by Software Architect task #108): "Export IQ for RE
+# analysis". field-bridge/iq_capture.py is a standalone, manually-invoked
+# tool (its own docstring is explicit: "This script intentionally does NOT
+# wire into the live detection pipeline (no backend/server.py changes, no
+# new ingest endpoint)"). So there is NO existing automatic association
+# between a detection record and an IQ capture file -- that had to be
+# designed here, not assumed.
+#
+# Minimal design chosen: a detection can have an `iq_capture_basename`
+# field (just a bare filename stem, no path). An operator who has manually
+# run iq_capture.py for a contact attaches the resulting capture via
+# POST .../iq-capture with that basename; the underlying pair of files
+# (`<basename>.sigmf-data` + `<basename>.sigmf-meta`) is expected to live in
+# IQ_CAPTURE_DIR. This is intentionally NOT a bigger new data model (no
+# capture registry/collection) -- one honest optional field is all the
+# current manual workflow justifies. Basename is restricted to a safe
+# charset (no `/`, `..`, etc.) both to prevent path traversal and because
+# SigMF basenames are simple by convention.
+IQ_CAPTURE_DIR = Path(
+    os.environ.get("IQ_CAPTURE_DIR", str(ROOT_DIR.parent / "field-bridge" / "iq_captures"))
+)
+
+import re as _re
+_SAFE_BASENAME_RE = _re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+@api.post("/detections/{det_id}/iq-capture")
+async def attach_iq_capture(det_id: str, body: AttachIqCaptureBody,
+                             user: Dict = Depends(get_current_user)):
+    """Attach a manually-captured SigMF IQ pair (see iq_capture.py) to a
+    detection record, so it can later be fetched via GET .../iq-export.
+    Does NOT capture anything itself, does NOT touch hardware -- purely
+    records that `<basename>.sigmf-data`/`.sigmf-meta` in IQ_CAPTURE_DIR
+    belong to this detection."""
+    doc = await db.detections.find_one({"id": det_id})
+    if not doc:
+        raise HTTPException(404, "Detection not found")
+    basename = body.basename.strip()
+    if not basename or not _SAFE_BASENAME_RE.match(basename):
+        raise HTTPException(400, "basename must be a bare filename stem (letters/digits/._- only, no path separators)")
+    data_path = IQ_CAPTURE_DIR / f"{basename}.sigmf-data"
+    meta_path = IQ_CAPTURE_DIR / f"{basename}.sigmf-meta"
+    if not data_path.is_file() or not meta_path.is_file():
+        raise HTTPException(
+            404,
+            f"No .sigmf-data/.sigmf-meta pair named '{basename}' found in {IQ_CAPTURE_DIR}. "
+            "Run field-bridge/iq_capture.py first and place its output there before attaching.",
+        )
+    await db.detections.update_one({"id": det_id}, {"$set": {"iq_capture_basename": basename}})
+    await log_event("DETECTION", f"IQ capture '{basename}' attached to {doc.get('callsign', det_id)}",
+                     meta={"detection_id": det_id, "basename": basename}, actor=user["email"])
+    return {"ok": True, "detection_id": det_id, "iq_capture_basename": basename}
+
+
+@api.get("/detections/{det_id}/iq-export")
+async def export_iq_capture(det_id: str, user: Dict = Depends(get_current_user)):
+    """Serve the SigMF IQ capture pair (.sigmf-data + .sigmf-meta) attached
+    to a detection, bundled as a zip, for an analyst to import into URH
+    (Universal Radio Hacker -- external tool, not vendored here) for manual
+    RE work. Primarily intended for confidence_type == "unclassified_signal"
+    detections (a genuinely unknown emitter is exactly the case that
+    benefits from manual signal inspection), but not hard-restricted to
+    that case: if a capture is attached to any other detection, the
+    underlying capability (get me the real IQ bytes) is still legitimately
+    useful and there is no honesty reason to block it. NO demodulation,
+    bit-slicing, or protocol inference happens here or anywhere else in
+    this codebase's export path -- that stays a manual analyst workflow in
+    URH itself."""
+    doc = await db.detections.find_one({"id": det_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Detection not found")
+    basename = doc.get("iq_capture_basename")
+    if not basename:
+        raise HTTPException(
+            404,
+            "No IQ capture is associated with this detection. iq_capture.py must be run "
+            "manually against this contact and attached via POST .../iq-capture first -- "
+            "there is no automatic capture-to-detection linkage in this system.",
+        )
+    data_path = IQ_CAPTURE_DIR / f"{basename}.sigmf-data"
+    meta_path = IQ_CAPTURE_DIR / f"{basename}.sigmf-meta"
+    if not data_path.is_file() or not meta_path.is_file():
+        raise HTTPException(
+            404,
+            f"Detection references IQ capture '{basename}' but its files are no longer "
+            f"present in {IQ_CAPTURE_DIR} (moved or deleted after attaching).",
+        )
+
+    import io
+    import zipfile
+    from fastapi.responses import StreamingResponse
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(data_path, arcname=f"{basename}.sigmf-data")
+        zf.write(meta_path, arcname=f"{basename}.sigmf-meta")
+    buf.seek(0)
+
+    await log_event("DETECTION", f"IQ export downloaded for {doc.get('callsign', det_id)}",
+                     meta={"detection_id": det_id, "basename": basename,
+                           "confidence_type": doc.get("confidence_type")},
+                     actor=user["email"])
+
+    zip_name = f"{basename}_iq_export.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{zip_name}"'},
+    )
+
+
 @api.delete("/detections/{det_id}")
 async def delete_detection(det_id: str, user: Dict = Depends(get_current_user)):
     res = await db.detections.delete_one({"id": det_id})
