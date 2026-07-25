@@ -16,6 +16,12 @@
 
 set -uo pipefail
 
+# launchd user agents run with a minimal default PATH
+# (/usr/bin:/bin:/usr/sbin:/sbin) that does not include Homebrew's prefix, so
+# dependencies like sshpass (and the Homebrew bash used by the shebang above)
+# would otherwise fail to resolve when this is invoked unattended.
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:${PATH}"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 KEYCHAIN_ACCOUNT="biswajit"
