@@ -65,6 +65,46 @@ When LoRa hardware exists: `run_live()` needs to be filled in with an actual
 read loop (pyserial read from an ESP32/RFM95 USB-serial bridge, or a pySX127x
 SPI receive callback) that hands each received FRAME_LEN-byte payload to
 `handle_frame()` -- that function is already real and already tested.
+
+=============================================================================
+HARDENING ADDED ON TOP OF TASK #60: REVOCATION + CHALLENGE-RESPONSE
+=============================================================================
+Two gaps found by a Security Architect's gap analysis (against the Army's
+"continuous authentication -- zero trust architecture" requirement wording
+and against how real Mode 4/5 IFF actually works) are addressed here:
+
+  1. Per-asset revocation: AssetRegistry now carries a revoked_asset_ids
+     set (loadable from the same JSON registry file). handle_frame()
+     rejects a revoked asset's frame with a distinct "revoked: ..." reason
+     even when its HMAC verifies -- so a single captured asset can be
+     locked out without rotating the whole mission's master secret and
+     punishing every other friendly asset.
+
+  2. Challenge-response (see iff_challenge.py for the full construction and
+     rationale): the one-way periodic beacon this file was built around
+     cannot fully defeat a jam-and-instantly-relay attack within its
+     timing-skew window -- stated plainly in iff_crypto.py's REPLAY DEFENSE
+     section. NonceStore + build_and_track_challenge()/handle_challenge()/
+     handle_response() below add an interrogate-on-demand path: a fresh,
+     single-use nonce per query closes that window entirely, matching how
+     real Mode 4/5 interrogation works. This is ADDITIVE -- the one-way
+     beacon and handle_frame() are unchanged in behavior and remain a valid
+     lower-power/lower-latency secondary "is this asset roughly still
+     around" signal; challenge-response is the recommended PRIMARY path
+     when a positive, current, wormhole-resistant answer is actually
+     needed (e.g. immediately before authorizing an RF effect near a
+     claimed friendly position). Both modes share the same per-asset key
+     derivation (iff_crypto.derive_asset_secret()) and the same
+     AssetRegistry/mission provisioning -- no separate secret material.
+
+     Same hardware caveat as everything else in this file: this needs a
+     BIDIRECTIONAL LoRa link (both sides can transmit AND receive), which
+     does not exist on this project's hardware any more than the one-way
+     link does. NonceStore/handle_challenge()/handle_response() are real,
+     tested logic (see test_iff_challenge.py, test_iff_beacon_bridge.py)
+     exercised only against synthetic-but-cryptographically-real frames --
+     NOT validated over any real RF link. Do not treat this as hardware-
+     validated; it isn't.
 """
 
 from __future__ import annotations
@@ -79,6 +119,7 @@ from typing import Deque, Dict, Optional, Tuple
 
 import requests
 
+import iff_challenge
 import iff_crypto as iff
 
 BRIDGE_NAME = "iff_beacon_bridge"
@@ -110,6 +151,135 @@ class ReplayCache:
         dq.append((slot, counter))
 
 
+class NonceStore:
+    """Interrogator-side bounded store of outstanding challenge nonces --
+    the stateful half of iff_challenge.py's challenge-response scheme (that
+    module is deliberately pure/stateless, same split as iff_crypto.py vs.
+    this file). A nonce is "outstanding" from the moment a challenge is
+    issued (issue()) until it is consumed exactly once, either by a matching
+    response (consume(), whether or not that response ultimately verifies)
+    or by expiring (checked lazily on consume(); a background sweep is not
+    needed since a bounded maxlen already caps memory use even if nothing
+    ever expires it).
+
+    This is what actually closes the relay/wormhole window described in
+    iff_challenge.py's module docstring: a captured-and-replayed response is
+    rejected here (nonce no longer outstanding) even if its HMAC tag is
+    (correctly) still valid for some now-already-answered nonce.
+    """
+
+    def __init__(self, ttl_s: int = iff_challenge.NONCE_TTL_S, maxlen: int = 256):
+        self._ttl_s = ttl_s
+        self._maxlen = maxlen
+        # nonce (bytes) -> (asset_id, mission_id, issued_time)
+        self._outstanding: Dict[bytes, Tuple[int, int, float]] = {}
+
+    def issue(self, nonce: bytes, asset_id: int, mission_id: int,
+              issued_time: Optional[float] = None) -> None:
+        if len(self._outstanding) >= self._maxlen:
+            # Drop the oldest entry rather than grow unbounded -- a burst of
+            # unanswered challenges should not let this store leak memory.
+            oldest = min(self._outstanding, key=lambda k: self._outstanding[k][2])
+            self._outstanding.pop(oldest, None)
+        self._outstanding[nonce] = (asset_id, mission_id,
+                                     time.time() if issued_time is None else issued_time)
+
+    def consume(self, nonce: bytes, now: Optional[float] = None) -> Optional[Tuple[int, int]]:
+        """Pop and return (asset_id, mission_id) for `nonce` if it is
+        currently outstanding and not expired; else return None (and, if it
+        WAS present but expired, remove it anyway -- an expired nonce is
+        never answerable, consumed or not). A nonce is removed on the very
+        first call regardless of outcome -- this is single-use by
+        construction, the core defense against replaying a captured
+        response."""
+        entry = self._outstanding.pop(nonce, None)
+        if entry is None:
+            return None
+        asset_id, mission_id, issued_time = entry
+        now = time.time() if now is None else now
+        if now - issued_time > self._ttl_s:
+            return None
+        return asset_id, mission_id
+
+
+def build_and_track_challenge(store: NonceStore, mission_master_secret: bytes,
+                               mission_id: int, asset_id: int) -> bytes:
+    """Interrogator side: build a fresh challenge for `asset_id` and record
+    its nonce as outstanding in `store`. Returns the raw wire frame to
+    transmit (over whatever the eventual bidirectional LoRa link is)."""
+    raw, nonce = iff_challenge.build_challenge(mission_master_secret, mission_id, asset_id)
+    store.issue(nonce, asset_id, mission_id)
+    return raw
+
+
+def handle_challenge(raw: bytes, registry: AssetRegistry, own_asset_id: int) -> dict:
+    """Asset side: verify an incoming challenge is genuinely from someone
+    holding the mission secret, targets this asset, and is fresh, THEN
+    check revocation (a revoked asset must not answer challenges either --
+    same "even if crypto is valid" reasoning as handle_frame() above), and
+    if all of that passes, build the response frame to transmit back.
+    Returns a result dict; "ok": True carries "response_frame" (raw bytes
+    ready to transmit), "ok": False carries "reason"."""
+    if registry.is_revoked(own_asset_id):
+        return {"ok": False, "reason": f"revoked: asset_id {own_asset_id} will not answer "
+                                        f"challenges (asset has been revoked)"}
+    try:
+        frame = iff_challenge.verify_challenge(
+            raw, registry.mission_master_secret, registry.mission_id, own_asset_id)
+    except iff_challenge.IFFChallengeError as e:
+        return {"ok": False, "reason": str(e)}
+
+    asset_secret = iff.derive_asset_secret(registry.mission_master_secret, frame.mission_id,
+                                            own_asset_id)
+    response = iff_challenge.build_response(asset_secret, own_asset_id, frame.mission_id,
+                                             frame.nonce)
+    return {"ok": True, "response_frame": response}
+
+
+def handle_response(raw: bytes, registry: AssetRegistry, store: NonceStore,
+                     now: Optional[float] = None) -> dict:
+    """Interrogator side: given a raw response frame and the NonceStore that
+    tracked the outstanding challenge, consume the claimed nonce (exactly
+    once, whatever the outcome) and verify. Returns a result dict shaped
+    like handle_frame()'s, plus "reason" values distinguishing an unknown/
+    already-consumed/expired nonce from a cryptographic failure, and a
+    revocation check identical in spirit to handle_frame()'s."""
+    now = time.time() if now is None else now
+    try:
+        pre = iff_challenge.parse_response(raw)
+    except iff_challenge.IFFChallengeError as e:
+        return {"ok": False, "reason": str(e)}
+
+    consumed = store.consume(pre.nonce, now=now)
+    if consumed is None:
+        return {"ok": False,
+                "reason": "nonce not outstanding -- unknown, already-consumed, or expired "
+                          "(this is what rejects a replayed/relayed response)"}
+    expected_asset_id, expected_mission_id = consumed
+
+    if registry.is_revoked(pre.asset_id):
+        return {"ok": False,
+                "reason": f"revoked: asset_id {pre.asset_id} has been revoked "
+                          f"and is no longer trusted (HMAC tag was valid)"}
+
+    try:
+        frame = iff_challenge.verify_response(
+            raw, registry.mission_master_secret, expected_mission_id, expected_asset_id,
+            pre.nonce)
+    except iff_challenge.IFFChallengeError as e:
+        return {"ok": False, "reason": str(e)}
+
+    callsign = registry.callsign_for(frame.asset_id) or f"unknown-asset-{frame.asset_id}"
+    return {
+        "ok": True,
+        "asset_id": frame.asset_id,
+        "callsign": callsign,
+        "mission_id": frame.mission_id,
+        "verified_at": now,
+        "mode": "challenge-response",
+    }
+
+
 class AssetRegistry:
     """Loads the out-of-band-provisioned mission secret + asset roster from a
     local JSON file. This file is deliberately NOT committed to git (see
@@ -125,15 +295,37 @@ class AssetRegistry:
           "assets": {
             "66": "Falcon-1",
             "67": "Ground-Relay-A"
-          }
+          },
+          "revoked_asset_ids": [67]
         }
+
+    revoked_asset_ids (per-asset revocation, hardening added on top of task
+    #60): a physical asset that is captured, lost, or otherwise suspected
+    compromised no longer needs the WHOLE mission's master secret rotated
+    (which would also lock out every other still-trusted asset) -- it can
+    instead be listed here. handle_frame() below rejects a frame from a
+    revoked asset_id with a distinct "revoked" reason EVEN IF its HMAC tag
+    verifies correctly, since the tag alone only proves the frame was built
+    with that asset's correctly-derived key, not that the asset (or whoever
+    now holds it) is still trusted. Operator workflow: edit this field in
+    the registry file (out-of-band, same channel as the rest of this file)
+    and/or call revoke()/unrevoke() on a live AssetRegistry instance (e.g.
+    the backend-driven revoke/unrevoke endpoints in backend/server.py mirror
+    this same intent server-side against already-ingested beacons; see that
+    file's iff_revoke_asset()/iff_unrevoke_asset()). This registry's
+    in-memory set is NOT automatically synced with the backend's revocation
+    list today -- reloading this bridge process's registry file (or calling
+    revoke() directly) is the mechanism until/unless a poll-the-backend
+    sync loop is added; stated as a real limitation, not silently assumed.
     """
 
     def __init__(self, mission_id: int, mission_master_secret: bytes,
-                 callsigns: Dict[int, str]):
+                 callsigns: Dict[int, str],
+                 revoked_asset_ids: Optional[set] = None):
         self.mission_id = mission_id
         self.mission_master_secret = mission_master_secret
         self.callsigns = callsigns  # asset_id -> human callsign, roster only, not secret
+        self.revoked_asset_ids: set = set(revoked_asset_ids or ())
 
     @classmethod
     def load(cls, path: str) -> "AssetRegistry":
@@ -141,11 +333,24 @@ class AssetRegistry:
             data = json.load(f)
         secret = bytes.fromhex(data["mission_master_secret_hex"])
         callsigns = {int(k): v for k, v in data.get("assets", {}).items()}
+        revoked = {int(a) for a in data.get("revoked_asset_ids", [])}
         return cls(mission_id=int(data["mission_id"]), mission_master_secret=secret,
-                   callsigns=callsigns)
+                   callsigns=callsigns, revoked_asset_ids=revoked)
 
     def callsign_for(self, asset_id: int) -> Optional[str]:
         return self.callsigns.get(asset_id)
+
+    def is_revoked(self, asset_id: int) -> bool:
+        return asset_id in self.revoked_asset_ids
+
+    def revoke(self, asset_id: int) -> None:
+        """Revoke a single asset in-memory (does not rewrite the registry
+        file). Callers that persist revocations across restarts should also
+        write revoked_asset_ids back into the JSON file themselves."""
+        self.revoked_asset_ids.add(asset_id)
+
+    def unrevoke(self, asset_id: int) -> None:
+        self.revoked_asset_ids.discard(asset_id)
 
 
 def handle_frame(raw: bytes, registry: AssetRegistry, replay_cache: ReplayCache,
@@ -166,6 +371,18 @@ def handle_frame(raw: bytes, registry: AssetRegistry, replay_cache: ReplayCache,
                                   registry.mission_id, now_slot=now_slot)
     except iff.IFFVerifyError as e:
         return {"ok": False, "reason": str(e)}
+
+    # Per-asset revocation check (hardening on top of task #60): deliberately
+    # AFTER the HMAC/slot verification above, so the rejection reason below
+    # is distinct from "bad HMAC" -- this frame's crypto is genuinely valid,
+    # the asset itself is simply no longer trusted (captured/compromised),
+    # without requiring a mission-wide master-secret rotation that would
+    # also lock out every other still-good asset. See AssetRegistry's
+    # revoked_asset_ids docstring above for the operator workflow.
+    if registry.is_revoked(frame.asset_id):
+        return {"ok": False,
+                "reason": f"revoked: asset_id {frame.asset_id} has been revoked "
+                          f"and is no longer trusted (HMAC tag was valid)"}
 
     if replay_cache.seen_before(frame.asset_id, frame.timestamp_slot, frame.counter):
         return {"ok": False, "reason": "replay: (timestamp_slot, counter) already accepted"}
@@ -332,6 +549,47 @@ def self_test() -> None:
     r6 = handle_frame(other_frame, registry, replay_cache, now=now)
     checks.append(("unrostered-but-valid asset flagged", r6["ok"] is True
                    and r6["callsign"] == "unknown-asset-999"))
+
+    # 7. Revoked asset rejected even though HMAC is valid, distinct reason.
+    registry.revoke(asset_id)
+    frame3 = iff.build_frame(asset_secret, asset_id, mission_id, now_slot, geocell, counter=2)
+    r7 = handle_frame(frame3, registry, replay_cache, now=now)
+    checks.append(("revoked asset rejected distinctly", r7["ok"] is False
+                   and "revoked" in r7["reason"] and "mismatch" not in r7["reason"]))
+    registry.unrevoke(asset_id)
+
+    # ---- Challenge-response (hardening on top of task #60) ----
+    store = NonceStore()
+
+    # 8. Genuine challenge -> genuine response round trip succeeds.
+    challenge = build_and_track_challenge(store, master_secret, mission_id, asset_id)
+    resp_result = handle_challenge(challenge, registry, own_asset_id=asset_id)
+    r8a = resp_result["ok"] is True
+    ir8 = handle_response(resp_result.get("response_frame", b""), registry, store, now=now) \
+        if r8a else {"ok": False}
+    checks.append(("challenge-response round trip succeeds", r8a and ir8["ok"] is True))
+
+    # 9. Replaying an already-consumed nonce's response is rejected.
+    r9 = handle_response(resp_result["response_frame"], registry, store, now=now)
+    checks.append(("replayed/consumed nonce rejected", r9["ok"] is False
+                   and "nonce" in r9["reason"]))
+
+    # 10. An expired (stale) nonce is rejected.
+    challenge2 = build_and_track_challenge(store, master_secret, mission_id, asset_id)
+    resp2 = handle_challenge(challenge2, registry, own_asset_id=asset_id)
+    r10 = handle_response(resp2["response_frame"], registry, store,
+                          now=now + iff_challenge.NONCE_TTL_S + 1)
+    checks.append(("expired nonce rejected", r10["ok"] is False
+                   and "nonce" in r10["reason"]))
+
+    # 11. A response claiming the wrong asset_id (wrong secret) is rejected.
+    challenge3 = build_and_track_challenge(store, master_secret, mission_id, asset_id)
+    other_secret2 = iff.derive_asset_secret(master_secret, mission_id, 777)
+    frame_parsed = iff_challenge.parse_challenge(challenge3)
+    forged_response = iff_challenge.build_response(other_secret2, asset_id, mission_id,
+                                                     frame_parsed.nonce)
+    r11 = handle_response(forged_response, registry, store, now=now)
+    checks.append(("wrong-asset-secret response rejected", r11["ok"] is False))
 
     failed = [name for name, ok in checks if not ok]
     for name, ok in checks:

@@ -14,8 +14,11 @@ import time
 
 import pytest
 
+import iff_challenge
 import iff_crypto as iff
-from iff_beacon_bridge import AssetRegistry, ReplayCache, handle_frame, post_verified_beacon
+from iff_beacon_bridge import (AssetRegistry, NonceStore, ReplayCache, build_and_track_challenge,
+                                handle_challenge, handle_frame, handle_response,
+                                post_verified_beacon)
 
 
 @pytest.fixture
@@ -116,6 +119,58 @@ def test_wrong_mission_id_rejected(mission):
     assert "mission_id" in result["reason"]
 
 
+def test_revoked_asset_rejected_even_with_valid_hmac(mission):
+    """Per-asset revocation (hardening on top of task #60): a frame whose
+    HMAC verifies correctly must still be rejected once its asset_id is
+    revoked, with a rejection reason distinct from a bad-HMAC failure."""
+    now = time.time()
+    now_slot = int(now // iff.INTERVAL_S)
+    frame = iff.build_frame(mission["asset_secret"], mission["asset_id"], mission["mission_id"],
+                             now_slot, iff.GEOCELL_UNKNOWN, counter=0)
+    mission["registry"].revoke(mission["asset_id"])
+    result = handle_frame(frame, mission["registry"], ReplayCache(), now=now)
+    assert result["ok"] is False
+    assert "revoked" in result["reason"]
+    assert "mismatch" not in result["reason"]  # distinct from a bad-HMAC rejection reason
+
+
+def test_unrevoke_restores_acceptance(mission):
+    now = time.time()
+    now_slot = int(now // iff.INTERVAL_S)
+    frame = iff.build_frame(mission["asset_secret"], mission["asset_id"], mission["mission_id"],
+                             now_slot, iff.GEOCELL_UNKNOWN, counter=0)
+    mission["registry"].revoke(mission["asset_id"])
+    cache = ReplayCache()
+    assert handle_frame(frame, mission["registry"], cache, now=now)["ok"] is False
+    mission["registry"].unrevoke(mission["asset_id"])
+    frame2 = iff.build_frame(mission["asset_secret"], mission["asset_id"], mission["mission_id"],
+                              now_slot, iff.GEOCELL_UNKNOWN, counter=1)
+    assert handle_frame(frame2, mission["registry"], cache, now=now)["ok"] is True
+
+
+def test_revoked_asset_id_loaded_from_registry_file(tmp_path, mission):
+    """AssetRegistry.load() reads revoked_asset_ids out of the JSON file, so
+    an operator can revoke a captured device by editing the out-of-band
+    provisioning file directly, without any code change."""
+    import json as _json
+    path = tmp_path / "registry.json"
+    path.write_text(_json.dumps({
+        "mission_id": mission["mission_id"],
+        "mission_master_secret_hex": mission["master_secret"].hex(),
+        "assets": {str(mission["asset_id"]): "Falcon-1"},
+        "revoked_asset_ids": [mission["asset_id"]],
+    }))
+    loaded = AssetRegistry.load(str(path))
+    assert loaded.is_revoked(mission["asset_id"]) is True
+    now = time.time()
+    now_slot = int(now // iff.INTERVAL_S)
+    frame = iff.build_frame(mission["asset_secret"], mission["asset_id"], mission["mission_id"],
+                             now_slot, iff.GEOCELL_UNKNOWN, counter=0)
+    result = handle_frame(frame, loaded, ReplayCache(), now=now)
+    assert result["ok"] is False
+    assert "revoked" in result["reason"]
+
+
 def test_post_verified_beacon_sends_expected_body(monkeypatch, mission):
     """Confirms the outbound POST body shape without hitting a real backend --
     mocks requests.post at the iff_beacon_bridge module level, same pattern as
@@ -138,6 +193,77 @@ def test_post_verified_beacon_sends_expected_body(monkeypatch, mission):
     assert captured["json"]["asset_id"] == 501
     assert captured["json"]["callsign"] == "Falcon-1"
     assert captured["json"]["bearing_deg"] == 45.0
+
+
+# =====================================================================
+# Challenge-response orchestration (NonceStore + build_and_track_challenge/
+# handle_challenge/handle_response) -- hardening on top of task #60 to
+# close the relay/wormhole gap the one-way beacon above cannot fully
+# defeat. See iff_challenge.py's module docstring for the full rationale.
+# =====================================================================
+
+def test_challenge_response_round_trip_succeeds(mission):
+    store = NonceStore()
+    challenge = build_and_track_challenge(store, mission["master_secret"], mission["mission_id"],
+                                           mission["asset_id"])
+    asset_side = handle_challenge(challenge, mission["registry"], own_asset_id=mission["asset_id"])
+    assert asset_side["ok"] is True
+
+    interrogator_side = handle_response(asset_side["response_frame"], mission["registry"], store)
+    assert interrogator_side["ok"] is True
+    assert interrogator_side["asset_id"] == mission["asset_id"]
+    assert interrogator_side["callsign"] == "Falcon-1"
+    assert interrogator_side["mode"] == "challenge-response"
+
+
+def test_challenge_response_replayed_nonce_rejected(mission):
+    """A captured response, replayed a second time, is rejected -- this is
+    the concrete relay/wormhole-window closure: the nonce is single-use."""
+    store = NonceStore()
+    challenge = build_and_track_challenge(store, mission["master_secret"], mission["mission_id"],
+                                           mission["asset_id"])
+    asset_side = handle_challenge(challenge, mission["registry"], own_asset_id=mission["asset_id"])
+    response = asset_side["response_frame"]
+
+    first = handle_response(response, mission["registry"], store)
+    assert first["ok"] is True
+    replay = handle_response(response, mission["registry"], store)
+    assert replay["ok"] is False
+    assert "nonce" in replay["reason"]
+
+
+def test_challenge_response_expired_nonce_rejected(mission):
+    store = NonceStore()
+    now = time.time()
+    challenge = build_and_track_challenge(store, mission["master_secret"], mission["mission_id"],
+                                           mission["asset_id"])
+    asset_side = handle_challenge(challenge, mission["registry"], own_asset_id=mission["asset_id"])
+    result = handle_response(asset_side["response_frame"], mission["registry"], store,
+                              now=now + iff_challenge.NONCE_TTL_S + 1)
+    assert result["ok"] is False
+    assert "nonce" in result["reason"]
+
+
+def test_challenge_response_wrong_asset_secret_rejected(mission):
+    store = NonceStore()
+    challenge = build_and_track_challenge(store, mission["master_secret"], mission["mission_id"],
+                                           mission["asset_id"])
+    parsed = iff_challenge.parse_challenge(challenge)
+    other_secret = iff.derive_asset_secret(mission["master_secret"], mission["mission_id"], 777)
+    forged_response = iff_challenge.build_response(other_secret, mission["asset_id"],
+                                                     mission["mission_id"], parsed.nonce)
+    result = handle_response(forged_response, mission["registry"], store)
+    assert result["ok"] is False
+
+
+def test_revoked_asset_does_not_answer_challenge(mission):
+    store = NonceStore()
+    mission["registry"].revoke(mission["asset_id"])
+    challenge = build_and_track_challenge(store, mission["master_secret"], mission["mission_id"],
+                                           mission["asset_id"])
+    result = handle_challenge(challenge, mission["registry"], own_asset_id=mission["asset_id"])
+    assert result["ok"] is False
+    assert "revoked" in result["reason"]
 
 
 if __name__ == "__main__":

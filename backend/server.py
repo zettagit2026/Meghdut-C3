@@ -821,6 +821,7 @@ async def _handle_tx_ack(msg: Dict[str, Any]) -> None:
 async def startup() -> None:
     await db.users.create_index("email", unique=True)
     await db.ingest_health.create_index("bridge", unique=True)
+    await db.iff_revocations.create_index("asset_id", unique=True)
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
     if existing is None:
         await db.users.insert_one({
@@ -2072,12 +2073,33 @@ async def _iff_ingest_beacon(body: "IFFBeaconIngestBody") -> None:
     )
 
 
+async def _revoked_asset_ids() -> set:
+    """Asset IDs an operator has revoked via POST /iff/assets/{id}/revoke
+    (see iff_revoke_asset() below). This is backend-side defense-in-depth,
+    NOT a substitute for updating field-bridge/iff_beacon_bridge.py's own
+    AssetRegistry.revoked_asset_ids -- the bridge is the one that decides
+    whether to accept a beacon at all; this backend only ever sees beacons
+    the bridge already verified and forwarded. Revoking here immediately
+    stops a captured asset's LAST-INGESTED beacon record from continuing to
+    count as "fresh friendly" for detection-suppression/attestation purposes
+    even if the bridge process hasn't reloaded its own registry file yet
+    (e.g. operator revokes from the console the instant capture is
+    reported, before anyone can walk out to the bridge host)."""
+    ids = set()
+    async for doc in db.iff_revocations.find({}):
+        ids.add(doc["asset_id"])
+    return ids
+
+
 async def _fresh_friendlies(freshness_s: int = IFF_FRESHNESS_S) -> List[Dict]:
     since = (datetime.now(timezone.utc) - timedelta(seconds=freshness_s)).isoformat()
+    revoked = await _revoked_asset_ids()
     cursor = db.iff_friendlies.find({"last_seen": {"$gt": since}})
     out = []
     async for doc in cursor:
         doc.pop("_id", None)
+        if doc["asset_id"] in revoked:
+            continue
         out.append(doc)
     return out
 
@@ -2142,6 +2164,61 @@ async def iff_friendlies(user: Dict = Depends(get_current_user)):
     effect -- see check_no_friendly_in_footprint_sync_note() above for the
     integration contract."""
     return {"friendlies": await _fresh_friendlies(), "freshness_s": IFF_FRESHNESS_S}
+
+
+@api.post("/iff/assets/{asset_id}/revoke")
+async def iff_revoke_asset(asset_id: int, user: Dict = Depends(require_commander)):
+    """Revoke a single IFF asset without touching the mission-wide master
+    secret (see field-bridge/iff_beacon_bridge.py AssetRegistry docstring
+    for the full rationale/tradeoff). commander-role-gated: this is a
+    security-sensitive trust decision about a specific physical asset, same
+    gating this codebase already uses for other destructive/security-
+    sensitive actions (require_commander, see e.g. deploy_jam,
+    deploy_gnss_spoof). Idempotent: revoking an already-revoked asset_id is
+    a no-op success, not an error.
+
+    NOTE: this only updates this backend's own revocation record (used by
+    _fresh_friendlies()/detection-suppression). It does NOT reach out and
+    update the actual field-bridge/iff_beacon_bridge.py process's in-memory
+    or on-disk AssetRegistry -- that bridge runs independently (possibly on
+    different hardware with no path back to this API) and must have its own
+    registry file's revoked_asset_ids updated out-of-band by the operator,
+    same as the rest of that registry's provisioning. This endpoint's real
+    effect today is immediate: it stops this backend from treating that
+    asset's last-ingested beacon as "fresh friendly" for detection-
+    suppression / GNSS-spoof-attestation purposes, without waiting on that
+    out-of-band bridge-side update."""
+    now = datetime.now(timezone.utc).isoformat()
+    await db.iff_revocations.update_one(
+        {"asset_id": asset_id},
+        {"$set": {"asset_id": asset_id, "revoked_at": now, "revoked_by": user["email"]}},
+        upsert=True,
+    )
+    await log_event("IFF_ASSET_REVOKED",
+                     f"IFF asset {asset_id} revoked by {user['email']}",
+                     meta={"asset_id": asset_id}, actor=user["email"])
+    return {"ok": True, "asset_id": asset_id, "revoked": True}
+
+
+@api.post("/iff/assets/{asset_id}/unrevoke")
+async def iff_unrevoke_asset(asset_id: int, user: Dict = Depends(require_commander)):
+    """Reverse a previous revoke (e.g. asset recovered intact, or revoked in
+    error). Same commander gating as iff_revoke_asset(); same "does not
+    reach the bridge's own registry" caveat applies."""
+    await db.iff_revocations.delete_one({"asset_id": asset_id})
+    await log_event("IFF_ASSET_UNREVOKED",
+                     f"IFF asset {asset_id} unrevoked by {user['email']}",
+                     meta={"asset_id": asset_id}, actor=user["email"])
+    return {"ok": True, "asset_id": asset_id, "revoked": False}
+
+
+@api.get("/iff/assets/revoked")
+async def iff_list_revoked(user: Dict = Depends(get_current_user)):
+    """List currently-revoked asset_ids known to this backend. Observe-only
+    (get_current_user, not require_commander) -- matches this codebase's
+    convention that read/observe endpoints stay at the base auth level while
+    only the destructive/security-sensitive write actions require commander."""
+    return {"revoked_asset_ids": sorted(await _revoked_asset_ids())}
 
 
 @api.post("/detections/ingest")
