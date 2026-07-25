@@ -30,6 +30,17 @@ MAX_DURATION_S = 10.0
 SAMPLE_RATE_HZ = 20_000_000  # 20 Msps, matches /CEMA/drone-kit/dronev5/cema/cema_base.py's
                               # proven RATE for these same bands.
 
+# GNSS-spoof ("soft-kill", Task #103) duration cap — deliberately much
+# shorter than jamming's MAX_DURATION_S. See
+# field-bridge/GNSS_SPOOF_ARCHITECTURE.md §2 for the full justification: a
+# deception effect's failsafe trigger fires off a single bad position
+# report, not sustained exposure, so there is no "more seconds = more
+# effect" scaling once a fake fix is accepted — a short, hard cap is part of
+# the safety design, not just a tuning knob. Lives here (not only in
+# backend/server.py / gnss_spoof_bridge.py) so any direct caller of
+# hackrf_jam.py has the same authoritative constant available.
+GNSS_SPOOF_MAX_DURATION_S = 3.0
+
 # Center frequencies from /CEMA/drone-kit/dronev5/cema/cema_{433,915,24,58}.py
 # (already field-validated on this rig), exposed here as --band shortcuts.
 #
@@ -91,6 +102,95 @@ def build_noise_iq(duration_s: float, bandwidth_khz: float, sample_rate: int = S
     return iq.tobytes()
 
 
+def transmit_iq_file(
+    iq_path: str,
+    freq_mhz: float,
+    duration_s: float,
+    tx_gain: int,
+    stop_event: Optional["threading.Event"] = None,
+    on_started: Optional[Callable[["subprocess.Popen"], None]] = None,
+) -> Dict[str, Any]:
+    """Shared subprocess-management / abort-mid-transmission mechanics,
+    factored out of transmit_burst() (Task #103, see
+    field-bridge/GNSS_SPOOF_ARCHITECTURE.md §1) so both the noise-burst path
+    (transmit_burst(), which builds its own IQ bytes in-process) and the new
+    GNSS-spoof path (field-bridge/gnss_spoof_bridge.py, which gets a
+    pre-built IQ file from gnss_signal_synth.py) can share the SAME
+    already-audited hackrf_transfer invocation, process-lifecycle, and
+    EMERGENCY-ABORT-kill logic, instead of the spoof path growing a second,
+    independently-reviewed bespoke TX primitive.
+
+    Takes a PATH to an already-written IQ file (rather than raw bytes),
+    since GNSS spoof IQ generation is comparatively expensive and the
+    caller may want to generate it once and reuse/inspect the file. Runs
+    `hackrf_transfer -t <iq_path> ...` — otherwise byte-for-byte the same
+    command construction transmit_burst() has always used.
+
+    stop_event / on_started: identical contract to transmit_burst()'s own
+    parameters — see that function's docstring.
+
+    Returns {"ok": bool, "error": Optional[str], "stopped_early": bool}.
+    Never raises for TX-side failures — same convention as transmit_burst().
+    """
+    cmd = [
+        "hackrf_transfer",
+        "-t", iq_path,
+        "-f", str(int(freq_mhz * 1_000_000)),
+        "-s", str(SAMPLE_RATE_HZ),
+        "-x", str(tx_gain),
+        "-a", "1",
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    except FileNotFoundError:
+        return {"ok": False, "error": "hackrf_transfer not found (install the `hackrf` package)",
+                 "stopped_early": False}
+
+    if on_started:
+        on_started(proc)
+
+    deadline = time.time() + duration_s + 5  # matches transmit_burst()'s timeout=duration+5 margin
+    stopped_early = False
+    while True:
+        ret = proc.poll()
+        if ret is not None:
+            break
+        if stop_event is not None and stop_event.is_set():
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            stopped_early = True
+            break
+        if time.time() > deadline:
+            # Same as transmit_burst()'s expected TimeoutExpired boundary:
+            # the bounded burst ran its full duration; this is success, not
+            # failure.
+            proc.kill()
+            break
+        time.sleep(0.1)
+
+    if stopped_early:
+        return {"ok": True, "error": None, "stopped_early": True}
+
+    rc = proc.returncode
+    if rc == 0 or rc is None or rc < 0:
+        # rc < 0 / None: killed by our own deadline above — expected
+        # bounded-burst completion, not a failure (mirrors transmit_burst()'s
+        # "pass # expected" handling of subprocess.TimeoutExpired).
+        return {"ok": True, "error": None, "stopped_early": False}
+
+    stderr = ""
+    if proc.stderr:
+        try:
+            stderr = proc.stderr.read().decode(errors="replace")
+        except Exception:
+            pass
+    return {"ok": False, "error": f"hackrf_transfer exited {rc}: {stderr[:300]}",
+             "stopped_early": False}
+
+
 def transmit_burst(
     freq_mhz: float,
     bandwidth_khz: float,
@@ -141,6 +241,16 @@ def transmit_burst(
     Never raises for TX-side failures (bad hackrf_transfer exit, missing
     binary) — those come back as ok=False with a reason so the caller can
     send an honest ack rather than crash the bridge process.
+
+    NOTE: this function's own behavior/signature is UNCHANGED by the
+    transmit_iq_file() extraction above (Task #103) — it still builds its
+    own noise IQ bytes and writes them to its own temp file inline, exactly
+    as before. It does NOT call transmit_iq_file() internally, specifically
+    so the proven, already-audited jam TX path has zero code-path overlap
+    with the new spoof path beyond the shared, mechanically-identical
+    subprocess logic (kept as a deliberate near-duplicate rather than a
+    shared call, per the architecture doc's explicit instruction not to
+    change this function at all).
     """
     duration = min(duration_s, MAX_DURATION_S)
     iq_bytes = build_noise_iq(duration, bandwidth_khz)

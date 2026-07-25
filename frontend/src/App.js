@@ -9,6 +9,7 @@ import MavlinkConsole from "@/pages/MavlinkConsole";
 import Payloads from "@/pages/Payloads";
 import ProtocolLibrary from "@/pages/ProtocolLibrary";
 import Jamming from "@/pages/Jamming";
+import GnssSpoof from "@/pages/GnssSpoof";
 import KillChain from "@/pages/KillChain";
 import DetectionHistory from "@/pages/DetectionHistory";
 import MissionLog from "@/pages/MissionLog";
@@ -41,6 +42,7 @@ export default function App() {
             <Route path="payloads"  element={<Payloads />} />
             <Route path="protocols" element={<ProtocolLibrary />} />
             <Route path="jamming"   element={<Jamming />} />
+            <Route path="gnss-spoof" element={<GnssSpoof />} />
             <Route path="killchain" element={<KillChain />} />
             <Route path="history"   element={<DetectionHistory />} />
             <Route path="map"       element={<MapView />} />

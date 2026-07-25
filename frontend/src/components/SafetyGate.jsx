@@ -26,6 +26,27 @@ export const JAM_CHECKS = [
   "Range Authorization is armed for this effect via the GUI toggle (see banner) for this session.",
 ];
 
+// GNSS L1 civil-signal spoofing ("soft-kill", Task #103) — a DECEPTION
+// effect (fabricated position), not a denial effect like jamming, so the
+// checklist wording differs materially. Per
+// field-bridge/GNSS_SPOOF_ARCHITECTURE.md §5b, the single most important
+// item here is NOT static — frontend/src/pages/GnssSpoof.jsx builds the
+// final `checks` array passed to SafetyGate by taking this BASE list and
+// APPENDING one more item whose text is built LIVE from
+// POST /gnss-spoof/preview's response (the exact fabricated lat/lon/offset/
+// bearing), so the operator ticks a box containing the real numbers, not a
+// generic "I confirm" button. This base list intentionally does NOT include
+// that dynamic item — see GnssSpoof.jsx's gateChecks construction.
+export const GNSS_SPOOF_CHECKS = [
+  "Range Authorization is armed for effect=gnss_spoof via the GUI toggle (see banner) for this session — " +
+    "arming effect=jam does NOT arm this.",
+  "This is DECEPTION (a fabricated position), not denial — GPS-dependent friendly assets that acquire this " +
+    "signal may enter a flyaway/self-preservation failsafe or an unexpected geofence-breach RTH.",
+  "Physical safety perimeter established; personnel clear of the TX antenna.",
+  "Burst duration (max 3.0s) and frequency (1575.42 MHz, GPS L1) reviewed — this is a REAL RF " +
+    "transmission, not a preview.",
+];
+
 export default function SafetyGate({
   open, onClose, onConfirm, payloadName, severity,
   checks = CHECKS,
