@@ -38,7 +38,7 @@ export default function Layout() {
           <div className="p-6 tactical-border-b">
             <div className="flex items-center gap-2">
               <Shield size={22} strokeWidth={1.5} style={{ color: "var(--accent-info)" }} />
-              <span className="font-heading font-black text-lg tracking-tighter">MEGHDUT C3</span>
+              <span className="font-heading font-black text-lg tracking-tighter">MEGHDUT C³</span>
             </div>
             <div className="mt-1 font-mono text-[10px] uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>
               Command · Control · Communications
