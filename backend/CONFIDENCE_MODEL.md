@@ -55,6 +55,7 @@ confidence_type: Optional[str] = None
 | `advisory_only` | Presence heuristic, explicitly not an identity or threat claim. | Plain neutral "advisory" tag, distinct styling from confirmed detections, no percentage. |
 | `unclassified_signal` | Real, energy-gated RF confirmed present (same gate as `ml_probability`), but the classifier's own winning-class softmax probability was below `CEMA_ML_UNCLASSIFIED_MAX_CONFIDENCE` (default **0.6**, aligned with `ML_RECLASSIFY_MIN_CONFIDENCE` — see coherence note below) — i.e. it could not confidently place the signal in any of its 3 known classes (drone/wifi_2_4/wifi_5). This is cheap, zero-new-dependency logic added directly in `ml_classify_bridge.py`, computed from softmax probabilities the classifier already produces — no new model or OOT dependency (e.g. gr-inspector) required. | Distinct "UNCLASSIFIED" tag (not "flagged", not a trusted probability) showing the weak top-guess percentage for context, distinct styling from `ml_probability`. Also counts as an "unconfirmed" detection for `isUnconfirmedDetection()`/`UnconfirmedTag` (2026-07-23 fix) — an explicit "I don't know" from the classifier is at least as uncertain as `heuristic_binary`, and that function previously only checked for `heuristic_binary`, silently missing this case. |
 | `bistatic_radar_detection` | A CFAR-thresholded cross-ambiguity-function (CAF) peak from `field-bridge/passive_radar_bridge.py` (task #43, C10) — a real physical-layer detection statistic derived from bistatic range-Doppler processing against an illuminator of opportunity (broadcast TV/FM/cellular), not an RSSI heuristic, not an ML softmax, not a protocol decode. Its own distinct epistemic category; see `field-bridge/PASSIVE_RADAR_ARCHITECTURE.md` §4 for the full field mapping (`distance_m`/`distance_estimated=False` since it's a genuine time-of-flight-derived range, `bearing_deg` from antenna boresight only, `speed_ms` from the CAF's Doppler bin, `rssi_dbm`/`snr_db` repurposed as CAF peak SNR). | Distinct "bistatic radar" tag/badge, showing peak SNR, with an explicit bearing-accuracy caveat (boresight-only until a rotator or antenna array exists, task #57+) — never conflated with `ml_probability`'s bar or `protocol_verified`'s checkmark. |
+| `multidomain_fused` | A DERIVED confidence produced by `field-bridge/multidomain_fusion.py` (task #123) combining two or more independent modalities' (RF/thermal/optical/acoustic) own confidence values via weighted log-likelihood-ratio (log-odds) summation — see that module's docstring for the full justification of this fusion rule over a plain weighted average. Genuinely distinct from every other value above: it is not any single sensor's raw probability, decode result, or heuristic — it is a combination of others, and can additionally carry a `conflict_detected` flag with no analogue in any single-sensor confidence type. **NOT WIRED INTO ANY LIVE INGEST PATH as of this writing** — see honesty note below. | Distinct "fused" tag/badge showing the combined probability AND, when `conflict_detected=True`, an explicit disagreement warning distinguishing it from an ordinary medium-confidence single-sensor read (not yet implemented in the frontend since nothing produces this value in production yet). |
 
 ### Bridge -> enum mapping
 
@@ -74,6 +75,27 @@ Notes:
   touched — not included in this pass's minimal wiring since it wasn't in
   the B4 scope list, but the mapping is the same rule: CRC/protocol decode
   succeeded => `protocol_verified`.
+- `field-bridge/multidomain_fusion.py` (task #123, added 2026-07-26)
+  implements `fuse_confidences()` and the new `"multidomain_fused"` enum
+  value above. It is fully unit-tested with synthetic per-modality
+  confidence inputs (`field-bridge/test_multidomain_fusion.py` — single-
+  modality graceful degradation, agreeing modalities raising confidence,
+  conflicting modalities NOT silently averaging to false confidence,
+  missing modalities excluded rather than fabricated as zero-evidence) but
+  is **HARDWARE-BLOCKED for two of its three intended inputs**: no thermal
+  camera, optical camera, or acoustic array hardware exists in this project
+  (`CAMERA_THERMAL_ACOUSTIC_SCOPE.md` Sec.1/3), so in production today only
+  RF-derived confidences could feed this module, and it has not actually
+  been wired into any ingest call site even for that RF-only case (no
+  same-contact correlation key exists yet to justify fusing e.g. the HackRF
+  heuristic and ML-classifier confidences for one physical contact — see
+  `CAMERA_THERMAL_ACOUSTIC_SCOPE.md` Sec.4's "Fusion question"). The module
+  is ready to accept real thermal/acoustic confidence values the moment
+  `thermal_bridge.py`/`acoustic_bridge.py`-style producers and real hardware
+  exist; do not wire `"multidomain_fused"` into any ingest call site until
+  that hardware exists AND a real correlation key is designed, per this
+  document's and the scope document's "don't manufacture false precision /
+  false correlation" discipline.
 - `field-bridge/rf_features.py` (spectral-feature RandomForest classifier,
   backlog C13, added 2026-07-23) is a FUTURE sixth source and would use a
   NEW enum value, `"spectral_features_ml"` (a real probability from a
