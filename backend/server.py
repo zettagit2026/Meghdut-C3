@@ -3,6 +3,9 @@
 Endpoints (all under /api):
   auth: /login /logout /me
   detections: /detections /detections/ingest /detections/{id}/cema-advance /detections/{id}/killchain-advance /detections/{id}/authorize-target /detections/{id}
+  swarm: /swarm/taxonomy (read-only Type-I..IV definitions) /swarm/clusters
+         (computes+persists swarm_id via backend/swarm_classifier.py; see
+         that module's docstring for full honesty scoping)
   iff: /iff/beacons/ingest (from field-bridge/iff_beacon_bridge.py, already HMAC-verified bridge-side)
        /iff/friendlies (current fresh friendly-asset roster; task #103 attestation gate consumer)
   spectrum: /spectrum/waterfall
@@ -100,6 +103,7 @@ from detection_state import (
     advance_cema,
     advance_kill_chain,
 )
+from swarm_classifier import build_swarm_clusters, SWARM_TAXONOMY
 
 # ---------- Config ----------
 # SECURITY: no hardcoded/default secrets. Operators MUST supply real values via
@@ -1278,6 +1282,64 @@ async def get_detection(det_id: str, user: Dict = Depends(get_current_user)):
     if not doc:
         raise HTTPException(404, "Detection not found")
     return doc
+
+
+@api.get("/swarm/taxonomy")
+async def get_swarm_taxonomy(user: Dict = Depends(get_current_user)):
+    """The Army's real Type-I..IV swarm taxonomy (see backend/
+    swarm_classifier.py module docstring for the source document). Exposed
+    read-only so the frontend/operators can see the authoritative
+    definitions this system classifies against -- and, just as importantly,
+    which of those types this system can actually assign vs. not (see
+    per_drone_type_gap)."""
+    return {
+        "taxonomy": SWARM_TAXONOMY,
+        "per_drone_type_gap": (
+            "This system can only assign Type-IV (co-ordinated attack "
+            "swarm) today, as a candidate, from concurrent-detection "
+            "timing clustering. Type-I/II/III require a flight-behaviour/ "
+            "airframe classifier this system does not yet have, and are "
+            "never guessed."
+        ),
+    }
+
+
+@api.get("/swarm/clusters")
+async def get_swarm_clusters(user: Dict = Depends(get_current_user)):
+    """Compute swarm candidate clusters from currently ACTIVE detections
+    (see backend/swarm_classifier.py) and write the resulting swarm_id back
+    onto each member detection so existing frontend UI (Dashboard.jsx's
+    "Swarms Detected" stat tile, KillChain.jsx's per-detection badge) lights
+    up. Detections not part of any >=2-member concurrent cluster keep
+    swarm_id=None -- this endpoint never fabricates a swarm membership for a
+    single, unclustered contact."""
+    await _expire_stale_detections()
+    active_docs = await db.detections.find({"status": "ACTIVE"}, {"_id": 0}).to_list(500)
+    clusters = build_swarm_clusters(active_docs)
+
+    clustered_ids = {mid for c in clusters for mid in c["member_ids"]}
+    for cluster in clusters:
+        await db.detections.update_many(
+            {"id": {"$in": cluster["member_ids"]}},
+            {"$set": {"swarm_id": cluster["swarm_id"]}},
+        )
+    # Any previously-clustered detection that is no longer part of a
+    # cluster this cycle (e.g. cluster broke up) gets its swarm_id cleared
+    # rather than left stale.
+    await db.detections.update_many(
+        {"status": "ACTIVE", "swarm_id": {"$ne": None}, "id": {"$nin": list(clustered_ids)}},
+        {"$set": {"swarm_id": None}},
+    )
+
+    if clusters:
+        await log_event(
+            "SWARM_CLASSIFY",
+            f"{len(clusters)} swarm candidate cluster(s) identified across "
+            f"{len(clustered_ids)} concurrent detection(s)",
+            meta={"clusters": [c["swarm_id"] for c in clusters]},
+            actor=user["email"],
+        )
+    return {"clusters": clusters}
 
 
 def _interval_stats(timestamps_iso: List[str]) -> Optional[Dict[str, Any]]:
