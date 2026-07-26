@@ -195,7 +195,29 @@ export default function Payloads() {
       setPayloads(p.data);
       const active = d.data.filter((x) => x.status === "ACTIVE");
       setDets(active);
-      if (!target && active.length) setTarget(active[0].id);
+      // TASK #119 (OB-04 concurrent multi-drone handling audit): the backend
+      // has no single-active-engagement lock — multiple detections can be
+      // independently ACTIVE/AWAITING_ACK/authorized at once (see
+      // backend/server.py's per-request _arm_tokens/_pending_acks, which are
+      // keyed by token/request_id, not by a single global "current target").
+      // The only real gap this audit found was here: `target` is a plain
+      // dropdown selection that used to go stale whenever the currently
+      // selected contact left the ACTIVE list (e.g. it moved to
+      // AWAITING_ACK the instant THIS operator deployed against it, or a
+      // different operator/bridge event changed its status) while another
+      // drone was still concurrently active. A stale `target` id matched no
+      // <option>, silently dropped `selectedDet` to undefined, and hid the
+      // authorize-target control — exactly the same class of stale-
+      // reference bug task #65 already fixed for Signals.jsx's contact
+      // selection. Re-derive here on every poll instead of only when empty,
+      // so the dropdown always falls back to a currently-active contact
+      // when the previous target concurrently drops out of ACTIVE, instead
+      // of the operator losing engagement control over a second drone that
+      // is still legitimately active.
+      setTarget((prev) => {
+        if (prev && active.some((x) => x.id === prev)) return prev;
+        return active.length ? active[0].id : "";
+      });
     } catch (e) { toast.error("Load failed", { description: formatApiError(e) }); }
   };
   useEffect(() => { load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, []); // eslint-disable-line
