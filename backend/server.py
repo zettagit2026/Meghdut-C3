@@ -3,9 +3,11 @@
 Endpoints (all under /api):
   auth: /login /logout /me
   detections: /detections /detections/ingest /detections/{id}/cema-advance /detections/{id}/killchain-advance /detections/{id}/authorize-target /detections/{id}
-  swarm: /swarm/taxonomy (read-only Type-I..IV definitions) /swarm/clusters
-         (computes+persists swarm_id via backend/swarm_classifier.py; see
-         that module's docstring for full honesty scoping)
+  swarm: /swarm/taxonomy (read-only Type-I..IV definitions)
+         /swarm/clusters (read-only GET, computes but does not persist)
+         /swarm/clusters/recompute (POST, computes+persists swarm_id via
+         backend/swarm_classifier.py; see that module's docstring for full
+         honesty scoping)
   iff: /iff/beacons/ingest (from field-bridge/iff_beacon_bridge.py, already HMAC-verified bridge-side)
        /iff/friendlies (current fresh friendly-asset roster; task #103 attestation gate consumer)
   spectrum: /spectrum/waterfall
@@ -1304,18 +1306,43 @@ async def get_swarm_taxonomy(user: Dict = Depends(get_current_user)):
     }
 
 
-@api.get("/swarm/clusters")
-async def get_swarm_clusters(user: Dict = Depends(get_current_user)):
-    """Compute swarm candidate clusters from currently ACTIVE detections
-    (see backend/swarm_classifier.py) and write the resulting swarm_id back
-    onto each member detection so existing frontend UI (Dashboard.jsx's
-    "Swarms Detected" stat tile, KillChain.jsx's per-detection badge) lights
-    up. Detections not part of any >=2-member concurrent cluster keep
-    swarm_id=None -- this endpoint never fabricates a swarm membership for a
-    single, unclustered contact."""
+async def _compute_swarm_clusters() -> List[Dict[str, Any]]:
+    """Shared read-only computation: expire stale detections, fetch
+    currently ACTIVE detections, and compute swarm candidate clusters (see
+    backend/swarm_classifier.py). Performs no writes -- callers decide
+    whether/how to persist the result."""
     await _expire_stale_detections()
     active_docs = await db.detections.find({"status": "ACTIVE"}, {"_id": 0}).to_list(500)
-    clusters = build_swarm_clusters(active_docs)
+    return build_swarm_clusters(active_docs)
+
+
+@api.get("/swarm/clusters")
+async def get_swarm_clusters(user: Dict = Depends(get_current_user)):
+    """Read-only: compute and return swarm candidate clusters from
+    currently ACTIVE detections. This endpoint performs no writes -- it
+    does not persist swarm_id onto detections and does not write an audit
+    log entry (a GET must be safe/side-effect-free per HTTP semantics). To
+    recompute AND persist swarm_id back onto member detections (e.g. so
+    Dashboard.jsx's "Swarms Detected" stat tile / KillChain.jsx's
+    per-detection badge stay current), call POST /swarm/clusters/recompute
+    instead. Detections not part of any >=2-member concurrent cluster are
+    never fabricated a swarm membership."""
+    clusters = await _compute_swarm_clusters()
+    return {"clusters": clusters}
+
+
+@api.post("/swarm/clusters/recompute")
+async def recompute_swarm_clusters(user: Dict = Depends(get_current_user)):
+    """Compute swarm candidate clusters from currently ACTIVE detections and
+    write the resulting swarm_id back onto each member detection so
+    Dashboard.jsx's "Swarms Detected" stat tile and KillChain.jsx's
+    per-detection badge reflect the latest clustering. Detections not part
+    of any >=2-member concurrent cluster keep swarm_id=None -- this
+    endpoint never fabricates a swarm membership for a single, unclustered
+    contact. This is the write/side-effecting counterpart to the read-only
+    GET /swarm/clusters; it is a POST specifically because it mutates state
+    and writes an audit log entry."""
+    clusters = await _compute_swarm_clusters()
 
     clustered_ids = {mid for c in clusters for mid in c["member_ids"]}
     for cluster in clusters:
