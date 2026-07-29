@@ -1,13 +1,34 @@
 """End-to-end backend tests for CEMA cUAS operator console.
 
-Covers: auth, detections (CRUD + simulate + upload), CEMA/killchain advance,
+Covers: auth, detections (CRUD via real ingest), CEMA/killchain advance,
 spectrum, MAVLink craft/broadcast/list, payloads (deploy target + broadcast),
 mission logs, and the WebSocket packet stream.
+
+Task #141: this file was stale against server.py's actual current API
+surface (found during 2026-07-29/30 QA of task #136). In particular:
+  - /detections/simulate and /detections/upload were removed at some point;
+    the real, current mechanism for creating a detection is POST
+    /detections/ingest (used by the field-bridge scripts, e.g.
+    hackrf_rx.py / ml_classify_bridge.py / mavlink_sniffer.py). Tests that
+    used to call /detections/simulate now call _ingest_detection() below,
+    which POSTs a unique (random center_freq_ghz + model) detection via
+    /detections/ingest so it never merges with another test's contact
+    (see DETECTION_MERGE_WINDOW_S / match_model+match_protocol matching in
+    server.py's detection_ingest()).
+  - /detections/upload has no current replacement at all (no upload_meta/
+    upload_filename/upload_size_bytes fields exist anywhere in server.py) --
+    that test is now explicitly skipped rather than silently deleted.
+  - The seeded admin's role is "commander", not "admin" (server.py ~845).
+  - No detections are seeded at boot (real detections only ever come from
+    real ingest -- confirmed intentional, honest behavior, not a bug).
+  - /spectrum/waterfall serves whatever was last POSTed to /spectrum/ingest
+    within the last 30s (and otherwise honestly reports an empty spectrum);
+    it does NOT synthesize rows from the bins/rows query params. The
+    waterfall test now seeds real spectrum data first.
 """
 from __future__ import annotations
 
 import asyncio
-import io
 import json
 import os
 import secrets
@@ -75,6 +96,53 @@ def auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
+def _ingest_detection(auth_headers: dict) -> dict:
+    """Create a fresh, uniquely-identified ACTIVE detection via the real
+    current ingest mechanism (POST /detections/ingest), replacing the old
+    (removed) POST /detections/simulate helper. A random center_freq_ghz and
+    model per call guarantees this never merges into another test's/worker's
+    in-flight contact -- see match_model/match_protocol matching in
+    server.py's detection_ingest()."""
+    body = {
+        "callsign": f"TEST-{uuid.uuid4().hex[:8]}",
+        "model": f"Test UAV {uuid.uuid4().hex[:8]}",
+        "protocol": "Test-Protocol",
+        "threat_level": "MEDIUM",
+        "center_freq_ghz": round(2.400 + secrets.randbelow(400) / 1000, 3),
+        "source": "HACKRF",
+    }
+    r = requests.post(f"{API}/detections/ingest", headers=auth_headers, json=body)
+    assert r.status_code == 200, f"detections/ingest failed: {r.status_code} {r.text}"
+    return r.json()
+
+
+def _ws_url(token: str) -> str:
+    u = urlparse(BASE_URL)
+    scheme = "wss" if u.scheme == "https" else "ws"
+    return f"{scheme}://{u.netloc}/api/ws/mavlink?token={token}"
+
+
+def _send_tx_ack(token: str, request_id: str, ok: bool = True) -> None:
+    """Simulate the real bridge's (rf-bridge/mavlink_bridge.py) tx_ack
+    reply over the mavlink WS after a real serial write attempt -- this is
+    the ONLY path that transitions a detection out of AWAITING_ACK into
+    NEUTRALIZED/TX_FAILED (see server.py's _handle_tx_ack()). Since task
+    #136's TX-halt/ack architecture, /payloads/deploy itself only ever
+    parks a detection in AWAITING_ACK and never marks it NEUTRALIZED
+    synchronously -- tests that need a deploy to actually resolve must
+    supply this ack themselves, same as a real connected bridge would."""
+
+    async def _do() -> None:
+        async with websockets.connect(_ws_url(token)) as ws:
+            await asyncio.wait_for(ws.recv(), timeout=5)  # hello frame
+            await ws.send(json.dumps({"type": "tx_ack", "request_id": request_id, "ok": ok}))
+            # Give the server a moment to process the ack before the caller
+            # re-reads detection state over HTTP.
+            await asyncio.sleep(0.2)
+
+    asyncio.run(_do())
+
+
 # ------------------------- Auth -------------------------
 class TestAuth:
     def test_login_success(self, session):
@@ -84,7 +152,9 @@ class TestAuth:
         assert isinstance(data.get("token"), str) and len(data["token"]) > 20
         u = data.get("user", {})
         assert u.get("email") == ADMIN_EMAIL
-        assert u.get("role") == "admin"
+        # Task #141: the seeded admin's actual role is "commander" (see
+        # server.py ~845), not "admin" -- fixed to match reality.
+        assert u.get("role") == "commander"
         assert u.get("clearance") == "RESTRICTED"
 
     def test_login_wrong_password(self, session):
@@ -106,41 +176,47 @@ class TestAuth:
 # ------------------------- Detections -------------------------
 class TestDetections:
     def test_list_seeded(self, auth_headers):
+        # Task #141: this project's established convention is that NO
+        # synthetic/seeded detections are ever inserted at boot (see
+        # server.py ~870-873) -- real detections only ever come from real
+        # ingest. That is confirmed honest, intentional behavior, not a
+        # bug, so a freshly-booted stack legitimately has zero detections
+        # here. Seed one via the real ingest mechanism ourselves so we can
+        # still assert on the shape of a real detection document.
+        det = _ingest_detection(auth_headers)
         r = requests.get(f"{API}/detections", headers=auth_headers)
         assert r.status_code == 200
         data = r.json()
         assert isinstance(data, list)
-        assert len(data) >= 6, f"expected >=6 seeded detections, got {len(data)}"
-        d0 = data[0]
+        assert len(data) >= 1, f"expected >=1 detection after seeding one via ingest, got {len(data)}"
+        assert any(d["id"] == det["id"] for d in data)
         for k in ["id", "callsign", "model", "protocol", "threat_level",
                   "center_freq_ghz", "rssi_dbm", "cema_stage", "kill_chain_stage", "status"]:
-            assert k in d0, f"detection missing field {k}"
+            assert k in det, f"detection missing field {k}"
 
-    def test_simulate_increases_count(self, auth_headers):
+    def test_ingest_increases_count(self, auth_headers):
         r1 = requests.get(f"{API}/detections", headers=auth_headers)
         c0 = len(r1.json())
-        r2 = requests.post(f"{API}/detections/simulate", headers=auth_headers)
-        assert r2.status_code == 200
-        det = r2.json()
+        det = _ingest_detection(auth_headers)
         assert "id" in det and "callsign" in det
         r3 = requests.get(f"{API}/detections", headers=auth_headers)
         assert len(r3.json()) == c0 + 1
 
+    @pytest.mark.skip(
+        reason="Task #141: POST /detections/upload was removed from server.py "
+               "with no replacement -- no upload_meta/upload_filename/"
+               "upload_size_bytes fields exist anywhere in the current backend. "
+               "Detection creation from an uploaded capture file is not "
+               "currently a supported feature; skipping rather than testing "
+               "removed functionality."
+    )
     def test_upload_returns_detection_with_meta(self, auth_headers):
-        # multipart upload
-        files = {"file": ("capture.iq", io.BytesIO(b"\x00" * 2048), "application/octet-stream")}
-        headers = {k: v for k, v in auth_headers.items() if k != "Content-Type"}
-        r = requests.post(f"{API}/detections/upload", headers=headers, files=files)
-        assert r.status_code == 200, r.text
-        det = r.json()
-        assert det.get("source") == "UPLOAD"
-        assert isinstance(det.get("upload_meta"), dict)
-        assert det["upload_filename"] == "capture.iq"
-        assert det["upload_size_bytes"] == 2048
+        pass
 
     def test_cema_advance(self, auth_headers):
-        # Create a fresh detection first
-        det = requests.post(f"{API}/detections/simulate", headers=auth_headers).json()
+        # Create a fresh detection first (via real ingest, not the removed
+        # /detections/simulate)
+        det = _ingest_detection(auth_headers)
         idx0 = det["cema_stage_index"]
         r = requests.post(f"{API}/detections/{det['id']}/cema-advance", headers=auth_headers)
         assert r.status_code == 200
@@ -151,7 +227,7 @@ class TestDetections:
         assert r404.status_code == 404
 
     def test_killchain_advance(self, auth_headers):
-        det = requests.post(f"{API}/detections/simulate", headers=auth_headers).json()
+        det = _ingest_detection(auth_headers)
         idx0 = det["kill_chain_index"]
         r = requests.post(f"{API}/detections/{det['id']}/killchain-advance", headers=auth_headers)
         assert r.status_code == 200
@@ -162,9 +238,23 @@ class TestDetections:
 # ------------------------- Spectrum -------------------------
 class TestSpectrum:
     def test_waterfall_shape(self, auth_headers):
+        # Task #141: /spectrum/waterfall does NOT synthesize rows from the
+        # bins/rows query params -- it only ever serves whatever was last
+        # POSTed to /spectrum/ingest within the last 30s (server.py's
+        # spectrum_waterfall(), _last_spectrum_ingest), and otherwise
+        # honestly reports an empty spectrum (bins from the query param,
+        # rows=[], source="NONE"). Seed real spectrum data first, the same
+        # way the real RF bridge (hackrf_sweep bridge) does.
+        bins = 64
+        rows = [[float(v) for v in range(bins)] for _ in range(8)]
+        ingest_body = {"bins": bins, "rows": rows, "center_freq_ghz": 2.44, "span_mhz": 40.0}
+        r_ingest = requests.post(f"{API}/spectrum/ingest", headers=auth_headers, json=ingest_body)
+        assert r_ingest.status_code == 200, r_ingest.text
+
         r = requests.get(f"{API}/spectrum/waterfall?bins=64&rows=8", headers=auth_headers)
         assert r.status_code == 200
         data = r.json()
+        assert data["source"] == "HACKRF"
         assert data["bins"] == 64
         assert isinstance(data["rows"], list)
         assert len(data["rows"]) == 8
@@ -220,15 +310,37 @@ class TestPayloads:
             for f in ["id", "name", "category", "severity", "mav_cmd"]:
                 assert f in p
 
-    def test_deploy_target_pl005(self, auth_headers):
-        # create a fresh active detection to target
-        det = requests.post(f"{API}/detections/simulate", headers=auth_headers).json()
+    def test_deploy_target_pl005(self, auth_headers, token):
+        # create a fresh active detection to target (via real ingest, not
+        # the removed /detections/simulate)
+        det = _ingest_detection(auth_headers)
+        # Friendly-fire interlock: a kinetic payload cannot target a
+        # detection until it has been explicitly authorized -- see
+        # server.py's authorize_target()/deploy_payload().
+        auth_r = requests.post(f"{API}/detections/{det['id']}/authorize-target",
+                                headers=auth_headers, json={"authorized": True})
+        assert auth_r.status_code == 200, auth_r.text
+        # PL-005 (PROPELLER_STOP) is CRITICAL severity, so /payloads/deploy
+        # requires a fresh single-use arm token (POST /arm) as a second
+        # factor -- see _consume_arm_token()/spec.severity == "CRITICAL" in
+        # server.py's deploy_payload().
+        arm = requests.post(f"{API}/arm", headers=auth_headers)
+        assert arm.status_code == 200, arm.text
+        arm_token = arm.json()["arm_token"]
         r = requests.post(f"{API}/payloads/deploy",
                           headers=auth_headers,
-                          json={"payload_id": "PL-005", "target_detection_id": det["id"]})
+                          json={"payload_id": "PL-005", "target_detection_id": det["id"],
+                                "arm_token": arm_token})
         assert r.status_code == 200, r.text
         pkt = r.json()
         assert pkt["payload_id"] == "PL-005"
+        assert pkt["status"] == "AWAITING_ACK"
+        # Since task #136's TX-halt/ack architecture, deploy only parks the
+        # detection in AWAITING_ACK -- it does not synchronously neutralize
+        # it. Simulate the real bridge's tx_ack over the mavlink WS to
+        # resolve it, exactly as rf-bridge/mavlink_bridge.py would after a
+        # real successful serial write.
+        _send_tx_ack(token, pkt["request_id"], ok=True)
         # Verify detection became NEUTRALIZED/DEFEAT
         r2 = requests.get(f"{API}/detections/{det['id']}", headers=auth_headers)
         assert r2.status_code == 200
@@ -248,18 +360,30 @@ class TestPayloads:
                           json={"payload_id": "PL-001", "broadcast": False})
         assert r.status_code == 400
 
-    def test_deploy_broadcast_pl010_neutralizes_all_active(self, auth_headers):
-        # Ensure at least a couple active targets
+    def test_deploy_broadcast_pl010_neutralizes_all_active(self, auth_headers, token):
+        # Ensure at least a couple active targets (via real ingest, not the
+        # removed /detections/simulate)
         for _ in range(3):
-            requests.post(f"{API}/detections/simulate", headers=auth_headers)
+            _ingest_detection(auth_headers)
         active_before = [d for d in requests.get(f"{API}/detections", headers=auth_headers).json()
                          if d["status"] == "ACTIVE"]
         assert len(active_before) >= 1
         before_ids = {d["id"] for d in active_before}
+        # Any broadcast (target_system=0) needs a fresh single-use arm
+        # token too, regardless of payload severity -- see body.broadcast
+        # check in server.py's deploy_payload().
+        arm = requests.post(f"{API}/arm", headers=auth_headers)
+        assert arm.status_code == 200, arm.text
+        arm_token = arm.json()["arm_token"]
         r = requests.post(f"{API}/payloads/deploy",
                           headers=auth_headers,
-                          json={"payload_id": "PL-010", "broadcast": True})
+                          json={"payload_id": "PL-010", "broadcast": True, "arm_token": arm_token})
         assert r.status_code == 200
+        pkt = r.json()
+        # Same as test_deploy_target_pl005: broadcast deploy only parks
+        # detections in AWAITING_ACK until a real bridge tx_ack resolves
+        # them (task #136 TX-halt/ack architecture) -- simulate that ack.
+        _send_tx_ack(token, pkt["request_id"], ok=True)
         # Verify every previously-active id is now NEUTRALIZED (other workers may have created
         # new ACTIVE detections after our broadcast — that's fine).
         after = {d["id"]: d for d in requests.get(f"{API}/detections", headers=auth_headers).json()}
