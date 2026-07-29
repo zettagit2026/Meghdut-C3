@@ -119,6 +119,34 @@ def login(console_url: str, email: str, password: str) -> str:
     return r.json()["token"]
 
 
+def _post_with_reauth(console_url: str, path: str, json_body: dict, headers: dict,
+                       email: str, password: str, timeout: float = 5) -> "requests.Response":
+    """POST to the backend, auto-recovering from an expired JWT by re-login
+    ONCE and retrying. Duplicated per-file (same convention as login() above
+    -- no shared auth module exists in field-bridge/); canonical copy +
+    rationale lives in hackrf_rx.py. This bridge runs Restart=always
+    indefinitely, so without this it would silently and permanently 401 on
+    every ingest past the backend's 12h JWT TTL (create_access_token() in
+    backend/server.py) until manually restarted -- task #150."""
+    url = f"{console_url}{path}"
+    headers.setdefault("X-Bridge-Name", "canopen_parser")
+    r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
+    if r.status_code == 401:
+        print(f"[auth] 401 from POST {path} -- token expired, re-authenticating as {email}",
+              file=sys.stderr)
+        try:
+            headers["Authorization"] = f"Bearer {login(console_url, email, password)}"
+        except requests.RequestException as e:
+            print(f"[auth] re-login failed ({e})", file=sys.stderr)
+            return r
+        r = requests.post(url, json=json_body, headers=headers, timeout=timeout)
+        if r.status_code == 401:
+            print(f"[auth] still 401 for POST {path} after re-authenticating -- real auth "
+                  f"problem (check credentials for {email}), not just an expired token.",
+                  file=sys.stderr)
+    return r
+
+
 def decode_heartbeat(can_id: int, data: bytearray) -> Optional[Dict]:
     """Decode a real CiA 301 NMT error-control (heartbeat/bootup) frame.
 
@@ -191,8 +219,8 @@ def run(console_url: str, email: str, password: str,
             "protocol_confirmed": True,
         }
         try:
-            r = requests.post(f"{console_url}/api/detections/ingest",
-                               json=detection, headers=headers, timeout=5)
+            r = _post_with_reauth(console_url, "/api/detections/ingest",
+                                   detection, headers, email, password, timeout=5)
             r.raise_for_status()
             print(f"CONFIRMED CANopen node: id={node_id} state={decoded['state_name']} "
                   f"-> {r.json().get('callsign')}")

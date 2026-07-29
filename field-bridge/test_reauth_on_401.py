@@ -3,8 +3,11 @@
 every field-bridge script that authenticates against the backend.
 
 Background: hackrf_rx.py, ml_classify_bridge.py, fpv_video_bridge.py,
-mavlink_sniffer.py, droneid_decode_bridge.py, and sik_mavlink_bridge.py each
-log in once at startup and cache the resulting bearer token forever. The
+mavlink_sniffer.py, droneid_decode_bridge.py, sik_mavlink_bridge.py,
+crsf_parser.py, dronecan_parser.py, canopen_parser.py,
+graupner_hott_parser.py, and ltm_parser.py each log in once at startup and
+cache the resulting bearer token forever (task #150 retrofitted the last
+five of these). The
 backend's JWT TTL is 12h (create_access_token() in backend/server.py), and
 these are systemd Restart=always services meant to run indefinitely, so a
 token cached at startup silently and PERMANENTLY 401s once the process has
@@ -28,6 +31,11 @@ from unittest import mock
 import hackrf_rx
 import mavlink_sniffer
 import sik_mavlink_bridge
+import crsf_parser
+import dronecan_parser
+import canopen_parser
+import graupner_hott_parser
+import ltm_parser
 
 
 def _resp(status_code: int, json_body: dict | None = None):
@@ -129,6 +137,26 @@ class MavlinkSnifferReauthTests(ReauthOnceTestsBase, unittest.TestCase):
 
 class SikMavlinkBridgeReauthTests(ReauthOnceTestsBase, unittest.TestCase):
     module = sik_mavlink_bridge
+
+
+class CrsfParserReauthTests(ReauthOnceTestsBase, unittest.TestCase):
+    module = crsf_parser
+
+
+class DroneCANParserReauthTests(ReauthOnceTestsBase, unittest.TestCase):
+    module = dronecan_parser
+
+
+class CanopenParserReauthTests(ReauthOnceTestsBase, unittest.TestCase):
+    module = canopen_parser
+
+
+class GraupnerHottParserReauthTests(ReauthOnceTestsBase, unittest.TestCase):
+    module = graupner_hott_parser
+
+
+class LtmParserReauthTests(ReauthOnceTestsBase, unittest.TestCase):
+    module = ltm_parser
 
 
 class FpvVideoBridgeReauthTests(unittest.TestCase):
