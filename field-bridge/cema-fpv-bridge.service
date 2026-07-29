@@ -51,7 +51,7 @@ EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 # capture — the entire point of this unit. The one-shot/--loop CLI modes
 # documented in fpv_video_bridge.py's module docstring remain available for
 # manual/ad-hoc use; this service intentionally does not use them.
-ExecStart=/usr/bin/python3 -u fpv_video_bridge.py --poll --channel 5800_R1
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u fpv_video_bridge.py --poll --channel 5800_R1
 Restart=always
 RestartSec=5
 StandardOutput=append:/CEMA/joydipdemo/field-bridge/fpv_video_bridge.log

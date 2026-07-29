@@ -35,7 +35,7 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 # committed to the repo. Restrict its permissions: chmod 600.
 EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
-ExecStart=/usr/bin/python3 -u hackrf_rx.py --interval-s 3
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u hackrf_rx.py --interval-s 3
 Restart=always
 RestartSec=5
 StandardOutput=append:/CEMA/joydipdemo/field-bridge/hackrf_rx.log
