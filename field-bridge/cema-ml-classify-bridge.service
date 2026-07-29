@@ -8,8 +8,7 @@ Wants=network-online.target
 # cema-hackrf-rx.service, USB re-enumeration, etc.) is the correct posture.
 # Default StartLimitBurst=5/StartLimitIntervalSec=10s can trip permanently,
 # requiring a manual reset-failed. Widen the window/burst and disable
-# give-up behavior. (Unit is currently not installed/enabled -- see note at
-# bottom of file -- but hardened now so it's correct the moment it is.)
+# give-up behavior.
 StartLimitIntervalSec=300
 StartLimitBurst=20
 StartLimitAction=none
@@ -31,7 +30,9 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 #   CEMA_PASSWORD=<this host's current admin password>
 # Optional overrides (see ml_classify_bridge.py module docstring for defaults
 # and full explanation of each):
-#   CEMA_ML_CHECKPOINT=/tmp/resnet18_leesburg_split_0.02_1_current.pt
+#   CEMA_ML_CHECKPOINT=/CEMA/joydipdemo/field-bridge/models/resnet18_leesburg_split_0.02_1_current.pt
+#   (task #133: must point at a persistent path, never /tmp -- the checkpoint
+#   is wiped on every reboot if left at the ephemeral /tmp default.)
 #   CEMA_ML_INTERVAL_S=12
 #   CEMA_ML_SAMPLE_RATE_HZ=10e6
 #   CEMA_ML_CAPTURE_S=0.3
@@ -41,12 +42,12 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 # Restrict its permissions: chmod 600.
 EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
-# NOTE: this script requires torch (see gamutrf_infer.py) which is typically
-# installed in a dedicated venv, not system Python -- point this at that
-# venv's python3 (e.g. /home/<user>/ml_venv/bin/python3), NOT /usr/bin/python3,
-# or the service will crash-loop with ModuleNotFoundError: No module named 'torch'.
-# Adjust this path per-deployment.
-ExecStart=/usr/bin/python3 -u ml_classify_bridge.py
+# This script requires torch (see gamutrf_infer.py), which lives in this
+# project's dedicated field-bridge venv, not system Python. Task #133: an
+# earlier version of this unit pointed ExecStart at /usr/bin/python3, which
+# crash-looped with ModuleNotFoundError: No module named 'torch' for ~24h
+# after a host reboot before being caught and fixed. Do not regress this.
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u ml_classify_bridge.py
 Restart=always
 RestartSec=5
 StandardOutput=append:/CEMA/joydipdemo/field-bridge/ml_classify_bridge.log
@@ -56,12 +57,10 @@ StandardError=append:/CEMA/joydipdemo/field-bridge/ml_classify_bridge.log
 WantedBy=multi-user.target
 
 # ---------------------------------------------------------------------------
-# NOT YET INSTALLED / ENABLED. Per project standing rule for this session:
-# code is deployed to field-bridge/ for QA/review, but this systemd unit is
-# intentionally left uninstalled and inactive (no `systemctl enable/start`
-# has been run) pending explicit confirmation this is ready for continuous
-# operation. See ml_classify_bridge.py's docstring for the empirically
-# confirmed Phase 1 finding (closed-world 3-class model hallucinates
-# confidently on pure noise) that motivated the energy gate this bridge
-# depends on, and the reasoning for its device-contention-aware interval.
+# Installed and enabled on primary (172.16.16.196) as of task #133
+# (2026-07-29), running against the venv ExecStart above. See
+# ml_classify_bridge.py's docstring for the empirically confirmed Phase 1
+# finding (closed-world 3-class model hallucinates confidently on pure
+# noise) that motivated the energy gate this bridge depends on, and the
+# reasoning for its device-contention-aware interval.
 # ---------------------------------------------------------------------------
