@@ -32,6 +32,12 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 # Optional overrides (see fpv_video_bridge.py --help for full list/defaults):
 #   HACKRF_SERIAL_PRIMARY=<serial, if disambiguating multiple HackRFs>
 #   FPV_FORWARD_URL=<external HTTP POST destination for captured frames, optional>
+#   FPV_CAPTURE_DIR=<persistent dir for capture output; default is
+#     field-bridge/fpv_captures/ under WorkingDirectory -- NOT /tmp, which is
+#     wiped on reboot and would silently lose operator-triggered capture
+#     evidence (task #137, same fix as CEMA_ML_CHECKPOINT/task #133). Only
+#     set this if you want captures written somewhere else, e.g. a larger
+#     mounted evidence volume.
 # Point this at either the project-root .env or a dedicated field-bridge/.env.
 # This file must be created per-deployment; it is not committed to the repo.
 # Restrict its permissions: chmod 600.

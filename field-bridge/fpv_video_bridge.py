@@ -223,6 +223,20 @@ DEFAULT_DURATION_S = 2.0
 # be "one video line's worth of samples".
 _ROW_WIDTH = 720
 
+# 2026-07-29 FIX (task #137): default capture output dir used to be
+# /tmp/fpv_capture -- ephemeral storage, wiped on every host reboot. Same
+# silent-evidence-loss pattern already found and fixed for the ML classifier
+# checkpoint (task #133, see ml_classify_bridge.py's CEMA_ML_CHECKPOINT).
+# Any operator-triggered FPV capture (sigmf-data/meta + PNG) written under
+# /tmp would vanish on reboot with no warning. Default now lives under the
+# project directory instead, with an explicit env var override so operators
+# can point it elsewhere (e.g. a larger/mounted evidence volume) without
+# editing code -- same override convention as CEMA_ML_CHECKPOINT/
+# FPV_FORWARD_URL/CEMA_API_URL.
+DEFAULT_FPV_CAPTURE_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "fpv_captures"
+)
+
 
 def am_envelope_demod(iq: np.ndarray) -> np.ndarray:
     """Textbook AM envelope detection: |I + jQ|.
@@ -278,7 +292,7 @@ def capture_and_demod(
     center_freq_hz: float,
     sample_rate_hz: float = DEFAULT_SAMPLE_RATE_HZ,
     duration_s: float = DEFAULT_DURATION_S,
-    out_dir: str = "/tmp/fpv_capture",
+    out_dir: str = DEFAULT_FPV_CAPTURE_DIR,
     serial: Optional[str] = None,
 ) -> dict:
     """Real capture (hackrf_transfer, RX only) + AM envelope demod + PNG.
@@ -508,7 +522,12 @@ def main() -> None:
                     help=f"one of {sorted(ALL_FPV_CHANNELS_MHZ.keys())} or a raw freq in MHz")
     ap.add_argument("--rate", type=float, default=DEFAULT_SAMPLE_RATE_HZ)
     ap.add_argument("--duration", type=float, default=DEFAULT_DURATION_S)
-    ap.add_argument("--out-dir", default="/tmp/fpv_capture")
+    ap.add_argument("--out-dir", default=os.environ.get("FPV_CAPTURE_DIR", DEFAULT_FPV_CAPTURE_DIR),
+                    help="directory for capture output (sigmf-data/meta + PNG). "
+                         "Persistent by default (env: FPV_CAPTURE_DIR) -- NOT /tmp, "
+                         "which is wiped on reboot and would silently lose operator-"
+                         "triggered capture evidence (same fix as CEMA_ML_CHECKPOINT, "
+                         "task #133/#137).")
     ap.add_argument("--serial", default=os.environ.get("HACKRF_SERIAL_PRIMARY"))
     ap.add_argument("--forward-url", default=os.environ.get("FPV_FORWARD_URL"),
                     help="external HTTP POST destination for captured frames "
