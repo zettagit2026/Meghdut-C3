@@ -37,24 +37,88 @@ export default function MavlinkConsole() {
   const [preview, setPreview] = useState(null);
   const [stream, setStream] = useState([]);
   const [broadcastFlag, setBroadcastFlag] = useState(false);
+  const [wsStatus, setWsStatus] = useState("connecting"); // connecting | open | reconnecting | no-auth | closed
   const wsRef = useRef(null);
+  const reconnectTimerRef = useRef(null);
+  const attemptRef = useRef(0);
+  const unmountedRef = useRef(false);
 
   useEffect(() => {
     api.get("/detections").then((r) => setDets(r.data)).catch(() => {});
     api.get("/mavlink/packets?limit=25").then((r) => setStream(r.data)).catch(() => {});
 
-    const token = localStorage.getItem("cema_token");
-    const ws = new WebSocket(`${wsUrl("/api/ws/mavlink")}?token=${encodeURIComponent(token)}`);
-    wsRef.current = ws;
-    ws.onmessage = (ev) => {
-      try {
-        const msg = JSON.parse(ev.data);
-        if (msg.type === "packet") {
-          setStream((s) => [msg.packet, ...s].slice(0, 40));
-        }
-      } catch { /* noop */ }
+    unmountedRef.current = false;
+
+    const MAX_BACKOFF_MS = 15000;
+    const NO_AUTH_RETRY_MS = 1500;
+
+    const scheduleReconnect = () => {
+      if (unmountedRef.current) return;
+      const attempt = attemptRef.current;
+      const delay = Math.min(1000 * 2 ** attempt, MAX_BACKOFF_MS);
+      attemptRef.current = attempt + 1;
+      setWsStatus("reconnecting");
+      reconnectTimerRef.current = setTimeout(connect, delay);
     };
-    return () => ws.close();
+
+    const connect = () => {
+      if (unmountedRef.current) return;
+
+      // Re-read token fresh on every attempt so a rotated/late token is picked up.
+      const token = localStorage.getItem("cema_token");
+      if (!token) {
+        setWsStatus("no-auth");
+        reconnectTimerRef.current = setTimeout(connect, NO_AUTH_RETRY_MS);
+        return;
+      }
+
+      setWsStatus((s) => (s === "open" ? s : "connecting"));
+      const ws = new WebSocket(`${wsUrl("/api/ws/mavlink")}?token=${encodeURIComponent(token)}`);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        attemptRef.current = 0;
+        setWsStatus("open");
+      };
+
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data);
+          if (msg.type === "packet") {
+            setStream((s) => [msg.packet, ...s].slice(0, 40));
+          }
+        } catch { /* noop */ }
+      };
+
+      ws.onerror = () => {
+        // onclose will fire right after and handle reconnect scheduling.
+      };
+
+      ws.onclose = () => {
+        if (wsRef.current === ws) wsRef.current = null;
+        if (unmountedRef.current) return;
+        scheduleReconnect();
+      };
+    };
+
+    connect();
+
+    return () => {
+      unmountedRef.current = true;
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (wsRef.current) {
+        const ws = wsRef.current;
+        wsRef.current = null;
+        ws.onopen = null;
+        ws.onmessage = null;
+        ws.onerror = null;
+        ws.onclose = null;
+        ws.close();
+      }
+    };
   }, []);
 
   const upd = (k, v) => setForm((f) => ({ ...f, [k]: v }));
@@ -208,7 +272,34 @@ export default function MavlinkConsole() {
             <RadioTower size={14} strokeWidth={1.5} style={{ color: "var(--accent-info)" }} />
             <span className="font-mono text-xs uppercase tracking-widest">Live MAVLink Broadcast Stream</span>
           </div>
-          <span className="font-mono text-[10px] text-slate-500 blink">● WS</span>
+          <span
+            data-testid="ws-status"
+            className={`font-mono text-[10px] uppercase tracking-widest ${
+              wsStatus === "open"
+                ? "text-[#00F0FF] blink"
+                : wsStatus === "no-auth"
+                ? "text-[#FF3B30]"
+                : "text-slate-500"
+            }`}
+            title={
+              wsStatus === "open"
+                ? "WebSocket connected"
+                : wsStatus === "connecting"
+                ? "WebSocket connecting…"
+                : wsStatus === "reconnecting"
+                ? "WebSocket disconnected — reconnecting…"
+                : wsStatus === "no-auth"
+                ? "Not authenticated — waiting for token"
+                : "WebSocket disconnected"
+            }
+          >
+            ●{" "}
+            {wsStatus === "open" && "WS LIVE"}
+            {wsStatus === "connecting" && "WS CONNECTING"}
+            {wsStatus === "reconnecting" && "WS RECONNECTING"}
+            {wsStatus === "no-auth" && "WS NO AUTH"}
+            {wsStatus === "closed" && "WS OFFLINE"}
+          </span>
         </div>
         <div className="max-h-[360px] overflow-y-auto font-mono text-xs">
           {stream.length === 0 && (
