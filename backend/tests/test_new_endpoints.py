@@ -59,7 +59,8 @@ class TestHealth:
         assert r.status_code == 200, r.text
         d = r.json()
         for k in ["backend", "mongo", "hackrf", "sik_radio", "ws_clients",
-                  "active_targets", "total_packets_tx", "server_time"]:
+                  "active_targets", "total_packets_tx", "server_time",
+                  "tx_halted"]:
             assert k in d, f"missing field {k} in health response"
         assert d["backend"] is True
         assert d["mongo"] is True
@@ -69,6 +70,24 @@ class TestHealth:
         assert isinstance(d["ws_clients"], int)
         assert isinstance(d["active_targets"], int)
         assert isinstance(d["total_packets_tx"], int)
+        assert isinstance(d["tx_halted"], bool)
+
+    def test_tx_halted_fail_closed_default(self, auth_headers):
+        # Task #136: a freshly-started backend must default to TX-HALTED
+        # (fail-closed) — see backend/TX_HALT_PERSISTENCE_SCOPE.md. This test
+        # is ordered before TestEmergencyAbort/TestEmergencyResume in this
+        # module so it observes the boot-time default rather than a value
+        # left over from another test's abort/resume call.
+        r = requests.get(f"{API}/health", headers=auth_headers, timeout=10)
+        assert r.status_code == 200, r.text
+        assert r.json()["tx_halted"] is True
+
+        logs = requests.get(f"{API}/logs", headers=auth_headers, timeout=10)
+        assert logs.status_code == 200, logs.text
+        kinds = [entry.get("kind") for entry in logs.json()]
+        assert "TX_HALT_STARTUP" in kinds, (
+            "expected a TX_HALT_STARTUP audit entry logged at process start"
+        )
 
     def test_health_requires_auth(self):
         r = requests.get(f"{API}/health", timeout=10)

@@ -349,7 +349,15 @@ _created_detection_ids: list[str] = []
 
 @pytest.fixture(scope="module")
 def token() -> str:
-    return login()
+    tok = login()
+    # Task #136: backend now boots TX-HALTED by default (fail-closed —
+    # see backend/TX_HALT_PERSISTENCE_SCOPE.md). This module exercises real
+    # /payloads/deploy TX, which is gated by that flag, so a commander-level
+    # resume is required before any deploy() call in this file will work.
+    r = requests.post(f"{API}/emergency/resume",
+                       headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+    assert r.status_code == 200, f"emergency/resume failed: {r.status_code} {r.text}"
+    return tok
 
 
 @pytest.fixture(scope="module", autouse=True)

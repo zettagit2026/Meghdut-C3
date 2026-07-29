@@ -58,7 +58,16 @@ def token(session: requests.Session) -> str:
     assert r.status_code == 200, f"login failed: {r.status_code} {r.text}"
     data = r.json()
     assert "token" in data
-    return data["token"]
+    tok = data["token"]
+    # Task #136: backend now boots TX-HALTED by default (fail-closed --
+    # see backend/TX_HALT_PERSISTENCE_SCOPE.md). This module exercises real
+    # /mavlink/broadcast and /payloads/deploy TX, which is gated by that
+    # flag, so a commander-level resume is required before any TX-gated
+    # call in this file will work.
+    r2 = session.post(f"{API}/emergency/resume",
+                       headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+    assert r2.status_code == 200, f"emergency/resume failed: {r2.status_code} {r2.text}"
+    return tok
 
 
 @pytest.fixture(scope="session")

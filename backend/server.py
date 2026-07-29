@@ -532,7 +532,15 @@ async def _expire_range_authorization() -> None:
 # /mavlink/broadcast both check this BEFORE building/sending any frame — the
 # prior implementation only broadcast a cooperative WebSocket notice with no
 # server-side enforcement.
-_tx_halted = False
+#
+# In-memory ONLY (never persisted to Mongo, never survives a restart —
+# defaults to the conservative/HALTED state every boot), same convention as
+# _range_authorization/_arm_tokens/_jam_confirm_tokens above. Task #136 (see
+# backend/TX_HALT_PERSISTENCE_SCOPE.md): a restart must never silently
+# resume TX. A commander must explicitly POST /api/emergency/resume after
+# every process start before jam/MAVLink-injection/GNSS-spoof TX is allowed,
+# regardless of what state the flag was in immediately before the restart.
+_tx_halted = True
 
 
 def _check_tx_not_halted() -> None:
@@ -846,6 +854,18 @@ async def startup() -> None:
             {"$set": {"password_hash": hash_password(ADMIN_PASSWORD)}},
         )
         logger.info("Admin password hash refreshed.")
+
+    # Task #136: unconditional, always-the-same, greppable startup audit
+    # line — every boot starts TX-HALTED (fail-closed default, see
+    # backend/TX_HALT_PERSISTENCE_SCOPE.md). There is no "resumed prior
+    # state" case: a commander must always explicitly POST
+    # /api/emergency/resume before TX is permitted again after a restart.
+    await log_event(
+        "TX_HALT_STARTUP",
+        "Backend started in TX-HALTED state (fail-closed default) — a "
+        "commander must POST /api/emergency/resume to enable TX.",
+        actor="SYSTEM",
+    )
 
     # NOTE: no synthetic/seeded detections are inserted here. An empty
     # detections collection on first boot is correct and honest — real
@@ -3415,6 +3435,7 @@ async def system_health(user: Dict = Depends(get_current_user)):
     return {
         "backend": True,
         "mongo": mongo_ok,
+        "tx_halted": _tx_halted,
         "hackrf": hackrf_live,
         "sik_radio": sik_count > 0,
         "ws_clients": len(ws_manager.clients),

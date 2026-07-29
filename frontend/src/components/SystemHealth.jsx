@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { HeartPulse } from "lucide-react";
+import { HeartPulse, ShieldAlert } from "lucide-react";
 
 const DOT = (ok) => ({
   color: ok ? "var(--accent-success)" : "var(--accent-critical)",
@@ -42,6 +42,18 @@ export default function SystemHealth() {
         </div>
         <span className="font-mono text-[10px] text-slate-500">poll 3s</span>
       </div>
+      {h?.tx_halted && (
+        <div
+          data-testid="tx-halted-banner"
+          className="tactical-border-b px-4 py-2 flex items-center gap-2 pulse-crit"
+          style={{ background: "#FF3B30", color: "black" }}
+        >
+          <ShieldAlert size={14} strokeWidth={2} />
+          <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
+            TX HALTED — commander must POST /emergency/resume
+          </span>
+        </div>
+      )}
       <div className="p-4 space-y-2 font-mono text-xs">
         {rows.map(([label, ok]) => (
           <div key={label} className="flex items-center justify-between">
