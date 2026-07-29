@@ -58,7 +58,8 @@ class TestHealth:
         r = requests.get(f"{API}/health", headers=auth_headers, timeout=10)
         assert r.status_code == 200, r.text
         d = r.json()
-        for k in ["backend", "mongo", "hackrf", "sik_radio", "ws_clients",
+        for k in ["backend", "mongo", "hackrf", "ml_classify_bridge_live",
+                  "sik_radio", "ws_clients",
                   "active_targets", "total_packets_tx", "server_time",
                   "tx_halted"]:
             assert k in d, f"missing field {k} in health response"
@@ -66,11 +67,34 @@ class TestHealth:
         assert d["mongo"] is True
         # In sandbox no hardware
         assert isinstance(d["hackrf"], bool)
+        assert isinstance(d["ml_classify_bridge_live"], bool)
         assert isinstance(d["sik_radio"], bool)
         assert isinstance(d["ws_clients"], int)
         assert isinstance(d["active_targets"], int)
         assert isinstance(d["total_packets_tx"], int)
         assert isinstance(d["tx_halted"], bool)
+
+    def test_ml_classify_bridge_live_false_with_no_heartbeat(self, auth_headers):
+        # Task #134: a fresh backend (this test module's own session) that
+        # has never received a POST to /api/ml-classify/heartbeat must
+        # honestly report the bridge as not live, same as hackrf_live's
+        # "no ingest yet" behavior -- never fabricate liveness.
+        r = requests.get(f"{API}/health", headers=auth_headers, timeout=10)
+        assert r.status_code == 200, r.text
+        assert r.json()["ml_classify_bridge_live"] is False
+
+    def test_ml_classify_bridge_live_true_after_recent_heartbeat(self, auth_headers):
+        # Task #134: simulate ml_classify_bridge.py's per-cycle heartbeat
+        # POST (see field-bridge/ml_classify_bridge.py) and confirm the
+        # liveness field goes true immediately afterwards, mirroring
+        # hackrf_live's recency-check pattern exactly.
+        r_hb = requests.post(f"{API}/ml-classify/heartbeat", headers=auth_headers,
+                              json={"bands_checked": 4, "cycle": 1}, timeout=10)
+        assert r_hb.status_code == 200, r_hb.text
+
+        r = requests.get(f"{API}/health", headers=auth_headers, timeout=10)
+        assert r.status_code == 200, r.text
+        assert r.json()["ml_classify_bridge_live"] is True
 
     def test_tx_halted_fail_closed_default(self, auth_headers):
         # Task #136: a freshly-started backend must default to TX-HALTED

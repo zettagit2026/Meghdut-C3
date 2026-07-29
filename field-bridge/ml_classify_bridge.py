@@ -311,6 +311,24 @@ def main() -> None:
     i = 0
     with tempfile.TemporaryDirectory(prefix="cema_ml_bridge_") as tmp_dir:
         while args.iterations == 0 or i < args.iterations:
+            # LIVENESS HEARTBEAT (task #134): posted once per gate-check
+            # cycle, unconditionally -- i.e. whether or not any band's
+            # energy gate passes below. Without this, /api/health's only
+            # signal for this bridge was ingest_health's last_success_ts,
+            # which only updates on an actual classified-detection POST
+            # and is therefore indistinguishable from "quiet RF
+            # environment" when the bridge has actually crash-looped (the
+            # 2026-07-29 incident, task #133). This mirrors hackrf_rx.py's
+            # /api/spectrum/ingest, which is posted every sweep cycle
+            # regardless of detection outcome for exactly this reason.
+            try:
+                _post_with_reauth(args.console_url, "/api/ml-classify/heartbeat",
+                                   {"bands_checked": len(ML_BANDS_MHZ), "cycle": i},
+                                   headers, args.email, args.password, timeout=10,
+                                   bridge_name="ml_classify_bridge")
+            except requests.RequestException as e:
+                print(f"[heartbeat] post failed: {e}", file=sys.stderr)
+
             for name, low, high, label in ML_BANDS_MHZ:
                 powers, center_mhz, is_real_data = sweep_band(name, low, high, serial=HACKRF_SERIAL)
                 if not is_real_data:

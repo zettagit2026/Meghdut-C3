@@ -168,7 +168,8 @@ logger = logging.getLogger("cema")
 # freshness, never whether ingest writes were actually succeeding server-side.
 # These paths are the full set of bridge->backend ingest endpoints (TX-side
 # jam_bridge.py is deliberately out of scope — see AGENT.md task #74 notes).
-INGEST_PATHS = {"/api/detections/ingest", "/api/spectrum/ingest", "/api/fpv/ingest"}
+INGEST_PATHS = {"/api/detections/ingest", "/api/spectrum/ingest", "/api/fpv/ingest",
+                "/api/ml-classify/heartbeat"}
 AUTH_FAIL_CONSECUTIVE_THRESHOLD = 3
 
 
@@ -1984,6 +1985,47 @@ async def spectrum_ingest(body: SpectrumIngestBody,
     return {"ok": True, "accepted_rows": len(body.rows)}
 
 
+# ---------------------------------------------------------------------
+# ml_classify_bridge.py liveness heartbeat (task #134)
+# ---------------------------------------------------------------------
+# Unlike hackrf_rx.py (which posts a spectrum row every sweep cycle
+# regardless of whether anything interesting was found -- see
+# _last_spectrum_ingest / hackrf_live above), ml_classify_bridge.py only
+# POSTs to /api/detections/ingest when its energy gate actually passes.
+# That means db.ingest_health's per-bridge last_success_ts for
+# "ml_classify_bridge" reflects "last time it found something to
+# classify", NOT "the process is alive and cycling" -- a crash-looped
+# bridge and a bridge sitting in a genuinely quiet RF environment are
+# indistinguishable via that signal alone. That gap is exactly what let
+# the 2026-07-29 incident (task #133) go undetected: the bridge
+# crash-looped so hard it never even reached the auth-check stage, but
+# /api/health had no way to tell that apart from "nothing to report".
+#
+# Fix: ml_classify_bridge.py now POSTs a lightweight heartbeat here once
+# per gate-check cycle (i.e. once per pass over ML_BANDS_MHZ), regardless
+# of whether any band's energy gate passed -- the same
+# "runs-every-cycle-no-matter-what" property that makes hackrf_live a
+# genuine liveness signal rather than an activity signal.
+_last_ml_classify_heartbeat: Optional[Dict] = None
+
+
+class MlClassifyHeartbeatBody(BaseModel):
+    bands_checked: Optional[int] = None
+    cycle: Optional[int] = None
+
+
+@api.post("/ml-classify/heartbeat")
+async def ml_classify_heartbeat(body: MlClassifyHeartbeatBody,
+                                 user: Dict = Depends(get_current_user)):
+    global _last_ml_classify_heartbeat
+    _last_ml_classify_heartbeat = {
+        "ts": datetime.now(timezone.utc),
+        "bands_checked": body.bands_checked,
+        "cycle": body.cycle,
+    }
+    return {"ok": True}
+
+
 DETECTION_MERGE_WINDOW_S = 20  # re-ingests of the same real contact within this
                                # window update the existing record instead of
                                # spawning a new one — a continuously-running RX
@@ -3341,6 +3383,19 @@ async def system_health(user: Dict = Depends(get_current_user)):
     ing = _last_spectrum_ingest
     hackrf_live = bool(ing and (datetime.now(timezone.utc) - ing["ts"]).total_seconds() < 30)
 
+    # ml_classify_bridge liveness (task #134): recency check on the
+    # heartbeat above, mirroring hackrf_live exactly. Default cycle
+    # interval is CEMA_ML_INTERVAL_S=12s; 40s is a bit over 3x that,
+    # analogous to hackrf_live's 30s window vs hackrf_sweep's few-seconds-
+    # per-band cadence -- generous enough to absorb a slow gate-check
+    # cycle (multi-band sweep + occasional gated IQ capture/inference)
+    # without false-flagging a genuinely live bridge, while still catching
+    # a crash-looped/stopped bridge (task #133) within well under a minute.
+    ml_hb = _last_ml_classify_heartbeat
+    ml_classify_bridge_live = bool(
+        ml_hb and (datetime.now(timezone.utc) - ml_hb["ts"]).total_seconds() < 40
+    )
+
     # SiK live if any detection with source SIK_RADIO seen in last 60s
     since = datetime.now(timezone.utc) - timedelta(seconds=60)
     sik_count = await db.detections.count_documents({
@@ -3437,6 +3492,7 @@ async def system_health(user: Dict = Depends(get_current_user)):
         "mongo": mongo_ok,
         "tx_halted": _tx_halted,
         "hackrf": hackrf_live,
+        "ml_classify_bridge_live": ml_classify_bridge_live,
         "sik_radio": sik_count > 0,
         "ws_clients": len(ws_manager.clients),
         "ws_upgrade_capable": WS_UPGRADE_CAPABLE,
