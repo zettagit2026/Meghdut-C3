@@ -336,6 +336,20 @@ def main() -> int:
     last_posted: Dict[int, float] = {}
     REPOST_INTERVAL_S = 10.0
 
+    # Task #139: idle-loop heartbeat print. This process is legitimately
+    # silent for long stretches whenever no real MAVLink traffic is on the
+    # link (see comment below on `m is None`) -- by design, there is no
+    # synthetic fallback data. That means log-file mtime alone can't
+    # distinguish "alive, just nothing in range" from "hung" the way it can
+    # for hackrf_rx.py (which produces spectrum-ingest/classification output
+    # every cycle regardless of ambient traffic). Printing a cheap, real
+    # "still listening" line on a fixed cadence -- independent of whether any
+    # traffic was ever seen -- gives preflight.sh's log-freshness heartbeat
+    # check (section 4) a genuine liveness signal for this bridge too,
+    # without inventing any detection/telemetry data.
+    IDLE_HEARTBEAT_INTERVAL_S = 60.0
+    last_idle_heartbeat = 0.0
+
     while True:
         try:
             m = mav.recv_match(blocking=True, timeout=1)
@@ -347,6 +361,13 @@ def main() -> int:
         if m is None:
             # Genuinely nothing on the link this second. No fallback data —
             # this is expected and correct behaviour absent real traffic.
+            now_idle = time.time()
+            if now_idle - last_idle_heartbeat >= IDLE_HEARTBEAT_INTERVAL_S:
+                last_idle_heartbeat = now_idle
+                print(f"[heartbeat] still listening on {args.serial} — no "
+                      f"MAVLink traffic decoded in the last "
+                      f"{IDLE_HEARTBEAT_INTERVAL_S:.0f}s (process alive, "
+                      f"nothing in range yet).")
             continue
         mtype = m.get_type()
         if mtype in ("BAD_DATA", "UNKNOWN"):

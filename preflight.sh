@@ -46,6 +46,20 @@ DETECTION_FRESH_WINDOW_S="${PREFLIGHT_FRESH_WINDOW_S:-300}"   # 5 min sanity win
 HEARTBEAT_MAX_AGE_S="${PREFLIGHT_HEARTBEAT_MAX_AGE_S:-120}"   # ~2 min
 HACKRF_RX_LOG="${PREFLIGHT_HACKRF_RX_LOG:-$SCRIPT_DIR/field-bridge/hackrf_rx.log}"
 ML_CLASSIFY_LOG="${PREFLIGHT_ML_CLASSIFY_LOG:-$SCRIPT_DIR/field-bridge/ml_classify_bridge.log}"
+MAVLINK_SNIFFER_LOG="${PREFLIGHT_MAVLINK_SNIFFER_LOG:-$SCRIPT_DIR/field-bridge/mavlink_sniffer.log}"
+FPV_BRIDGE_LOG="${PREFLIGHT_FPV_BRIDGE_LOG:-$SCRIPT_DIR/field-bridge/fpv_video_bridge.log}"
+
+# cema-mavlink-sniffer.service and cema-fpv-bridge.service (task #139) are
+# both, by design, legitimately silent on their normal capture/detection
+# output for long stretches (no craft in range / no operator-triggered
+# capture) -- unlike hackrf-rx/ml-classify-bridge, which produce output every
+# cycle regardless of ambient activity. Both scripts were given a cheap,
+# fixed-cadence "still alive" heartbeat print (independent of real
+# traffic/capture activity — see mavlink_sniffer.py's idle branch and
+# fpv_video_bridge.py's run_poll_mode()) specifically so log-mtime freshness
+# stays a valid liveness signal for them too. That heartbeat cadence is 60s
+# for both, so the same HEARTBEAT_MAX_AGE_S window (default 120s, 2x margin)
+# applies without needing a separate/looser threshold.
 
 # ---------------------------------------------------------------------------
 # Output helpers — mirrors start.sh's "[X] message" bracket convention,
@@ -228,6 +242,10 @@ check_bridge_heartbeat "cema-hackrf-rx.service" "$HACKRF_RX_LOG" \
   "Detections will rely on SiK / manual injects only."
 check_bridge_heartbeat "cema-ml-classify-bridge.service" "$ML_CLASSIFY_LOG" \
   "ML classification is an additional signal on top of hackrf_rx.py's RSSI heuristics, not a replacement — inactive is a known/expected state on hosts where it has not yet been enabled for continuous operation, not itself a demo blocker."
+check_bridge_heartbeat "cema-mavlink-sniffer.service" "$MAVLINK_SNIFFER_LOG" \
+  "Passive MAVLink/ArduPilot identification will be unavailable — protocol-confirmed detections rely solely on this bridge; inactive is a real coverage gap, not merely 'additional signal', unlike ml-classify-bridge above."
+check_bridge_heartbeat "cema-fpv-bridge.service" "$FPV_BRIDGE_LOG" \
+  "Operator-triggered analog FPV video capture (GUI 'CAPTURE NOW') will be unavailable — inactive is expected/normal on hosts where this unit has not yet been installed/enabled (see cema-fpv-bridge.service's own NOT YET INSTALLED note), not itself a demo blocker unless this capability was specifically planned for today."
 
 # ---------------------------------------------------------------------------
 # 5. One dry-run frame: live-data / detection freshness check (WARN-only,
@@ -437,7 +455,9 @@ report_tx_service() {
 
 report_tx_service cema-rf-bridge.service
 report_tx_service cema-jam-bridge.service
-report_tx_service cema-mavlink-sniffer.service
+# cema-mavlink-sniffer.service is RX-only (not TX-capable) and moved to
+# section 4 as a real heartbeat check (task #139) — no longer duplicated
+# here as a bare/never-failing informational line.
 
 echo "  NOTE: this script never starts, enables, or otherwise actuates these services."
 

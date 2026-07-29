@@ -473,7 +473,27 @@ def run_poll_mode(
           f"{poll_interval_s}s for operator-triggered capture requests "
           f"(GUI-only trigger, no SSH/CLI needed by the operator)", file=sys.stderr)
 
+    # Task #139: idle-loop heartbeat print. This bridge is, by design,
+    # legitimately idle for long stretches between operator-triggered
+    # captures (see module/unit docstrings) -- capture-output freshness
+    # therefore cannot be preflight.sh's liveness signal for this service
+    # the way log freshness works for hackrf_rx.py/ml_classify_bridge (which
+    # produce output every cycle regardless of activity). This poll loop
+    # already runs unconditionally every poll_interval_s whether or not a
+    # capture is pending; printing a cheap "still polling" line on a fixed,
+    # longer cadence -- independent of pending/capture state -- gives
+    # preflight a real "process is alive and looping" signal that survives
+    # arbitrarily long idle periods without needing an actual capture.
+    IDLE_HEARTBEAT_INTERVAL_S = 60.0
+    last_idle_heartbeat = 0.0
+
     while True:
+        now_idle = time.time()
+        if now_idle - last_idle_heartbeat >= IDLE_HEARTBEAT_INTERVAL_S:
+            last_idle_heartbeat = now_idle
+            print(f"[fpv_video_bridge] [heartbeat] still polling {status_url} "
+                  f"every {poll_interval_s}s (process alive, no capture "
+                  f"pending unless noted below).", file=sys.stderr)
         try:
             resp = requests.get(status_url, headers=headers, timeout=10)
             if resp.status_code == 401 and _reauth_once(console_url, headers, email, password):
