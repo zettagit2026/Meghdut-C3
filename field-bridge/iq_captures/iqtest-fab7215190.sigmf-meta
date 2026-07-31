@@ -1,0 +1,1 @@
+{"global": {"core:datatype": "ci8", "core:sample_rate": 20000000.0, "core:version": "1.0.0", "core:hw": "HackRF One (test fixture)", "core:sha512": "deadbeef"}, "captures": [{"core:sample_start": 0, "core:frequency": 2440000000.0, "core:datetime": "2026-07-25T00:00:00.000000Z"}], "annotations": [{"core:sample_start": 0, "core:sample_count": 256}]}
