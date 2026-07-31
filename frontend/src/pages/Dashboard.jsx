@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
+import ReactECharts from "echarts-for-react";
 import { Radar, Skull, Activity, Signal, TrendingUp, AlertTriangle, Volume2, VolumeX } from "lucide-react";
 import SystemHealth from "@/components/SystemHealth";
 import MlClassifierBadge from "@/components/MlClassifierBadge";
@@ -48,9 +49,27 @@ async function exportIqCapture(detection) {
   }
 }
 
+// dBm -> tactical waterfall color: dark cyan/black noise floor rising through
+// cyan/green to a hot red for strong signals. Mirrors the hue ramp the old
+// per-cell div renderer used (cyan -> red), just expressed as an ECharts
+// visualMap gradient instead of a per-div inline style.
+const WATERFALL_COLOR_STOPS = [
+  "#000000", // noise floor / no signal -- matches --bg-terminal
+  "#003b46", // faint energy
+  "#00838f",
+  "#00F0FF", // --accent-info, moderate signal
+  "#39FF14", // --accent-success, strong signal
+  "#FFD60A", // --accent-warning
+  "#FF3B30", // --accent-critical, saturated/very strong signal
+];
+const WF_MIN_DBM = -95;
+const WF_MAX_DBM = -30;
+
 function Waterfall() {
   const [rows, setRows] = useState([]);
   const [source, setSource] = useState("NONE");
+  const chartRef = useRef(null);
+
   useEffect(() => {
     let id;
     const load = async () => {
@@ -65,12 +84,71 @@ function Waterfall() {
     return () => clearInterval(id);
   }, []);
 
-  const cell = (v) => {
-    // v in dBm, range roughly -95..-30
-    const norm = Math.min(1, Math.max(0, (v + 95) / 65));
-    const hue = 200 - norm * 200; // cyan → red
-    return `hsl(${hue}, 90%, ${20 + norm * 45}%)`;
-  };
+  const binCount = rows[0]?.length || 96;
+  const rowCount = rows.length;
+
+  // Imperative setOption on the existing chart instance on every poll tick,
+  // instead of re-rendering <ReactECharts option=.../> with a brand new
+  // option object -- avoids a full chart teardown/remount on each of the
+  // 2.5s polls so the canvas keeps its zoom/size and only repaints data.
+  useEffect(() => {
+    const inst = chartRef.current?.getEchartsInstance?.();
+    if (!inst) return;
+    const heatData = [];
+    rows.forEach((row, ri) => {
+      row.forEach((v, ci) => {
+        heatData.push([ci, ri, Math.round(v * 10) / 10]);
+      });
+    });
+    inst.setOption({
+      series: [{ data: heatData }],
+      yAxis: { data: Array.from({ length: rowCount }, (_, i) => i) },
+      xAxis: { data: Array.from({ length: binCount }, (_, i) => i) },
+    });
+  }, [rows, binCount, rowCount]);
+
+  const baseOption = useMemo(() => ({
+    backgroundColor: "transparent",
+    animation: false,
+    grid: { left: 36, right: 12, top: 8, bottom: 22, containLabel: false },
+    tooltip: {
+      trigger: "item",
+      backgroundColor: "#0C111D",
+      borderColor: "rgba(255,255,255,0.15)",
+      textStyle: { color: "#F8FAFC", fontFamily: "JetBrains Mono, monospace", fontSize: 10 },
+      formatter: (p) => {
+        const freq = 2.400 + (p.value[0] / Math.max(1, binCount - 1)) * 0.1;
+        return `${freq.toFixed(3)} GHz · row -${p.value[1]}<br/>${p.value[2]} dBm`;
+      },
+    },
+    xAxis: {
+      type: "category",
+      data: Array.from({ length: binCount }, (_, i) => i),
+      show: false,
+      boundaryGap: false,
+    },
+    yAxis: {
+      type: "category",
+      data: Array.from({ length: rowCount || 1 }, (_, i) => i),
+      show: false,
+      inverse: true, // row 0 (most recent sample) rendered at top, matching prior div-stack order
+    },
+    visualMap: {
+      show: false,
+      min: WF_MIN_DBM,
+      max: WF_MAX_DBM,
+      calculable: false,
+      inRange: { color: WATERFALL_COLOR_STOPS },
+    },
+    series: [
+      {
+        type: "heatmap",
+        data: [],
+        progressive: 2000,
+        itemStyle: { borderWidth: 0 },
+      },
+    ],
+  }), [binCount, rowCount]);
 
   const isReal = source === "HACKRF";
 
@@ -96,19 +174,20 @@ function Waterfall() {
         </div>
         <span className="font-mono text-[10px] text-slate-600 blink">● LIVE</span>
       </div>
-      <div className="p-2">
+      <div className="p-2 relative" style={{ height: 200 }}>
         {rows.length === 0 && (
-          <div className="font-mono text-xs text-slate-600 p-6 text-center">
+          <div className="font-mono text-xs text-slate-600 p-6 text-center absolute inset-0 flex items-center justify-center">
             capturing IQ stream<span className="term-caret"></span>
           </div>
         )}
-        {rows.map((row, ri) => (
-          <div key={ri} className="flex" style={{ height: 8 }}>
-            {row.map((v, ci) => (
-              <div key={ci} className="wf-bar flex-1" style={{ background: cell(v) }} />
-            ))}
-          </div>
-        ))}
+        <ReactECharts
+          ref={chartRef}
+          option={baseOption}
+          notMerge={false}
+          lazyUpdate={true}
+          style={{ height: "100%", width: "100%", opacity: rows.length === 0 ? 0 : 1 }}
+          opts={{ renderer: "canvas" }}
+        />
       </div>
       <div className="tactical-border-t px-3 py-1 flex justify-between font-mono text-[10px] text-slate-600">
         <span>2.400</span><span>2.425</span><span>2.450</span><span>2.475</span><span>2.500 GHz</span>
