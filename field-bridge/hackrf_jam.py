@@ -26,6 +26,9 @@ from typing import Any, Callable, Dict, Optional
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from hackrf_device_lock import HackrfDeviceBusy, hackrf_device_lock  # shared device mutex, see that module's docstring
+
 MAX_DURATION_S = 10.0
 SAMPLE_RATE_HZ = 20_000_000  # 20 Msps, matches /CEMA/drone-kit/dronev5/cema/cema_base.py's
                               # proven RATE for these same bands.
@@ -277,6 +280,26 @@ def transmit_burst(
     subprocess logic (kept as a deliberate near-duplicate rather than a
     shared call, per the architecture doc's explicit instruction not to
     change this function at all).
+
+    DEVICE-ACCESS COORDINATION (task #152): jam_bridge.py is a long-lived
+    service that can run concurrently with hackrf_rx.py's sweep loop and
+    ml_classify_bridge.py's gate-check sweep/IQ-capture cycle against the
+    SAME physical HackRF (only one open libusb handle supported at a time).
+    Those two already coordinate via hackrf_device_lock() (see
+    hackrf_device_lock.py, hackrf_rx.py's _one_sweep(), iq_capture.py's
+    capture_iq()) — this jam TX path previously did not participate in that
+    same mutex at all, a real latent collision risk with any of them.  The
+    lock is acquired here around the ENTIRE hackrf_transfer subprocess
+    lifecycle (spawn through poll/terminate/kill), not just the initial
+    Popen call, because for a TX burst the "critical section" IS the whole
+    live transmission, not a single quick blocking call like a one-shot
+    sweep — the device must stay exclusively held for as long as
+    hackrf_transfer actually has it open. If the lock cannot be acquired
+    within LOCK_ACQUIRE_TIMEOUT_S (device busy with another sweep/capture),
+    this returns ok=False with a clear error — same "log clearly, don't
+    crash the caller" convention hackrf_rx.py already uses for
+    HackrfDeviceBusy, so jam_bridge.py sends a normal "failed" jam_ack for
+    this request rather than the whole service dying.
     """
     duration = min(duration_s, MAX_DURATION_S)
     iq_bytes = build_noise_iq(duration, bandwidth_khz)
@@ -293,35 +316,46 @@ def transmit_burst(
             "-a", "1",
         ]
         try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        except FileNotFoundError:
-            return {"ok": False, "error": "hackrf_transfer not found (install the `hackrf` package)",
-                     "stopped_early": False}
-
-        if on_started:
-            on_started(proc)
-
-        deadline = time.time() + duration + 5  # matches CLI's timeout=duration+5 margin
-        stopped_early = False
-        while True:
-            ret = proc.poll()
-            if ret is not None:
-                break
-            if stop_event is not None and stop_event.is_set():
-                proc.terminate()
+            with hackrf_device_lock():
                 try:
-                    proc.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                stopped_early = True
-                break
-            if time.time() > deadline:
-                # Same as the CLI's expected TimeoutExpired boundary: the
-                # bounded burst ran its full duration; this is success, not
-                # failure.
-                proc.kill()
-                break
-            time.sleep(0.1)
+                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                except FileNotFoundError:
+                    return {"ok": False, "error": "hackrf_transfer not found (install the `hackrf` package)",
+                             "stopped_early": False}
+
+                if on_started:
+                    on_started(proc)
+
+                deadline = time.time() + duration + 5  # matches CLI's timeout=duration+5 margin
+                stopped_early = False
+                while True:
+                    ret = proc.poll()
+                    if ret is not None:
+                        break
+                    if stop_event is not None and stop_event.is_set():
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                        stopped_early = True
+                        break
+                    if time.time() > deadline:
+                        # Same as the CLI's expected TimeoutExpired boundary: the
+                        # bounded burst ran its full duration; this is success, not
+                        # failure.
+                        proc.kill()
+                        break
+                    time.sleep(0.1)
+        except HackrfDeviceBusy as e:
+            # Another process (hackrf_rx.py's sweep loop or
+            # ml_classify_bridge.py's gate-check sweep/IQ capture) is
+            # currently holding the device. Treat this exactly like any
+            # other TX-side failure -- log-worthy, but never crash the
+            # bridge process; jam_bridge.py's caller sends a normal
+            # "failed" jam_ack for this request and the service keeps
+            # running for the next one.
+            return {"ok": False, "error": f"HackRF device busy: {e}", "stopped_early": False}
 
         if stopped_early:
             return {"ok": True, "error": None, "stopped_early": True}
