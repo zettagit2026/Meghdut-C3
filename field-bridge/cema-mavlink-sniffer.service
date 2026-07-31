@@ -48,7 +48,7 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 # committed to the repo. Restrict its permissions: chmod 600.
 EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
-ExecStart=/usr/bin/python3 -u mavlink_sniffer.py
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u mavlink_sniffer.py
 Restart=always
 RestartSec=5
 StandardOutput=append:/CEMA/joydipdemo/field-bridge/mavlink_sniffer.log

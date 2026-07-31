@@ -40,7 +40,7 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 # yourself, and remove it again when that authorization period ends.
 EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
-ExecStart=/usr/bin/python3 -u jam_bridge.py
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u jam_bridge.py
 Restart=always
 RestartSec=3
 StandardOutput=append:/CEMA/joydipdemo/field-bridge/jam_bridge.log
