@@ -411,9 +411,31 @@ class DroneCANBridge:
               "ONLY when a real NodeStatus/heartbeat or Fix2/GPS transfer is genuinely "
               "decoded off this bus. No synthetic fallback -- if nothing arrives, "
               "nothing is ever posted.")
+
+        # TASK #151: idle-loop liveness heartbeat, same pattern as
+        # mavlink_sniffer.py's IDLE_HEARTBEAT_INTERVAL_S (task #139). Unlike
+        # the byte-read parsers, this spin() loop gives no per-iteration
+        # signal at all of whether anything genuine arrived (add_handler()
+        # callbacks fire asynchronously inside spin(), not as a return
+        # value) -- so there is otherwise zero periodic liveness signal
+        # after startup, ever. Print a cheap "still listening" line on a
+        # fixed cadence, independent of whether any transfer was ever
+        # decoded, so log-freshness liveness checks can distinguish "alive,
+        # nothing on the bus yet" from "hung".
+        IDLE_HEARTBEAT_INTERVAL_S = 60.0
+        last_idle_heartbeat = 0.0
+
         try:
             while True:
                 self.node.spin(1.0)  # never blocks longer than 1s per iteration
+                now_idle = time.time()
+                if now_idle - last_idle_heartbeat >= IDLE_HEARTBEAT_INTERVAL_S:
+                    last_idle_heartbeat = now_idle
+                    print(f"[dronecan_parser] [heartbeat] still listening on "
+                          f"bustype={self.bustype} channel={self.channel} -- "
+                          f"no DroneCAN traffic decoded in the last "
+                          f"{IDLE_HEARTBEAT_INTERVAL_S:.0f}s (process alive, "
+                          f"nothing on the bus yet).")
         except KeyboardInterrupt:
             pass
         finally:

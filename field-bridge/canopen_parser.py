@@ -239,9 +239,29 @@ def run(console_url: str, email: str, password: str,
           "running. Posts a detection ONLY when a real CiA301 error-control "
           "frame is decoded off this bus. No synthetic fallback.")
 
+    # TASK #151: idle-loop liveness heartbeat, same pattern as
+    # mavlink_sniffer.py's IDLE_HEARTBEAT_INTERVAL_S (task #139). This main
+    # loop is a bare `sleep(1)` with no per-iteration signal at all -- all
+    # real work happens asynchronously inside canopen's own listener thread
+    # via on_error_control() -- so there is otherwise zero periodic liveness
+    # log after startup, ever. Print a cheap "still listening" line on a
+    # fixed cadence, independent of whether any node's heartbeat was ever
+    # decoded, so log-freshness liveness checks can distinguish "alive,
+    # nothing on the bus yet" from "hung".
+    IDLE_HEARTBEAT_INTERVAL_S = 60.0
+    last_idle_heartbeat = 0.0
+
     try:
         while True:
             time.sleep(1)
+            now_idle = time.time()
+            if now_idle - last_idle_heartbeat >= IDLE_HEARTBEAT_INTERVAL_S:
+                last_idle_heartbeat = now_idle
+                print(f"[heartbeat] still listening on CANopen bus "
+                      f"interface={interface} channel={channel} -- no CiA301 "
+                      f"error-control frame decoded in the last "
+                      f"{IDLE_HEARTBEAT_INTERVAL_S:.0f}s (process alive, "
+                      f"nothing on the bus yet).")
     except KeyboardInterrupt:
         pass
     finally:

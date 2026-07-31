@@ -1076,6 +1076,17 @@ class CRSFSerialBridge:
               "ONLY when a real CRC8-verified CRSF frame is decoded off the wire. "
               "If no such traffic ever arrives, nothing is ever posted -- there is "
               "no synthetic fallback, by design.")
+
+        # TASK #151: idle-loop liveness heartbeat, same pattern as
+        # mavlink_sniffer.py's IDLE_HEARTBEAT_INTERVAL_S (task #139). This
+        # process is legitimately silent for long stretches whenever no real
+        # CRSF traffic is on the wire -- print a cheap "still listening" line
+        # on a fixed cadence, independent of whether any frame was ever seen,
+        # so log-freshness liveness checks can distinguish "alive, nothing on
+        # the wire yet" from "hung".
+        IDLE_HEARTBEAT_INTERVAL_S = 60.0
+        last_idle_heartbeat = 0.0
+
         while True:
             try:
                 chunk = ser.read(256)  # blocks up to timeout=1s, never portMAX_DELAY-style forever
@@ -1084,6 +1095,13 @@ class CRSFSerialBridge:
                 time.sleep(0.5)
                 continue
             if not chunk:
+                now_idle = time.time()
+                if now_idle - last_idle_heartbeat >= IDLE_HEARTBEAT_INTERVAL_S:
+                    last_idle_heartbeat = now_idle
+                    print(f"[crsf_parser] [heartbeat] still listening on "
+                          f"{self.serial_device} -- no CRSF traffic decoded in "
+                          f"the last {IDLE_HEARTBEAT_INTERVAL_S:.0f}s (process "
+                          f"alive, nothing on the wire yet).")
                 continue  # genuinely nothing on the link this second -- expected, not an error
             for frame in self.parser.feed_bytes(chunk):
                 self._ingest(frame)

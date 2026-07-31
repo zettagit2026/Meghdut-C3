@@ -12,6 +12,7 @@ from typing import Dict, List
 
 import pytest
 
+import graupner_hott_parser
 from graupner_hott_parser import (
     HOTT_BINARY_BODY_LEN,
     HOTT_BINARY_FRAME_LEN,
@@ -35,6 +36,7 @@ from graupner_hott_parser import (
     HoTTParser,
     HoTTRequestFrame,
     HoTTResponseFrame,
+    HoTTSerialBridge,
     SENSOR_TYPE_NAMES,
     build_binary_frame,
     build_text_frame,
@@ -351,3 +353,55 @@ def test_mixed_request_and_response_stream():
     assert len(frames) == 2
     assert isinstance(frames[0], HoTTRequestFrame)
     assert isinstance(frames[1], HoTTResponseFrame)
+
+
+# -----------------------------------------------------------------------
+# TASK #151: run_forever() idle-loop liveness heartbeat (same pattern as
+# mavlink_sniffer.py's IDLE_HEARTBEAT_INTERVAL_S, task #139). Verifies the
+# "still listening" print fires on the fixed cadence when the serial link
+# is genuinely idle (empty reads), and not more often than that cadence.
+# -----------------------------------------------------------------------
+
+class _StopLoop(BaseException):
+    """Sentinel used to break run_forever()'s `while True` after a fixed
+    number of iterations, so the test doesn't hang. Deliberately derives
+    from BaseException (like KeyboardInterrupt), NOT Exception -- the read
+    loop's `except Exception` (for real serial I/O errors) would otherwise
+    swallow this sentinel too and loop forever instead of propagating out."""
+
+
+class _FakeIdleSerial:
+    """Fake serial.Serial-like object whose .read() always returns an empty
+    chunk (genuinely idle link), and raises _StopLoop once the caller has
+    exhausted the number of reads the test wants to observe."""
+
+    def __init__(self, max_reads: int):
+        self.max_reads = max_reads
+        self.n = 0
+
+    def read(self, size):
+        self.n += 1
+        if self.n > self.max_reads:
+            raise _StopLoop()
+        return b""
+
+
+def test_run_forever_prints_idle_heartbeat_on_cadence(monkeypatch, capsys):
+    bridge = HoTTSerialBridge("http://console.example", {}, "/dev/fake-hott",
+                               email="e@example.com", password="pw")
+    fake_serial = _FakeIdleSerial(max_reads=3)
+    monkeypatch.setattr(bridge, "_open_serial", lambda: fake_serial)
+
+    # Fake clock: three idle reads at t=1000, t=1061, t=1062 (61s then 1s
+    # apart) so exactly two of the three should cross the 60s cadence.
+    fake_times = iter([1000.0, 1061.0, 1062.0])
+    monkeypatch.setattr(graupner_hott_parser.time, "time", lambda: next(fake_times))
+
+    with pytest.raises(_StopLoop):
+        bridge.run_forever()
+
+    out = capsys.readouterr().out
+    heartbeat_lines = [line for line in out.splitlines() if "[heartbeat]" in line]
+    assert len(heartbeat_lines) == 2
+    assert "still listening" in heartbeat_lines[0]
+    assert "/dev/fake-hott" in heartbeat_lines[0]
