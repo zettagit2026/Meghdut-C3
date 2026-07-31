@@ -1,9 +1,21 @@
 import { useEffect, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Radio, AlertTriangle } from "lucide-react";
+import { Radio, AlertTriangle, ShieldAlert } from "lucide-react";
 import SafetyGate, { JAM_CHECKS } from "@/components/SafetyGate";
 import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
+
+// task #146: /jam/status polling previously swallowed failures in an empty
+// catch block, so if polling died (backend restart, network partition, auth
+// expiry) the jam session cards would freeze on their last-known status
+// (e.g. "AWAITING ACK" / "TRANSMITTING") with zero indication that
+// monitoring itself had stopped. Same tracking pattern as
+// SystemHealth.jsx (task #144): consecutive-failure count + last-success
+// timestamp, ~4x this page's own 2s poll interval for the staleness
+// threshold.
+const POLL_INTERVAL_MS = 2000;
+const MAX_CONSECUTIVE_FAILURES = 3;
+const STALE_THRESHOLD_MS = POLL_INTERVAL_MS * 4; // ~8s
 
 const BANDS = [
   { value: "433", label: "433 MHz (SiK ISM lower)" },
@@ -52,14 +64,33 @@ export default function Jamming() {
   const [gateOpen, setGateOpen] = useState(false);
   const [sessions, setSessions] = useState([]);
   const [submitting, setSubmitting] = useState(false);
+  const [lastSuccessAt, setLastSuccessAt] = useState(null);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
 
   const loadStatus = async () => {
     try {
       const { data } = await api.get("/jam/status");
       setSessions(data.sessions || []);
-    } catch (e) { /* non-fatal — status polling failure shouldn't spam toasts every 2s */ }
+      setLastSuccessAt(Date.now());
+      setConsecutiveFailures(0);
+    } catch (e) {
+      setConsecutiveFailures((n) => n + 1);
+    }
   };
-  useEffect(() => { loadStatus(); const id = setInterval(loadStatus, 2000); return () => clearInterval(id); }, []);
+  useEffect(() => { loadStatus(); const id = setInterval(loadStatus, POLL_INTERVAL_MS); return () => clearInterval(id); }, []);
+
+  // Local clock tick so staleness (time-since-last-success) updates even
+  // between poll ticks — same pattern as SystemHealth.jsx.
+  useEffect(() => {
+    const tickId = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tickId);
+  }, []);
+
+  const staleByAge = lastSuccessAt != null && now - lastSuccessAt > STALE_THRESHOLD_MS;
+  const staleByFailures = consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+  const neverSucceeded = lastSuccessAt == null && consecutiveFailures > 0;
+  const statusUnconfirmed = staleByAge || staleByFailures || neverSucceeded;
 
   const active = sessions.find((s) => s.status === "AWAITING_ACK" || s.status === "JAM_ACTIVE");
   const isGnssTarget = GNSS_BANDS.has(band);
@@ -223,6 +254,18 @@ export default function Jamming() {
           <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 mb-3">
             Jam Sessions
           </div>
+          {statusUnconfirmed && (
+            <div
+              data-testid="jam-status-unconfirmed-banner"
+              className="mb-3 flex items-center gap-2 px-3 py-2 pulse-crit"
+              style={{ background: "#FF9500", color: "black" }}
+            >
+              <ShieldAlert size={14} strokeWidth={2} />
+              <span className="font-mono text-[10px] font-bold uppercase tracking-widest">
+                STATUS UNCONFIRMED — jam status feed stale, session states below may be out of date
+              </span>
+            </div>
+          )}
           {sessions.length === 0 && (
             <div className="font-mono text-xs text-slate-600 text-center py-8">
               no jam sessions yet<span className="term-caret" />

@@ -1,7 +1,8 @@
-import { useEffect, useState, useCallback } from "react";
-import { Radiation, AlertOctagon, X } from "lucide-react";
+import { useState } from "react";
+import { Radiation, AlertOctagon, ShieldAlert, X } from "lucide-react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
+import { useRangeAuthStatus, fmtRemaining } from "@/hooks/useRangeAuthStatus";
 
 // Higher-level, additive gate per backend/RANGE_AUTHORIZATION_REDESIGN.md.
 // This is NOT a replacement for SafetyGate's per-action ARM&FIRE->CONFIRM
@@ -16,48 +17,16 @@ import { toast } from "sonner";
 
 const CONFIRM_PHRASE = "AUTHORIZE LIVE RANGE";
 
-function fmtRemaining(seconds) {
-  if (seconds == null || seconds < 0) return "--:--";
-  const m = Math.floor(seconds / 60);
-  const s = Math.floor(seconds % 60);
-  return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
-}
-
 export default function RangeAuthorizationControl({ effect, label }) {
-  const [status, setStatus] = useState(null);
-  const [remaining, setRemaining] = useState(null);
+  // Polling + staleness tracking (task #146) lives in the shared
+  // hooks/useRangeAuthStatus.js hook, used by both this control and
+  // RangeAuthorizationBanner.jsx.
+  const { status, remaining, applyStatus, statusUnconfirmed } = useRangeAuthStatus(effect);
   const [modalOpen, setModalOpen] = useState(false);
   const [password, setPassword] = useState("");
   const [phrase, setPhrase] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [disabling, setDisabling] = useState(false);
-
-  const poll = useCallback(async () => {
-    try {
-      const { data } = await api.get("/range-authorization/status", { params: { effect } });
-      setStatus(data);
-      setRemaining(data?.seconds_remaining ?? null);
-    } catch {
-      // non-fatal — status polling failure shouldn't spam toasts
-    }
-  }, [effect]);
-
-  useEffect(() => {
-    poll();
-    const id = setInterval(poll, 3000);
-    return () => clearInterval(id);
-  }, [poll]);
-
-  useEffect(() => {
-    if (!status?.enabled || !status?.expires_at) return;
-    const tick = () => {
-      const ms = new Date(status.expires_at).getTime() - Date.now();
-      setRemaining(Math.max(0, Math.floor(ms / 1000)));
-    };
-    tick();
-    const id = setInterval(tick, 1000);
-    return () => clearInterval(id);
-  }, [status?.enabled, status?.expires_at]);
 
   const openModal = () => {
     // Always start from a fresh, empty state — never pre-fill/bind from any
@@ -86,8 +55,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
         password,
         confirm_phrase: phrase,
       });
-      setStatus(data);
-      setRemaining(data?.seconds_remaining ?? null);
+      applyStatus(data);
       toast.success(`RANGE AUTHORIZATION ENABLED — ${label}`, {
         description: `Lease active — expires ${data?.expires_at || ""}`,
       });
@@ -103,7 +71,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
     setDisabling(true);
     try {
       const { data } = await api.post("/range-authorization", { effect, enabled: false });
-      setStatus(data);
+      applyStatus(data);
       toast.success(`RANGE AUTHORIZATION DISABLED — ${label}`);
     } catch (err) {
       toast.error("Disable failed", { description: formatApiError(err) });
@@ -143,6 +111,19 @@ export default function RangeAuthorizationControl({ effect, label }) {
               </span>
             </div>
           </div>
+          {statusUnconfirmed && (
+            <div
+              data-testid={`range-auth-control-unconfirmed-${effect}`}
+              className="flex items-center gap-2 px-3 py-2 pulse-crit"
+              style={{ background: "#FF9500", color: "black" }}
+            >
+              <ShieldAlert size={14} strokeWidth={2} />
+              <span className="font-mono text-[10px] font-bold uppercase tracking-widest">
+                STATUS UNCONFIRMED — status feed stale, real range state not verified — countdown may
+                not reflect reality
+              </span>
+            </div>
+          )}
           <div className="font-mono text-[10px] text-slate-500">
             armed by <span className="text-slate-300">{status?.enabled_by || "unknown"}</span>
             {status?.enabled_at ? <> at <span className="text-slate-300">{status.enabled_at}</span></> : null}
