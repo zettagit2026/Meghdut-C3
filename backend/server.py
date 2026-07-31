@@ -3620,8 +3620,8 @@ async def mission_pdf(user: Dict = Depends(get_current_user)):
     story.append(Spacer(1, 8))
 
     # Summary tile
-    active = sum(1 for d in detections if d["status"] == "ACTIVE")
-    neutralized = sum(1 for d in detections if d["status"] == "NEUTRALIZED")
+    active = sum(1 for d in detections if d.get("status", "") == "ACTIVE")
+    neutralized = sum(1 for d in detections if d.get("status", "") == "NEUTRALIZED")
     story.append(Paragraph("Executive Summary", h2))
     sum_tbl = Table(
         [
