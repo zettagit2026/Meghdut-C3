@@ -10,13 +10,7 @@ import UnconfirmedTag from "@/components/UnconfirmedTag";
 import { isUnconfirmedDetection, shouldShowUnconfirmedTag, getOriginalModelAnnotation } from "@/lib/detectionConfidence";
 import { isRecentCritical, isStaticCritical } from "@/lib/threatSalience";
 import { announceNewCriticalContacts, isCriticalAlertMuted, setCriticalAlertMuted } from "@/lib/criticalAlertSound";
-
-const THREAT_COLOR = {
-  LOW: "var(--accent-success)",
-  MEDIUM: "var(--accent-warning)",
-  HIGH: "#FF8A00",
-  CRITICAL: "var(--accent-critical)",
-};
+import { THREAT_COLOR } from "@/lib/threatLevels";
 
 // Task #117: "Export IQ for RE analysis". Downloads the SigMF .sigmf-data/
 // .sigmf-meta pair (see backend GET /detections/{id}/iq-export) as a zip so

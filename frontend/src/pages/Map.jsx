@@ -4,6 +4,7 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { MapPin, AlertTriangle } from "lucide-react";
+import { THREAT_COLOR_HEX as THREAT_COLOR } from "@/lib/threatLevels";
 
 // ---------------------------------------------------------------------------
 // HONESTY NOTE (read before touching this file):
@@ -33,13 +34,6 @@ import { MapPin, AlertTriangle } from "lucide-react";
 // SENSOR_LAT/SENSOR_LON), gated on `bearing_available` from
 // GET /sensor/position and a per-detection "this bearing is real" flag.
 // ---------------------------------------------------------------------------
-
-const THREAT_COLOR = {
-  LOW: "#39FF14",
-  MEDIUM: "#FFD60A",
-  HIGH: "#FF8A00",
-  CRITICAL: "#FF3B30",
-};
 
 // Metres -> approximate degrees offset at a given latitude (WGS84 sphere
 // approximation, plenty accurate for a UI ring at few-km scale).

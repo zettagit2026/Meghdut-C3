@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { Bomb, AlertTriangle, Target as TargetIcon, ShieldCheck, ShieldOff, Signal } from "lucide-react";
@@ -39,9 +39,21 @@ function FpvVideoPanel() {
   const [captureState, setCaptureState] = useState("idle"); // idle | pending | timeout
   const [captureError, setCaptureError] = useState(null);
 
+  // Guards against setState-after-unmount: load() is invoked repeatedly by
+  // the polling intervals below across the component's whole lifetime (not
+  // just once per effect run), so a single ref flipped on unmount -- rather
+  // than a per-effect "let cancelled" local -- is what actually protects
+  // every in-flight call. Same intent as the cancelled-flag pattern used in
+  // DetectionHistory.jsx's CadencePanel and GnssSpoof.jsx's preview fetch.
+  const cancelledRef = useRef(false);
+  useEffect(() => {
+    return () => { cancelledRef.current = true; };
+  }, []);
+
   const load = async () => {
     try {
       const { data } = await api.get("/fpv/latest-frame");
+      if (cancelledRef.current) return;
       setMeta((prev) => {
         // Real completion signal: a genuinely new captured_at timestamp
         // after a capture was requested -- no fake instant "success".
@@ -51,6 +63,7 @@ function FpvVideoPanel() {
         }
         return data;
       });
+      if (cancelledRef.current) return;
       setImgKey((k) => k + 1);
     } catch { /* silent */ }
   };

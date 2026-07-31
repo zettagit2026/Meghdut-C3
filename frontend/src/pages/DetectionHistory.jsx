@@ -9,13 +9,7 @@ import UnconfirmedTag from "@/components/UnconfirmedTag";
 import { isUnconfirmedDetection, shouldShowUnconfirmedTag, getOriginalModelAnnotation } from "@/lib/detectionConfidence";
 import { isStaticCritical } from "@/lib/threatSalience";
 import { AlertTriangle } from "lucide-react";
-
-const THREAT_COLOR = {
-  LOW: "var(--accent-success)",
-  MEDIUM: "var(--accent-warning)",
-  HIGH: "#FF8A00",
-  CRITICAL: "var(--accent-critical)",
-};
+import { THREAT_COLOR } from "@/lib/threatLevels";
 
 // Status badge colors — kept consistent with KillChain.jsx's AWAITING_ACK /
 // TX_FAILED / TX_TIMEOUT convention (amber = pending ack, red-family =
