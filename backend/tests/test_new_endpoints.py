@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import secrets
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -50,6 +51,25 @@ def token() -> str:
 @pytest.fixture(scope="module")
 def auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
+
+
+def _ingest_detection(auth_headers: dict) -> dict:
+    """Create a fresh, uniquely-identified ACTIVE detection via the real
+    /detections/ingest endpoint (mirrors test_backend.py's helper of the
+    same name). Used by test_pdf_returns_valid_file so that test seeds its
+    own contact data instead of relying on detections left behind by
+    another test/class in this module."""
+    body = {
+        "callsign": f"PDFTEST-{uuid.uuid4().hex[:8]}",
+        "model": f"Test UAV {uuid.uuid4().hex[:8]}",
+        "protocol": "Test-Protocol",
+        "threat_level": "MEDIUM",
+        "center_freq_ghz": round(2.400 + secrets.randbelow(400) / 1000, 3),
+        "source": "HACKRF",
+    }
+    r = requests.post(f"{API}/detections/ingest", headers=auth_headers, json=body, timeout=15)
+    assert r.status_code == 200, f"detections/ingest failed: {r.status_code} {r.text}"
+    return r.json()
 
 
 # ------------- System health -------------
@@ -141,6 +161,20 @@ class TestEmergencyAbort:
 # ------------- Mission PDF -------------
 class TestMissionPDF:
     def test_pdf_returns_valid_file(self, auth_headers):
+        # Self-contained fixture data: /report/mission.pdf renders whatever
+        # is currently in db.detections / db.mission_log (see
+        # mission_pdf() in server.py), so this test must not depend on
+        # TestHealth/TestEmergencyAbort (or any other class in this module)
+        # having already run and left behind mission_log entries /
+        # detections -- it used to pass only because of that incidental
+        # ordering. Create its own detections and its own mission_log
+        # entry (via /emergency/abort) so the PDF has real content and the
+        # >= 5KB size assertion holds regardless of execution order.
+        for _ in range(3):
+            _ingest_detection(auth_headers)
+        r_abort = requests.post(f"{API}/emergency/abort", headers=auth_headers, timeout=10)
+        assert r_abort.status_code == 200, r_abort.text
+
         r = requests.get(f"{API}/report/mission.pdf", headers=auth_headers, timeout=30)
         assert r.status_code == 200, r.text[:400]
         ctype = r.headers.get("content-type", "")
