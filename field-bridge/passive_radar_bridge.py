@@ -154,6 +154,14 @@ def run_once(args, headers: dict) -> int:
         surveillance_antenna_boresight_deg=args.antenna_boresight_deg,
     )
     posted = 0
+    # Idle-loop liveness heartbeat, same pattern as mavlink_sniffer.py's
+    # IDLE_HEARTBEAT_INTERVAL_S (task #139). This loop is legitimately
+    # silent whenever blocks are processed but nothing clears min_snr_db --
+    # print a cheap "still scanning" line on a fixed cadence, independent of
+    # whether any detection was ever found, so log-freshness liveness checks
+    # can distinguish "alive, nothing above threshold" from "hung".
+    IDLE_HEARTBEAT_INTERVAL_S = 60.0
+    last_idle_heartbeat = 0.0
     try:
         source = build_source(args)
         with source:
@@ -170,6 +178,15 @@ def run_once(args, headers: dict) -> int:
                     max_lag=args.max_lag, dsi_enabled=not args.no_dsi,
                     min_snr_db=args.min_snr_db,
                 )
+                if not detections:
+                    now_idle = time.time()
+                    if now_idle - last_idle_heartbeat >= IDLE_HEARTBEAT_INTERVAL_S:
+                        last_idle_heartbeat = now_idle
+                        print(f"[passive_radar] [heartbeat] still scanning radar blocks "
+                              f"(block {block_num}) -- 0 detections above SNR threshold "
+                              f"({args.min_snr_db:.1f} dB) in the last "
+                              f"{IDLE_HEARTBEAT_INTERVAL_S:.0f}s (process alive).",
+                              file=sys.stderr)
                 for det in detections:
                     body = detection_to_ingest_body(det, illuminator, receiver)
                     print(f"[passive_radar] block {block_num}: range={det.range_m:.1f}m "

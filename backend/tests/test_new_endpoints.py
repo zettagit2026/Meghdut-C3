@@ -26,7 +26,7 @@ else:
 assert BASE_URL, "REACT_APP_BACKEND_URL not resolvable"
 
 API = f"{BASE_URL}/api"
-ADMIN_EMAIL = "operator@cema.mil"
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "operator@meghaduta.mil")
 # Task #127: never hardcode a real password here -- server.py's
 # _PLACEHOLDER_SECRETS blocklist refuses to boot with known placeholder
 # values (the old "cema@2026" literal that used to live here included), so a

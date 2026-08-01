@@ -123,7 +123,14 @@ from hackrf_rx import (  # gate math reused verbatim from the live energy-detect
 from gamutrf_infer import GamutRFClassifier, load_sigmf
 from ml_calibration import load_calibration, is_ood
 
-DEFAULT_CHECKPOINT = "/tmp/resnet18_leesburg_split_0.02_1_current.pt"
+# Default lives under the project directory, not /tmp -- /tmp is wiped on
+# reboot and would silently strand this checkpoint (same
+# ephemeral-/tmp-storage fix already applied to fpv_video_bridge.py's
+# DEFAULT_FPV_CAPTURE_DIR, task #137). CEMA_ML_CHECKPOINT still overrides.
+DEFAULT_CHECKPOINT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "models",
+    "resnet18_leesburg_split_0.02_1_current.pt"
+)
 
 # UNCLASSIFIED-SIGNAL THRESHOLD (2026-07-23): the deployed checkpoint is a
 # closed-world 3-class model {drone, wifi_2_4, wifi_5} with no reject/

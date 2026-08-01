@@ -25,15 +25,15 @@ export default function Signals() {
   // instead of having to hunt for it in the contacts rail.
   const [searchParams] = useSearchParams();
   const deepLinkedId = searchParams.get("contact");
-  const appliedDeepLinkRef = useRef(false);
+  const appliedDeepLinkIdRef = useRef(null);
 
   const load = async () => {
     try {
       const { data } = await api.get("/detections");
       setDets(data);
       setSelected((prev) => {
-        if (deepLinkedId && !appliedDeepLinkRef.current && data.some((d) => d.id === deepLinkedId)) {
-          appliedDeepLinkRef.current = true;
+        if (deepLinkedId && appliedDeepLinkIdRef.current !== deepLinkedId && data.some((d) => d.id === deepLinkedId)) {
+          appliedDeepLinkIdRef.current = deepLinkedId;
           return deepLinkedId;
         }
         if (!prev && data.length) {
@@ -47,6 +47,14 @@ export default function Signals() {
   };
 
   useEffect(() => { load(); const id = setInterval(load, 4000); return () => clearInterval(id); }, []); // eslint-disable-line
+
+  // The polling effect above intentionally has an empty dep array so the
+  // interval isn't torn down/recreated on every render; its `load` closure
+  // is therefore fixed at mount and never sees a later `deepLinkedId`. This
+  // effect re-runs `load()` (with a fresh closure) whenever the deep-link
+  // target changes, so navigating from ?contact=A to ?contact=B without a
+  // remount still jumps to the new contact.
+  useEffect(() => { if (deepLinkedId) load(); }, [deepLinkedId]); // eslint-disable-line
 
   const current = dets.find((d) => d.id === selected);
 

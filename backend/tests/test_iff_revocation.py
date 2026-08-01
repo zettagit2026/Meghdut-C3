@@ -33,7 +33,7 @@ assert BASE_URL, "REACT_APP_BACKEND_URL not resolvable"
 API = f"{BASE_URL}/api"
 # The seeded admin account is provisioned with role="commander" (see
 # backend/server.py startup()) -- same account test_new_endpoints.py uses.
-ADMIN_EMAIL = "operator@cema.mil"
+ADMIN_EMAIL = os.environ.get("ADMIN_EMAIL", "operator@meghaduta.mil")
 # Task #127: never hardcode a real password here -- server.py's
 # _PLACEHOLDER_SECRETS blocklist refuses to boot with known placeholder
 # values (the old "cema@2026" literal that used to live here included), so a
@@ -43,6 +43,11 @@ ADMIN_EMAIL = "operator@cema.mil"
 # invocation) and only fall back to a random session-only value -- generated
 # fresh each run, never written to disk -- if the harness didn't export one.
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD") or secrets.token_urlsafe(16)
+# POST /iff/beacons/ingest now requires this separate bridge-only shared
+# secret in addition to JWT auth (see backend/server.py's IFF_BRIDGE_API_KEY
+# docstring) -- reuse whatever the backend was actually booted with, same
+# convention as ADMIN_PASSWORD above.
+IFF_BRIDGE_API_KEY = os.environ.get("IFF_BRIDGE_API_KEY") or secrets.token_urlsafe(16)
 
 
 @pytest.fixture(scope="module")
@@ -117,7 +122,8 @@ class TestIFFRevocation:
             "distance_m": None,
         }
         r = requests.post(f"{API}/iff/beacons/ingest", json=ingest_body,
-                           headers=auth_headers, timeout=10)
+                           headers={**auth_headers, "X-IFF-Bridge-Key": IFF_BRIDGE_API_KEY},
+                           timeout=10)
         assert r.status_code == 200, r.text
 
         before = requests.get(f"{API}/iff/friendlies", headers=auth_headers, timeout=10)

@@ -522,14 +522,35 @@ class SmartPortSerialBridge:
             "a signal inverter will NOT see valid S.Port framing.",
             self.port, self.baud,
         )
+        # Idle-loop liveness heartbeat, same pattern as mavlink_sniffer.py's
+        # IDLE_HEARTBEAT_INTERVAL_S (task #139). This loop is legitimately
+        # silent whenever the S.Port bus is quiet -- print a cheap "still
+        # reading" line on a fixed cadence, independent of whether any frame
+        # was ever seen, so log-freshness liveness checks can distinguish
+        # "alive, nothing on the wire yet" from "hung".
+        IDLE_HEARTBEAT_INTERVAL_S = 60.0
+        last_idle_heartbeat = 0.0
+        frames_since_heartbeat = 0
+
         with serial.Serial(self.port, self.baud, timeout=1) as ser:
             while True:
                 chunk = ser.read(256)
                 if not chunk:
+                    now_idle = time.time()
+                    if now_idle - last_idle_heartbeat >= IDLE_HEARTBEAT_INTERVAL_S:
+                        last_idle_heartbeat = now_idle
+                        log.info(
+                            "[heartbeat] still reading S.Port serial on %s -- "
+                            "%d frame(s) decoded in the last %.0fs (process "
+                            "alive, nothing on the wire yet).",
+                            self.port, frames_since_heartbeat, IDLE_HEARTBEAT_INTERVAL_S,
+                        )
+                        frames_since_heartbeat = 0
                     continue
                 for byte in chunk:
                     frame = self._parser.feed(byte)
                     if frame is not None:
+                        frames_since_heartbeat += 1
                         self.on_frame(frame)
 
 

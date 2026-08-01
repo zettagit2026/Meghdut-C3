@@ -4,13 +4,7 @@ import { toast } from "sonner";
 import { Bomb, AlertTriangle, Target as TargetIcon, ShieldCheck, ShieldOff, Signal } from "lucide-react";
 import SafetyGate, { SAFETY_GATED } from "@/components/SafetyGate";
 import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
-
-const SEV_COLOR = {
-  LOW: "var(--accent-success)",
-  MEDIUM: "var(--accent-warning)",
-  HIGH: "#FF8A00",
-  CRITICAL: "var(--accent-critical)",
-};
+import { THREAT_COLOR } from "@/lib/threatLevels";
 
 const CAT_LABEL = {
   kinetic: "KINETIC",
@@ -388,7 +382,7 @@ export default function Payloads() {
               </span>
               <span
                 className="px-2 py-0.5 tactical-border font-mono font-bold text-[10px]"
-                style={{ color: SEV_COLOR[p.severity], borderColor: SEV_COLOR[p.severity] }}
+                style={{ color: THREAT_COLOR[p.severity], borderColor: THREAT_COLOR[p.severity] }}
               >
                 {p.severity}
               </span>

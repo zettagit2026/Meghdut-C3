@@ -2,7 +2,7 @@ import { Fragment, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { History } from "lucide-react";
+import { History, ShieldAlert } from "lucide-react";
 import MlClassifierBadge from "@/components/MlClassifierBadge";
 import ConfidenceTypeBadge from "@/components/ConfidenceTypeBadge";
 import UnconfirmedTag from "@/components/UnconfirmedTag";
@@ -28,6 +28,10 @@ const STATUS_STYLE = {
 const STATUS_FILTERS = ["ALL", "ACTIVE", "LOST", "AWAITING_ACK", "NEUTRALIZED", "TX_FAILED", "TX_TIMEOUT"];
 
 const ROW_CAP = 100;
+
+const POLL_INTERVAL_MS = 60000;
+const MAX_CONSECUTIVE_FAILURES = 3;
+const STALE_THRESHOLD_MS = POLL_INTERVAL_MS * 4;
 
 // Small local relative-time formatter (no date lib in this project) so
 // "LAST SEEN" reads as "3s ago" / "2m ago" / "1h ago" and keeps ticking live.
@@ -138,22 +142,30 @@ export default function DetectionHistory() {
   const [statusFilter, setStatusFilter] = useState("ALL");
   const [visibleCount, setVisibleCount] = useState(ROW_CAP);
   const [expandedId, setExpandedId] = useState(null);
+  const [lastSuccessAt, setLastSuccessAt] = useState(null);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
 
-  const load = async () => {
+  const load = async (cancelled) => {
     try {
       const { data } = await api.get("/detections");
+      if (cancelled?.current) return;
       setDetections(data);
+      setLastSuccessAt(Date.now());
+      setConsecutiveFailures(0);
     } catch (e) {
+      if (cancelled?.current) return;
+      setConsecutiveFailures((n) => n + 1);
       toast.error("Failed to load detection history", { description: formatApiError(e) });
     } finally {
-      setLoading(false);
+      if (!cancelled?.current) setLoading(false);
     }
   };
 
   useEffect(() => {
-    load();
-    const id = setInterval(load, 60000);
-    return () => clearInterval(id);
+    const cancelled = { current: false };
+    load(cancelled);
+    const id = setInterval(() => load(cancelled), POLL_INTERVAL_MS);
+    return () => { cancelled.current = true; clearInterval(id); };
   }, []);
 
   useEffect(() => {
@@ -182,6 +194,11 @@ export default function DetectionHistory() {
     return c;
   }, [detections]);
 
+  const staleByAge = lastSuccessAt != null && now - lastSuccessAt > STALE_THRESHOLD_MS;
+  const staleByFailures = consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+  const neverSucceeded = lastSuccessAt == null && consecutiveFailures > 0;
+  const monitoringDegraded = staleByAge || staleByFailures || neverSucceeded;
+
   return (
     <div className="space-y-6">
       <div>
@@ -192,6 +209,19 @@ export default function DetectionHistory() {
           All Contacts
         </h1>
       </div>
+
+      {monitoringDegraded && (
+        <div
+          data-testid="history-monitoring-degraded-banner"
+          className="tactical-border px-4 py-2 flex items-center gap-2 pulse-crit"
+          style={{ background: "#FF9500", color: "black" }}
+        >
+          <ShieldAlert size={14} strokeWidth={2} />
+          <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
+            MONITORING DEGRADED — detection feed stale, history below may be out of date
+          </span>
+        </div>
+      )}
 
       <div className="flex flex-wrap gap-2">
         {STATUS_FILTERS.map((s) => {

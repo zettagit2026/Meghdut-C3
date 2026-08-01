@@ -12,6 +12,8 @@
 #   JWT_SECRET=<output of: openssl rand -hex 32>
 #   ADMIN_EMAIL=<real operator email>
 #   ADMIN_PASSWORD=<a strong, non-default password>
+#   IFF_BRIDGE_API_KEY=<output of: openssl rand -hex 32 -- also set identically
+#     in field-bridge/iff_beacon_bridge.py's own env, see field-bridge/README.md>
 #   CORS_ORIGINS=http://localhost:3000,http://<your-LAN-IP>:3000
 # The backend fails fast at startup if any of these are unset or match a
 # known placeholder/default value (see backend/server.py).
@@ -50,6 +52,10 @@ services:
       JWT_SECRET: "${JWT_SECRET}"
       ADMIN_EMAIL: "${ADMIN_EMAIL}"
       ADMIN_PASSWORD: "${ADMIN_PASSWORD}"
+      # Separate trust boundary secret for POST /api/iff/beacons/ingest --
+      # see backend/server.py's IFF_BRIDGE_API_KEY docstring. Must match the
+      # value configured on the field-bridge/iff_beacon_bridge.py host.
+      IFF_BRIDGE_API_KEY: "${IFF_BRIDGE_API_KEY}"
       # Optional -- real surveyed sensor GPS coordinates for the Map page.
       # Unset by default (server.py treats missing/empty as "not configured"
       # and reports that honestly rather than falling back to a fake

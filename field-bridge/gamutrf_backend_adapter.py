@@ -99,6 +99,7 @@ from hackrf_rx import (
     DETECT_THRESHOLD_DB,
     estimate_distance_m,
     login,
+    _post_with_reauth,  # shared 401-retry-once helper -- see hackrf_rx.py for rationale
 )
 
 try:
@@ -195,6 +196,8 @@ def _gate(band_name: str, power_dbm: Optional[float]) -> bool:
 class Adapter:
     def __init__(self, console_url: str, email: str, password: str):
         self.console_url = console_url
+        self.email = email
+        self.password = password
         self.token = login(console_url, email, password)
         self.headers = {"Authorization": f"Bearer {self.token}"}
         self._last_ingest_by_band: dict = {}
@@ -260,8 +263,9 @@ class Adapter:
                   f"posting with ml_gated=False for visibility, not suppressing.")
 
         try:
-            requests.post(f"{self.console_url}/api/detections/ingest",
-                          json=det, headers=self.headers, timeout=10)
+            _post_with_reauth(self.console_url, "/api/detections/ingest", det,
+                               self.headers, self.email, self.password, timeout=10,
+                               bridge_name="gamutrf_backend_adapter")
             print(f"[gamutrf_backend_adapter] [{label_human}] ingested: "
                   f"{fields['label']} conf={fields['confidence']:.4f} gated={ml_gated}")
         except requests.RequestException as e:

@@ -278,7 +278,8 @@ def classify_window_via_classidyne(
     chroma_path: str, collection_name: str,
     radionet_checkpoint_path: str,
     similarity_threshold: float = 0.5,
-    tmp_png_path: str = "/tmp/classidyne_query.png",
+    tmp_png_path: str = os.environ.get("CEMA_CLASSIDYNE_QUERY_PNG",
+                                        "/tmp/classidyne_query.png"),
 ) -> Tuple[str, float, Dict[str, float]]:
     """Real, end-to-end spectrogram-similarity second opinion, reimplementing
     Classidyne's RadioNetExtractor + Chroma k-NN vote (see module docstring)

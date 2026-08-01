@@ -3,9 +3,13 @@ import { useSearchParams } from "react-router-dom";
 import CytoscapeComponent from "react-cytoscapejs";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Crosshair, ChevronRight, CheckCircle2, Circle, Loader2, Skull } from "lucide-react";
+import { Crosshair, ChevronRight, CheckCircle2, Circle, Loader2, Skull, ShieldAlert } from "lucide-react";
 
 const CHAIN = ["DETECT", "TRACK", "IDENTIFY", "DECIDE", "DEFEAT"];
+
+const POLL_INTERVAL_MS = 5000;
+const MAX_CONSECUTIVE_FAILURES = 3;
+const STALE_THRESHOLD_MS = POLL_INTERVAL_MS * 4;
 
 // Layout geometry for the preset stage-column layout: one column per
 // kill-chain stage, contacts stacked vertically within their stage's
@@ -43,12 +47,39 @@ export default function KillChain() {
   const scrolledRef = useRef(false);
   const [selectedId, setSelectedId] = useState(null);
   const cyRef = useRef(null);
+  const [lastSuccessAt, setLastSuccessAt] = useState(null);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
 
-  const load = async () => {
-    try { const { data } = await api.get("/detections"); setDets(data); }
-    catch (e) { toast.error("Load failed", { description: formatApiError(e) }); }
+  const load = async (cancelled) => {
+    try {
+      const { data } = await api.get("/detections");
+      if (cancelled?.current) return;
+      setDets(data);
+      setLastSuccessAt(Date.now());
+      setConsecutiveFailures(0);
+    } catch (e) {
+      if (cancelled?.current) return;
+      setConsecutiveFailures((n) => n + 1);
+      toast.error("Load failed", { description: formatApiError(e) });
+    }
   };
-  useEffect(() => { load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, []);
+  useEffect(() => {
+    const cancelled = { current: false };
+    load(cancelled);
+    const id = setInterval(() => load(cancelled), POLL_INTERVAL_MS);
+    return () => { cancelled.current = true; clearInterval(id); };
+  }, []);
+
+  useEffect(() => {
+    const tickId = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tickId);
+  }, []);
+
+  const staleByAge = lastSuccessAt != null && now - lastSuccessAt > STALE_THRESHOLD_MS;
+  const staleByFailures = consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+  const neverSucceeded = lastSuccessAt == null && consecutiveFailures > 0;
+  const monitoringDegraded = staleByAge || staleByFailures || neverSucceeded;
 
   useEffect(() => {
     if (!deepLinkedId || scrolledRef.current || dets.length === 0) return;
@@ -151,6 +182,20 @@ export default function KillChain() {
           Detect → Track → Identify → Decide → Defeat
         </h1>
       </div>
+
+      {monitoringDegraded && (
+        <div
+          data-testid="killchain-monitoring-degraded-banner"
+          className="tactical-border px-4 py-2 flex items-center gap-2 pulse-crit"
+          style={{ background: "#FF9500", color: "black" }}
+        >
+          <ShieldAlert size={14} strokeWidth={2} />
+          <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
+            MONITORING DEGRADED — kill-chain feed stale, statuses below (including AWAITING ACK /
+            NEUTRALIZED) may be out of date
+          </span>
+        </div>
+      )}
 
       {/* Node-link graph: one node per active detection, columns keyed to
           kill-chain stage, dashed edges linking swarm-cluster members. This

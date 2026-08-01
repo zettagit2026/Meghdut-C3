@@ -3,7 +3,7 @@ import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { MapPin, AlertTriangle } from "lucide-react";
+import { MapPin, AlertTriangle, ShieldAlert } from "lucide-react";
 import { THREAT_COLOR_HEX as THREAT_COLOR } from "@/lib/threatLevels";
 
 // ---------------------------------------------------------------------------
@@ -60,27 +60,49 @@ export default function MapView() {
   const [detections, setDetections] = useState([]);
   const [loading, setLoading] = useState(true);
   const markersRef = useRef([]);
+  const [lastSuccessAt, setLastSuccessAt] = useState(null);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
 
-  const load = async () => {
+  const load = async (cancelled) => {
     try {
       const [{ data: sensorData }, { data: detData }] = await Promise.all([
         api.get("/sensor/position"),
         api.get("/detections"),
       ]);
+      if (cancelled?.current) return;
       setSensor(sensorData);
       setDetections(detData || []);
+      setLastSuccessAt(Date.now());
+      setConsecutiveFailures(0);
     } catch (e) {
+      if (cancelled?.current) return;
+      setConsecutiveFailures((n) => n + 1);
       toast.error("Failed to load map data", { description: formatApiError(e) });
     } finally {
-      setLoading(false);
+      if (!cancelled?.current) setLoading(false);
     }
   };
 
   useEffect(() => {
-    load();
-    const id = setInterval(load, 10000);
-    return () => clearInterval(id);
+    const cancelled = { current: false };
+    load(cancelled);
+    const id = setInterval(() => load(cancelled), 10000);
+    return () => { cancelled.current = true; clearInterval(id); };
   }, []);
+
+  useEffect(() => {
+    const tickId = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tickId);
+  }, []);
+
+  const POLL_INTERVAL_MS = 10000;
+  const MAX_CONSECUTIVE_FAILURES = 3;
+  const STALE_THRESHOLD_MS = POLL_INTERVAL_MS * 4;
+  const staleByAge = lastSuccessAt != null && now - lastSuccessAt > STALE_THRESHOLD_MS;
+  const staleByFailures = consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+  const neverSucceeded = lastSuccessAt == null && consecutiveFailures > 0;
+  const monitoringDegraded = staleByAge || staleByFailures || neverSucceeded;
 
   const activeContacts = useMemo(
     () => detections.filter((d) => d.status === "ACTIVE"),
@@ -263,8 +285,8 @@ export default function MapView() {
 
       {!loading && hasSensor && (
         <div
-          className="tactical-border px-4 py-2 flex items-center gap-3"
-          style={{ background: "rgba(0,240,255,0.05)" }}
+          className="tactical-border px-4 py-2 flex items-center gap-3 flex-wrap"
+          style={{ background: monitoringDegraded ? "rgba(255,149,0,0.08)" : "rgba(0,240,255,0.05)" }}
         >
           <span className="font-mono text-[10px] uppercase tracking-widest" style={{ color: "var(--accent-info)" }}>
             ● SENSOR: {sensor.label} @ {sensor.lat.toFixed(5)}, {sensor.lon.toFixed(5)}
@@ -274,6 +296,16 @@ export default function MapView() {
             Bearing/DF hardware: not present — contacts shown as RANGE RINGS only (direction unknown),
             not as position pins
           </span>
+          {monitoringDegraded && (
+            <span
+              data-testid="map-monitoring-degraded"
+              className="ml-auto flex items-center gap-1 font-mono text-[10px] font-bold uppercase tracking-widest"
+              style={{ color: "#FF9500" }}
+            >
+              <ShieldAlert size={12} strokeWidth={2} />
+              MONITORING DEGRADED — contact positions may be stale
+            </span>
+          )}
         </div>
       )}
 

@@ -928,6 +928,16 @@ def main() -> int:
 
     seen_macs: Dict[str, float] = {}
     last_time_t: Optional[int] = None
+
+    # Idle-loop liveness heartbeat, same pattern as mavlink_sniffer.py's
+    # IDLE_HEARTBEAT_INTERVAL_S (task #139). This loop is legitimately silent
+    # whenever Kismet is reachable but has nothing new/matching to report --
+    # print a cheap "still polling" line on a fixed cadence, independent of
+    # whether any device was ever matched, so log-freshness liveness checks
+    # can distinguish "alive, nothing to report" from "hung".
+    IDLE_HEARTBEAT_INTERVAL_S = 60.0
+    last_idle_heartbeat = 0.0
+
     while True:
         try:
             devices = fetch_kismet_devices(args.kismet_url, args.kismet_apikey, last_time_t)
@@ -942,6 +952,14 @@ def main() -> int:
                  kismet_url=args.kismet_url, kismet_apikey=args.kismet_apikey,
                  pcapng_max_frames=args.pcapng_max_frames,
                  pcapng_max_seconds=args.pcapng_max_seconds)
+
+        now_idle = time.time()
+        if now_idle - last_idle_heartbeat >= IDLE_HEARTBEAT_INTERVAL_S:
+            last_idle_heartbeat = now_idle
+            print(f"[kismet_bridge] [heartbeat] still polling Kismet at "
+                  f"{args.kismet_url} -- {len(seen_macs)} device(s) tracked, "
+                  f"0 drone matches in the last {IDLE_HEARTBEAT_INTERVAL_S:.0f}s "
+                  f"(process alive, nothing new to report).")
 
         last_times = [d.get("kismet.device.base.last_time") for d in devices
                      if d.get("kismet.device.base.last_time")]

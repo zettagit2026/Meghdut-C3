@@ -65,23 +65,42 @@ const WATERFALL_COLOR_STOPS = [
 const WF_MIN_DBM = -95;
 const WF_MAX_DBM = -30;
 
+const WF_POLL_INTERVAL_MS = 2500;
+const WF_MAX_CONSECUTIVE_FAILURES = 3;
+const WF_STALE_THRESHOLD_MS = WF_POLL_INTERVAL_MS * 4;
+
 function Waterfall() {
   const [rows, setRows] = useState([]);
   const [source, setSource] = useState("NONE");
+  const [lastSuccessAt, setLastSuccessAt] = useState(null);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
   const chartRef = useRef(null);
 
   useEffect(() => {
     let id;
+    let cancelled = false;
     const load = async () => {
       try {
         const { data } = await api.get("/spectrum/waterfall?bins=96&rows=24");
+        if (cancelled) return;
         setRows(data.rows || []);
         setSource(data.source || "NONE");
-      } catch { /* silent */ }
+        setLastSuccessAt(Date.now());
+        setConsecutiveFailures(0);
+      } catch {
+        if (cancelled) return;
+        setConsecutiveFailures((n) => n + 1);
+      }
     };
     load();
-    id = setInterval(load, 2500);
-    return () => clearInterval(id);
+    id = setInterval(load, WF_POLL_INTERVAL_MS);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  useEffect(() => {
+    const tickId = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tickId);
   }, []);
 
   const binCount = rows[0]?.length || 96;
@@ -150,7 +169,12 @@ function Waterfall() {
     ],
   }), [binCount, rowCount]);
 
-  const isReal = source === "HACKRF";
+  const staleByAge = lastSuccessAt != null && now - lastSuccessAt > WF_STALE_THRESHOLD_MS;
+  const staleByFailures = consecutiveFailures >= WF_MAX_CONSECUTIVE_FAILURES;
+  const neverSucceeded = lastSuccessAt == null && consecutiveFailures > 0;
+  const pollStale = staleByAge || staleByFailures || neverSucceeded;
+
+  const isReal = source === "HACKRF" && !pollStale;
 
   return (
     <div data-testid="rf-waterfall" className="tactical-border" style={{ background: "var(--bg-terminal)" }}>
@@ -164,12 +188,12 @@ function Waterfall() {
             data-testid="waterfall-source"
             className="px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-widest tactical-border"
             style={{
-              color: isReal ? "var(--accent-success)" : "var(--accent-warning)",
-              borderColor: isReal ? "var(--accent-success)" : "var(--accent-warning)",
-              background: isReal ? "rgba(57,255,20,0.08)" : "rgba(255,214,10,0.06)",
+              color: pollStale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",
+              borderColor: pollStale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",
+              background: pollStale ? "rgba(255,59,48,0.08)" : isReal ? "rgba(57,255,20,0.08)" : "rgba(255,214,10,0.06)",
             }}
           >
-            {isReal ? "● HACKRF LIVE" : "◌ NO SIGNAL"}
+            {pollStale ? "◌ STALE" : isReal ? "● HACKRF LIVE" : "◌ NO SIGNAL"}
           </span>
         </div>
         <span className="font-mono text-[10px] text-slate-600 blink">● LIVE</span>
@@ -233,21 +257,24 @@ export default function Dashboard() {
   const [now, setNow] = useState(() => Date.now());
   const [alertMuted, setAlertMuted] = useState(() => isCriticalAlertMuted());
 
-  const load = async () => {
+  const load = async (cancelledRef) => {
     try {
       const { data } = await api.get("/detections");
+      if (cancelledRef?.current) return;
       setDetections(data);
     } catch (e) {
+      if (cancelledRef?.current) return;
       toast.error("Failed to load detections", { description: formatApiError(e) });
     } finally {
-      setLoading(false);
+      if (!cancelledRef?.current) setLoading(false);
     }
   };
 
   useEffect(() => {
-    load();
-    const id = setInterval(load, 60000);
-    return () => clearInterval(id);
+    const cancelledRef = { current: false };
+    load(cancelledRef);
+    const id = setInterval(() => load(cancelledRef), 60000);
+    return () => { cancelledRef.current = true; clearInterval(id); };
   }, []);
 
   // Salience escalation (Task #38 / C5): fire the one-shot audio cue for any

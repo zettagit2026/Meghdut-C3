@@ -90,6 +90,21 @@ apply to `rf-bridge/cema-rf-bridge.service`, which also runs the MAVLink TX
 bridge and is out of scope here — do not enable/start that unit as part of
 this change.
 
+## iff_beacon_bridge.py — env vars
+
+In addition to the usual `CEMA_API_URL` / `CEMA_EMAIL` / `CEMA_PASSWORD` (JWT
+login, same as every other bridge here), `iff_beacon_bridge.py` also requires
+`IFF_BRIDGE_API_KEY` (or `--bridge-api-key`): a separate shared secret sent as
+the `X-IFF-Bridge-Key` header on every `POST /api/iff/beacons/ingest` call.
+This is intentionally **not** the same secret as the login credentials — see
+`backend/server.py`'s `IFF_BRIDGE_API_KEY` module-level docstring for why this
+endpoint needs its own trust boundary distinct from ordinary JWT auth (it is
+the sole source of "verified friendly" claims that suppress friendly-fire
+warnings, so an ordinary authenticated console login must not be sufficient
+on its own to call it). Set the identical value in both this bridge host's
+env file and the backend's `.env` (`IFF_BRIDGE_API_KEY=` in `.env.example`);
+generate with `openssl rand -hex 32`.
+
 ## kismet_bridge.py — passive WiFi/Bluetooth device-presence layer (task #63/B5)
 
 `kismet_bridge.py` polls a **real Kismet server's** REST API

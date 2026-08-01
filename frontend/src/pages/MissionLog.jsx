@@ -14,14 +14,45 @@ const KIND_COLOR = {
   SYSTEM: "var(--text-muted)",
 };
 
+const POLL_INTERVAL_MS = 4000;
+const MAX_CONSECUTIVE_FAILURES = 3;
+const STALE_THRESHOLD_MS = POLL_INTERVAL_MS * 4;
+
 export default function MissionLog() {
   const [logs, setLogs] = useState([]);
+  const [lastSuccessAt, setLastSuccessAt] = useState(null);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
 
-  const load = async () => {
-    try { const { data } = await api.get("/logs?limit=300"); setLogs(data); }
-    catch (e) { toast.error("Load failed", { description: formatApiError(e) }); }
+  const load = async (cancelled) => {
+    try {
+      const { data } = await api.get("/logs?limit=300");
+      if (cancelled?.current) return;
+      setLogs(data);
+      setLastSuccessAt(Date.now());
+      setConsecutiveFailures(0);
+    } catch (e) {
+      if (cancelled?.current) return;
+      setConsecutiveFailures((n) => n + 1);
+      toast.error("Load failed", { description: formatApiError(e) });
+    }
   };
-  useEffect(() => { load(); const id = setInterval(load, 4000); return () => clearInterval(id); }, []);
+  useEffect(() => {
+    const cancelled = { current: false };
+    load(cancelled);
+    const id = setInterval(() => load(cancelled), POLL_INTERVAL_MS);
+    return () => { cancelled.current = true; clearInterval(id); };
+  }, []);
+
+  useEffect(() => {
+    const tickId = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tickId);
+  }, []);
+
+  const staleByAge = lastSuccessAt != null && now - lastSuccessAt > STALE_THRESHOLD_MS;
+  const staleByFailures = consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+  const neverSucceeded = lastSuccessAt == null && consecutiveFailures > 0;
+  const tailingStale = staleByAge || staleByFailures || neverSucceeded;
 
   const downloadPdf = async () => {
     try {
@@ -72,7 +103,15 @@ export default function MissionLog() {
           <span className="font-mono text-xs uppercase tracking-widest" style={{ color: "var(--text-term)" }}>
             /var/log/cema-cuas.jsonl
           </span>
-          <span className="font-mono text-[10px] text-slate-500 blink">● TAILING</span>
+          <span
+            data-testid="mission-log-tailing"
+            className={`font-mono text-[10px] ${tailingStale ? "" : "blink"}`}
+            style={tailingStale ? { color: "var(--accent-critical)" } : { color: "var(--text-muted, #64748b)" }}
+          >
+            {tailingStale
+              ? `● TAILING (stale, ${lastSuccessAt ? Math.max(0, Math.round((now - lastSuccessAt) / 1000)) : "?"}s ago)`
+              : "● TAILING"}
+          </span>
         </div>
         <div data-testid="mission-log-list" className="max-h-[70vh] overflow-y-auto font-mono text-xs">
           {logs.length === 0 && (

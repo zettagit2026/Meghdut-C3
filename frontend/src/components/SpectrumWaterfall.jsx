@@ -28,10 +28,22 @@ function dbmToColor(v, min, max) {
   return [255, 40, 40];
 }
 
+const POLL_INTERVAL_MS = 1500;
+const MAX_CONSECUTIVE_FAILURES = 3;
+const STALE_THRESHOLD_MS = POLL_INTERVAL_MS * 3;
+
 export default function SpectrumWaterfall() {
   const canvasRef = useRef(null);
   const historyRef = useRef([]); // array of rows (each an array of dBm bins), newest first
   const [meta, setMeta] = useState({ bins: 0, source: "NONE" });
+  const [lastSuccessAt, setLastSuccessAt] = useState(null);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const tickId = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tickId);
+  }, []);
 
   useEffect(() => {
     let stopped = false;
@@ -40,10 +52,15 @@ export default function SpectrumWaterfall() {
         const { data } = await api.get("/spectrum/waterfall", { params: { bins: 96, rows: 1 } });
         if (stopped) return;
         setMeta({ bins: data.bins, source: data.source });
+        setLastSuccessAt(Date.now());
+        setConsecutiveFailures(0);
         const newRows = data.rows || [];
         historyRef.current = [...newRows, ...historyRef.current].slice(0, 80);
         draw();
-      } catch { /* silent, keep last frame */ }
+      } catch {
+        if (stopped) return;
+        setConsecutiveFailures((n) => n + 1);
+      }
     };
     const draw = () => {
       const canvas = canvasRef.current;
@@ -74,9 +91,15 @@ export default function SpectrumWaterfall() {
       ctx.putImageData(img, 0, 0);
     };
     poll();
-    const id = setInterval(poll, 1500);
+    const id = setInterval(poll, POLL_INTERVAL_MS);
     return () => { stopped = true; clearInterval(id); };
   }, []);
+
+  const staleByAge = lastSuccessAt != null && now - lastSuccessAt > STALE_THRESHOLD_MS;
+  const staleByFailures = consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+  const neverSucceeded = lastSuccessAt == null && consecutiveFailures > 0;
+  const stale = staleByAge || staleByFailures || neverSucceeded;
+  const isReal = meta.source === "HACKRF" && !stale;
 
   return (
     <div className="tactical-border" style={{ background: "var(--bg-surface)" }}>
@@ -88,18 +111,18 @@ export default function SpectrumWaterfall() {
         <span
           className="font-mono text-[10px] uppercase tracking-widest px-2 py-0.5 tactical-border"
           style={{
-            color: meta.source === "HACKRF" ? "var(--accent-success)" : "var(--accent-warning)",
-            borderColor: meta.source === "HACKRF" ? "var(--accent-success)" : "var(--accent-warning)",
+            color: stale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",
+            borderColor: stale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",
           }}
         >
-          {meta.source === "HACKRF" ? "● LIVE HACKRF" : "○ NO SIGNAL"}
+          {stale ? "◌ STALE" : isReal ? "● LIVE HACKRF" : "○ NO SIGNAL"}
         </span>
       </div>
       <div className="p-3">
         <canvas
           ref={canvasRef}
           data-testid="spectrum-waterfall-canvas"
-          style={{ width: "100%", height: "240px", imageRendering: "pixelated", display: "block" }}
+          style={{ width: "100%", height: "240px", imageRendering: "pixelated", display: "block", opacity: stale ? 0.35 : 1 }}
         />
         <div className="flex justify-between font-mono text-[10px] text-slate-500 mt-1">
           <span>freq bins →</span>

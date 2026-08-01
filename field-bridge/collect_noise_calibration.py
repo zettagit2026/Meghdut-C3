@@ -52,6 +52,7 @@ from iq_capture import capture_iq
 from hackrf_rx import BANDS_MHZ, BAND_NOISE_FLOOR_DBM, DETECT_THRESHOLD_DB, sweep_band
 from gamutrf_infer import GamutRFClassifier, load_sigmf
 from ml_calibration import NoiseCalibrationStats, load_calibration, save_calibration
+from ml_classify_bridge import DEFAULT_CHECKPOINT  # project-relative default, not /tmp
 
 HACKRF_SERIAL = os.environ.get("HACKRF_SERIAL") or None
 
@@ -59,7 +60,7 @@ HACKRF_SERIAL = os.environ.get("HACKRF_SERIAL") or None
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--checkpoint", default=os.environ.get(
-        "CEMA_ML_CHECKPOINT", "/tmp/resnet18_leesburg_split_0.02_1_current.pt"))
+        "CEMA_ML_CHECKPOINT", DEFAULT_CHECKPOINT))
     ap.add_argument("--duration-s", type=float, default=600.0,
                      help="how long to collect for before exiting (0 = forever)")
     ap.add_argument("--interval-s", type=float, default=10.0)

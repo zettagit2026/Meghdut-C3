@@ -449,7 +449,8 @@ def _post_with_reauth(console_url: str, path: str, json_body: dict, headers: dic
 
 def post_verified_beacon(console_url: str, headers: dict, email: str, password: str,
                           result: dict, bearing_deg: Optional[float] = None,
-                          distance_m: Optional[float] = None) -> None:
+                          distance_m: Optional[float] = None,
+                          bridge_api_key: Optional[str] = None) -> None:
     """POST a verified beacon to /api/iff/beacons/ingest (see backend/server.py).
 
     bearing_deg/distance_m are left optional/None here because a one-way LoRa
@@ -457,6 +458,15 @@ def post_verified_beacon(console_url: str, headers: dict, email: str, password: 
     -- if/when this is paired with a directional antenna or an SDR-based
     angle-of-arrival estimate, those would be filled in from that real
     measurement, never fabricated.
+
+    SECURITY: bridge_api_key is sent as X-IFF-Bridge-Key and MUST match the
+    backend's IFF_BRIDGE_API_KEY env var (see backend/server.py). The bearer
+    JWT (Authorization header, already in `headers`) alone is NOT sufficient
+    to call this endpoint -- it is a distinct trust boundary restricted to
+    this bridge process, since this ingest path is what lets a detection be
+    relabeled FRIENDLY. Read from the IFF_BRIDGE_API_KEY env var / --bridge-
+    api-key CLI arg by main() below; if not provided the backend will reject
+    the request with 403.
     """
     body = {
         "asset_id": result["asset_id"],
@@ -467,6 +477,9 @@ def post_verified_beacon(console_url: str, headers: dict, email: str, password: 
         "bearing_deg": bearing_deg,
         "distance_m": distance_m,
     }
+    if bridge_api_key:
+        headers = dict(headers)
+        headers["X-IFF-Bridge-Key"] = bridge_api_key
     r = _post_with_reauth(console_url, "/api/iff/beacons/ingest", body, headers, email, password)
     if r.status_code >= 300:
         print(f"[ingest] iff beacon POST failed: {r.status_code} {r.text[:200]}",
@@ -616,6 +629,11 @@ def main() -> int:
     ap.add_argument("--console-url", default=os.environ.get("CEMA_API_URL"))
     ap.add_argument("--email", default=os.environ.get("CEMA_EMAIL"))
     ap.add_argument("--password", default=os.environ.get("CEMA_PASSWORD"))
+    # SECURITY: separate trust-boundary secret required by POST
+    # /api/iff/beacons/ingest (backend/server.py's IFF_BRIDGE_API_KEY) -- NOT
+    # the same as the CEMA_EMAIL/CEMA_PASSWORD login used for JWT auth. See
+    # post_verified_beacon()'s docstring above for why this exists.
+    ap.add_argument("--bridge-api-key", default=os.environ.get("IFF_BRIDGE_API_KEY"))
     args = ap.parse_args()
 
     if args.self_test:

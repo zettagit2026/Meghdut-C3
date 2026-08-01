@@ -25,13 +25,32 @@ const AMP_MAX = 0.95;
 const AMP_LERP = 0.18;
 const NOISE_FLOOR_PX = 1.6; // subtle per-point "grass" jitter, like real RF noise on a scope
 
+const POLL_INTERVAL_MS = 1000;
+const MAX_CONSECUTIVE_FAILURES = 3;
+const STALE_THRESHOLD_MS = POLL_INTERVAL_MS * 3;
+
 export default function SpectrumScope() {
   const canvasRef = useRef(null);
   const phaseRef = useRef(0);
   const targetAmpRef = useRef(0.08);
   const displayAmpRef = useRef(0.08);
   const [meta, setMeta] = useState({ source: "NONE", peakDbm: null });
+  const [lastSuccessAt, setLastSuccessAt] = useState(null);
+  const [consecutiveFailures, setConsecutiveFailures] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
   const rafRef = useRef(null);
+  // Mirrored into refs so the requestAnimationFrame draw loop (a long-lived
+  // closure created once) always reads the latest staleness values instead
+  // of whatever was current when the effect first ran.
+  const lastSuccessAtRef = useRef(null);
+  const consecutiveFailuresRef = useRef(0);
+  useEffect(() => { lastSuccessAtRef.current = lastSuccessAt; }, [lastSuccessAt]);
+  useEffect(() => { consecutiveFailuresRef.current = consecutiveFailures; }, [consecutiveFailures]);
+
+  useEffect(() => {
+    const tickId = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tickId);
+  }, []);
 
   useEffect(() => {
     let stopped = false;
@@ -60,12 +79,25 @@ export default function SpectrumScope() {
           targetAmpRef.current = AMP_MIN;
           setMeta({ source: "NONE", peakDbm: null });
         }
-      } catch { /* keep last amplitude, silent */ }
+        setLastSuccessAt(Date.now());
+        setConsecutiveFailures(0);
+      } catch {
+        if (stopped) return;
+        setConsecutiveFailures((n) => n + 1);
+      }
     };
 
     const draw = () => {
       const canvas = canvasRef.current;
-      if (!canvas || stopped) return;
+      // Freeze the animation once polling has gone stale — a continuously
+      // sweeping trace on frozen data implies liveness that isn't real, which
+      // is worse than a static freeze.
+      const staleByAge = lastSuccessAtRef.current != null && Date.now() - lastSuccessAtRef.current > STALE_THRESHOLD_MS;
+      const staleByFailures = consecutiveFailuresRef.current >= MAX_CONSECUTIVE_FAILURES;
+      if (!canvas || stopped || staleByAge || staleByFailures) {
+        if (canvas && !stopped) rafRef.current = requestAnimationFrame(draw);
+        return;
+      }
       const dpr = window.devicePixelRatio || 1;
       const w = canvas.clientWidth;
       const h = canvas.clientHeight;
@@ -130,16 +162,25 @@ export default function SpectrumScope() {
           <AudioWaveform size={14} strokeWidth={1.5} style={{ color: "var(--accent-info)" }} />
           <span className="font-mono text-xs uppercase tracking-widest">RF Scope (Time Domain)</span>
         </div>
-        <span
-          className="font-mono text-[10px] uppercase tracking-widest px-2 py-0.5 tactical-border"
-          style={{
-            color: meta.source === "HACKRF" ? "var(--accent-success)" : "var(--accent-warning)",
-            borderColor: meta.source === "HACKRF" ? "var(--accent-success)" : "var(--accent-warning)",
-          }}
-        >
-          {meta.source === "HACKRF" ? "● LIVE HACKRF" : "○ NO SIGNAL"}
-          {meta.peakDbm != null && <span className="ml-2 text-slate-400">{meta.peakDbm.toFixed(1)} dBm pk</span>}
-        </span>
+        {(() => {
+          const staleByAge = lastSuccessAt != null && now - lastSuccessAt > STALE_THRESHOLD_MS;
+          const staleByFailures = consecutiveFailures >= MAX_CONSECUTIVE_FAILURES;
+          const neverSucceeded = lastSuccessAt == null && consecutiveFailures > 0;
+          const stale = staleByAge || staleByFailures || neverSucceeded;
+          const isReal = meta.source === "HACKRF" && !stale;
+          return (
+            <span
+              className="font-mono text-[10px] uppercase tracking-widest px-2 py-0.5 tactical-border"
+              style={{
+                color: stale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",
+                borderColor: stale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",
+              }}
+            >
+              {stale ? "◌ STALE" : isReal ? "● LIVE HACKRF" : "○ NO SIGNAL"}
+              {!stale && meta.peakDbm != null && <span className="ml-2 text-slate-400">{meta.peakDbm.toFixed(1)} dBm pk</span>}
+            </span>
+          );
+        })()}
       </div>
       <div className="p-3">
         <canvas

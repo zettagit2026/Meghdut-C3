@@ -61,6 +61,7 @@ load_dotenv(ROOT_DIR / ".env")
 import asyncio
 import base64
 import binascii
+import hmac
 import importlib.util
 import json
 import logging
@@ -79,6 +80,7 @@ from fastapi import (
     FastAPI,
     File,
     Form,
+    Header,
     HTTPException,
     Request,
     UploadFile,
@@ -144,6 +146,29 @@ if ADMIN_PASSWORD.lower() in _PLACEHOLDER_SECRETS:
     raise RuntimeError(
         "ADMIN_PASSWORD matches a known placeholder/default value ('cema@2026', "
         "'change-me', etc). Set a strong password via a gitignored .env file."
+    )
+
+# IFF_BRIDGE_API_KEY: a SEPARATE trust boundary on top of ordinary JWT auth,
+# scoped ONLY to POST /api/iff/beacons/ingest. Rationale: that endpoint's
+# whole job is to report an asset as cryptographically-verified-friendly
+# (HMAC/HKDF/nonce-checked bridge-side by field-bridge/iff_beacon_bridge.py),
+# and that "verified friendly" claim is later used by
+# _check_iff_friendly_match() to relabel a detection as
+# "FRIENDLY (IFF verified)" -- i.e. to suppress a friendly-fire warning. If
+# ANY authenticated console user (any operator role) could hit that endpoint,
+# they could fabricate a "verified friendly" claim for an arbitrary asset_id/
+# bearing_deg/geocell with no actual LoRa hardware or crypto involved at all,
+# completely bypassing the mechanism this whole subsystem exists to provide.
+# So this endpoint requires BOTH a valid JWT (defense in depth, unchanged)
+# AND this separate shared secret known only to the bridge process itself.
+IFF_BRIDGE_API_KEY = _require_env("IFF_BRIDGE_API_KEY")
+if IFF_BRIDGE_API_KEY.lower() in _PLACEHOLDER_SECRETS or IFF_BRIDGE_API_KEY.lower().startswith("change-me"):
+    raise RuntimeError(
+        "IFF_BRIDGE_API_KEY matches a known placeholder/default value. Generate "
+        "a real secret (e.g. `openssl rand -hex 32`) and set it via a "
+        "gitignored .env file. This key gates POST /api/iff/beacons/ingest -- "
+        "see that endpoint's docstring for why this is a distinct trust "
+        "boundary from ordinary JWT auth."
     )
 
 # ---------- Mongo ----------
@@ -1573,10 +1598,41 @@ async def authorize_target(det_id: str, body: AuthorizeTargetBody,
     operator may authorize a single, individually-identified target — this is
     the routine "yes, engage this contact" action. Broadcast/target_system=0
     actions are NOT covered by this and separately require commander role +
-    an arm token (see /payloads/deploy, /mavlink/broadcast)."""
+    an arm token (see /payloads/deploy, /mavlink/broadcast).
+
+    IFF INTERLOCK: if the detection is currently iff_verified (i.e. its
+    threat_level has been set to "FRIENDLY (IFF verified)" by
+    _check_iff_friendly_match() -- see detection_ingest()/kc_advance() where
+    that field is populated), authorizing it as a kinetic target is blocked
+    for ordinary operators (403). A commander MAY still override this and
+    authorize anyway (mirroring this codebase's existing commander-override
+    pattern for other CRITICAL/security-sensitive actions -- see
+    require_commander, deploy_jam, deploy_gnss_spoof), but the override is
+    logged as a distinct, high-visibility IFF_OVERRIDE_AUTHORIZE audit event
+    so there is always a clear trail if this is ever invoked. De-authorizing
+    (body.authorized=False) is never blocked by this interlock -- it only
+    ever makes the system safer."""
     doc = await db.detections.find_one({"id": det_id})
     if not doc:
         raise HTTPException(404, "Detection not found")
+
+    if body.authorized and doc.get("iff_verified"):
+        if user.get("role") != "commander":
+            raise HTTPException(
+                403,
+                "Cannot authorize a target currently IFF-verified as friendly "
+                "(threat_level=FRIENDLY (IFF verified)). Commander role "
+                "required to override this friendly-fire interlock.",
+            )
+        await log_event(
+            "IFF_OVERRIDE_AUTHORIZE",
+            f"COMMANDER OVERRIDE: {doc['callsign']} authorized as kinetic target "
+            f"despite being IFF-verified FRIENDLY",
+            meta={"detection_id": det_id, "asset_id": doc.get("asset_id"),
+                  "callsign": doc.get("callsign")},
+            actor=user["email"],
+        )
+
     await db.detections.update_one({"id": det_id}, {"$set": {"authorized_target": body.authorized}})
     await log_event(
         "TARGETING",
@@ -2298,10 +2354,25 @@ def check_no_friendly_in_footprint_sync_note() -> None:
 
 @api.post("/iff/beacons/ingest")
 async def iff_beacon_ingest(body: IFFBeaconIngestBody,
-                            user: Dict = Depends(get_current_user)):
+                            user: Dict = Depends(get_current_user),
+                            x_iff_bridge_key: Optional[str] = Header(default=None)):
     """Ingest a single already-HMAC-verified IFF beacon from field-bridge/
     iff_beacon_bridge.py. See IFFBeaconIngestBody docstring -- this endpoint
-    trusts the bridge's verification and does not re-check any HMAC."""
+    trusts the bridge's verification and does not re-check any HMAC.
+
+    SECURITY: this endpoint is a distinct trust boundary from ordinary JWT
+    auth (see IFF_BRIDGE_API_KEY module-level docstring above). A valid JWT
+    (get_current_user, kept as defense in depth) is NOT sufficient on its
+    own -- any authenticated operator/commander console login must NOT be
+    able to fabricate a "verified friendly" claim for an arbitrary asset_id,
+    since _check_iff_friendly_match() uses exactly that claim to relabel a
+    real hostile detection as FRIENDLY. The caller must also present the
+    X-IFF-Bridge-Key header matching IFF_BRIDGE_API_KEY, known only to the
+    field-bridge/iff_beacon_bridge.py process. Compared with hmac.compare_digest
+    to avoid timing side-channels (never `==` for secret comparison)."""
+    if not x_iff_bridge_key or not hmac.compare_digest(x_iff_bridge_key, IFF_BRIDGE_API_KEY):
+        raise HTTPException(403, "Invalid or missing X-IFF-Bridge-Key -- this endpoint is "
+                                  "restricted to the IFF beacon bridge process.")
     await _iff_ingest_beacon(body)
     return {"ok": True, "asset_id": body.asset_id, "callsign": body.callsign}
 

@@ -24,6 +24,7 @@ os.environ.setdefault("DB_NAME", "test_db_unused")
 os.environ.setdefault("JWT_SECRET", "test-secret-unused")
 os.environ.setdefault("ADMIN_EMAIL", "test-admin@unused.local")
 os.environ.setdefault("ADMIN_PASSWORD", "test-password-unused")
+os.environ.setdefault("IFF_BRIDGE_API_KEY", "test-iff-bridge-key-unused")
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
