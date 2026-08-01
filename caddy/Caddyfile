@@ -30,5 +30,13 @@
 		# confirmed stable across all operator machines. Do not set a long
 		# max-age or preload while HTTP is still served in parallel.
 		Strict-Transport-Security "max-age=300; includeSubDomains"
+
+		# Baseline clickjacking/MIME-sniffing/referrer-leak hardening (low
+		# risk, well-understood defaults). CSP intentionally NOT added here
+		# yet -- needs a verification pass against the built frontend bundle
+		# first (tracked separately).
+		X-Frame-Options "DENY"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
 	}
 }

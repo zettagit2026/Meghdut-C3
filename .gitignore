@@ -96,3 +96,11 @@ credentials.json
 
 # Environment-specific generated TLS artifacts (task #95/#100)
 caddy/*.crt
+
+# Ad-hoc pre-change backup copies left on deployment hosts (e.g.
+# docker-compose.yml.pre-cutover-backup, preflight.sh.bak.<timestamp>).
+# No live secrets in these (just env-var name references), but they are
+# host-local scratch artifacts, not something to track in git.
+*.pre-*-backup
+*.bak.*
+*.bak-*
