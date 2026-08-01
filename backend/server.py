@@ -59,6 +59,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 import asyncio
+import contextlib
 import base64
 import binascii
 import hmac
@@ -860,8 +861,10 @@ async def _handle_tx_ack(msg: Dict[str, Any]) -> None:
 @app.on_event("startup")
 async def startup() -> None:
     await db.users.create_index("email", unique=True)
+    await db.users.create_index("id", unique=True)
     await db.ingest_health.create_index("bridge", unique=True)
     await db.iff_revocations.create_index("asset_id", unique=True)
+    await db.detections.create_index([("status", 1), ("last_seen", 1), ("source", 1)])
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
     if existing is None:
         await db.users.insert_one({
@@ -898,9 +901,16 @@ async def startup() -> None:
     # contacts are only ever created from real ingested data via
     # POST /detections/ingest (HackRF / SiK radio bridges).
 
+    global _stale_detections_task
+    _stale_detections_task = asyncio.create_task(_stale_detections_loop())
+
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
+    if _stale_detections_task is not None:
+        _stale_detections_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _stale_detections_task
     client.close()
 
 
@@ -1258,10 +1268,10 @@ def _new_detection_skeleton() -> Dict[str, Any]:
 
 async def _expire_stale_detections() -> None:
     """Flip any ACTIVE detection that hasn't been re-confirmed within
-    DETECTION_STALE_TIMEOUT_S to LOST. Lazy/on-read expiry: this app has no
-    background scheduler (asyncio is only used for locks/websockets), so we
-    run this check inline whenever detections are read, keeping reads
-    self-consistent without adding new infrastructure. Records are only
+    DETECTION_STALE_TIMEOUT_S to LOST. Runs periodically from a background
+    task started at app startup (see _stale_detections_loop below) rather
+    than inline per-request -- an unindexed update_many scan on every single
+    /api/health or /api/detections call doesn't scale. Records are only
     updated in place (status change), never deleted, to preserve the Mission
     Log / audit trail.
     """
@@ -1270,6 +1280,26 @@ async def _expire_stale_detections() -> None:
         {"status": "ACTIVE", "last_seen": {"$lt": cutoff}},
         {"$set": {"status": "LOST"}},
     )
+
+
+STALE_DETECTIONS_SWEEP_INTERVAL_S = 7
+_stale_detections_task: Optional[asyncio.Task] = None
+
+
+async def _stale_detections_loop() -> None:
+    """Background task (started at app startup, cancelled at shutdown) that
+    periodically runs _expire_stale_detections(), replacing the old
+    per-request inline call. A single bad iteration must not kill the loop
+    (or the whole process) -- caught, logged (never swallowed silently per
+    this codebase's convention), and retried on the next tick."""
+    while True:
+        try:
+            await _expire_stale_detections()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("_stale_detections_loop: sweep iteration failed")
+        await asyncio.sleep(STALE_DETECTIONS_SWEEP_INTERVAL_S)
 
 
 # --- Sensor (HackRF RX site) fixed position ---------------------------------
@@ -1317,7 +1347,8 @@ async def get_sensor_position(user: Dict = Depends(get_current_user)):
 
 @api.get("/detections")
 async def list_detections(user: Dict = Depends(get_current_user)):
-    await _expire_stale_detections()
+    # Stale-detection expiry now runs on a periodic background task (see
+    # _stale_detections_loop) instead of inline here per request.
     await _expire_pending_acks()
     docs = await db.detections.find({}, {"_id": 0}).sort("last_seen", -1).to_list(500)
     return docs
@@ -3475,10 +3506,9 @@ async def system_health(user: Dict = Depends(get_current_user)):
         "last_seen": {"$gt": since.isoformat()},
     })
 
-    # Run the same lazy staleness expiry the detections list uses, so this
-    # health tile's "active_targets" count doesn't disagree with the
-    # dashboard's Active Contacts count.
-    await _expire_stale_detections()
+    # Staleness expiry runs on a periodic background task (see
+    # _stale_detections_loop), not inline here -- active_targets reflects
+    # the most recent sweep (at most STALE_DETECTIONS_SWEEP_INTERVAL_S old).
     active_targets = await db.detections.count_documents({"status": "ACTIVE"})
     total_packets = await db.mav_packets.count_documents({})
 
