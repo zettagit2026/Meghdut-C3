@@ -105,6 +105,7 @@ export default function MissionLog() {
           </span>
           <span
             data-testid="mission-log-tailing"
+            role="status"
             className={`font-mono text-[10px] ${tailingStale ? "" : "blink"}`}
             style={tailingStale ? { color: "var(--accent-critical)" } : { color: "var(--text-muted, #64748b)" }}
           >

@@ -296,16 +296,15 @@ export default function MapView() {
             Bearing/DF hardware: not present — contacts shown as RANGE RINGS only (direction unknown),
             not as position pins
           </span>
-          {monitoringDegraded && (
-            <span
-              data-testid="map-monitoring-degraded"
-              className="ml-auto flex items-center gap-1 font-mono text-[10px] font-bold uppercase tracking-widest"
-              style={{ color: "#FF9500" }}
-            >
-              <ShieldAlert size={12} strokeWidth={2} />
-              MONITORING DEGRADED — contact positions may be stale
-            </span>
-          )}
+          <span
+            data-testid="map-monitoring-degraded"
+            role="alert"
+            className="ml-auto items-center gap-1 font-mono text-[10px] font-bold uppercase tracking-widest"
+            style={{ display: monitoringDegraded ? "flex" : "none", color: "#FF9500" }}
+          >
+            <ShieldAlert size={12} strokeWidth={2} />
+            MONITORING DEGRADED — contact positions may be stale
+          </span>
         </div>
       )}
 

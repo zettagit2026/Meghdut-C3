@@ -78,6 +78,33 @@ body::before {
 
 .threat-critical-static { border-left: 3px solid var(--accent-critical); }
 
+/* Reduced-motion: kill the infinite/looping animations used on CRITICAL /
+   AWAITING_ACK / NEUTRALIZED status badges and the EmergencyAbort confirming
+   state (.blink, .pulse-crit) plus Tailwind's .animate-spin on active
+   kill-chain nodes -- but, per the salience-fatigue reasoning above
+   (.threat-critical-flash / .threat-critical-static), don't just remove the
+   emphasis outright. That would itself be a safety regression for
+   motion-sensitive users on a safety-critical indicator. Swap the motion for
+   a static, equally-salient treatment: a solid critical-color border plus a
+   held (non-animated) glow/background, same visual weight as
+   .threat-critical-static, without any flashing or spinning. */
+@media (prefers-reduced-motion: reduce) {
+  .blink {
+    animation: none;
+    visibility: visible;
+    font-weight: 700;
+  }
+  .pulse-crit {
+    animation: none;
+    box-shadow: 0 0 0 2px rgba(255,59,48,0.55);
+    border-color: var(--accent-critical);
+  }
+  .animate-spin {
+    animation: none;
+    filter: drop-shadow(0 0 3px var(--accent-critical));
+  }
+}
+
 .scanline-btn {
   position: relative;
   overflow: hidden;

@@ -68,19 +68,22 @@ function EffectBanner({ effect, label }) {
           [ DISABLE NOW ]
         </button>
       </div>
-      {statusUnconfirmed && (
-        <div
-          data-testid={`range-auth-unconfirmed-${effect}`}
-          className="w-full px-4 py-2 flex items-center justify-center gap-2 pulse-crit"
-          style={{ background: "#FF9500", color: "black" }}
-        >
-          <ShieldAlert size={14} strokeWidth={2} />
-          <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
-            STATUS UNCONFIRMED — {label} status feed stale, real range state is NOT verified — the
-            countdown above may not reflect reality
-          </span>
-        </div>
-      )}
+      <div
+        data-testid={`range-auth-unconfirmed-${effect}`}
+        role="status"
+        className="w-full px-4 py-2 items-center justify-center gap-2 pulse-crit"
+        style={{
+          display: statusUnconfirmed ? "flex" : "none",
+          background: "#FF9500",
+          color: "black",
+        }}
+      >
+        <ShieldAlert size={14} strokeWidth={2} />
+        <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
+          STATUS UNCONFIRMED — {label} status feed stale, real range state is NOT verified — the
+          countdown above may not reflect reality
+        </span>
+      </div>
     </div>
   );
 }

@@ -109,6 +109,7 @@ export default function SpectrumWaterfall() {
           <span className="font-mono text-xs uppercase tracking-widest">RF Spectrum Waterfall</span>
         </div>
         <span
+          role="status"
           className="font-mono text-[10px] uppercase tracking-widest px-2 py-0.5 tactical-border"
           style={{
             color: stale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",

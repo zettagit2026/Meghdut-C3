@@ -186,6 +186,7 @@ function Waterfall() {
           </span>
           <span
             data-testid="waterfall-source"
+            role="status"
             className="px-2 py-0.5 font-mono text-[10px] font-bold uppercase tracking-widest tactical-border"
             style={{
               color: pollStale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",

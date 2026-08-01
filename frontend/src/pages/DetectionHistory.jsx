@@ -210,18 +210,21 @@ export default function DetectionHistory() {
         </h1>
       </div>
 
-      {monitoringDegraded && (
-        <div
-          data-testid="history-monitoring-degraded-banner"
-          className="tactical-border px-4 py-2 flex items-center gap-2 pulse-crit"
-          style={{ background: "#FF9500", color: "black" }}
-        >
-          <ShieldAlert size={14} strokeWidth={2} />
-          <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
-            MONITORING DEGRADED — detection feed stale, history below may be out of date
-          </span>
-        </div>
-      )}
+      <div
+        data-testid="history-monitoring-degraded-banner"
+        role="alert"
+        className="tactical-border px-4 py-2 items-center gap-2 pulse-crit"
+        style={{
+          display: monitoringDegraded ? "flex" : "none",
+          background: "#FF9500",
+          color: "black",
+        }}
+      >
+        <ShieldAlert size={14} strokeWidth={2} />
+        <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
+          MONITORING DEGRADED — detection feed stale, history below may be out of date
+        </span>
+      </div>
 
       <div className="flex flex-wrap gap-2">
         {STATUS_FILTERS.map((s) => {

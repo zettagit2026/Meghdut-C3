@@ -170,6 +170,7 @@ export default function SpectrumScope() {
           const isReal = meta.source === "HACKRF" && !stale;
           return (
             <span
+              role="status"
               className="font-mono text-[10px] uppercase tracking-widest px-2 py-0.5 tactical-border"
               style={{
                 color: stale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",

@@ -183,19 +183,22 @@ export default function KillChain() {
         </h1>
       </div>
 
-      {monitoringDegraded && (
-        <div
-          data-testid="killchain-monitoring-degraded-banner"
-          className="tactical-border px-4 py-2 flex items-center gap-2 pulse-crit"
-          style={{ background: "#FF9500", color: "black" }}
-        >
-          <ShieldAlert size={14} strokeWidth={2} />
-          <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
-            MONITORING DEGRADED — kill-chain feed stale, statuses below (including AWAITING ACK /
-            NEUTRALIZED) may be out of date
-          </span>
-        </div>
-      )}
+      <div
+        data-testid="killchain-monitoring-degraded-banner"
+        role="alert"
+        className="tactical-border px-4 py-2 items-center gap-2 pulse-crit"
+        style={{
+          display: monitoringDegraded ? "flex" : "none",
+          background: "#FF9500",
+          color: "black",
+        }}
+      >
+        <ShieldAlert size={14} strokeWidth={2} />
+        <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
+          MONITORING DEGRADED — kill-chain feed stale, statuses below (including AWAITING ACK /
+          NEUTRALIZED) may be out of date
+        </span>
+      </div>
 
       {/* Node-link graph: one node per active detection, columns keyed to
           kill-chain stage, dashed edges linking swarm-cluster members. This
@@ -203,7 +206,12 @@ export default function KillChain() {
           replacement -- clicking a node highlights (and scrolls to) that
           contact's full detail row, which retains all WCAG icon+color
           encoding, status badges, and the ADVANCE control. */}
-      <div className="tactical-border" style={{ background: "var(--bg-surface)" }}>
+      <div
+        className="tactical-border"
+        style={{ background: "var(--bg-surface)" }}
+        role="group"
+        aria-label="Kill-chain contact graph — visual summary; see the detail list below for the same information in an accessible format"
+      >
         <div className="px-4 pt-3 font-mono text-[10px] uppercase tracking-widest text-slate-500">
           contact graph · {dets.length} tracked
         </div>
