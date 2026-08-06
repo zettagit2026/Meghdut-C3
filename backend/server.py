@@ -112,6 +112,7 @@ from detection_state import (
     advance_kill_chain,
 )
 from swarm_classifier import build_swarm_clusters, SWARM_TAXONOMY
+from track_manager import TrackManager, STATE_DROPPED as TRACK_STATE_DROPPED
 
 # ---------- Config ----------
 # SECURITY: no hardcoded/default secrets. Operators MUST supply real values via
@@ -907,6 +908,21 @@ async def startup() -> None:
     global _stale_detections_task
     _stale_detections_task = asyncio.create_task(_stale_detections_loop())
 
+    # Track manager (OB-04): index tracks by id, and rehydrate live (non-
+    # DROPPED) tracks so a restart doesn't lose in-flight tracks -- same
+    # "state lives in Mongo, survives reboot" property the detections
+    # collection already has.
+    await db.tracks.create_index("track_id", unique=True)
+    await db.tracks.create_index([("state", 1), ("last_seen", 1)])
+    live_track_docs = await db.tracks.find(
+        {"state": {"$ne": TRACK_STATE_DROPPED}}, {"_id": 0}).to_list(TRACK_RELOAD_CAP)
+    track_manager.load_existing(live_track_docs)
+    if live_track_docs:
+        logger.info("Rehydrated %d live track(s) from Mongo.", len(live_track_docs))
+
+    global _track_sweep_task
+    _track_sweep_task = asyncio.create_task(_track_sweep_loop())
+
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
@@ -914,6 +930,10 @@ async def shutdown() -> None:
         _stale_detections_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await _stale_detections_task
+    if _track_sweep_task is not None:
+        _track_sweep_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _track_sweep_task
     client.close()
 
 
@@ -1439,6 +1459,120 @@ async def _stale_detections_loop() -> None:
         except Exception:
             logger.exception("_stale_detections_loop: sweep iteration failed")
         await asyncio.sleep(STALE_DETECTIONS_SWEEP_INTERVAL_S)
+
+
+# =====================================================================
+# Multi-target track manager (OB-04) -- see backend/track_manager.py.
+#
+# This is an ADDITIVE layer over the detection ingest/merge/expiry flow above:
+# every detection_ingest also feeds the track manager (association + N-of-M
+# lifecycle), but nothing here changes how `detections` themselves are stored.
+# The manager keeps live tracks in-memory on this single worker; every mutation
+# is mirrored to the `tracks` Mongo collection for the audit trail and restart
+# survival. All access to the in-memory index is serialized through
+# _track_lock, exactly like the audit-chain append is serialized through
+# _audit_append_lock -- the association/lifecycle update mutates shared state on
+# the asyncio loop and must not interleave with a concurrent sweep.
+# =====================================================================
+track_manager = TrackManager()
+_track_lock = asyncio.Lock()
+TRACK_SWEEP_INTERVAL_S = 5  # a bit tighter than the coast/drop timeouts so
+                            # state transitions fire promptly, same spirit as
+                            # STALE_DETECTIONS_SWEEP_INTERVAL_S.
+_track_sweep_task: Optional[asyncio.Task] = None
+TRACK_RELOAD_CAP = 500  # upper bound on live tracks reloaded from Mongo at
+                        # startup (well above the budget; a guard, not a limit).
+
+
+async def _persist_track_snapshots(snapshots: List[Dict[str, Any]]) -> None:
+    """Mirror dirty track snapshots to the Mongo `tracks` collection (upsert by
+    track_id). Best-effort but never silently swallowed: a persistence failure
+    is logged (per this codebase's convention) and does not crash the ingest
+    path -- the in-memory index remains authoritative for live logic."""
+    for snap in snapshots:
+        try:
+            await db.tracks.replace_one(
+                {"track_id": snap["track_id"]}, snap.copy(), upsert=True)
+        except Exception:
+            logger.exception("track persist failed (track_id=%s)",
+                             snap.get("track_id"))
+
+
+async def _log_track_events(events: List[Dict[str, Any]], actor: str) -> None:
+    """Turn operationally-significant lifecycle events into audit log entries.
+    Routine ASSOCIATE events are intentionally NOT logged (they happen every
+    few seconds and would flood the mission log, same reasoning as detection
+    re-confirmations not each getting a log line); births, confirmations,
+    coasts, drops, and -- critically -- capacity-forced drops / refusals ARE
+    logged, because an operator must know when the system stopped tracking
+    something for capacity reasons."""
+    for ev in events:
+        kind = ev.get("event")
+        if kind == "ASSOCIATE":
+            continue
+        if kind == "CAPACITY_DROP":
+            await log_event(
+                "TRACK_CAPACITY_DROP",
+                f"Track budget ({ev.get('budget_max')}) exceeded — evicted "
+                f"lowest-priority track {ev.get('track_id')} "
+                f"(was {ev.get('evicted_state_before')}) to admit a new contact. "
+                f"Operator: a target stopped being tracked due to capacity.",
+                meta=ev, actor=actor)
+        elif kind == "CAPACITY_REFUSED":
+            await log_event(
+                "TRACK_CAPACITY_REFUSED",
+                f"Track budget ({ev.get('budget_max')}) full and all tracks are "
+                f"protected (confirmed) — NEW contact from {ev.get('source')} "
+                f"(detection {ev.get('detection_id')}) is NOT being tracked. "
+                f"System is at capacity; situational awareness is degraded.",
+                meta=ev, actor=actor)
+        elif kind == "BIRTH":
+            await log_event("TRACK_BIRTH",
+                            f"New tentative track {ev.get('track_id')} "
+                            f"born from {ev.get('source')}.",
+                            meta=ev, actor=actor)
+        elif kind == "CONFIRM":
+            await log_event("TRACK_CONFIRM",
+                            f"Track {ev.get('track_id')} CONFIRMED "
+                            f"({ev.get('hits')} hits).",
+                            meta=ev, actor=actor)
+        elif kind == "COAST":
+            await log_event("TRACK_COAST",
+                            f"Track {ev.get('track_id')} COASTING — no longer "
+                            f"observed (stale, not a live confirmed contact).",
+                            meta=ev, actor=actor)
+        elif kind == "DROP":
+            await log_event("TRACK_DROP",
+                            f"Track {ev.get('track_id')} DROPPED "
+                            f"({ev.get('reason')}).",
+                            meta=ev, actor=actor)
+
+
+async def _observe_track_for_detection(det: Dict[str, Any], actor: str) -> None:
+    """Feed a just-ingested detection into the track manager under the lock,
+    then persist + log the resulting lifecycle events. Additive: this is called
+    at the end of detection_ingest and does not touch the detection record."""
+    async with _track_lock:
+        result = track_manager.observe(det)
+    await _persist_track_snapshots(result["dirty"])
+    await _log_track_events(result["events"], actor)
+
+
+async def _track_sweep_loop() -> None:
+    """Background task (started at startup, cancelled at shutdown) running the
+    time-driven track lifecycle sweep. Mirrors _stale_detections_loop: a single
+    bad iteration is logged and retried, never allowed to kill the loop."""
+    while True:
+        try:
+            async with _track_lock:
+                result = track_manager.sweep()
+            await _persist_track_snapshots(result["dirty"])
+            await _log_track_events(result["events"], actor="SYSTEM")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("_track_sweep_loop: sweep iteration failed")
+        await asyncio.sleep(TRACK_SWEEP_INTERVAL_S)
 
 
 # --- Sensor (HackRF RX site) fixed position ---------------------------------
@@ -2823,6 +2957,9 @@ async def detection_ingest(body: DetectionIngestBody,
         det["reconfirm_events"] = (existing.get("reconfirm_events") or []) + [updates["last_seen"]]
         det["reconfirm_events"] = det["reconfirm_events"][-RECONFIRM_EVENTS_CAP:]
         det.pop("_id", None)
+        # Track-manager layer (OB-04): associate this re-confirmed detection to
+        # its track / advance lifecycle. Additive — does not alter `det`.
+        await _observe_track_for_detection(det, user["email"])
         return det
 
     det = _new_detection_skeleton()  # id/timestamps/state only — no fabricated RF fields
@@ -2916,6 +3053,9 @@ async def detection_ingest(body: DetectionIngestBody,
                     meta={"detection_id": det["id"], "source": body.source},
                     actor=user["email"])
     det.pop("_id", None)
+    # Track-manager layer (OB-04): birth/associate a track for this new
+    # detection. Additive — does not alter the detection record.
+    await _observe_track_for_detection(det, user["email"])
     return det
 
 
@@ -3641,6 +3781,34 @@ async def audit_verify(user: Dict = Depends(require_commander)):
 # =====================================================================
 # Routes: System health (dashboard tile + pre-demo check)
 # =====================================================================
+@api.get("/tracks")
+async def list_tracks(
+    include_dropped: bool = False,
+    user: Dict = Depends(get_current_user),
+):
+    """Current tracks with their lifecycle state (OB-04). Auth-gated like the
+    other read endpoints.
+
+    By default returns only LIVE tracks (TENTATIVE/CONFIRMED/COASTING) straight
+    from the in-memory index -- the authoritative live state, no Mongo round-
+    trip. `state` is the honest lifecycle field: a COASTING track carries
+    stale=true and MUST NOT be rendered as a live confirmed contact; a TENTATIVE
+    track is explicitly unconfirmed. Pass include_dropped=true to also pull the
+    persisted DROPPED tracks from Mongo for the mission-log / audit view.
+    """
+    async with _track_lock:
+        live = [t.to_dict() for t in track_manager.live_tracks()]
+        summary = track_manager.counts()
+    live.sort(key=lambda t: (t.get("first_seen") or ""))
+    result = {"tracks": live, **summary}
+    if include_dropped:
+        dropped = await db.tracks.find(
+            {"state": TRACK_STATE_DROPPED}, {"_id": 0}
+        ).sort("dropped_at", -1).to_list(500)
+        result["dropped_tracks"] = dropped
+    return result
+
+
 @api.get("/health")
 async def system_health(user: Dict = Depends(get_current_user)):
     # Mongo ping
@@ -3769,6 +3937,11 @@ async def system_health(user: Dict = Depends(get_current_user)):
         "ws_clients": len(ws_manager.clients),
         "ws_upgrade_capable": WS_UPGRADE_CAPABLE,
         "active_targets": active_targets,
+        # Track-manager summary (OB-04). active_tracks/tracks_confirmed reflect
+        # the live in-memory index; tracks_at_capacity is the honest capacity
+        # flag an operator needs (see /api/tracks and TRACK_CAPACITY_* audit
+        # events). counts() is a cheap in-memory read, no Mongo round-trip.
+        **track_manager.counts(),
         "total_packets_tx": total_packets,
         "tx_pending_acks": tx_pending_acks,
         "tx_awaiting_ack_detections": tx_awaiting_ack,
