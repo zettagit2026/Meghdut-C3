@@ -113,6 +113,7 @@ from detection_state import (
 )
 from swarm_classifier import build_swarm_clusters, SWARM_TAXONOMY
 from track_manager import TrackManager, STATE_DROPPED as TRACK_STATE_DROPPED
+from engagement_planner import build_engagement_plan
 
 # ---------- Config ----------
 # SECURITY: no hardcoded/default secrets. Operators MUST supply real values via
@@ -1717,6 +1718,96 @@ async def recompute_swarm_clusters(user: Dict = Depends(get_current_user)):
             actor=user["email"],
         )
     return {"clusters": clusters}
+
+
+# =====================================================================
+# Routes: Prioritized engagement PLANNER (OB-02 / SOL-02 anti-swarm)
+# ---------------------------------------------------------------------
+# STRICTLY human-in-the-loop DECISION SUPPORT. These endpoints compute a
+# ranked engagement PROPOSAL only (see backend/engagement_planner.py). They
+# have NO capability to engage, transmit, jam, or mutate any detection/track:
+# the planner is a pure function over dicts and imports nothing that can
+# transmit. The ACTUAL execution of any proposed engagement MUST go through
+# the existing POST /api/payloads/deploy or POST /api/mavlink/broadcast path,
+# each of which independently re-enforces, at fire time and for THAT specific
+# target: commander role, TX-not-halted master kill, a fresh single-use arm
+# token (CRITICAL/broadcast), the IFF friendly-fire interlock, and range
+# authorization. We deliberately do NOT provide an "execute-next-in-plan"
+# convenience endpoint: there is intentionally no orchestration wrapper that
+# could fire, so there is no surface on which a gate-bypass/auto-fire path
+# could ever exist. The operator reviews the plan here, then engages each
+# proposal one at a time through the existing fully-gated deploy path.
+# =====================================================================
+async def _compute_engagement_plan() -> Dict[str, Any]:
+    """Shared read-only computation of the ranked engagement PROPOSAL from the
+    current confirmed tracks + swarm candidate clusters + ACTIVE detections.
+
+    Performs NO transmission and NO detection/track mutation. It reuses
+    _compute_swarm_clusters() (which lazily expires stale detections) and the
+    authoritative in-memory live-track index. Returns a plain plan dict; the
+    caller decides whether to audit-log it (the POST does; the GET stays
+    side-effect-free per HTTP semantics, mirroring the /swarm/clusters split).
+    """
+    clusters = await _compute_swarm_clusters()
+    active_docs = await db.detections.find({"status": "ACTIVE"}, {"_id": 0}).to_list(500)
+    async with _track_lock:
+        tracks = [t.to_dict() for t in track_manager.live_tracks()]
+    return build_engagement_plan(active_docs, clusters, tracks)
+
+
+@api.get("/engagement/plan")
+async def get_engagement_plan(user: Dict = Depends(require_commander)):
+    """Read-only: return the current ranked engagement PROPOSAL for the
+    commander to review. NO side effects -- computes nothing persistent,
+    transmits nothing, mutates nothing, and (per HTTP GET safe-method
+    semantics, exactly like GET /swarm/clusters) does not write an audit
+    entry. Use POST /api/engagement/plan/recompute to recompute AND record
+    the computation in the tamper-evident mission log.
+
+    The returned plan is a PROPOSAL ONLY. Every proposal is stamped
+    status=PROPOSED_REQUIRES_HUMAN_AUTHORIZATION and lists the exact existing
+    safety gates a human must clear to engage it via /api/payloads/deploy or
+    /api/mavlink/broadcast. This endpoint cannot and does not engage anything.
+    Commander-gated so the proposal (which reveals targeting priorities) is
+    not exposed to lower-privilege operators.
+    """
+    return await _compute_engagement_plan()
+
+
+@api.post("/engagement/plan/recompute")
+async def recompute_engagement_plan(user: Dict = Depends(require_commander)):
+    """Recompute the ranked engagement PROPOSAL and record the computation in
+    the tamper-evident mission-log audit chain (the recompute is the side
+    effect -- verb semantics mirror the GET/POST /swarm/clusters split). Still
+    engages NOTHING: this only produces and audits a proposal object. The
+    human commander must separately clear the full arm-token/TX-halt/range-
+    auth/IFF gate chain per engagement via the existing deploy/broadcast
+    endpoints to actually fire.
+    """
+    plan = await _compute_engagement_plan()
+    summary = plan["summary"]
+    await log_event(
+        "ENGAGEMENT_PLAN",
+        f"Engagement PROPOSAL recomputed: {summary['proposal_count']} proposed "
+        f"target(s) ({summary['controller_candidate_count']} swarm-controller "
+        f"candidate(s) ranked first), {summary['excluded_count']} contact(s) "
+        "excluded (IFF-friendly/unconfirmed/coasting). PROPOSAL ONLY -- no "
+        "engagement performed; each requires human commander gate clearance.",
+        meta={
+            "summary": summary,
+            "proposed_targets": [
+                {"rank": p["rank"], "detection_id": p["detection_id"],
+                 "callsign": p.get("callsign"), "role": p["role"],
+                 "is_controller_candidate": p["is_controller_candidate"],
+                 "priority_score": p["priority_score"],
+                 "swarm_id": p["swarm_id"]}
+                for p in plan["proposals"]
+            ],
+            "excluded": plan["excluded"],
+        },
+        actor=user["email"],
+    )
+    return plan
 
 
 def _interval_stats(timestamps_iso: List[str]) -> Optional[Dict[str, Any]]:
