@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { HeartPulse, ShieldAlert } from "lucide-react";
+import { useAuth } from "@/context/AuthContext";
+import ResumeTx from "./ResumeTx";
 
 const DOT = (ok) => ({
   color: ok ? "var(--accent-success)" : "var(--accent-critical)",
@@ -11,6 +13,8 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 const STALE_THRESHOLD_MS = POLL_INTERVAL_MS * 4; // ~12s
 
 export default function SystemHealth() {
+  const { user } = useAuth();
+  const isCommander = user?.role === "commander";
   const [h, setH] = useState(null);
   const [lastSuccessAt, setLastSuccessAt] = useState(null);
   const [consecutiveFailures, setConsecutiveFailures] = useState(0);
@@ -87,13 +91,19 @@ export default function SystemHealth() {
       {h?.tx_halted && (
         <div
           data-testid="tx-halted-banner"
-          className="tactical-border-b px-4 py-2 flex items-center gap-2 pulse-crit"
+          role="alert"
+          className="tactical-border-b px-4 py-2 flex items-center justify-between gap-3 pulse-crit"
           style={{ background: "#FF3B30", color: "black" }}
         >
-          <ShieldAlert size={14} strokeWidth={2} />
-          <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
-            TX HALTED — commander must POST /emergency/resume
-          </span>
+          <div className="flex items-center gap-2">
+            <ShieldAlert size={14} strokeWidth={2} />
+            <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
+              {isCommander
+                ? "TX HALTED — resume to re-arm the transmit path"
+                : "TX HALTED — awaiting commander authorization to resume"}
+            </span>
+          </div>
+          {isCommander && <ResumeTx />}
         </div>
       )}
       <div className="p-4 space-y-2 font-mono text-xs">
