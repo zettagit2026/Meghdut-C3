@@ -568,7 +568,7 @@ export default function Dashboard() {
                         </span>
                       )}
                     </div>
-                    <div>BEARING: <span className="text-slate-300">{d.bearing_deg}°</span> · ALT: <span className="text-slate-300">{d.altitude_m}m</span></div>
+                    <div>BEARING: <span className="text-slate-300">{(d.bearing_deg === null || d.bearing_deg === undefined || d.bearing_available === false) ? "UNKNOWN (no DF array)" : `${d.bearing_deg}°${d.bearing_estimated ? ` ±${d.bearing_uncertainty_deg ?? "?"}° est.` : ""}`}</span> · ALT: <span className="text-slate-300">{d.altitude_m}m</span></div>
                     <div className="flex items-center gap-2">
                       <TrendingUp size={10} strokeWidth={1.5} /> {d.speed_ms} m/s
                       {d.swarm_id && (

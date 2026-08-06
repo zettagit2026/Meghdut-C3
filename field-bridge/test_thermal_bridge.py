@@ -66,7 +66,9 @@ def test_detection_to_ingest_body_shape():
     # honesty guards: no fabricated ranging/bearing numbers
     assert body["distance_m"] == 0.0
     assert body["distance_estimated"] is False
-    assert body["bearing_deg"] == 0.0
+    # bearing is EXPLICITLY unavailable (None), never a fake 0.0 "North"
+    assert body["bearing_deg"] is None
+    assert body["bearing_available"] is False
 
 
 def test_detection_to_ingest_body_confidence_rounding():
@@ -76,12 +78,13 @@ def test_detection_to_ingest_body_confidence_rounding():
     assert body["ml_confidence"] == round(0.123456, 4)
 
 
-def test_bearing_deg_placeholder_is_honest_zero_not_fabricated():
-    """No camera calibration/mounting-azimuth data exists -- the placeholder
-    must stay 0.0, not synthesize a plausible-looking bearing."""
+def test_bearing_deg_is_unavailable_not_fabricated():
+    """No camera calibration/mounting-azimuth data (and no multi-antenna DF
+    array) exists -- bearing must be an EXPLICIT None ("unknown"), never a
+    fabricated 0.0 that renders as a confident '0 deg North'."""
     det = ThermalDetection(score=0.9, box_xyxy=(0, 0, 10, 10),
                             frame_width_px=100, frame_height_px=100)
-    assert det.bearing_deg_placeholder() == 0.0
+    assert det.bearing_deg() is None
 
 
 def test_min_report_score_is_a_real_threshold_not_zero_or_one():

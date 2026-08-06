@@ -1071,7 +1071,8 @@ def main() -> None:
                     "bandwidth_mhz": occupied_bw_mhz,
                     "rssi_dbm": peak,
                     "snr_db": peak - floor,
-                    "bearing_deg": 0.0,
+                    "bearing_deg": None,  # honest: no DF array -> direction unknown (was 0.0 fake)
+                    "bearing_available": False,
                     "distance_m": 0.0,
                     "distance_estimated": False,  # not a range estimate -- advisory only
                     "source": "HACKRF",
@@ -1100,7 +1101,8 @@ def main() -> None:
                     "bandwidth_mhz": high - low,
                     "rssi_dbm": peak,
                     "snr_db": peak - floor,
-                    "bearing_deg": 0.0,
+                    "bearing_deg": None,  # honest: no DF array -> direction unknown (was 0.0 fake)
+                    "bearing_available": False,
                     "distance_m": round(est_distance_m, 1),
                     "distance_estimated": True,  # RSSI path-loss model, not a real range measurement
                     "source": meta["source"],

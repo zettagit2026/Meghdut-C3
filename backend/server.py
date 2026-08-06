@@ -1993,7 +1993,19 @@ class DetectionIngestBody(BaseModel):
     bandwidth_mhz: float = 20.0
     rssi_dbm: float = -80.0
     snr_db: float = 10.0
-    bearing_deg: float = 0.0
+    # Bearing / direction-of-arrival. Defaults to None = EXPLICITLY UNKNOWN,
+    # NOT 0.0. Real bearing requires the multi-antenna amplitude-comparison DF
+    # array (field-bridge/direction_finding.py), which is hardware-gated
+    # (>=2 directional antennas, task #20) and not present yet. Single-antenna
+    # sources (hackrf_rx.py) and the thermal camera scaffold send None so the
+    # console renders "bearing unknown", never a fabricated "0 deg North".
+    # bearing_available mirrors the distance_estimated honesty-flag pattern.
+    bearing_deg: Optional[float] = None
+    bearing_available: bool = False
+    # True only when bearing_deg is a real (coarse) DF estimate from the
+    # amplitude-comparison array; paired with bearing_uncertainty_deg.
+    bearing_estimated: bool = False
+    bearing_uncertainty_deg: Optional[float] = None
     distance_m: float = 0.0
     # True when distance_m is a model-based RSSI path-loss estimate, not a real
     # range measurement (radar/TDOA/etc). Defaults False so existing sources
@@ -2696,6 +2708,9 @@ async def detection_ingest(body: DetectionIngestBody,
             "rssi_dbm": body.rssi_dbm,
             "snr_db": body.snr_db,
             "bearing_deg": body.bearing_deg,
+            "bearing_available": body.bearing_available,
+            "bearing_estimated": body.bearing_estimated,
+            "bearing_uncertainty_deg": body.bearing_uncertainty_deg,
             "distance_m": body.distance_m,
             "distance_estimated": body.distance_estimated,
             "altitude_m": body.altitude_m,
@@ -2867,6 +2882,9 @@ async def detection_ingest(body: DetectionIngestBody,
         "rssi_dbm": body.rssi_dbm,
         "snr_db": body.snr_db,
         "bearing_deg": body.bearing_deg,
+        "bearing_available": body.bearing_available,
+        "bearing_estimated": body.bearing_estimated,
+        "bearing_uncertainty_deg": body.bearing_uncertainty_deg,
         "distance_m": body.distance_m,
         "distance_estimated": body.distance_estimated,
         "altitude_m": body.altitude_m,

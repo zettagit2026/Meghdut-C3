@@ -172,15 +172,22 @@ class ThermalDetection:
     frame_width_px: int
     frame_height_px: int
 
-    def bearing_deg_placeholder(self) -> float:
-        """NOT a real bearing estimate. A real implementation needs the
-        camera's known field-of-view and mounting azimuth to convert a
-        bounding-box horizontal center into a bearing, which requires
-        camera calibration data that does not exist yet (no camera is
-        physically mounted). Returns 0.0 -- same "no real number, don't
-        fake one" discipline as bearing_deg defaults elsewhere in this
-        codebase until a real estimate exists."""
-        return 0.0
+    def bearing_deg(self) -> None:
+        """NO real bearing estimate is available from a single uncalibrated
+        thermal camera. A real implementation needs the camera's known
+        field-of-view and mounting azimuth to convert a bounding-box
+        horizontal center into a bearing (camera calibration data that does
+        not exist yet -- no camera is physically mounted), OR the
+        multi-antenna RF amplitude-comparison DF in
+        field-bridge/direction_finding.py (also hardware-gated, needs >=2
+        directional antennas -- task #20).
+
+        Returns None -- an EXPLICIT "bearing unknown", never a fabricated
+        0.0 that the map/console would render as a confident "0 deg North".
+        This is the project's no-fake-data rule: an unavailable measurement
+        is surfaced as unavailable, not as a plausible-looking number.
+        Formerly returned a hardcoded 0.0 (removed)."""
+        return None
 
 
 def _require_torch():
@@ -320,8 +327,10 @@ def detection_to_ingest_body(det: ThermalDetection, model_name: str = "thermal-d
     Does NOT set distance_m/altitude_m/speed_ms to any real value (no
     ranging capability exists for a monocular thermal camera without
     stereo/known-object-size assumptions) -- left at ingest defaults.
-    Does NOT set bearing_deg to anything but the placeholder 0.0 (see
-    ThermalDetection.bearing_deg_placeholder's docstring for why).
+    Sets bearing_deg to None (EXPLICITLY unavailable), not a fake 0.0 -- see
+    ThermalDetection.bearing_deg's docstring. bearing_available=False mirrors
+    the existing distance_estimated honesty-flag pattern so the backend and
+    map render "bearing unknown", never "0 deg North".
     """
     return {
         "model": model_name,
@@ -334,7 +343,8 @@ def detection_to_ingest_body(det: ThermalDetection, model_name: str = "thermal-d
         "bandwidth_mhz": 0.0,
         "rssi_dbm": 0.0,
         "snr_db": 0.0,
-        "bearing_deg": det.bearing_deg_placeholder(),
+        "bearing_deg": det.bearing_deg(),      # None -- honest "unknown"
+        "bearing_available": False,
         "distance_m": 0.0,
         "distance_estimated": False,
         "source": SOURCE_THERMAL_CAM,
