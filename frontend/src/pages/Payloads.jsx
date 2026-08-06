@@ -373,7 +373,7 @@ export default function Payloads() {
           <div
             key={p.id}
             data-testid={`payload-${p.id}`}
-            className={`p-5 tactical-border-r tactical-border-b ${i % 3 === 2 ? "border-r-0" : ""}`}
+            className={`p-4 tactical-border-r tactical-border-b ${i % 3 === 2 ? "border-r-0" : ""}`}
             style={{ background: "var(--bg-surface)" }}
           >
             <div className="flex items-center justify-between mb-2">

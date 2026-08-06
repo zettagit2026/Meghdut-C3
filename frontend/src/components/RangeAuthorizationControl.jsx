@@ -85,7 +85,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
   return (
     <div
       data-testid={`range-auth-control-${effect}`}
-      className="tactical-border p-5 space-y-3"
+      className="tactical-border p-4 space-y-3"
       style={{ background: enabled ? "rgba(255,59,48,0.10)" : "var(--bg-surface)", borderColor: "var(--accent-critical)" }}
     >
       <div className="flex items-center gap-2">
@@ -107,7 +107,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
             <div className="font-mono text-xs">
               <span className="font-bold blink" style={{ color: "var(--accent-critical)" }}>● RANGE LIVE</span>
               <span className="text-slate-400 ml-3">
-                expires in <span data-testid={`range-auth-control-countdown-${effect}`} className="text-white">{fmtRemaining(remaining)}</span>
+                expires in <span data-testid={`range-auth-control-countdown-${effect}`} className="text-white tnum">{fmtRemaining(remaining)}</span>
               </span>
             </div>
           </div>
@@ -185,7 +185,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
               </button>
             </div>
 
-            <div className="p-5 space-y-4">
+            <div className="p-4 space-y-4">
               <div className="font-mono text-xs text-slate-300 leading-relaxed">
                 This is <span className="font-bold" style={{ color: "var(--text-primary)" }}>not</span> the same as the per-action
                 SafetyGate checklist you complete before every individual jam/deploy — that still runs

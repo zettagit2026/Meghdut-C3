@@ -16,7 +16,7 @@ export function ClassificationBanner({ position = "top" }) {
       style={{ background: "var(--accent-critical)", color: "#000" }}
     >
       <span>{position === "top" ? "//" : "\\\\"} RESTRICTED — INDIAN MINISTRY OF DEFENCE — CEMA-cUAS EVAL {position === "top" ? "//" : "\\\\"}</span>
-      <span className="hidden md:inline">
+      <span className="hidden md:inline tnum">
         {position === "top" ? "SESSION" : "UTC"}: {time}
       </span>
       <span>NOFORN // NOT FOR OPERATIONAL USE</span>

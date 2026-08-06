@@ -225,7 +225,7 @@ function StatTile({ label, value, sub, color = "var(--accent-info)", testid }) {
   return (
     <div data-testid={testid} className="tactical-border p-4" style={{ background: "var(--bg-surface)" }}>
       <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">{label}</div>
-      <div className="font-heading font-black text-4xl tracking-tighter mt-1" style={{ color }}>
+      <div className="font-heading font-black text-4xl tracking-tighter mt-1 tnum" style={{ color }}>
         {value}
       </div>
       {sub && (

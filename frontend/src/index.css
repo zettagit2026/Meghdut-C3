@@ -1,4 +1,32 @@
-@import url('https://fonts.googleapis.com/css2?family=Chivo:wght@400;700;900&family=IBM+Plex+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+/* ---------------------------------------------------------------------------
+   SELF-HOSTED FONTS (air-gapped / offline-critical)
+   This console runs on an isolated field network, so the type system must NOT
+   depend on a remote font import (fonts.googleapis.com). The three families
+   are vendored locally under src/fonts/ as latin-subset variable woff2
+   files (one file per family covers the whole wght axis). font-display: swap
+   keeps first paint instant while the face loads from local disk.
+--------------------------------------------------------------------------- */
+@font-face {
+  font-family: 'Chivo';
+  font-style: normal;
+  font-weight: 100 900;
+  font-display: swap;
+  src: url('./fonts/chivo-latin-var.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'IBM Plex Sans';
+  font-style: normal;
+  font-weight: 100 700;
+  font-display: swap;
+  src: url('./fonts/ibmplexsans-latin-var.woff2') format('woff2');
+}
+@font-face {
+  font-family: 'JetBrains Mono';
+  font-style: normal;
+  font-weight: 100 800;
+  font-display: swap;
+  src: url('./fonts/jetbrainsmono-latin-var.woff2') format('woff2');
+}
 
 @tailwind base;
 @tailwind components;
@@ -52,7 +80,6 @@
   --hover-surface: #0F1626;
   --active-surface: #1A2235;
   --elev-shadow: 0 0 0 rgba(0, 0, 0, 0); /* dark theme uses glow, not shadow */
-  --scanline-color: rgba(255, 255, 255, 0.02);
 }
 
 [data-theme="light"] {
@@ -79,7 +106,6 @@
   --hover-surface: #E1E6EE;
   --active-surface: #DBE2EC;
   --elev-shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 2px 8px rgba(15, 23, 42, 0.05);
-  --scanline-color: rgba(15, 23, 42, 0.015);
 }
 
 html, body, #root {
@@ -90,27 +116,6 @@ html, body, #root {
   margin: 0;
   min-height: 100vh;
 }
-
-body::before {
-  /* subtle CRT scanlines */
-  content: "";
-  position: fixed;
-  inset: 0;
-  pointer-events: none;
-  background: repeating-linear-gradient(
-    to bottom,
-    var(--scanline-color) 0px,
-    var(--scanline-color) 1px,
-    transparent 1px,
-    transparent 3px
-  );
-  z-index: 9999;
-  mix-blend-mode: overlay;
-}
-
-/* The CRT scanline overlay is a dark-console affectation; it reads as haze on
-   a light background, so it's suppressed in light mode. */
-[data-theme="light"] body::before { display: none; }
 
 /* Tokenized sidebar nav + hover-surface helpers so the main app chrome
    (Layout.jsx) is theme-correct without literal dark hexes in JSX. */
@@ -147,7 +152,11 @@ body::before {
 .font-body     { font-family: 'IBM Plex Sans', sans-serif; }
 .font-mono     { font-family: 'JetBrains Mono', ui-monospace, monospace; font-variant-numeric: tabular-nums; }
 
-.tactical-border { border: 1px solid var(--border-col); }
+/* Full-box bordered panels/buttons get the 4px card radius (A3). The
+   directional divider variants below stay square -- they draw internal grid
+   lines, not panel outlines, and full-bleed alert/classification banners use
+   inline backgrounds (not .tactical-border) so they remain square chrome. */
+.tactical-border { border: 1px solid var(--border-col); border-radius: var(--radius); }
 .tactical-border-b { border-bottom: 1px solid var(--border-col); }
 .tactical-border-r { border-right: 1px solid var(--border-col); }
 .tactical-border-t { border-top: 1px solid var(--border-col); }
@@ -202,24 +211,18 @@ body::before {
   }
 }
 
+/* .scanline-btn previously layered a CRT-scanline hover overlay (removed: it
+   cut button-label contrast and read as consumer sci-fi). The class is kept as
+   a no-op so existing JSX using it doesn't break. */
 .scanline-btn {
   position: relative;
-  overflow: hidden;
 }
-.scanline-btn::after {
-  content: "";
-  position: absolute; inset: 0;
-  background: repeating-linear-gradient(
-    to bottom,
-    rgba(255,255,255,0.06) 0px,
-    rgba(255,255,255,0.06) 1px,
-    transparent 1px,
-    transparent 4px
-  );
-  opacity: 0;
-  transition: opacity 0.15s ease-out;
-}
-.scanline-btn:hover::after { opacity: 1; }
+
+/* Tabular figures for live-updating numeric readouts (countdowns, dBm peaks,
+   UTC clock, packet counters, RSSI/FREQ/DIST columns) so digits don't reflow
+   as values change. .font-mono already sets this; .tnum is for the non-mono
+   numeric cells. */
+.tnum { font-variant-numeric: tabular-nums; }
 
 /* Tailwind base tokens (shadcn compatibility) */
 @layer base {
@@ -243,7 +246,11 @@ body::before {
     --border: 0 0% 100% / 0.15;
     --input: 220 30% 14%;
     --ring: 187 100% 47%;
-    --radius: 0rem;
+    /* Radii scale (A3). 4px base: cards/panels rounded-md->4px via shadcn
+       rounded-lg, inputs/badges rounded-md->2px. Structural full-bleed chrome
+       (classification bars, range-auth alert banners) is kept square on
+       purpose and never carries a rounded/ .tactical-border radius. */
+    --radius: 0.25rem;
   }
   [data-theme="light"] {
     --background: 220 27% 92%;      /* #E8EBF0 */
@@ -266,7 +273,7 @@ body::before {
     --input: 220 20% 84%;
     --ring: 194 70% 27%;
   }
-  * { @apply border-border; border-radius: 0 !important; }
+  * { @apply border-border; }
   body { @apply bg-background text-foreground; }
 }
 

@@ -281,7 +281,7 @@ export default function KillChain() {
           const isDeepLinked = deepLinkedId === d.id || selectedId === d.id;
           return (
             <div key={d.id} data-testid={`kc-${d.id}`} id={`kc-row-${d.id}`}
-                 className="p-5 tactical-border-b last:border-b-0"
+                 className="p-4 tactical-border-b last:border-b-0"
                  style={{
                    background: "var(--bg-surface)",
                    outline: isDeepLinked ? "1px solid var(--accent-info)" : "none",

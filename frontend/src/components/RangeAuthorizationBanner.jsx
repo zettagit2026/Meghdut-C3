@@ -56,7 +56,7 @@ function EffectBanner({ effect, label }) {
         <Radiation size={16} strokeWidth={2} />
         <span>
           RANGE LIVE — {label} — expires in{" "}
-          <span data-testid={`range-auth-countdown-${effect}`}>{fmtRemaining(remaining)}</span>
+          <span data-testid={`range-auth-countdown-${effect}`} className="tnum">{fmtRemaining(remaining)}</span>
           {status.enabled_by ? <> — armed by {status.enabled_by}</> : null}
         </span>
         <button

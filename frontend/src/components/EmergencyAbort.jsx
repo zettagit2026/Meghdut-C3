@@ -27,6 +27,7 @@ export default function EmergencyAbort() {
   };
 
   return (
+    <>
     <button
       data-testid="emergency-abort-btn"
       onClick={confirming ? abort : () => setConfirming(true)}
@@ -46,5 +47,13 @@ export default function EmergencyAbort() {
       <Siren size={14} strokeWidth={1.5} />
       {confirming ? "CONFIRM ABORT" : "EMERGENCY ABORT"}
     </button>
+    <span data-testid="emergency-abort-status" role="status" aria-live="assertive" className="sr-only">
+      {busy
+        ? "Emergency abort, request in progress"
+        : confirming
+        ? "Emergency abort armed — activate again to confirm"
+        : ""}
+    </span>
+    </>
   );
 }

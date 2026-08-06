@@ -178,7 +178,7 @@ export default function SpectrumScope() {
               }}
             >
               {stale ? "◌ STALE" : isReal ? "● LIVE HACKRF" : "○ NO SIGNAL"}
-              {!stale && meta.peakDbm != null && <span className="ml-2 text-slate-400">{meta.peakDbm.toFixed(1)} dBm pk</span>}
+              {!stale && meta.peakDbm != null && <span className="ml-2 text-slate-400 tnum">{meta.peakDbm.toFixed(1)} dBm pk</span>}
             </span>
           );
         })()}

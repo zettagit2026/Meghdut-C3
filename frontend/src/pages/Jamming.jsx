@@ -186,7 +186,7 @@ export default function Jamming() {
       )}
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-        <div className="tactical-border p-5 space-y-4" style={{ background: "var(--bg-surface)" }}>
+        <div className="tactical-border p-4 space-y-4" style={{ background: "var(--bg-surface)" }}>
           <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Burst Parameters</div>
 
           <label className="block">
@@ -250,7 +250,7 @@ export default function Jamming() {
           </button>
         </div>
 
-        <div className="tactical-border p-5" style={{ background: "var(--bg-surface)" }}>
+        <div className="tactical-border p-4" style={{ background: "var(--bg-surface)" }}>
           <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 mb-3">
             Jam Sessions
           </div>

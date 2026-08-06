@@ -213,14 +213,16 @@ function SignatureDbPanel() {
 
 export default function ProtocolLibrary() {
   return (
-    <div className="p-6 flex flex-col gap-6" data-testid="page-protocol-library">
-      <div className="flex items-center gap-3">
-        <BookOpen size={20} strokeWidth={1.5} style={{ color: "var(--accent-info)" }} />
-        <div>
-          <div className="font-heading font-black text-xl tracking-tight">DRONE PROTOCOL LIBRARY</div>
-          <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-            Real parser/decoder inventory &middot; not a generic reference — every entry traces to a file in this repo
-          </div>
+    <div className="space-y-6" data-testid="page-protocol-library">
+      <div>
+        <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 mb-1">
+          <BookOpen size={12} className="inline mr-2" strokeWidth={1.5} /> Drone Protocol Library
+        </div>
+        <h1 className="font-heading font-black text-5xl uppercase tracking-tighter">
+          Protocol Library
+        </h1>
+        <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 mt-1">
+          Real parser/decoder inventory &middot; not a generic reference — every entry traces to a file in this repo
         </div>
       </div>
 

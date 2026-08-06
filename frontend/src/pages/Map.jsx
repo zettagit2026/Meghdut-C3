@@ -295,7 +295,7 @@ export default function MapView() {
   }, [hasSensor, sensor, activeContacts, theme]);
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-6">
       <div>
         <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 mb-1">
           <MapPin size={12} className="inline mr-2" strokeWidth={1.5} /> Geospatial

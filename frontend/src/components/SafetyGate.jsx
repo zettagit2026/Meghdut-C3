@@ -98,7 +98,7 @@ export default function SafetyGate({
               <X size={16} />
             </button>
           </div>
-          <div className="p-5 space-y-4">
+          <div className="p-4 space-y-4">
             <AlertDialogPrimitive.Description asChild>
               <div className="font-mono text-xs">
                 You are about to arm <span className="font-bold" style={{ color: "var(--text-primary)" }}>{payloadName}</span>{" "}
