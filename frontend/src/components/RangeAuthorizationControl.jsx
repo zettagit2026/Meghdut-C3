@@ -132,7 +132,8 @@ export default function RangeAuthorizationControl({ effect, label }) {
             data-testid={`range-auth-disable-btn-${effect}`}
             onClick={disableNow}
             disabled={disabling}
-            className="w-full px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors text-[#FF3B30] border-[#FF3B30] hover:bg-[#FF3B30] hover:text-black disabled:opacity-50"
+            className="w-full px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors hover:bg-[#FF3B30] hover:text-black disabled:opacity-50"
+            style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
           >
             DISABLE RANGE AUTHORIZATION
           </button>
@@ -171,7 +172,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
               <div className="flex items-center gap-3">
                 <AlertOctagon size={22} strokeWidth={1.5} className="pulse-crit" style={{ color: "var(--accent-critical)" }} />
                 <div>
-                  <div className="font-heading font-black text-xl uppercase tracking-tighter text-white">
+                  <div className="font-heading font-black text-xl uppercase tracking-tighter" style={{ color: "var(--text-primary)" }}>
                     Authorize Live Range
                   </div>
                   <div className="font-mono text-[10px] uppercase tracking-widest" style={{ color: "var(--accent-critical)" }}>
@@ -186,7 +187,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
 
             <div className="p-5 space-y-4">
               <div className="font-mono text-xs text-slate-300 leading-relaxed">
-                This is <span className="font-bold text-white">not</span> the same as the per-action
+                This is <span className="font-bold" style={{ color: "var(--text-primary)" }}>not</span> the same as the per-action
                 SafetyGate checklist you complete before every individual jam/deploy — that still runs
                 separately, every time. This action arms the field-bridge host to accept live TX for{" "}
                 <span className="font-bold" style={{ color: "var(--accent-critical)" }}>{label}</span>{" "}
@@ -212,7 +213,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
 
               <label className="block">
                 <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-                  Type the exact phrase: <span className="text-white">{CONFIRM_PHRASE}</span>
+                  Type the exact phrase: <span style={{ color: "var(--text-primary)" }}>{CONFIRM_PHRASE}</span>
                 </span>
                 <input
                   data-testid={`range-auth-phrase-${effect}`}
@@ -233,7 +234,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
                   type="button"
                   data-testid={`range-auth-modal-cancel-${effect}`}
                   onClick={closeModal}
-                  className="px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest text-slate-400 hover:text-white hover:bg-[#0F1626]"
+                  className="px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest text-slate-400 hover-surface"
                 >
                   CANCEL
                 </button>

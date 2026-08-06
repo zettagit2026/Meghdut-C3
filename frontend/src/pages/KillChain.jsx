@@ -4,8 +4,18 @@ import CytoscapeComponent from "react-cytoscapejs";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { Crosshair, ChevronRight, CheckCircle2, Circle, Loader2, Skull, ShieldAlert } from "lucide-react";
+import { getThreatHex } from "@/lib/threatLevels";
+import { useTheme } from "@/context/ThemeContext";
 
 const CHAIN = ["DETECT", "TRACK", "IDENTIFY", "DECIDE", "DEFEAT"];
+
+// cytoscape stylesheets/elements take literal color strings (they don't
+// resolve CSS custom properties), so graph colors are snapshotted per theme
+// in JS and recomputed when the theme flips (see useTheme() below).
+const CY_CHROME = {
+  dark:  { nodeLabel: "#E2E8F0", nodeBorder: "#1E293B", selected: "#00F0FF" },
+  light: { nodeLabel: "#111827", nodeBorder: "#CBD5E1", selected: "#155E75" },
+};
 
 const POLL_INTERVAL_MS = 5000;
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -23,20 +33,21 @@ const ROW_SPACING = 90;
 // WCAG 1.4.1 (Use of Color): every graph-node state below is encoded by
 // shape AND color, mirroring the icon+color convention from the flat-list
 // view (task #37) so colorblind operators aren't relying on hue alone.
-function stageVisual(d) {
+function stageVisual(d, hex) {
   const idx = d.kill_chain_index;
   const defeated = d.status === "NEUTRALIZED";
   const awaitingAck = d.status === "AWAITING_ACK";
   const txFailed = d.status === "TX_FAILED";
   const txTimeout = d.status === "TX_TIMEOUT";
-  if (defeated) return { color: "#FB3A5D", shape: "diamond", label: "NEUTRALIZED" };
-  if (awaitingAck) return { color: "#F5A623", shape: "hexagon", label: "AWAITING ACK" };
-  if (txFailed || txTimeout) return { color: "#FB3A5D", shape: "octagon", label: txFailed ? "TX FAILED" : "TX TIMEOUT" };
+  if (defeated) return { color: hex.CRITICAL, shape: "diamond", label: "NEUTRALIZED" };
+  if (awaitingAck) return { color: hex.MEDIUM, shape: "hexagon", label: "AWAITING ACK" };
+  if (txFailed || txTimeout) return { color: hex.CRITICAL, shape: "octagon", label: txFailed ? "TX FAILED" : "TX TIMEOUT" };
   // In-progress stage node
-  return { color: "#00F0FF", shape: "ellipse", label: CHAIN[idx] || "DETECT" };
+  return { color: hex.INFO, shape: "ellipse", label: CHAIN[idx] || "DETECT" };
 }
 
 export default function KillChain() {
+  const { theme } = useTheme();
   const [dets, setDets] = useState([]);
   // Deep-link support: Dashboard/DetectionHistory link here as
   // /killchain?contact=<id> so an operator clicking a KC-stage cell on the
@@ -101,6 +112,8 @@ export default function KillChain() {
   // graph state to keep in sync, so the graph updates in place on the
   // existing 5s poll without a remount (CytoscapeComponent diffs `elements`
   // by id and only touches what changed).
+  const hex = getThreatHex(theme);
+  const chrome = CY_CHROME[theme] || CY_CHROME.dark;
   const elements = useMemo(() => {
     const stageCounts = {};
     const nodes = dets.map((d) => {
@@ -108,7 +121,7 @@ export default function KillChain() {
       const col = d.status === "NEUTRALIZED" ? CHAIN.length - 1 : idx;
       const row = stageCounts[col] || 0;
       stageCounts[col] = row + 1;
-      const v = stageVisual(d);
+      const v = stageVisual(d, hex);
       return {
         data: {
           id: d.id,
@@ -135,7 +148,7 @@ export default function KillChain() {
     });
 
     return [...nodes, ...edges];
-  }, [dets]);
+  }, [dets, hex]);
 
   const stylesheet = useMemo(() => [
     {
@@ -144,7 +157,7 @@ export default function KillChain() {
         "background-color": "data(color)",
         shape: "data(shape)",
         label: "data(label)",
-        color: "#E2E8F0",
+        color: chrome.nodeLabel,
         "font-family": "monospace",
         "font-size": 9,
         "text-wrap": "wrap",
@@ -153,24 +166,24 @@ export default function KillChain() {
         width: 34,
         height: 34,
         "border-width": 2,
-        "border-color": "#1E293B",
+        "border-color": chrome.nodeBorder,
       },
     },
     {
       selector: "node:selected",
-      style: { "border-color": "#00F0FF", "border-width": 3 },
+      style: { "border-color": chrome.selected, "border-width": 3 },
     },
     {
       selector: "edge",
       style: {
         width: 2,
-        "line-color": "var(--accent-warning, #F5A623)",
+        "line-color": hex.MEDIUM,
         "line-style": "dashed",
         "curve-style": "bezier",
         "target-arrow-shape": "none",
       },
     },
-  ], []);
+  ], [chrome, hex]);
 
   return (
     <div className="space-y-6">
@@ -238,10 +251,10 @@ export default function KillChain() {
           />
         )}
         <div className="px-4 pb-3 pt-1 font-mono text-[9px] uppercase tracking-widest text-slate-600 flex gap-4 flex-wrap">
-          <span><span style={{ color: "#00F0FF" }}>●</span> in-progress</span>
-          <span><span style={{ color: "#FB3A5D" }}>◆</span> neutralized</span>
-          <span><span style={{ color: "#F5A623" }}>⬡</span> awaiting ack</span>
-          <span><span style={{ color: "#FB3A5D" }}>⬣</span> tx failed/timeout</span>
+          <span><span style={{ color: "var(--threat-info)" }}>●</span> in-progress</span>
+          <span><span style={{ color: "var(--threat-critical)" }}>◆</span> neutralized</span>
+          <span><span style={{ color: "var(--threat-medium)" }}>⬡</span> awaiting ack</span>
+          <span><span style={{ color: "var(--threat-critical)" }}>⬣</span> tx failed/timeout</span>
           <span>┄ swarm-cluster link</span>
         </div>
       </div>
@@ -332,7 +345,7 @@ export default function KillChain() {
                   // the 3:1 UI-component contrast minimum against this bg.
                   const nodeColor = isDefeat ? "var(--accent-critical)"
                     : done ? "var(--accent-success)"
-                    : active ? "var(--accent-info)" : "#94A3B8";
+                    : active ? "var(--accent-info)" : "var(--text-secondary)";
                   const NodeIcon = isDefeat ? Skull : done ? CheckCircle2 : active ? Loader2 : Circle;
                   const stateLabel = isDefeat ? "NEUTRALIZED" : done ? "COMPLETE" : active ? "IN PROGRESS" : "PENDING";
                   return (

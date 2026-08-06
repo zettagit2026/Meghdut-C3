@@ -4,7 +4,29 @@
 @tailwind components;
 @tailwind utilities;
 
-:root {
+/* ---------------------------------------------------------------------------
+   THEMING (dark default + light)
+   ---------------------------------------------------------------------------
+   Dark values live under :root (and [data-theme="dark"]) and remain the
+   fallback if no data-theme is set. The light theme is a full parallel set
+   under [data-theme="light"] -- NOT a mechanical invert. It is a calm,
+   low-glare tactical-console light theme: cool warm-neutral off-white
+   backgrounds, elevation carried by subtle borders + soft shadows instead of
+   the dark theme's neon glow, near-black high-contrast text, and threat
+   accents re-tuned so every severity tier still meets WCAG AA against the
+   LIGHT backgrounds (the dark theme's neons -- e.g. #00F0FF / #39FF14 --
+   fail badly on white and are replaced with deeper, AA-passing variants).
+
+   Threat colors are safety-critical and are given dedicated tokens
+   (--threat-*) so their light/dark variants are decoupled from the general
+   UI accents. THREAT_COLOR / THREAT_COLOR_HEX in lib/threatLevels.js mirror
+   these (maplibre paint props can't read CSS vars -- see Map.jsx).
+   Measured AA ratios (light threat vs --bg-base #E8EBF0):
+     low #047857 4.59 · medium #92600A 4.51 · high #9A3412 6.11 ·
+     critical #B91C1C 5.41 · info #155E75 6.08   (all >= 4.5)
+--------------------------------------------------------------------------- */
+:root,
+[data-theme="dark"] {
   --bg-base: #050810;
   --bg-surface: #0C111D;
   --bg-elev: #1A2235;
@@ -18,6 +40,46 @@
   --accent-success: #39FF14;
   --accent-info: #00F0FF;
   --border-col: rgba(255, 255, 255, 0.15);
+
+  /* Safety-critical threat tiers (decoupled from UI accents). */
+  --threat-low: #39FF14;
+  --threat-medium: #FFD60A;
+  --threat-high: #FF8A00;
+  --threat-critical: #FF3B30;
+  --threat-info: #00F0FF;
+
+  /* Surface chrome helpers used by tokenized nav/hover classes. */
+  --hover-surface: #0F1626;
+  --active-surface: #1A2235;
+  --elev-shadow: 0 0 0 rgba(0, 0, 0, 0); /* dark theme uses glow, not shadow */
+  --scanline-color: rgba(255, 255, 255, 0.02);
+}
+
+[data-theme="light"] {
+  --bg-base: #E8EBF0;      /* soft cool off-white page */
+  --bg-surface: #F4F6FA;   /* panels/cards lift above base */
+  --bg-elev: #FFFFFF;      /* highest elevation / active rows */
+  --bg-terminal: #0B0F17;  /* scopes/waterfall stay a dark "screen" in both themes */
+  --text-primary: #111827; /* 16.4:1 on surface */
+  --text-secondary: #3F4A5A; /* 8.3:1 */
+  --text-muted: #5B6675;   /* 4.88:1 on base -- AA for small labels */
+  --text-term: #00F0FF;    /* terminal panel is dark in both themes */
+  --accent-critical: #B91C1C;
+  --accent-warning: #92600A;
+  --accent-success: #047857;
+  --accent-info: #155E75;
+  --border-col: rgba(15, 23, 42, 0.14);
+
+  --threat-low: #047857;
+  --threat-medium: #92600A;
+  --threat-high: #9A3412;
+  --threat-critical: #B91C1C;
+  --threat-info: #155E75;
+
+  --hover-surface: #E1E6EE;
+  --active-surface: #DBE2EC;
+  --elev-shadow: 0 1px 2px rgba(15, 23, 42, 0.06), 0 2px 8px rgba(15, 23, 42, 0.05);
+  --scanline-color: rgba(15, 23, 42, 0.015);
 }
 
 html, body, #root {
@@ -37,14 +99,49 @@ body::before {
   pointer-events: none;
   background: repeating-linear-gradient(
     to bottom,
-    rgba(255,255,255,0.02) 0px,
-    rgba(255,255,255,0.02) 1px,
+    var(--scanline-color) 0px,
+    var(--scanline-color) 1px,
     transparent 1px,
     transparent 3px
   );
   z-index: 9999;
   mix-blend-mode: overlay;
 }
+
+/* The CRT scanline overlay is a dark-console affectation; it reads as haze on
+   a light background, so it's suppressed in light mode. */
+[data-theme="light"] body::before { display: none; }
+
+/* Tokenized sidebar nav + hover-surface helpers so the main app chrome
+   (Layout.jsx) is theme-correct without literal dark hexes in JSX. */
+.nav-link {
+  color: var(--text-secondary);
+  border-left: 2px solid transparent;
+}
+.nav-link:hover {
+  color: var(--text-primary);
+  background: var(--hover-surface);
+}
+.nav-link.is-active {
+  background: var(--active-surface);
+  color: var(--accent-info);
+  border-left-color: var(--accent-info);
+}
+.hover-surface:hover { background: var(--hover-surface); }
+.elev-surface { box-shadow: var(--elev-shadow); }
+
+/* App-wide muted-text remap for light mode.
+   The pages lean heavily on Tailwind's slate text utilities for muted
+   foreground copy (labels, meta, values) on light/dark SURFACES -- never on
+   solid colored alert fills (those use explicit text-black / color:black), so
+   remapping only the slate scale here is safe and keeps every screen legible
+   in light mode without editing each file. Values chosen for WCAG AA on the
+   light --bg-surface (#F4F6FA); hierarchy preserved (300 strongest → 600 most
+   muted, mirroring the dark scale). */
+[data-theme="light"] .text-slate-300 { color: #1E293B; }  /* 13.5:1 */
+[data-theme="light"] .text-slate-400 { color: #334155; }  /* 9.7:1  */
+[data-theme="light"] .text-slate-500 { color: #475569; }  /* 7.0:1  */
+[data-theme="light"] .text-slate-600 { color: #5B6675; }  /* 5.4:1  */
 
 .font-heading  { font-family: 'Chivo', sans-serif; letter-spacing: -0.03em; }
 .font-body     { font-family: 'IBM Plex Sans', sans-serif; }
@@ -148,6 +245,27 @@ body::before {
     --ring: 187 100% 47%;
     --radius: 0rem;
   }
+  [data-theme="light"] {
+    --background: 220 27% 92%;      /* #E8EBF0 */
+    --foreground: 222 47% 11%;      /* #111827 */
+    --card: 222 33% 97%;            /* #F4F6FA */
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 194 70% 27%;         /* #155E75 deep teal */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 20% 88%;
+    --secondary-foreground: 222 47% 11%;
+    --muted: 220 20% 88%;
+    --muted-foreground: 217 12% 41%; /* #5B6675 */
+    --accent: 194 70% 27%;
+    --accent-foreground: 0 0% 100%;
+    --destructive: 0 74% 42%;        /* #B91C1C */
+    --destructive-foreground: 0 0% 100%;
+    --border: 222 47% 11% / 0.14;
+    --input: 220 20% 84%;
+    --ring: 194 70% 27%;
+  }
   * { @apply border-border; border-radius: 0 !important; }
   body { @apply bg-background text-foreground; }
 }
@@ -179,16 +297,16 @@ body::before {
   color: var(--accent-critical);
 }
 
-/* Sonner overrides */
+/* Sonner overrides (theme-aware via tokens) */
 [data-sonner-toaster] {
-  --normal-bg: #0C111D;
-  --normal-border: rgba(255,255,255,0.15);
-  --normal-text: #F8FAFC;
+  --normal-bg: var(--bg-surface);
+  --normal-border: var(--border-col);
+  --normal-text: var(--text-primary);
   font-family: 'JetBrains Mono', monospace !important;
 }
 
-/* Scrollbar */
+/* Scrollbar (theme-aware) */
 ::-webkit-scrollbar { width: 8px; height: 8px; }
-::-webkit-scrollbar-track { background: #0C111D; }
-::-webkit-scrollbar-thumb { background: #1A2235; border: 1px solid var(--border-col); }
-::-webkit-scrollbar-thumb:hover { background: #263149; }
+::-webkit-scrollbar-track { background: var(--bg-surface); }
+::-webkit-scrollbar-thumb { background: var(--bg-elev); border: 1px solid var(--border-col); }
+::-webkit-scrollbar-thumb:hover { background: var(--active-surface); }

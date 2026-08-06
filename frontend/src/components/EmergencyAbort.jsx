@@ -32,11 +32,15 @@ export default function EmergencyAbort() {
       onClick={confirming ? abort : () => setConfirming(true)}
       disabled={busy}
       className={`flex items-center gap-2 px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest transition-colors border scanline-btn ${
-        confirming
-          ? "text-white border-[#FF3B30] pulse-crit"
-          : "text-[#FF3B30] border-[#FF3B30] hover:bg-[#FF3B30] hover:text-black"
+        confirming ? "text-white pulse-crit" : "hover:text-white"
       }`}
-      style={confirming ? { background: "#FF3B30" } : undefined}
+      style={
+        confirming
+          ? { background: "var(--accent-critical)", borderColor: "var(--accent-critical)" }
+          : { color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }
+      }
+      onMouseEnter={(e) => { if (!confirming) e.currentTarget.style.background = "var(--accent-critical)"; }}
+      onMouseLeave={(e) => { if (!confirming) e.currentTarget.style.background = ""; }}
       title="Halt all RF transmissions instantly"
     >
       <Siren size={14} strokeWidth={1.5} />

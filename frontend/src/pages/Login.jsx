@@ -38,7 +38,7 @@ export default function Login() {
           className="hidden lg:flex flex-col justify-between p-16 tactical-border-r"
           style={{
             background:
-              "linear-gradient(180deg, #0C111D 0%, #050810 100%)",
+              "linear-gradient(180deg, var(--bg-surface) 0%, var(--bg-base) 100%)",
           }}
         >
           <div className="flex items-center gap-3">

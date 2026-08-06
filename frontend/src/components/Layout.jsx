@@ -2,6 +2,7 @@ import { NavLink, Outlet, useNavigate } from "react-router-dom";
 import { ClassificationBanner } from "@/components/ClassificationBanner";
 import RangeAuthorizationBanner from "@/components/RangeAuthorizationBanner";
 import EmergencyAbort from "@/components/EmergencyAbort";
+import ThemeToggle from "@/components/ThemeToggle";
 import { useAuth } from "@/context/AuthContext";
 import {
   Radar, Waves, Radio, Bomb, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History, MapPin, BookOpen,
@@ -55,10 +56,8 @@ export default function Layout() {
                 to={to}
                 data-testid={testid}
                 className={({ isActive }) =>
-                  `flex items-center gap-3 px-6 py-3 font-mono text-xs uppercase tracking-widest transition-colors ${
-                    isActive
-                      ? "bg-[#1A2235] text-[#00F0FF] border-l-2 border-[#00F0FF]"
-                      : "text-slate-400 hover:text-white hover:bg-[#0F1626] border-l-2 border-transparent"
+                  `nav-link flex items-center gap-3 px-6 py-3 font-mono text-xs uppercase tracking-widest transition-colors ${
+                    isActive ? "is-active" : ""
                   }`
                 }
               >
@@ -101,8 +100,9 @@ export default function Layout() {
             </div>
             <div className="flex items-center gap-4 shrink-0">
               <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-                MISSION-ID: <span className="text-white">CEMA-2026-{new Date().getFullYear()}-A</span>
+                MISSION-ID: <span style={{ color: "var(--text-primary)" }}>CEMA-2026-{new Date().getFullYear()}-A</span>
               </div>
+              <ThemeToggle />
               <EmergencyAbort />
             </div>
           </div>

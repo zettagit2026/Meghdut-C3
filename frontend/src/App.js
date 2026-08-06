@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
 import { AuthProvider, useAuth } from "@/context/AuthContext";
+import { ThemeProvider, useTheme } from "@/context/ThemeContext";
 import { Toaster } from "@/components/ui/sonner";
 import Layout from "@/components/Layout";
 import Login from "@/pages/Login";
@@ -20,7 +21,7 @@ function Protected({ children }) {
   const { user, loading } = useAuth();
   if (loading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-[#050810] font-mono text-xs text-slate-500">
+      <div className="min-h-screen flex items-center justify-center font-mono text-xs text-slate-500" style={{ background: "var(--bg-base)" }}>
         establishing secure channel<span className="term-caret" />
       </div>
     );
@@ -28,8 +29,14 @@ function Protected({ children }) {
   return user ? children : <Navigate to="/login" replace />;
 }
 
+function ThemedToaster() {
+  const { theme } = useTheme();
+  return <Toaster position="top-right" theme={theme} />;
+}
+
 export default function App() {
   return (
+    <ThemeProvider>
     <AuthProvider>
       <BrowserRouter>
         <Routes>
@@ -51,7 +58,8 @@ export default function App() {
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
       </BrowserRouter>
-      <Toaster position="top-right" theme="dark" />
+      <ThemedToaster />
     </AuthProvider>
+    </ThemeProvider>
   );
 }

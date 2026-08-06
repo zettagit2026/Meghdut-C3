@@ -6,7 +6,7 @@ import { ScrollText, FileDown } from "lucide-react";
 const KIND_COLOR = {
   AUTH: "var(--accent-info)",
   DETECTION: "var(--accent-warning)",
-  UPLOAD: "#FF8A00",
+  UPLOAD: "var(--threat-high)",
   CEMA: "var(--accent-info)",
   KILLCHAIN: "var(--accent-warning)",
   MAVLINK: "var(--accent-success)",

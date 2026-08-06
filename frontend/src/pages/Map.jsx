@@ -4,7 +4,25 @@ import "maplibre-gl/dist/maplibre-gl.css";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { MapPin, AlertTriangle, ShieldAlert } from "lucide-react";
-import { THREAT_COLOR_HEX as THREAT_COLOR } from "@/lib/threatLevels";
+import { getThreatHex } from "@/lib/threatLevels";
+import { useTheme } from "@/context/ThemeContext";
+
+// CARTO raster basemaps per theme -- a dark basemap under a light UI (or vice
+// versa) is jarring and hurts contrast against the threat-colored contacts.
+const BASEMAP_TILES = {
+  dark: [
+    "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+    "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+    "https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
+  ],
+  light: [
+    "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+    "https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+    "https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
+  ],
+};
+// Context ring stroke (the non-threat reference rings) per theme.
+const CTX_RING_COLOR = { dark: "#1E2A3F", light: "#94A3B8" };
 
 // ---------------------------------------------------------------------------
 // HONESTY NOTE (read before touching this file):
@@ -54,6 +72,7 @@ function ringGeoJSON(centerLat, centerLon, radiusM, points = 72) {
 }
 
 export default function MapView() {
+  const { theme } = useTheme();
   const mapContainer = useRef(null);
   const mapRef = useRef(null);
   const [sensor, setSensor] = useState(null);
@@ -123,18 +142,14 @@ export default function MapView() {
       style: {
         version: 8,
         sources: {
-          "carto-dark": {
+          "carto": {
             type: "raster",
-            tiles: [
-              "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-              "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-              "https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-            ],
+            tiles: BASEMAP_TILES[theme] || BASEMAP_TILES.dark,
             tileSize: 256,
             attribution: "© OpenStreetMap contributors © CARTO",
           },
         },
-        layers: [{ id: "carto-dark-layer", type: "raster", source: "carto-dark" }],
+        layers: [{ id: "carto-layer", type: "raster", source: "carto" }],
       },
       center,
       zoom,
@@ -149,10 +164,30 @@ export default function MapView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sensor === null]);
 
+  // Swap the basemap tiles + reference-ring color in place when the theme
+  // flips, without tearing down the map (keeps zoom/pan).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const apply = () => {
+      const src = map.getSource("carto");
+      if (src && src.setTiles) src.setTiles(BASEMAP_TILES[theme] || BASEMAP_TILES.dark);
+      (map.getStyle()?.layers || []).forEach((l) => {
+        if (l.id.startsWith("ring-ctx-") && map.getLayer(l.id)) {
+          map.setPaintProperty(l.id, "line-color", CTX_RING_COLOR[theme] || CTX_RING_COLOR.dark);
+        }
+      });
+    };
+    if (map.isStyleLoaded()) apply();
+    else map.once("load", apply);
+  }, [theme]);
+
   // Draw sensor marker + range rings + range-only contact indicators.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !hasSensor) return;
+    const THREAT_COLOR = getThreatHex(theme);
+    const ctxRingColor = CTX_RING_COLOR[theme] || CTX_RING_COLOR.dark;
 
     const drawLayer = () => {
       markersRef.current.forEach((m) => m.remove());
@@ -198,7 +233,7 @@ export default function MapView() {
             id,
             type: "line",
             source: id,
-            paint: { "line-color": "#1E2A3F", "line-width": 1, "line-dasharray": [2, 2] },
+            paint: { "line-color": ctxRingColor, "line-width": 1, "line-dasharray": [2, 2] },
           });
         }
       });
@@ -257,7 +292,7 @@ export default function MapView() {
 
     if (map.isStyleLoaded()) drawLayer();
     else map.once("load", drawLayer);
-  }, [hasSensor, sensor, activeContacts]);
+  }, [hasSensor, sensor, activeContacts, theme]);
 
   return (
     <div className="space-y-4">
@@ -300,7 +335,7 @@ export default function MapView() {
             data-testid="map-monitoring-degraded"
             role="alert"
             className="ml-auto items-center gap-1 font-mono text-[10px] font-bold uppercase tracking-widest"
-            style={{ display: monitoringDegraded ? "flex" : "none", color: "#FF9500" }}
+            style={{ display: monitoringDegraded ? "flex" : "none", color: "var(--accent-warning)" }}
           >
             <ShieldAlert size={12} strokeWidth={2} />
             MONITORING DEGRADED — contact positions may be stale

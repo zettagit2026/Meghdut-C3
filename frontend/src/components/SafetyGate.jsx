@@ -88,7 +88,7 @@ export default function SafetyGate({
             <div className="flex items-center gap-2">
               <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
               <AlertDialogPrimitive.Title asChild>
-                <span className="font-heading font-black text-lg uppercase tracking-tighter text-white">
+                <span className="font-heading font-black text-lg uppercase tracking-tighter" style={{ color: "var(--text-primary)" }}>
                   Pre-Flight Safety Gate
                 </span>
               </AlertDialogPrimitive.Title>
@@ -101,25 +101,26 @@ export default function SafetyGate({
           <div className="p-5 space-y-4">
             <AlertDialogPrimitive.Description asChild>
               <div className="font-mono text-xs">
-                You are about to arm <span className="text-white font-bold">{payloadName}</span>{" "}
+                You are about to arm <span className="font-bold" style={{ color: "var(--text-primary)" }}>{payloadName}</span>{" "}
                 <span className="px-2 py-0.5 tactical-border font-bold text-[10px]"
                       style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}>
                   {severity}
                 </span>{" "}
-                — this action is <span className="text-[#FF3B30] font-bold">{irreversibleNote}</span>.
+                — this action is <span className="font-bold" style={{ color: "var(--accent-critical)" }}>{irreversibleNote}</span>.
               </div>
             </AlertDialogPrimitive.Description>
             <div className="space-y-2">
               {checks.map((c, i) => (
                 <label key={i} data-testid={`safety-check-${i}`}
-                       className="flex items-start gap-3 p-2 tactical-border cursor-pointer hover:bg-[#0F1626]">
+                       className="flex items-start gap-3 p-2 tactical-border cursor-pointer hover-surface">
                   <input
                     type="checkbox"
                     checked={ticks[i]}
                     onChange={(e) => {
                       const nt = [...ticks]; nt[i] = e.target.checked; setTicks(nt);
                     }}
-                    className="mt-0.5 accent-[#39FF14]"
+                    className="mt-0.5"
+                    style={{ accentColor: "var(--accent-success)" }}
                   />
                   <span className="font-mono text-xs text-slate-300">{c}</span>
                 </label>
@@ -130,7 +131,7 @@ export default function SafetyGate({
                 <button
                   data-testid="safety-cancel"
                   onClick={onClose}
-                  className="px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest text-slate-400 hover:text-white hover:bg-[#0F1626]"
+                  className="px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest text-slate-400 hover-surface"
                 >
                   CANCEL
                 </button>
@@ -143,10 +144,16 @@ export default function SafetyGate({
                   !allTicked
                     ? "opacity-30 border-slate-700 text-slate-600 cursor-not-allowed"
                     : confirming
-                      ? "text-white border-[#FF3B30] pulse-crit"
-                      : "text-[#FF3B30] border-[#FF3B30] hover:bg-[#FF3B30] hover:text-black"
+                      ? "text-white pulse-crit"
+                      : ""
                 }`}
-                style={confirming ? { background: "#FF3B30" } : undefined}
+                style={
+                  !allTicked
+                    ? undefined
+                    : confirming
+                      ? { background: "var(--accent-critical)", borderColor: "var(--accent-critical)" }
+                      : { color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }
+                }
               >
                 <ShieldCheck size={14} strokeWidth={1.5} />
                 {confirming ? `CONFIRM ${actionLabel}` : `ARM & ${actionLabel}`}
