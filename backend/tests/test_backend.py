@@ -324,7 +324,8 @@ class TestPayloads:
         # requires a fresh single-use arm token (POST /arm) as a second
         # factor -- see _consume_arm_token()/spec.severity == "CRITICAL" in
         # server.py's deploy_payload().
-        arm = requests.post(f"{API}/arm", headers=auth_headers)
+        arm = requests.post(f"{API}/arm", headers=auth_headers,
+                            json={"effect": "deploy", "target_detection_id": det["id"]})
         assert arm.status_code == 200, arm.text
         arm_token = arm.json()["arm_token"]
         r = requests.post(f"{API}/payloads/deploy",
@@ -372,7 +373,8 @@ class TestPayloads:
         # Any broadcast (target_system=0) needs a fresh single-use arm
         # token too, regardless of payload severity -- see body.broadcast
         # check in server.py's deploy_payload().
-        arm = requests.post(f"{API}/arm", headers=auth_headers)
+        arm = requests.post(f"{API}/arm", headers=auth_headers,
+                            json={"effect": "deploy"})
         assert arm.status_code == 200, arm.text
         arm_token = arm.json()["arm_token"]
         r = requests.post(f"{API}/payloads/deploy",

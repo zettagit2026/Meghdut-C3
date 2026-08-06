@@ -271,7 +271,13 @@ export default function Payloads() {
       // spec.severity === "CRITICAL" or broadcast is true.
       let arm_token;
       if (pl.severity === "CRITICAL" || broadcast) {
-        const { data: arm } = await api.post("/arm");
+        // F3: arm token is bound to effect="deploy" and (for a single-target
+        // deploy) the exact target detection — the backend rejects a token
+        // spent on a different effect/target.
+        const { data: arm } = await api.post("/arm", {
+          effect: "deploy",
+          target_detection_id: broadcast ? null : target,
+        });
         arm_token = arm.arm_token;
       }
       const { data } = await api.post("/payloads/deploy", {

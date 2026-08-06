@@ -116,7 +116,7 @@ export default function Jamming() {
       // Step 1: a fresh arm token — jamming is unconditionally CRITICAL
       // severity, same second factor as FORCE_DISARM/FLIGHT_TERMINATION/
       // broadcast payload deploys.
-      const { data: arm } = await api.post("/arm");
+      const { data: arm } = await api.post("/arm", { effect: "jam" });  // F3: bound to jam
       // Step 2: mint the jam confirmation token RIGHT NOW — this call only
       // happens because the SafetyGate checklist + two-click ARM & FIRE ->
       // CONFIRM FIRE sequence just completed (see onConfirm below). This is

@@ -266,26 +266,68 @@ async def require_commander(user: Dict = Depends(get_current_user)) -> Dict:
 # single click/request from ever being enough to trigger FORCE_DISARM,
 # FLIGHT_TERMINATION, or a swarm-wide PL-010 broadcast takedown.
 ARM_TOKEN_TTL_S = 60
-_arm_tokens: Dict[str, datetime] = {}
+# F3 (2026-08): arm tokens are now BOUND at mint time to the specific effect
+# (and, for a single-target deploy, the target detection id) they were
+# requested for. A bare UUID unbound to effect/target let a token minted
+# intending e.g. a single-target payload deploy be spent within its TTL on a
+# broadcast / jam / gnss_spoof instead. Each entry now carries the intended
+# effect + optional target so _consume_arm_token can reject cross-effect /
+# cross-target reuse. Valid effects mirror the transmit consumers below.
+ARM_TOKEN_EFFECTS = ("deploy", "mavlink", "jam", "gnss_spoof")
+# token -> {"expiry": datetime, "effect": str, "target_detection_id": Optional[str]}
+_arm_tokens: Dict[str, Dict[str, Any]] = {}
 
 
-def _issue_arm_token() -> Dict[str, Any]:
+def _issue_arm_token(effect: str, target_detection_id: Optional[str] = None) -> Dict[str, Any]:
     token = str(uuid.uuid4())
-    _arm_tokens[token] = datetime.now(timezone.utc) + timedelta(seconds=ARM_TOKEN_TTL_S)
-    return {"arm_token": token, "expires_in_s": ARM_TOKEN_TTL_S}
+    _arm_tokens[token] = {
+        "expiry": datetime.now(timezone.utc) + timedelta(seconds=ARM_TOKEN_TTL_S),
+        "effect": effect,
+        "target_detection_id": target_detection_id,
+    }
+    return {
+        "arm_token": token,
+        "expires_in_s": ARM_TOKEN_TTL_S,
+        "effect": effect,
+        "target_detection_id": target_detection_id,
+    }
 
 
-def _consume_arm_token(token: Optional[str]) -> None:
-    """Validate and burn a single-use arm token. Raises 403 if missing/expired/unknown."""
+def _consume_arm_token(token: Optional[str], effect: str,
+                       target_detection_id: Optional[str] = None) -> None:
+    """Validate and burn a single-use arm token, verifying it was minted for
+    THIS effect (and, when the mint bound a specific target, THIS target).
+    Raises 403 if missing/expired/unknown OR bound to a different effect/target.
+
+    ATOMICITY (F3): the lookup-and-pop is a single synchronous dict.pop with NO
+    `await` between the read and the removal — this is what makes the token
+    genuinely single-use and immune to a double-spend race. The added binding
+    checks run AFTER the atomic pop (so a mismatched presentation still burns
+    the token — a mismatch is a security-relevant event, not a retryable one)
+    and introduce no new await, preserving that atomicity guarantee."""
     if not token:
         raise HTTPException(
             403,
             "Arm token required: this action needs a fresh POST /api/arm "
             "(commander role) before it can proceed.",
         )
-    expiry = _arm_tokens.pop(token, None)
-    if not expiry or datetime.now(timezone.utc) > expiry:
+    rec = _arm_tokens.pop(token, None)  # atomic single-use burn — no await around this
+    if not rec or datetime.now(timezone.utc) > rec["expiry"]:
         raise HTTPException(403, "Arm token invalid or expired — request a new one via POST /api/arm")
+    if rec["effect"] != effect:
+        raise HTTPException(
+            403,
+            f"Arm token effect mismatch: this token was armed for effect="
+            f"'{rec['effect']}' but is being spent on effect='{effect}'. "
+            f"Request a fresh POST /api/arm for the intended effect.",
+        )
+    bound_target = rec.get("target_detection_id")
+    if bound_target is not None and bound_target != target_detection_id:
+        raise HTTPException(
+            403,
+            "Arm token target mismatch: this token was armed for a different "
+            "target detection. Request a fresh POST /api/arm for this target.",
+        )
 
 
 # ---- Jam-confirm token (SEPARATE from arm_token — the digital equivalent
@@ -557,6 +599,83 @@ async def _expire_range_authorization() -> None:
                 actor="SYSTEM",
             )
             await ws_manager.broadcast_json({"type": "range_authorization", **_range_auth_status(effect)})
+
+
+async def _require_range_authorized(effect: str, actor: str) -> None:
+    """F4 (2026-08): synchronous, BACKEND-SIDE range-authorization gate for a
+    transmit endpoint. Previously only the field/rf bridges polled
+    GET /range-authorization/status at TX time, so a request that never
+    reached a bridge (or reached a mis-configured/compromised one) had no
+    server-side lease enforcement at all. Every RF-transmit endpoint now calls
+    this before broadcasting its request over the WS, making range-auth a true
+    two-sided gate (the bridge-side poll is kept as defense in depth).
+
+    Runs the same lazy expiry as the status endpoint first, so a lease past its
+    TTL can never be observed as still-enabled here, then rejects with 409 if
+    the relevant effect's lease is not currently enabled."""
+    await _expire_range_authorization()
+    if not _range_authorization[effect]["enabled"]:
+        await log_event(
+            "RANGE_AUTH_TX_REFUSED",
+            f"Transmit for effect={effect} REFUSED backend-side: range "
+            f"authorization lease is OFF (must be armed via POST /api/range-authorization)",
+            meta={"effect": effect, "reason": "lease_off"},
+            actor=actor,
+        )
+        raise HTTPException(
+            409,
+            f"Range authorization for effect='{effect}' is OFF — a commander must arm the "
+            f"live-range lease (POST /api/range-authorization) before this transmission can proceed.",
+        )
+
+
+async def _enforce_fire_time_iff(detection: Dict[str, Any], user: Dict[str, Any],
+                                 *, context: str) -> None:
+    """F1/F2 (2026-08): fire-time friendly-fire interlock, re-evaluated at the
+    exact moment of transmission (not just at authorize-target time).
+
+    IFF status can flip AFTER a target was authorized: detection_ingest() can
+    re-classify a previously-authorized-while-hostile contact to
+    iff_verified=True / threat_level="FRIENDLY (IFF verified)". Checking only
+    detection.authorized_target at fire time is therefore a TOCTOU fratricide
+    hole. This re-check refuses (403) any kinetic/targeted effect against a
+    contact that is CURRENTLY IFF-verified friendly, UNLESS an explicit
+    commander IFF override is recorded on the detection
+    (iff_override_authorized=True — set ONLY by authorize_target's
+    commander-override path, which also emits the high-visibility
+    IFF_OVERRIDE_AUTHORIZE audit event, and cleared whenever the target is
+    de-authorized or re-classified friendly). The refusal AND the honored
+    override are both routed through the tamper-evident audit chain."""
+    is_friendly = (
+        detection.get("iff_verified")
+        or detection.get("threat_level") == "FRIENDLY (IFF verified)"
+    )
+    if not is_friendly:
+        return
+    if not detection.get("iff_override_authorized"):
+        await log_event(
+            "IFF_FIRE_REFUSED",
+            f"FRATRICIDE INTERLOCK: {context} against {detection.get('callsign')} REFUSED — "
+            f"target is currently IFF-verified FRIENDLY with no standing commander override. "
+            f"Re-authorize via POST /api/detections/{{id}}/authorize-target (commander) to override.",
+            meta={"detection_id": detection.get("id"), "callsign": detection.get("callsign"),
+                  "asset_id": detection.get("iff_asset_id"), "context": context},
+            actor=user["email"],
+        )
+        raise HTTPException(
+            403,
+            "Fire refused — target is currently IFF-verified as FRIENDLY. Its prior target "
+            "authorization is no longer valid after the friendly re-classification. A commander "
+            "must explicitly re-authorize it (POST /api/detections/{id}/authorize-target) to override.",
+        )
+    await log_event(
+        "IFF_OVERRIDE_AUTHORIZE",
+        f"COMMANDER OVERRIDE honored at fire time ({context}): {detection.get('callsign')} "
+        f"engaged despite being IFF-verified FRIENDLY",
+        meta={"detection_id": detection.get("id"), "callsign": detection.get("callsign"),
+              "asset_id": detection.get("iff_asset_id"), "context": context},
+        actor=user["email"],
+    )
 
 
 # ---- Authoritative transmit-halt (server-side, checked before any TX) ----
@@ -974,6 +1093,14 @@ class DeployPayloadBody(BaseModel):
 
 class AuthorizeTargetBody(BaseModel):
     authorized: bool = True
+
+
+class ArmTokenBody(BaseModel):
+    # F3 (2026-08): an arm token is bound at mint time to the effect it is for
+    # (and, for a single-target deploy, the target detection). See
+    # _issue_arm_token/_consume_arm_token.
+    effect: str = Field(pattern="^(deploy|mavlink|jam|gnss_spoof)$")
+    target_detection_id: Optional[str] = None
 
 
 class JamRequestBody(BaseModel):
@@ -2011,6 +2138,14 @@ async def authorize_target(det_id: str, body: AuthorizeTargetBody,
     if not doc:
         raise HTTPException(404, "Detection not found")
 
+    # F2 (2026-08): iff_override_authorized is the STANDING record that a
+    # commander deliberately overrode the friendly-fire interlock for THIS
+    # target. It is the only thing that lets a currently-IFF-friendly contact
+    # be fired on at fire time (see _enforce_fire_time_iff). It is set True
+    # ONLY on the commander-override path below, and forced False otherwise
+    # (normal authorize of a non-friendly, or any de-authorize) so it can never
+    # linger as a stale license after the reason for the override is gone.
+    iff_override = False
     if body.authorized and doc.get("iff_verified"):
         if user.get("role") != "commander":
             raise HTTPException(
@@ -2019,6 +2154,7 @@ async def authorize_target(det_id: str, body: AuthorizeTargetBody,
                 "(threat_level=FRIENDLY (IFF verified)). Commander role "
                 "required to override this friendly-fire interlock.",
             )
+        iff_override = True
         await log_event(
             "IFF_OVERRIDE_AUTHORIZE",
             f"COMMANDER OVERRIDE: {doc['callsign']} authorized as kinetic target "
@@ -2028,7 +2164,11 @@ async def authorize_target(det_id: str, body: AuthorizeTargetBody,
             actor=user["email"],
         )
 
-    await db.detections.update_one({"id": det_id}, {"$set": {"authorized_target": body.authorized}})
+    await db.detections.update_one(
+        {"id": det_id},
+        {"$set": {"authorized_target": body.authorized,
+                  "iff_override_authorized": iff_override}},
+    )
     await log_event(
         "TARGETING",
         f"{doc['callsign']} {'AUTHORIZED' if body.authorized else 'DE-AUTHORIZED'} as kinetic target",
@@ -2154,11 +2294,31 @@ async def export_iq_capture(det_id: str, user: Dict = Depends(get_current_user))
 
 
 @api.delete("/detections/{det_id}")
-async def delete_detection(det_id: str, user: Dict = Depends(get_current_user)):
+async def delete_detection(det_id: str, user: Dict = Depends(require_commander)):
+    # F5 (2026-08): deleting a detection is a state-integrity lever — an
+    # operator could otherwise erase any record, including an IFF-verified
+    # FRIENDLY contact, weakening the friendly-fire audit trail. Now gated with
+    # require_commander, matching every other destructive/state-integrity
+    # action in this file (emergency/resume, iff_revoke, range-authorization).
+    # The deletion is fully audited BEFORE it happens, capturing the record's
+    # callsign and IFF status so an erased friendly is always traceable in the
+    # tamper-evident mission log.
+    doc = await db.detections.find_one({"id": det_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(404, "Detection not found")
+    await log_event(
+        "DETECTION",
+        f"Contact removed {det_id} ({doc.get('callsign')}) — "
+        f"threat_level={doc.get('threat_level')}, iff_verified={bool(doc.get('iff_verified'))}",
+        meta={"detection_id": det_id, "callsign": doc.get("callsign"),
+              "threat_level": doc.get("threat_level"),
+              "iff_verified": bool(doc.get("iff_verified")),
+              "authorized_target": bool(doc.get("authorized_target"))},
+        actor=user["email"],
+    )
     res = await db.detections.delete_one({"id": det_id})
     if res.deleted_count == 0:
         raise HTTPException(404, "Detection not found")
-    await log_event("DETECTION", f"Contact removed {det_id}", actor=user["email"])
     return {"ok": True}
 
 
@@ -3025,6 +3185,22 @@ async def detection_ingest(body: DetectionIngestBody,
             updates["iff_verified"] = True
             updates["iff_asset_id"] = iff_friendly["asset_id"]
             updates["iff_callsign"] = iff_friendly["callsign"]
+            # F2 (2026-08): a contact re-classified as IFF-friendly must NOT
+            # keep a stale kinetic authorization granted while it was hostile
+            # (fire-time TOCTOU fratricide hole). Clear both the authorization
+            # and any prior commander override — engaging it again now requires
+            # a fresh, explicit commander override via authorize-target.
+            if existing.get("authorized_target") or existing.get("iff_override_authorized"):
+                await log_event(
+                    "IFF_AUTHORIZATION_CLEARED",
+                    f"{existing.get('callsign')} re-classified IFF-verified FRIENDLY — "
+                    f"prior kinetic target authorization automatically revoked",
+                    meta={"detection_id": existing["id"], "asset_id": iff_friendly["asset_id"],
+                          "callsign": existing.get("callsign")},
+                    actor=user["email"],
+                )
+            updates["authorized_target"] = False
+            updates["iff_override_authorized"] = False
         await db.detections.update_one(
             {"id": existing["id"]},
             {
@@ -3199,10 +3375,44 @@ async def broadcast_packet(body: MavlinkCraftBody, user: Dict = Depends(require_
     # role. /mavlink/craft (preview-only, never transmitted/persisted/broadcast
     # to the RF bridge) remains available to any authenticated operator.
     _check_tx_not_halted()
-    if body.target_system == 0:
-        # #4: broadcast (target_system=0) hits every drone in RF range,
-        # including friendlies — require a freshly-issued arm token.
-        _consume_arm_token(body.arm_token)
+    # F1 (2026-08): previously the arm token was consumed ONLY for
+    # target_system==0, so a NON-zero target_system built and transmitted an
+    # arbitrary MAVLink COMMAND_LONG (ARM_DISARM / NAV_LAND / flight-
+    # termination) at a specific system with NO arm token and NO IFF/authorize
+    # interlock — a total bypass of the /payloads/deploy gate chain.
+    #
+    # Fix (RESTRICT, not resolve): /mavlink/broadcast is now true-broadcast
+    # ONLY. A targeted (non-zero target_system) inject is refused and directed
+    # through /payloads/deploy, which carries the full interlock
+    # (authorized_target + fire-time IFF re-check + effect/target-bound arm
+    # token). RESTRICT was chosen over resolve-target_system→detection because
+    # a detection's system_id is NOT a unique/guaranteed key back to a single
+    # detection (many contacts can share, or lack, a system_id), so any
+    # resolution would be ambiguous and itself a friendly-fire hazard; refusing
+    # is unambiguous and pushes the caller onto the one fully-gated path.
+    if body.target_system != 0:
+        await log_event(
+            "MAVLINK_TARGETED_REFUSED",
+            f"Targeted /mavlink/broadcast REFUSED (target_system={body.target_system}, "
+            f"msgid={body.message_id}, cmd={body.command}) — targeted injects must go "
+            f"through /payloads/deploy's full interlock",
+            meta={"target_system": body.target_system, "message_id": body.message_id,
+                  "command": body.command},
+            actor=user["email"],
+        )
+        raise HTTPException(
+            403,
+            "Targeted MAVLink injection is not permitted via /mavlink/broadcast — this "
+            "endpoint is true-broadcast only (target_system=0). Route a targeted command "
+            "through POST /api/payloads/deploy, which enforces the authorized-target + "
+            "fire-time IFF friendly-fire interlock.",
+        )
+    # Broadcast (target_system=0) hits every drone in RF range, including
+    # friendlies — require a freshly-issued arm token bound to the mavlink
+    # effect, on EVERY call (no longer conditional on target_system).
+    _consume_arm_token(body.arm_token, effect="mavlink")
+    # F4: backend-side range-authorization gate (mavlink effect lease).
+    await _require_range_authorized("mavlink", user["email"])
     frame = _craft(body)
     # Same request_id/ack correlation as /payloads/deploy — this frame has no
     # associated detection to gate, but we still want a real bridge
@@ -3328,7 +3538,12 @@ async def deploy_payload(body: DeployPayloadBody,
     # #4: any broadcast (target_system=0) needs the same, regardless of
     # severity, since it can strike friendlies in RF range.
     if spec.severity == "CRITICAL" or body.broadcast:
-        _consume_arm_token(body.arm_token)
+        # F3 (2026-08): bind the arm token to effect="deploy" and, for a
+        # single-target deploy, to this exact target_detection_id — so a token
+        # minted for one deploy target can't be spent on a broadcast or a
+        # different target within its TTL.
+        _consume_arm_token(body.arm_token, effect="deploy",
+                           target_detection_id=None if body.broadcast else body.target_detection_id)
 
     target_sys = 0
     target_comp = 0
@@ -3347,6 +3562,13 @@ async def deploy_payload(body: DeployPayloadBody,
                 "Target not authorized — friendly-fire interlock: "
                 "POST /api/detections/{id}/authorize-target first.",
             )
+        # F2 (2026-08): belt-and-suspenders fire-time IFF re-check. Even though
+        # ingest now clears authorized_target when a contact flips to friendly,
+        # re-evaluate IFF status HERE at the instant of transmission: refuse if
+        # the target is currently IFF-verified friendly with no standing
+        # commander override. Closes the TOCTOU where a target authorized while
+        # hostile later became IFF-friendly.
+        await _enforce_fire_time_iff(detection, user, context="payload deploy")
         target_sys = detection.get("system_id", 1)
         target_comp = detection.get("component_id", 1)
 
@@ -3499,8 +3721,11 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
     severity-dependent arm_token) — every jam request needs both, every time.
     """
     _check_tx_not_halted()
-    _consume_arm_token(body.arm_token)
+    _consume_arm_token(body.arm_token, effect="jam")  # F3: bound to jam effect
     _consume_jam_confirm_token(body.jam_confirm_token)
+    # F4: backend-side range-authorization gate (jam effect lease) — no longer
+    # relying solely on the field-bridge's own poll at TX time.
+    await _require_range_authorized("jam", user["email"])
 
     freq_mhz = body.freq_mhz if body.freq_mhz is not None else JAM_BAND_PRESETS_MHZ.get(body.band)
     if not freq_mhz:
@@ -3657,8 +3882,10 @@ async def deploy_gnss_spoof(body: GnssSpoofRequestBody, user: Dict = Depends(req
          matches what was attested at /gnss-spoof/confirm time.
     """
     _check_tx_not_halted()
-    _consume_arm_token(body.arm_token)
+    _consume_arm_token(body.arm_token, effect="gnss_spoof")  # F3: bound to gnss_spoof effect
     _consume_gnss_spoof_confirm_token(body.gnss_spoof_confirm_token, body.friendly_asset_attestation)
+    # F4: backend-side range-authorization gate (gnss_spoof effect lease).
+    await _require_range_authorized("gnss_spoof", user["email"])
 
     duration_s = min(body.duration_s, GNSS_SPOOF_MAX_DURATION_S)
     freq_mhz = JAM_BAND_PRESETS_MHZ["gps_l1"]  # 1575.42 MHz, the only supported band at launch
@@ -4049,12 +4276,20 @@ async def system_health(user: Dict = Depends(get_current_user)):
 # Routes: Arm token (second factor for CRITICAL payloads / broadcasts)
 # =====================================================================
 @api.post("/arm")
-async def request_arm_token(user: Dict = Depends(require_commander)):
-    """Issue a single-use arm token, valid for ARM_TOKEN_TTL_S seconds, that a
-    commander must present when deploying a CRITICAL-severity payload or any
-    broadcast (target_system=0) action."""
-    tok = _issue_arm_token()
-    await log_event("ARM", f"Arm token issued (valid {ARM_TOKEN_TTL_S}s)", actor=user["email"])
+async def request_arm_token(body: ArmTokenBody, user: Dict = Depends(require_commander)):
+    """Issue a single-use arm token, valid for ARM_TOKEN_TTL_S seconds, BOUND to
+    the specific effect (and, for a single-target deploy, target detection id)
+    the commander intends to use it for. The token is only accepted at
+    consume time for that same effect+target (F3) — a token armed for a
+    single-target deploy cannot be spent on a broadcast / jam / gnss_spoof."""
+    tok = _issue_arm_token(body.effect, body.target_detection_id)
+    await log_event(
+        "ARM",
+        f"Arm token issued (valid {ARM_TOKEN_TTL_S}s) for effect={body.effect}"
+        + (f" target={body.target_detection_id}" if body.target_detection_id else ""),
+        meta={"effect": body.effect, "target_detection_id": body.target_detection_id},
+        actor=user["email"],
+    )
     return tok
 
 

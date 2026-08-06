@@ -134,7 +134,7 @@ export default function GnssSpoof() {
     try {
       // Step 1: a fresh arm token — gnss_spoof is unconditionally CRITICAL
       // severity, same second factor as jamming/broadcast payload deploys.
-      const { data: arm } = await api.post("/arm");
+      const { data: arm } = await api.post("/arm", { effect: "gnss_spoof" });  // F3: bound to gnss_spoof
       // Step 2: mint the gnss_spoof confirmation token RIGHT NOW, carrying
       // the attestation text — this call only happens because the
       // SafetyGate checklist + two-click ARM & FIRE -> CONFIRM FIRE
