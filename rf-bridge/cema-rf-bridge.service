@@ -1,24 +1,61 @@
 [Unit]
-Description=CEMA cUAS RF Bridge (MAVLink serial TX/RX bridge — SiK/RFD900)
+Description=CEMA cUAS RF Bridge (combined MAVLink serial RX+TX bridge — SiK/RFD900; LIVE control-transmit / RC-override takeover path)
 # task #36: this unit used to run run.sh "both" (HackRF scanner +
 # MAVLink bridge). The HackRF scanner half was a duplicate, earlier
 # iteration of field-bridge/hackrf_rx.py (cema-hackrf-rx.service) and has
 # been removed from this directory; HackRF detection is now exclusively
 # field-bridge's responsibility. This unit now only starts the MAVLink
 # bridge, which has no field-bridge equivalent.
-After=network-online.target
+#
+# UNLIKE the sibling field-bridge units (mavlink-sniffer/hackrf-rx), this one
+# is NOT RX-only: mavlink_bridge.py is the sole component that writes frames to
+# the radio and drives the sustained RC-override takeover. It must therefore
+# stay DISABLED + STOPPED until (a) a TX radio is physically present as
+# /dev/cema-sik-adapter AND (b) a human explicitly starts it. See ACTIVATION.md.
+After=network-online.target docker.service
 Wants=network-online.target
+# Restart-limit hardening: same convention as cema-mavlink-sniffer.service /
+# cema-hackrf-rx.service (task #80). Widen the counting window and burst so a
+# transient USB re-enumeration blip on the SiK adapter does not trip systemd's
+# default StartLimitBurst=5/StartLimitIntervalSec=10s and wedge the unit
+# `inactive (dead)` needing a manual reset-failed. StartLimitAction=none: never
+# let systemd give up and disable the unit on our behalf.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+StartLimitAction=none
 
 [Service]
 Type=simple
-# Change these to match your deployment:
-User=root
-WorkingDirectory=/opt/cema/rf-bridge
-ExecStart=/opt/cema/rf-bridge/run.sh bridge
+# Host-specific values (User/WorkingDirectory/EnvironmentFile) match the
+# established /CEMA/joydipdemo deployment convention. There is deliberately
+# only ONE copy of this unit in the repo; do not fork per-host copies with
+# hardcoded paths baked in. Host-specific secrets live in the EnvironmentFile.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/rf-bridge
+
+# Credentials and console URL are NOT hardcoded here. They come from the
+# EnvironmentFile, which must define at minimum:
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=<service operator account>
+#   CEMA_PASSWORD=<this host's current operator password>
+#   MAVLINK_SERIAL=/dev/cema-sik-adapter   (stable udev symlink for the SiK/
+#                                           CP210x TX radio — task #155; NOT a
+#                                           raw /dev/ttyUSB0 which re-enumerates)
+#   MAVLINK_BAUD=57600
+#   MAVLINK_RX_ENABLED=1
+# This file is created per-deployment (chmod 600) and is NOT committed.
+EnvironmentFile=/CEMA/joydipdemo/rf-bridge/.env
+
+# Reuse the field-bridge venv interpreter (python3 -> /usr/bin/python3 with
+# pyserial/pymavlink/websocket-client present), per tasks #133/#149 — same
+# interpreter the sibling field-bridge units run. mavlink_bridge.py imports its
+# local `common` (hence WorkingDirectory=rf-bridge) and adds ../field-bridge to
+# sys.path itself for the sustained-takeover primitive.
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u mavlink_bridge.py
 Restart=always
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
+StandardOutput=append:/CEMA/joydipdemo/rf-bridge/mavlink_bridge.log
+StandardError=append:/CEMA/joydipdemo/rf-bridge/mavlink_bridge.log
 
 [Install]
 WantedBy=multi-user.target
