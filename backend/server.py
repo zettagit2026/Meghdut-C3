@@ -23,6 +23,8 @@ Endpoints (all under /api):
            to enable; low-friction to disable) — see
            backend/RANGE_AUTHORIZATION_REDESIGN.md
   logs:  /logs
+  audit: /audit/verify (commander-only; verifies the stored, append-time
+         SHA-256 hash chain over mission_log — genuine tamper-evidence)
 
 RBAC: two roles, "operator" and "commander". Anything that transmits a
 kinetic/broadcast command (/payloads/deploy, /mavlink/broadcast, /payloads/jam)
@@ -62,6 +64,7 @@ import asyncio
 import contextlib
 import base64
 import binascii
+import hashlib
 import hmac
 import importlib.util
 import json
@@ -1158,8 +1161,128 @@ async def ingest_health_middleware(request: Request, call_next):
 
 
 # =====================================================================
-# Mission log helper
+# Mission log helper + tamper-evident (hash-chained) audit trail
 # =====================================================================
+# The Operational Requirement Doc (Section 6) calls the mission log a
+# "hash-chain ... tamper-evident" audit trail. To make that claim TRUE (rather
+# than recomputing a throwaway chain at PDF-report time over mutable rows, which
+# proves nothing — a row edited in Mongo just changes the recomputed hash with
+# nothing authoritative to compare against), each entry's hash is computed and
+# STORED at append time:
+#
+#     entry_hash = SHA256( canonical(ts,kind,message,actor,meta) + "|" + prev_hash )
+#
+# where prev_hash is the stored entry_hash of the immediately-preceding chained
+# entry (the genesis entry uses AUDIT_GENESIS_PREV_HASH, a fixed all-zeros seed).
+# Only the SEMANTIC fields are hashed — the `_id`/`seq`/`prev_hash`/`entry_hash`
+# fields are deliberately excluded so there is no circular dependency and so
+# verification is reproducible. A monotonic `seq` gives the chain a strict,
+# authoritative linear order independent of wall-clock `ts`.
+AUDIT_GENESIS_PREV_HASH = "0" * 64
+# Semantic fields covered by the hash. MUST stay stable & ordered for
+# verification to be reproducible; changing this set is a breaking chain change.
+_AUDIT_HASHED_FIELDS = ("ts", "kind", "message", "actor", "meta")
+
+# CONCURRENCY: multiple bridges/requests call log_event() concurrently on this
+# single-worker asyncio backend. The chain needs a strict linear order, so the
+# "read prev_hash -> compute -> insert" sequence MUST be atomic per append; two
+# concurrent appends that both read the same prev_hash would fork the chain.
+# We serialize appends through this asyncio.Lock. This is correct AND simplest
+# for this deployment, which is deliberately kept single-worker precisely
+# because chain-head state like this is not shared across workers (a Mongo-level
+# atomic counter + findAndModify would be required for a multi-worker rollout).
+_audit_append_lock = asyncio.Lock()
+
+
+def _canonical_audit_payload(entry: Dict) -> str:
+    """Deterministic, stable serialization of an entry's SEMANTIC fields only.
+    sorted-keys / compact-separator JSON so the exact same bytes are produced at
+    append time and at verification time regardless of dict insertion order.
+    `default=str` keeps it robust to any non-JSON-native value that slips into
+    meta. Excludes _id/seq/prev_hash/entry_hash to avoid a circular dependency."""
+    return json.dumps(
+        {k: entry.get(k) for k in _AUDIT_HASHED_FIELDS},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    )
+
+
+def _compute_entry_hash(entry: Dict, prev_hash: str) -> str:
+    return hashlib.sha256(
+        (_canonical_audit_payload(entry) + "|" + prev_hash).encode("utf-8")
+    ).hexdigest()
+
+
+def _next_chained_entry(base_entry: Dict, head: Optional[Dict]) -> Dict:
+    """Pure: given a base entry (semantic fields only) and the current chain
+    head (the last chained row, or None for genesis), return a copy stamped with
+    seq/prev_hash/entry_hash. Used by log_event inside the append lock; exposed
+    as a pure function so the chaining logic is unit-testable without a live
+    Mongo (mirrors the pattern of the other pure helpers in this module)."""
+    entry = base_entry.copy()
+    prev_hash = head["entry_hash"] if head else AUDIT_GENESIS_PREV_HASH
+    seq = (head["seq"] + 1) if head else 0
+    entry["seq"] = seq
+    entry["prev_hash"] = prev_hash
+    entry["entry_hash"] = _compute_entry_hash(entry, prev_hash)
+    return entry
+
+
+def verify_audit_chain(entries: List[Dict]) -> Dict:
+    """Walk mission_log entries in sequence order, recompute each entry_hash
+    from its semantic fields + stored prev_hash, and confirm (a) each recomputed
+    entry_hash matches the stored entry_hash and (b) each prev_hash matches the
+    previous chained entry's stored entry_hash. Returns a clear pass/fail plus
+    the seq of the first broken link.
+
+    MIGRATION (honest option): rows written before this feature existed have no
+    `entry_hash`/`seq`. Rather than pretend they were always chained, they are
+    treated as an explicit UNCHAINED LEGACY PREFIX and reported in
+    `legacy_unchained_entries`; the chain is only enforced from the first
+    chained entry forward (whose prev_hash is the genesis seed). Verification of
+    the chained portion is unaffected by how many legacy rows precede it."""
+    chained = [e for e in entries
+               if e.get("entry_hash") is not None and e.get("seq") is not None]
+    legacy_count = len(entries) - len(chained)
+    chained.sort(key=lambda e: e["seq"])
+
+    prev_hash = AUDIT_GENESIS_PREV_HASH
+    for e in chained:
+        if e.get("prev_hash") != prev_hash:
+            return {
+                "valid": False,
+                "broken_seq": e["seq"],
+                "reason": "prev_hash does not match previous entry's entry_hash "
+                          "(a link was removed, reordered, or inserted)",
+                "chained_entries": len(chained),
+                "legacy_unchained_entries": legacy_count,
+                "head_hash": None,
+            }
+        expected = _compute_entry_hash(e, prev_hash)
+        if e.get("entry_hash") != expected:
+            return {
+                "valid": False,
+                "broken_seq": e["seq"],
+                "reason": "entry_hash does not match recomputed hash "
+                          "(this entry's content was tampered with)",
+                "chained_entries": len(chained),
+                "legacy_unchained_entries": legacy_count,
+                "head_hash": None,
+            }
+        prev_hash = e["entry_hash"]
+
+    return {
+        "valid": True,
+        "broken_seq": None,
+        "reason": None,
+        "chained_entries": len(chained),
+        "legacy_unchained_entries": legacy_count,
+        "head_hash": prev_hash if chained else None,
+    }
+
+
 async def log_event(kind: str, message: str, meta: Optional[Dict] = None,
                     actor: Optional[str] = None) -> Dict:
     entry = {
@@ -1170,7 +1293,23 @@ async def log_event(kind: str, message: str, meta: Optional[Dict] = None,
         "actor": actor or "SYSTEM",
         "meta": meta or {},
     }
-    await db.mission_log.insert_one(entry.copy())
+    # Atomic read-prev -> compute -> insert critical section (see
+    # _audit_append_lock rationale above). A failure mid-append is logged and
+    # re-raised (never swallowed, per this codebase's convention) so a
+    # half-written / broken link can never be silently committed.
+    async with _audit_append_lock:
+        try:
+            head = await db.mission_log.find_one(
+                {"entry_hash": {"$exists": True}},
+                sort=[("seq", -1)],
+                projection={"_id": 0, "seq": 1, "entry_hash": 1},
+            )
+            entry = _next_chained_entry(entry, head)
+            await db.mission_log.insert_one(entry.copy())
+        except Exception:
+            logger.exception("log_event: failed to append tamper-evident "
+                             "mission_log entry (kind=%s)", kind)
+            raise
     return entry
 
 
@@ -3467,6 +3606,20 @@ async def list_logs(limit: int = 200, user: Dict = Depends(get_current_user)):
     return docs
 
 
+@api.get("/audit/verify")
+async def audit_verify(user: Dict = Depends(require_commander)):
+    """Commander-only tamper-evidence check. Walks the STORED mission_log hash
+    chain in sequence order and proves it is intact (or pinpoints the seq of the
+    first broken link). This is what makes the chain useful as an audit trail:
+    an operator/auditor can demonstrate the log has not been altered, or show
+    exactly where it was. See verify_audit_chain() for the migration/legacy
+    semantics (pre-feature rows are reported as an unchained legacy prefix)."""
+    entries = await db.mission_log.find({}, {"_id": 0}).to_list(100000)
+    result = verify_audit_chain(entries)
+    result["total_entries"] = len(entries)
+    return result
+
+
 # =====================================================================
 # Routes: System health (dashboard tile + pre-demo check)
 # =====================================================================
@@ -3668,7 +3821,6 @@ async def emergency_resume(user: Dict = Depends(require_commander)):
 @api.get("/report/mission.pdf")
 async def mission_pdf(user: Dict = Depends(get_current_user)):
     from io import BytesIO
-    import hashlib
     from fastapi.responses import Response
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
@@ -3682,14 +3834,17 @@ async def mission_pdf(user: Dict = Depends(get_current_user)):
     packets    = await db.mav_packets.find({}, {"_id": 0}).sort("ts", -1).to_list(500)
     logs       = await db.mission_log.find({}, {"_id": 0}).sort("ts", 1).to_list(2000)
 
-    # Build a simple hash chain over log events for tamper-evident audit trail
-    prev = ""
-    hash_chain = []
-    for e in logs:
-        h = hashlib.sha256(f"{prev}|{e['ts']}|{e['kind']}|{e['message']}|{e['actor']}".encode()).hexdigest()
-        hash_chain.append(h)
-        prev = h
-    final_hash = prev or "0" * 64
+    # Use the STORED, append-time hash chain (see log_event / verify_audit_chain)
+    # rather than recomputing a throwaway chain over mutable rows. Verify it here
+    # so the report actually attests to integrity instead of merely asserting it.
+    chain_result = verify_audit_chain(logs)
+    final_hash = chain_result.get("head_hash") or ("0" * 64)
+    chain_valid = chain_result["valid"]
+    chain_status = (
+        "VERIFIED — chain intact"
+        if chain_valid else
+        f"FAILED — first broken link at seq {chain_result.get('broken_seq')}"
+    )
 
     buf = BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4,
@@ -3728,7 +3883,9 @@ async def mission_pdf(user: Dict = Depends(get_current_user)):
         [
             ["Contacts detected", str(len(detections)), "Active", str(active)],
             ["Neutralized", str(neutralized), "MAVLink packets emitted", str(len(packets))],
-            ["Mission log entries", str(len(logs)), "Audit chain hash", final_hash[:16] + "…"],
+            ["Mission log entries", str(len(logs)), "Audit chain head", final_hash[:16] + "…"],
+            ["Audit chain status", chain_status, "Chained / legacy rows",
+             f"{chain_result['chained_entries']} / {chain_result['legacy_unchained_entries']}"],
         ],
         colWidths=[45*mm, 25*mm, 45*mm, 55*mm],
     )
@@ -3791,12 +3948,15 @@ async def mission_pdf(user: Dict = Depends(get_current_user)):
     # Mission log (hash-chained)
     story.append(PageBreak())
     story.append(Paragraph("Chronological Audit Trail (SHA-256 chained)", h2))
-    lrows = [["#", "TS (UTC)", "KIND", "MESSAGE", "ACTOR", "HASH"]]
-    for i, (e, h) in enumerate(zip(logs, hash_chain), start=1):
+    lrows = [["SEQ", "TS (UTC)", "KIND", "MESSAGE", "ACTOR", "STORED HASH"]]
+    for i, e in enumerate(logs, start=1):
+        stored = e.get("entry_hash")
+        seq_disp = str(e["seq"]) if e.get("seq") is not None else "—"
+        hash_disp = (stored[:12] + "…") if stored else "legacy/unchained"
         lrows.append([
-            str(i), (e.get("ts","")[:19]).replace("T"," "),
+            seq_disp, (e.get("ts","")[:19]).replace("T"," "),
             e.get("kind",""), (e.get("message","") or "")[:65],
-            e.get("actor",""), h[:12] + "…",
+            e.get("actor",""), hash_disp,
         ])
     lt = Table(lrows, colWidths=[8*mm, 30*mm, 18*mm, 70*mm, 30*mm, 25*mm], repeatRows=1)
     lt.setStyle(TableStyle([
@@ -3811,9 +3971,13 @@ async def mission_pdf(user: Dict = Depends(get_current_user)):
 
     story.append(Spacer(1, 10))
     story.append(Paragraph(
-        f"<b>Final chain hash:</b> <font face='Courier'>{final_hash}</font>", mono))
+        f"<b>Chain head hash:</b> <font face='Courier'>{final_hash}</font>", mono))
     story.append(Paragraph(
-        "Any modification to prior log entries would invalidate this hash.", body))
+        f"<b>Integrity check (at report time):</b> {chain_status}. "
+        f"Each entry stores <font face='Courier'>SHA256(canonical(entry) | prev_hash)</font> "
+        f"computed at write time; GET /api/audit/verify (commander-only) re-walks this stored "
+        f"chain on demand. Any modification to a prior entry's content, or removal/reordering of "
+        f"an entry, breaks the recomputed hash at that link and is detected.", body))
     story.append(Spacer(1, 6))
     story.append(Paragraph("// RESTRICTED — NOT FOR OPERATIONAL USE //", red_banner))
 

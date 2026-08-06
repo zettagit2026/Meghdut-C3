@@ -189,6 +189,29 @@ class TestMissionPDF:
         assert r.status_code == 401
 
 
+# ------------- Audit chain verification -------------
+class TestAuditVerify:
+    def test_verify_passes_after_appends(self, auth_headers):
+        # Generate real mission_log appends (each /emergency/abort calls
+        # log_event, which now stamps the stored hash chain), then confirm the
+        # commander-only verifier walks the STORED chain and reports it intact.
+        for _ in range(2):
+            r = requests.post(f"{API}/emergency/abort", headers=auth_headers, timeout=10)
+            assert r.status_code == 200, r.text
+        r = requests.get(f"{API}/audit/verify", headers=auth_headers, timeout=15)
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["valid"] is True, d
+        assert d["broken_seq"] is None
+        assert d["chained_entries"] >= 2
+        # head_hash is a full SHA-256 hex digest
+        assert isinstance(d["head_hash"], str) and len(d["head_hash"]) == 64
+
+    def test_verify_requires_auth(self):
+        r = requests.get(f"{API}/audit/verify", timeout=10)
+        assert r.status_code == 401
+
+
 # ------------- WebSocket handshake (regression) -------------
 def _ws_url(token: str | None = None) -> str:
     u = urlparse(BASE_URL)
