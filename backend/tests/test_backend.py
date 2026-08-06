@@ -302,9 +302,9 @@ class TestPayloads:
         r = requests.get(f"{API}/payloads", headers=auth_headers)
         assert r.status_code == 200
         data = r.json()
-        assert len(data) == 10
+        assert len(data) == 11
         ids = {p["id"] for p in data}
-        for k in [f"PL-{i:03d}" for i in range(1, 11)]:
+        for k in [f"PL-{i:03d}" for i in range(1, 12)]:
             assert k in ids, f"missing payload {k}"
         for p in data:
             for f in ["id", "name", "category", "severity", "mav_cmd"]:

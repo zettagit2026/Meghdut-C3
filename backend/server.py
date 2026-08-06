@@ -1089,6 +1089,16 @@ class DeployPayloadBody(BaseModel):
     target_detection_id: Optional[str] = None
     broadcast: bool = False
     arm_token: Optional[str] = None  # required for CRITICAL severity or broadcast
+    # Only meaningful for sustained payloads (PL-011 maneuver takeover). The
+    # operator-set engagement window; server-side clamped to the payload's
+    # max_duration_s hard cap regardless of what is sent. Ignored for one-shot
+    # payloads.
+    duration_s: Optional[float] = None
+    # Honesty acknowledgement for sustained RC-override: an operator asserting
+    # the target is a legacy/unencrypted-MAVLink craft. Not a substitute for the
+    # backend's own protocol check — an encrypted/FHSS protocol is refused
+    # regardless of this flag.
+    target_link_legacy_mavlink: bool = False
 
 
 class AuthorizeTargetBody(BaseModel):
@@ -3518,6 +3528,25 @@ async def list_payloads(user: Dict = Depends(get_current_user)):
     return [p.to_dict() for p in PAYLOAD_CATALOG]
 
 
+# Target link protocols against which sustained RC_CHANNELS_OVERRIDE (PL-011)
+# is a NO-OP (encrypted / frequency-hopping / crypto-bound). Mirrors
+# field-bridge/mavlink_takeover.py's ENCRYPTED_LINK_PROTOCOLS. A takeover
+# targeting any of these is refused (reported not-applicable), NOT transmitted
+# uselessly — honesty rule DOC_CORRECTIONS_MEMO 3H.
+TAKEOVER_ENCRYPTED_LINK_PROTOCOLS = (
+    "elrs", "crsf", "expresslrs", "ocusync", "lightbridge", "dji",
+    "dsmx", "dsm2", "spektrum", "frsky", "accst", "access", "flysky",
+    "afhds", "hott", "ghst", "tbs", "crossfire", "encrypted", "fhss",
+)
+
+
+def _takeover_link_overridable(protocol: Optional[str]) -> bool:
+    if not protocol:
+        return True
+    p = protocol.lower()
+    return not any(tok in p for tok in TAKEOVER_ENCRYPTED_LINK_PROTOCOLS)
+
+
 @api.post("/payloads/deploy")
 async def deploy_payload(body: DeployPayloadBody,
                          user: Dict = Depends(require_commander)):
@@ -3544,6 +3573,17 @@ async def deploy_payload(body: DeployPayloadBody,
         # different target within its TTL.
         _consume_arm_token(body.arm_token, effect="deploy",
                            target_detection_id=None if body.broadcast else body.target_detection_id)
+
+    # Sustained RC-override takeover (PL-011) is single-target ONLY: a bounded
+    # controlled-landing stream at a specific craft, never a broadcast. This
+    # keeps it target-bound (arm token bound to the target) and inside the
+    # per-target IFF interlock below — no swarm-wide sustained injection.
+    if getattr(spec, "sustained", False) and body.broadcast:
+        raise HTTPException(
+            400,
+            "Sustained maneuver-takeover cannot be broadcast — it is a single, "
+            "target-bound controlled-landing engagement. Provide target_detection_id.",
+        )
 
     target_sys = 0
     target_comp = 0
@@ -3572,6 +3612,31 @@ async def deploy_payload(body: DeployPayloadBody,
         target_sys = detection.get("system_id", 1)
         target_comp = detection.get("component_id", 1)
 
+    # HONESTY GATE (DOC_CORRECTIONS_MEMO 3H) for sustained RC-override takeover:
+    # RC_CHANNELS_OVERRIDE has NO effect against an encrypted/FHSS control link
+    # (ELRS/CRSF, DJI OcuSync, DSMX, hop-paired RC). If the target's detected
+    # protocol is such a link, REFUSE and report not-applicable rather than
+    # transmitting uselessly. Effective only against unencrypted/legacy
+    # MAVLink-over-RF craft. Broadcast is already excluded above.
+    if getattr(spec, "sustained", False) and detection is not None:
+        proto = detection.get("protocol")
+        if not _takeover_link_overridable(proto):
+            await log_event(
+                "PAYLOAD",
+                f"Maneuver-takeover NOT APPLICABLE against {detection.get('callsign','?')} "
+                f"— link protocol '{proto}' is encrypted/FHSS; RC override is ignored by "
+                f"such a craft. No RF transmitted.",
+                meta={"payload_id": spec.id, "target_detection_id": body.target_detection_id,
+                      "protocol": proto, "not_applicable": True},
+                actor=user["email"],
+            )
+            raise HTTPException(
+                422,
+                f"Maneuver-takeover not applicable: target link '{proto}' is "
+                f"encrypted/frequency-hopping. RC_CHANNELS_OVERRIDE only works against "
+                f"unencrypted/legacy MAVLink-over-RF craft — refusing to transmit uselessly.",
+            )
+
     # target_sys/target_comp are already 0/0 for the broadcast case (set above),
     # so always pass them through — calling builder(seq=0) alone previously
     # raised TypeError for every payload except PL-010 (missing required
@@ -3598,6 +3663,25 @@ async def deploy_payload(body: DeployPayloadBody,
         "decoded": describe_packet(frame),
         "actor": user["email"],
     }
+
+    # Sustained payloads (PL-011 maneuver takeover): the single frame above is
+    # the template the field-side takeover driver (field-bridge/mavlink_takeover.py)
+    # re-emits at rc_rate_hz for a BOUNDED, hard-capped window. Clamp the
+    # operator-set duration to the payload's max_duration_s server-side (never
+    # trust the caller past the cap) and carry the sustain plan in the packet.
+    # This adds NO authorization path — the gate chain above already ran; it
+    # only tells an already-authorized bridge to hold the controlled landing
+    # for a bounded time and to abort immediately on EMERGENCY ABORT.
+    takeover_duration_s = None
+    if getattr(spec, "sustained", False):
+        requested = body.duration_s if body.duration_s is not None else (spec.duration_ms / 1000.0)
+        takeover_duration_s = max(0.0, min(float(requested), spec.max_duration_s))
+        pkt["sustained"] = True
+        pkt["mode"] = "rc_override_takeover"
+        pkt["duration_s"] = takeover_duration_s
+        pkt["max_duration_s"] = spec.max_duration_s
+        pkt["rc_rate_hz"] = spec.rc_rate_hz
+        pkt["target_component"] = target_comp
     await db.mav_packets.insert_one(pkt.copy())
     pkt.pop("_id", None)
 
@@ -3652,9 +3736,14 @@ async def deploy_payload(body: DeployPayloadBody,
         "PAYLOAD",
         f"Requested {spec.name} ({spec.severity}) on "
         f"{'BROADCAST' if body.broadcast else detection.get('callsign','?')} "
-        f"— awaiting bridge TX confirmation (request {request_id})",
+        + (f"— SUSTAINED controlled-landing, bounded {takeover_duration_s:.1f}s "
+           f"(cap {spec.max_duration_s:.0f}s), aborts on EMERGENCY ABORT "
+           if takeover_duration_s is not None else "")
+        + f"— awaiting bridge TX confirmation (request {request_id})",
         meta={"payload_id": spec.id, "packet_id": pkt["id"], "broadcast": body.broadcast,
-              "target_detection_id": body.target_detection_id, "request_id": request_id},
+              "target_detection_id": body.target_detection_id, "request_id": request_id,
+              "sustained": bool(takeover_duration_s is not None),
+              "duration_s": takeover_duration_s},
         actor=user["email"],
     )
 
