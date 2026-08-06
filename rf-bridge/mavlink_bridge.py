@@ -64,6 +64,69 @@ except Exception as _e:  # pragma: no cover - field-bridge must be co-deployed
 
 log = logging.getLogger("mav-bridge")
 
+# INFO #173 hardening: short TTL for the range-auth lease cache used ONLY by the
+# sustained-takeover _halted() hot path. <= 500ms per the reviewer's bound.
+RANGE_AUTH_CACHE_TTL_S = 0.5
+
+
+class _RangeAuthLeaseCache:
+    """Short-TTL, fail-closed cache around the range-authorization lease poll
+    used by the sustained-takeover _halted() check (INFO #173 hardening).
+
+    WHY: the sustained loop polls _halted() before EVERY frame (~20/s at 20Hz).
+    Without caching, each poll makes a BLOCKING HTTP GET
+    /api/range-authorization/status, so (a) backend latency throttles the
+    effective frame rate and (b) worst-case abort-detection latency is bounded
+    by the HTTP timeout instead of the ~50ms frame period. Caching the lease for
+    a short TTL (<= 500ms) makes ~2 range-auth polls/sec instead of ~20 (~10x
+    less backend load) and removes the per-frame blocking call from the hot path.
+
+    FAIL-CLOSED INVARIANTS (this is the critical part — do NOT weaken):
+      * Only a POSITIVE ("authorized") lease is ever cached, and only for TTL.
+        A poll that returns not-authorized, times out, or raises is treated as
+        lease-OFF (halt) AND INVALIDATES the cache (value=False, expiry reset),
+        so a previously-cached "authorized" value can NEVER persist past an
+        error or an expiry.
+      * The EMERGENCY-ABORT flag (tx_halted) is NOT handled here — it is a local
+        boolean checked separately, every frame, with NO caching (see _halted()).
+        Only the range-auth HTTP poll is cached.
+      * Worst-case: a lease that flips off (or a backend error) is detected
+        within at most one frame period + TTL (<= ~550ms at 20Hz + 500ms TTL).
+
+    Clock (`now`) and `poll` are injected so this is deterministically testable.
+    is_range_authorized() itself already fails closed (returns False, never
+    raises) on any backend error; the try/except here is defense-in-depth so a
+    fail-closed halt survives even a poll callable that raises."""
+
+    def __init__(self, poll, ttl_s: float = RANGE_AUTH_CACHE_TTL_S, now=time.monotonic) -> None:
+        self._poll = poll
+        self._ttl_s = max(0.0, float(ttl_s))
+        self._now = now
+        self._authorized = False   # last known lease state
+        self._expires_at = 0.0     # monotonic deadline of a cached positive lease
+        self.poll_count = 0        # exposed for tests: underlying polls actually made
+
+    def authorized(self) -> bool:
+        """Return the (possibly cached) live lease state. Fail-closed on error."""
+        t = self._now()
+        # Reuse a still-fresh POSITIVE lease without hitting the backend.
+        if self._authorized and t < self._expires_at:
+            return True
+        # Cache miss / expired / previously-off: make a fresh live poll.
+        self.poll_count += 1
+        try:
+            live = bool(self._poll())
+        except Exception:
+            live = False  # defense-in-depth: any raise => fail closed
+        if live:
+            self._authorized = True
+            self._expires_at = t + self._ttl_s
+            return True
+        # Not authorized / error => halt AND invalidate so nothing stale survives.
+        self._authorized = False
+        self._expires_at = 0.0
+        return False
+
 
 def _send_tx_ack(ws, request_id: str, ok: bool, error: Optional[str] = None) -> None:
     """Send a real ack back to the server over the same WS connection this
@@ -149,12 +212,31 @@ class MavlinkBridge:
         duration_s = float(pkt.get("duration_s") or 0.0)
         rc_rate_hz = float(pkt.get("rc_rate_hz") or 0.0)
 
+        # INFO #173 hardening: cache the range-auth lease for a short TTL so the
+        # per-frame _halted() check does NOT make a blocking HTTP GET on every
+        # single frame. Fresh per takeover run so no state leaks between runs.
+        # NOTE: tx_halted is deliberately NOT routed through this cache — see
+        # below.
+        range_auth = _RangeAuthLeaseCache(
+            poll=lambda: self.client.is_range_authorized("mavlink"),
+            ttl_s=RANGE_AUTH_CACHE_TTL_S,
+        )
+
         def _halted() -> bool:
             # Checked before EVERY frame by the primitive. Either an EMERGENCY
             # ABORT or a lease that is no longer live terminates the stream.
+            #
+            # tx_halted (EMERGENCY ABORT) is a local boolean and is checked here
+            # EVERY frame with NO caching — the abort flag must never be stale,
+            # so an EMERGENCY ABORT still stops the stream within one frame
+            # period, unchanged by this hardening.
             if self.tx_halted:
                 return True
-            if not self.client.is_range_authorized("mavlink"):
+            # The range-auth lease is the only thing cached (short TTL). A lease
+            # that expires/errors is detected within one frame period + TTL, and
+            # the cache fails closed + self-invalidates on any poll error, so a
+            # stale "authorized" value can't carry the stream past an expiry.
+            if not range_auth.authorized():
                 log.warning("sustained takeover HALTING: range-auth (mavlink) no "
                             "longer live (request_id=%s)", request_id)
                 return True

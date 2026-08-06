@@ -14,6 +14,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "backend"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "rf-bridge"))
 
 import mavlink_codec as mc  # noqa: E402
 from mavlink_takeover import (  # noqa: E402
@@ -21,6 +22,7 @@ from mavlink_takeover import (  # noqa: E402
     link_is_overridable,
     run_sustained_takeover,
 )
+from mavlink_bridge import _RangeAuthLeaseCache  # noqa: E402
 
 
 # ---- fake deterministic clock -------------------------------------------
@@ -256,6 +258,124 @@ def test_stop_event_mid_stream_aborts():
         now=clock.now, sleep=clock.sleep,
     )
     assert res.stopped_early and res.frames_sent == 3, res
+
+
+# =========================================================================
+# INFO #173: short-TTL range-auth lease cache in the sustained _halted() path.
+# Proves the cache cuts poll frequency WITHOUT weakening the fail-closed
+# invariants: tx_halted stays uncached/instant; a poll error halts AND
+# invalidates the cache; a lease flipping off is caught within TTL + one period.
+# =========================================================================
+
+def _make_halted(clock, tx_halted, poll, ttl_s=0.5):
+    """Rebuild mavlink_bridge._run_sustained's _halted() closure with injected
+    clock/poll: tx_halted (local bool) checked EVERY call uncached; range-auth
+    routed through the short-TTL cache. Returns (halted_fn, cache)."""
+    cache = _RangeAuthLeaseCache(poll=poll, ttl_s=ttl_s, now=clock.now)
+
+    def _halted():
+        if tx_halted():           # uncached, every frame
+            return True
+        if not cache.authorized():  # cached, short TTL, fail-closed
+            return True
+        return False
+
+    return _halted, cache
+
+
+def test_cache_reduces_poll_frequency_within_ttl():
+    clock = FakeClock()
+    polls = {"n": 0}
+    def poll():
+        polls["n"] += 1
+        return True
+    cache = _RangeAuthLeaseCache(poll=poll, ttl_s=0.5, now=clock.now)
+    # 10 checks inside one TTL window (advance < TTL total) => exactly ONE poll.
+    for _ in range(10):
+        assert cache.authorized() is True
+        clock.t += 0.04  # 10 * 40ms = 400ms < 500ms TTL
+    assert polls["n"] == 1, polls["n"]
+    assert cache.poll_count == 1
+    # Crossing the TTL boundary forces exactly one more underlying poll.
+    clock.t += 0.2  # now well past 500ms since first poll
+    assert cache.authorized() is True
+    assert polls["n"] == 2, polls["n"]
+
+
+def test_cache_poll_error_halts_and_invalidates():
+    clock = FakeClock()
+    state = {"raise": False, "ret": True}
+    def poll():
+        if state["raise"]:
+            raise RuntimeError("backend unreachable")
+        return state["ret"]
+    cache = _RangeAuthLeaseCache(poll=poll, ttl_s=0.5, now=clock.now)
+    # Prime a cached positive lease.
+    assert cache.authorized() is True
+    # Expire it, then make the poll error: must fail closed (halt).
+    clock.t += 0.6
+    state["raise"] = True
+    assert cache.authorized() is False
+    # INVALIDATION: even though the clock has NOT advanced past a fresh TTL, the
+    # next check must NOT return a stale cached True — it must re-poll. Prove it
+    # by letting the poll succeed again immediately with no clock movement.
+    state["raise"] = False
+    poll_before = cache.poll_count
+    assert cache.authorized() is True
+    assert cache.poll_count == poll_before + 1, "error must have invalidated cache"
+
+
+def test_tx_halted_aborts_regardless_of_cache():
+    # Cache says authorized forever; tx_halted flips true mid-stream. The stream
+    # must stop within one frame period because tx_halted is UNCACHED.
+    clock = FakeClock()
+    sent = []
+    halted_flag = {"v": False}
+    def send(frame):
+        sent.append(frame)
+        if len(sent) == 6:
+            halted_flag["v"] = True
+    _halted, cache = _make_halted(
+        clock, tx_halted=lambda: halted_flag["v"], poll=lambda: True, ttl_s=0.5)
+    res = run_sustained_takeover(
+        send_frame=send, target_system=5, target_protocol="MAVLink",
+        duration_s=30.0, rc_rate_hz=20.0, tx_halted=_halted,
+        now=clock.now, sleep=clock.sleep,
+    )
+    assert res.stopped_early and res.ok, res
+    assert res.frames_sent == 6, res.frames_sent  # stopped one period after flip
+
+
+def test_lease_flip_off_detected_within_ttl_plus_one_period():
+    # Lease is live, then flips off. With a cache TTL the takeover must still
+    # terminate within TTL + ~one frame period, not run the full window.
+    clock = FakeClock()
+    sent = []
+    lease = {"on": True}
+    ttl = 0.5
+    period = 1.0 / 20.0
+    off_time = {"t": None}
+    def send(frame):
+        sent.append(frame)
+        # Flip the lease off at ~0.2s into the stream.
+        if lease["on"] and clock.now() >= 0.2:
+            lease["on"] = False
+            off_time["t"] = clock.now()
+    _halted, cache = _make_halted(
+        clock, tx_halted=lambda: False,
+        poll=lambda: lease["on"], ttl_s=ttl)
+    res = run_sustained_takeover(
+        send_frame=send, target_system=5, target_protocol="MAVLink",
+        duration_s=30.0, rc_rate_hz=20.0, tx_halted=_halted,
+        now=clock.now, sleep=clock.sleep,
+    )
+    assert res.stopped_early and res.ok, res
+    # Detection latency from flip to halt must be within TTL + one frame period.
+    assert off_time["t"] is not None
+    latency = res.elapsed_s - off_time["t"]
+    assert latency <= ttl + period + 1e-6, latency
+    # And it definitely did NOT run the full 30s window.
+    assert res.elapsed_s < 1.0, res.elapsed_s
 
 
 if __name__ == "__main__":
