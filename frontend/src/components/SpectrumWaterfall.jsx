@@ -1,32 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { Activity } from "lucide-react";
-
-// Power (dBm) -> color, cool-to-hot heatmap
-function dbmToColor(v, min, max) {
-  const t = Math.max(0, Math.min(1, (v - min) / (max - min || 1)));
-  // dark blue -> cyan -> yellow -> red
-  const stops = [
-    [0.0, [10, 10, 40]],
-    [0.35, [0, 120, 200]],
-    [0.6, [0, 220, 200]],
-    [0.8, [255, 220, 0]],
-    [1.0, [255, 40, 40]],
-  ];
-  for (let i = 0; i < stops.length - 1; i++) {
-    const [t0, c0] = stops[i];
-    const [t1, c1] = stops[i + 1];
-    if (t >= t0 && t <= t1) {
-      const f = (t - t0) / (t1 - t0 || 1);
-      return [
-        Math.round(c0[0] + (c1[0] - c0[0]) * f),
-        Math.round(c0[1] + (c1[1] - c0[1]) * f),
-        Math.round(c0[2] + (c1[2] - c0[2]) * f),
-      ];
-    }
-  }
-  return [255, 40, 40];
-}
+import {
+  dbmToRGB,
+  INFERNO_STOPS,
+  SPECTRUM_FLOOR_DBM,
+  SPECTRUM_CEIL_DBM,
+} from "@/lib/spectrumColormap";
 
 const POLL_INTERVAL_MS = 1500;
 const MAX_CONSECUTIVE_FAILURES = 3;
@@ -72,15 +52,15 @@ export default function SpectrumWaterfall() {
       canvas.width = bins;
       canvas.height = 80;
       const ctx = canvas.getContext("2d");
-      const flat = rows.flat();
-      const min = Math.min(...flat);
-      const max = Math.max(...flat);
+      // ABSOLUTE calibration: every color maps to a fixed dBm via the shared
+      // colormap (floor/ceiling in lib/spectrumColormap.js) -- no per-frame
+      // auto-scaling, so a given color always means the same power level.
       const img = ctx.createImageData(bins, 80);
       for (let y = 0; y < 80; y++) {
         const row = rows[y] || rows[rows.length - 1];
         for (let x = 0; x < bins; x++) {
-          const v = row[x] ?? min;
-          const [r, g, b] = dbmToColor(v, min, max);
+          const v = row[x] ?? SPECTRUM_FLOOR_DBM;
+          const [r, g, b] = dbmToRGB(v);
           const idx = (y * bins + x) * 4;
           img.data[idx] = r;
           img.data[idx + 1] = g;
@@ -120,11 +100,36 @@ export default function SpectrumWaterfall() {
         </span>
       </div>
       <div className="p-3">
-        <canvas
-          ref={canvasRef}
-          data-testid="spectrum-waterfall-canvas"
-          style={{ width: "100%", height: "240px", imageRendering: "pixelated", display: "block", opacity: stale ? 0.35 : 1 }}
-        />
+        <div className="flex gap-2">
+          <canvas
+            ref={canvasRef}
+            data-testid="spectrum-waterfall-canvas"
+            style={{ width: "100%", height: "240px", imageRendering: "pixelated", display: "block", opacity: stale ? 0.35 : 1 }}
+          />
+          {/* Colorbar legend: without a dBm->color scale the waterfall is not
+              interpretable as a measurement. Absolute (fixed floor/ceiling),
+              so it reads the same every frame. */}
+          <div
+            data-testid="spectrum-waterfall-colorbar"
+            className="flex items-stretch gap-1 shrink-0"
+            aria-label={`power scale ${SPECTRUM_CEIL_DBM} to ${SPECTRUM_FLOOR_DBM} dBm`}
+          >
+            <div
+              style={{
+                width: "10px",
+                height: "240px",
+                borderRadius: "2px",
+                background: `linear-gradient(to top, ${INFERNO_STOPS.join(",")})`,
+                opacity: stale ? 0.35 : 1,
+              }}
+            />
+            <div className="flex flex-col justify-between font-mono text-[9px] text-slate-500 tabular-nums">
+              <span>{SPECTRUM_CEIL_DBM}</span>
+              <span className="text-slate-600">dBm</span>
+              <span>{SPECTRUM_FLOOR_DBM}</span>
+            </div>
+          </div>
+        </div>
         <div className="flex justify-between font-mono text-[10px] text-slate-500 mt-1">
           <span>freq bins →</span>
           <span>{meta.bins} bins</span>

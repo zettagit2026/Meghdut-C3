@@ -12,6 +12,7 @@ import { isUnconfirmedDetection, shouldShowUnconfirmedTag, getOriginalModelAnnot
 import { isRecentCritical, isStaticCritical } from "@/lib/threatSalience";
 import { announceNewCriticalContacts, isCriticalAlertMuted, setCriticalAlertMuted } from "@/lib/criticalAlertSound";
 import { THREAT_COLOR } from "@/lib/threatLevels";
+import { INFERNO_STOPS, SPECTRUM_FLOOR_DBM, SPECTRUM_CEIL_DBM } from "@/lib/spectrumColormap";
 
 // Task #117: "Export IQ for RE analysis". Downloads the SigMF .sigmf-data/
 // .sigmf-meta pair (see backend GET /detections/{id}/iq-export) as a zip so
@@ -49,21 +50,14 @@ async function exportIqCapture(detection) {
   }
 }
 
-// dBm -> tactical waterfall color: dark cyan/black noise floor rising through
-// cyan/green to a hot red for strong signals. Mirrors the hue ramp the old
-// per-cell div renderer used (cyan -> red), just expressed as an ECharts
-// visualMap gradient instead of a per-div inline style.
-const WATERFALL_COLOR_STOPS = [
-  "#000000", // noise floor / no signal -- matches --bg-terminal
-  "#003b46", // faint energy
-  "#00838f",
-  "#00F0FF", // --accent-info, moderate signal
-  "#39FF14", // --accent-success, strong signal
-  "#FFD60A", // --accent-warning
-  "#FF3B30", // --accent-critical, saturated/very strong signal
-];
-const WF_MIN_DBM = -95;
-const WF_MAX_DBM = -30;
+// dBm -> waterfall color. Uses the shared, ABSOLUTE, calibrated colormap
+// (perceptually-uniform "inferno" ramp; fixed floor/ceiling in
+// lib/spectrumColormap.js) instead of the old per-frame blue->cyan->yellow->red
+// rainbow, so a given color always means the same power level and there is no
+// false banding at color transitions. ECharts interpolates across these stops.
+const WATERFALL_COLOR_STOPS = INFERNO_STOPS;
+const WF_MIN_DBM = SPECTRUM_FLOOR_DBM;
+const WF_MAX_DBM = SPECTRUM_CEIL_DBM;
 
 const WF_POLL_INTERVAL_MS = 2500;
 const WF_MAX_CONSECUTIVE_FAILURES = 3;
@@ -129,7 +123,7 @@ function Waterfall() {
   const baseOption = useMemo(() => ({
     backgroundColor: "transparent",
     animation: false,
-    grid: { left: 36, right: 12, top: 8, bottom: 22, containLabel: false },
+    grid: { left: 36, right: 64, top: 8, bottom: 22, containLabel: false },
     tooltip: {
       trigger: "item",
       backgroundColor: "#0C111D",
@@ -152,11 +146,20 @@ function Waterfall() {
       show: false,
       inverse: true, // row 0 (most recent sample) rendered at top, matching prior div-stack order
     },
+    // Continuous colorbar legend -- a waterfall without a dBm scale is not a
+    // measurement. Fixed min/max (WF_MIN/MAX_DBM) so the scale is absolute.
     visualMap: {
-      show: false,
+      show: true,
+      type: "continuous",
       min: WF_MIN_DBM,
       max: WF_MAX_DBM,
       calculable: false,
+      itemHeight: 120,
+      itemWidth: 10,
+      right: 8,
+      top: "center",
+      text: [`${WF_MAX_DBM} dBm`, `${WF_MIN_DBM}`],
+      textStyle: { color: "#94A3B8", fontFamily: "JetBrains Mono, monospace", fontSize: 9 },
       inRange: { color: WATERFALL_COLOR_STOPS },
     },
     series: [

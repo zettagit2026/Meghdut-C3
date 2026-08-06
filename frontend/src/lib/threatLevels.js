@@ -3,9 +3,15 @@
 //
 // THEMING: these colors are safety-critical and were WCAG-AA validated against
 // BOTH the dark and light console backgrounds (see index.css --threat-*).
-//   dark  vs #0C111D surface  ·  light vs #E8EBF0 base (all >= 4.5:1):
-//   low #047857 4.59 · medium #92600A 4.51 · high #9A3412 6.11 ·
-//   critical #B91C1C 5.41 · info #155E75 6.08
+// The dark set was re-tuned off maxed-saturation neon to calmer instrument-grade
+// values, CVD-validated as a set (dataviz palette validator: worst adjacent
+// Machado deutan ΔE 11.7), CRITICAL kept dominant, no AA regression.
+//   dark  vs #0C111D surface (all >= 4.5:1):
+//     low #10B981 7.43 · medium #EAB308 9.83 · high #F97316 6.73 ·
+//     critical #EF4444 5.01 · info #38BDF8 8.80
+//   light vs #E8EBF0 base (all >= 4.5:1):
+//     low #047857 4.59 · medium #92600A 4.51 · high #9A3412 6.11 ·
+//     critical #B91C1C 5.41 · info #155E75 6.08
 
 // DOM badges (Dashboard.jsx, DetectionHistory.jsx) use inline style
 // color/borderColor, where CSS custom properties resolve fine -- so these
@@ -21,11 +27,11 @@ export const THREAT_COLOR = {
 // CSS custom properties), so the hex is duplicated per theme here. These MUST
 // stay 1:1 with the --threat-* values in index.css.
 export const THREAT_COLOR_HEX_DARK = {
-  LOW: "#39FF14",
-  MEDIUM: "#FFD60A",
-  HIGH: "#FF8A00",
-  CRITICAL: "#FF3B30",
-  INFO: "#00F0FF",
+  LOW: "#10B981",
+  MEDIUM: "#EAB308",
+  HIGH: "#F97316",
+  CRITICAL: "#EF4444",
+  INFO: "#38BDF8",
 };
 
 export const THREAT_COLOR_HEX_LIGHT = {

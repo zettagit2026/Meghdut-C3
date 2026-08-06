@@ -63,18 +63,25 @@
   --text-secondary: #94A3B8;
   --text-muted: #475569;
   --text-term: #00F0FF;
-  --accent-critical: #FF3B30;
-  --accent-warning: #FFD60A;
-  --accent-success: #39FF14;
-  --accent-info: #00F0FF;
+  /* Instrument-grade status accents (re-tuned off maxed-saturation neon).
+     Calmer, CVD-validated as a set (worst adjacent Machado deutan ΔE 11.7,
+     top of the 8-12 floor band -- legal with the mandatory icon+label pairing);
+     all remain >= 5:1 (WCAG AA text) on both --bg-base #050810 and
+     --bg-surface #0C111D, with CRITICAL kept dominant. */
+  --accent-critical: #EF4444;
+  --accent-warning: #EAB308;
+  --accent-success: #10B981;
+  --accent-info: #38BDF8;
   --border-col: rgba(255, 255, 255, 0.15);
 
-  /* Safety-critical threat tiers (decoupled from UI accents). */
-  --threat-low: #39FF14;
-  --threat-medium: #FFD60A;
-  --threat-high: #FF8A00;
-  --threat-critical: #FF3B30;
-  --threat-info: #00F0FF;
+  /* Safety-critical threat tiers (decoupled from UI accents).
+     Dark AA vs #0C111D surface: low 7.43 · medium 9.83 · high 6.73 ·
+     critical 5.01 · info 8.80  (all >= 4.5). */
+  --threat-low: #10B981;
+  --threat-medium: #EAB308;
+  --threat-high: #F97316;
+  --threat-critical: #EF4444;
+  --threat-info: #38BDF8;
 
   /* Surface chrome helpers used by tokenized nav/hover classes. */
   --hover-surface: #0F1626;
