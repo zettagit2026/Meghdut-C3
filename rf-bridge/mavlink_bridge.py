@@ -35,6 +35,7 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Dict, Optional
 from urllib.parse import quote
 
@@ -43,6 +44,23 @@ import websocket  # websocket-client
 from pymavlink import mavutil
 
 from common import CemaClient, cfg, cfg_int
+
+# F-1: the SUSTAINED RC-override maneuver-takeover (PL-011) primitive lives in
+# the field-bridge package. This rf-bridge is the ONLY component that actually
+# writes frames to the radio, so the sustained controlled-landing loop must be
+# driven from HERE. Import run_sustained_takeover from the sibling field-bridge
+# dir (which itself adds backend/ to sys.path for mavlink_codec).
+_FIELD_BRIDGE = str(Path(__file__).resolve().parent.parent / "field-bridge")
+if _FIELD_BRIDGE not in sys.path:
+    sys.path.insert(0, _FIELD_BRIDGE)
+try:
+    from mavlink_takeover import run_sustained_takeover  # noqa: E402
+except Exception as _e:  # pragma: no cover - field-bridge must be co-deployed
+    run_sustained_takeover = None
+    logging.getLogger("mav-bridge").warning(
+        "sustained-takeover primitive unavailable (%s) — PL-011 sustained "
+        "packets will be refused, not single-shot transmitted.", _e,
+    )
 
 log = logging.getLogger("mav-bridge")
 
@@ -101,6 +119,78 @@ class MavlinkBridge:
             raise RuntimeError("serial port not open")
         self.ser.write(frame)
         self.ser.flush()
+
+    # ---- F-1: sustained maneuver-takeover driver -------------------------
+    def _run_sustained(self, ws, pkt: dict, request_id: str) -> None:
+        """Drive the bounded, immediately-abortable RC-override controlled
+        landing on the live radio. Called only for sustained (PL-011) packets.
+
+        Two independent, LIVE, per-frame kill conditions are wired into the
+        primitive's abort check (polled BEFORE every single frame, so either
+        stops the stream within one frame period):
+
+          1. tx_halted — the EMERGENCY ABORT flag set by a server 'abort' WS
+             message. Stops an in-progress controlled landing immediately.
+          2. LIVE range-authorization — is_range_authorized('mavlink') is
+             re-polled before EVERY frame (not just once at start), so a lease
+             that expires or is disabled mid-stream terminates the takeover.
+             Fails closed (treated as halt) on any backend/network error.
+
+        Nothing after an abort is transmitted. Duration and rc_rate are taken
+        from the packet (already server-clamped to the PL-011 hard cap); the
+        primitive additionally hard-caps duration itself as defense in depth."""
+        if run_sustained_takeover is None:
+            _send_tx_ack(ws, request_id, False,
+                         "sustained-takeover primitive unavailable on this bridge")
+            return
+
+        target_system = int(pkt.get("target_system") or 0)
+        target_component = int(pkt.get("target_component") or 1)
+        duration_s = float(pkt.get("duration_s") or 0.0)
+        rc_rate_hz = float(pkt.get("rc_rate_hz") or 0.0)
+
+        def _halted() -> bool:
+            # Checked before EVERY frame by the primitive. Either an EMERGENCY
+            # ABORT or a lease that is no longer live terminates the stream.
+            if self.tx_halted:
+                return True
+            if not self.client.is_range_authorized("mavlink"):
+                log.warning("sustained takeover HALTING: range-auth (mavlink) no "
+                            "longer live (request_id=%s)", request_id)
+                return True
+            return False
+
+        log.info("TX → serial (SUSTAINED takeover): tgt_sys=%s dur=%.2fs rate=%.1fHz "
+                 "request_id=%s", target_system, duration_s, rc_rate_hz, request_id)
+        try:
+            res = run_sustained_takeover(
+                send_frame=self.write_frame,
+                target_system=target_system,
+                target_component=target_component,
+                duration_s=duration_s,
+                rc_rate_hz=rc_rate_hz,
+                tx_halted=_halted,
+                target_protocol=pkt.get("target_protocol"),
+                target_link_legacy_mavlink=bool(pkt.get("target_link_legacy_mavlink")),
+            )
+        except Exception as e:
+            log.error("SUSTAINED takeover crashed (request_id=%s): %s", request_id, e)
+            _send_tx_ack(ws, request_id, False, f"sustained takeover error: {e}")
+            return
+
+        log.info("SUSTAINED takeover done (request_id=%s): frames=%d release=%d "
+                 "stopped_early=%s not_applicable=%s reason=%s", request_id,
+                 res.frames_sent, res.release_frames_sent, res.stopped_early,
+                 res.not_applicable, res.reason)
+        # ok=True with >0 frames means the radio actually carried the stream.
+        # not_applicable / error => honest failure ack (nothing effective TX'd).
+        if res.not_applicable or res.error or (not res.ok):
+            _send_tx_ack(ws, request_id, False, res.error or res.reason)
+        elif res.frames_sent == 0:
+            # e.g. aborted before the first frame — nothing reached the radio.
+            _send_tx_ack(ws, request_id, False, res.reason or "no frames transmitted")
+        else:
+            _send_tx_ack(ws, request_id, True)
 
     # ---- WS subscribe (TX path: app → radio → drone) ---------------------
     def start_ws_subscriber(self) -> None:
@@ -168,6 +258,26 @@ class MavlinkBridge:
                 )
                 _send_tx_ack(_ws, request_id, False,
                             "bridge refused: range-authorization (effect=mavlink) not enabled")
+                return
+
+            # ---- F-1: SUSTAINED maneuver-takeover (PL-011) dispatch ----------
+            # A sustained packet is NOT a single frame — it carries a bounded
+            # controlled-landing PLAN (mode/duration_s/rc_rate_hz). Previously
+            # this handler ignored that metadata and wrote exactly ONE frame,
+            # so the primitive never actually ran in the live path. Now dispatch
+            # into run_sustained_takeover, which re-emits the RC-override frame
+            # at rc_rate_hz for the server-clamped duration and aborts within one
+            # frame period on tx-halt OR a mid-stream range-lease expiry.
+            if pkt.get("mode") == "rc_override_takeover" or pkt.get("sustained"):
+                # Run the bounded stream on a SEPARATE thread so this WS reader
+                # thread stays free to receive a subsequent 'abort' message and
+                # flip self.tx_halted — which the sustained loop polls before
+                # every frame. If we ran it inline here, on_message would block
+                # and the EMERGENCY ABORT could never be delivered mid-stream.
+                threading.Thread(
+                    target=self._run_sustained, args=(_ws, pkt, request_id),
+                    name=f"sustained-{request_id[:8]}", daemon=True,
+                ).start()
                 return
 
             hex_str = pkt.get("hex")

@@ -72,6 +72,78 @@ MAV_CMD = {
 }
 
 
+# =====================================================================
+# F-7: SINGLE SOURCE OF TRUTH for the sustained maneuver-takeover (PL-011)
+# safety cap and the link-override classification data. Previously the 30 s
+# cap and the encrypted-protocol list were duplicated (with "keep in sync"
+# comments) across payload_library.py, server.py, and
+# field-bridge/mavlink_takeover.py — a safety cap that can silently drift is
+# itself a hazard. They now live HERE, in the lowest-level module that every
+# component already imports (backend/server.py & payload_library.py import
+# mavlink_codec directly; field-bridge/mavlink_takeover.py adds backend/ to
+# sys.path and imports it too), and everyone imports these names instead of
+# re-declaring them.
+# =====================================================================
+
+# Hard cap on the sustained RC_CHANNELS_OVERRIDE controlled-landing window.
+# Bounded engagement, NEVER transmit-forever.
+MANEUVER_TAKEOVER_MAX_DURATION_S = 30.0
+
+# Link protocols against which RC_CHANNELS_OVERRIDE (msg 70) is a NO-OP
+# (encrypted / frequency-hopping / crypto-bound). A takeover targeting any of
+# these is reported not-applicable and NOT transmitted. Match is
+# case-insensitive / substring, since detection "protocol" strings vary.
+ENCRYPTED_LINK_PROTOCOLS = (
+    "elrs", "crsf", "expresslrs", "ocusync", "lightbridge", "dji",
+    "dsmx", "dsm2", "spektrum", "frsky", "accst", "access", "flysky",
+    "afhds", "hott", "ghst", "tbs", "crossfire", "encrypted", "fhss",
+)
+
+# Substrings that positively identify a legacy / unencrypted MAVLink-over-RF
+# control link — the ONLY surface RC override actually works against.
+LEGACY_MAVLINK_PROTOCOL_TOKENS = ("mavlink", "ardupilot", "px4", "sik")
+
+
+def classify_override_link(protocol) -> str:
+    """Classify a target's control-link protocol string for RC-override
+    applicability. Returns one of:
+
+      'encrypted'      — a recognized FHSS/encrypted link: override is a NO-OP.
+      'legacy_mavlink' — a recognized legacy/unencrypted MAVLink link.
+      'unknown'        — missing/empty/unrecognized protocol.
+
+    Encrypted match takes precedence over legacy (a string mentioning both is
+    treated as encrypted / not overridable)."""
+    if not protocol:
+        return "unknown"
+    p = str(protocol).lower()
+    if any(tok in p for tok in ENCRYPTED_LINK_PROTOCOLS):
+        return "encrypted"
+    if any(tok in p for tok in LEGACY_MAVLINK_PROTOCOL_TOKENS):
+        return "legacy_mavlink"
+    return "unknown"
+
+
+def link_is_overridable(protocol, legacy_attested: bool = False) -> bool:
+    """FAIL-CLOSED applicability gate for a control override (F-3).
+
+    True ONLY when the target link plausibly accepts unauthenticated legacy
+    MAVLink RC override:
+      * encrypted/FHSS link  => False (NO-OP, refuse).
+      * recognized legacy MAVLink link => True.
+      * UNKNOWN/empty protocol => fail CLOSED (False) UNLESS the operator has
+        explicitly attested the target is legacy MAVLink (legacy_attested=True).
+        For a control override an unknown link type must never default to
+        'allowed'."""
+    cls = classify_override_link(protocol)
+    if cls == "encrypted":
+        return False
+    if cls == "legacy_mavlink":
+        return True
+    # unknown / empty
+    return bool(legacy_attested)
+
+
 def build_command_long_payload(
     target_system: int,
     target_component: int,

@@ -103,6 +103,10 @@ from mavlink_codec import (
     describe_packet,
     hexdump,
     CRC_EXTRA,
+    # F-3/F-7: single-source-of-truth link-override classification (fail-closed)
+    # shared with field-bridge/mavlink_takeover.py.
+    classify_override_link,
+    link_is_overridable as _codec_link_is_overridable,
 )
 from payload_library import PAYLOAD_CATALOG, PAYLOAD_BUILDERS, get_payload_by_id
 from detection_state import (
@@ -3528,23 +3532,13 @@ async def list_payloads(user: Dict = Depends(get_current_user)):
     return [p.to_dict() for p in PAYLOAD_CATALOG]
 
 
-# Target link protocols against which sustained RC_CHANNELS_OVERRIDE (PL-011)
-# is a NO-OP (encrypted / frequency-hopping / crypto-bound). Mirrors
-# field-bridge/mavlink_takeover.py's ENCRYPTED_LINK_PROTOCOLS. A takeover
-# targeting any of these is refused (reported not-applicable), NOT transmitted
-# uselessly — honesty rule DOC_CORRECTIONS_MEMO 3H.
-TAKEOVER_ENCRYPTED_LINK_PROTOCOLS = (
-    "elrs", "crsf", "expresslrs", "ocusync", "lightbridge", "dji",
-    "dsmx", "dsm2", "spektrum", "frsky", "accst", "access", "flysky",
-    "afhds", "hott", "ghst", "tbs", "crossfire", "encrypted", "fhss",
-)
-
-
-def _takeover_link_overridable(protocol: Optional[str]) -> bool:
-    if not protocol:
-        return True
-    p = protocol.lower()
-    return not any(tok in p for tok in TAKEOVER_ENCRYPTED_LINK_PROTOCOLS)
+# F-3/F-7: the encrypted-protocol list and the fail-closed override
+# classification now live in ONE place — mavlink_codec.classify_override_link /
+# link_is_overridable — shared verbatim with field-bridge/mavlink_takeover.py.
+# For a CONTROL override an unknown/empty protocol must FAIL CLOSED (refuse)
+# unless the operator explicitly attests the target is legacy MAVLink via
+# DeployPayloadBody.target_link_legacy_mavlink; a recognized encrypted/FHSS
+# link is hard-refused regardless of that attestation.
 
 
 @api.post("/payloads/deploy")
@@ -3612,30 +3606,72 @@ async def deploy_payload(body: DeployPayloadBody,
         target_sys = detection.get("system_id", 1)
         target_comp = detection.get("component_id", 1)
 
-    # HONESTY GATE (DOC_CORRECTIONS_MEMO 3H) for sustained RC-override takeover:
-    # RC_CHANNELS_OVERRIDE has NO effect against an encrypted/FHSS control link
-    # (ELRS/CRSF, DJI OcuSync, DSMX, hop-paired RC). If the target's detected
-    # protocol is such a link, REFUSE and report not-applicable rather than
-    # transmitting uselessly. Effective only against unencrypted/legacy
-    # MAVLink-over-RF craft. Broadcast is already excluded above.
+    # F-4 (2026-08): target_system==0 (or missing) BROADCASTS a targeted
+    # MAVLink override/command to EVERY craft in RF range — defeating the
+    # target-bound arm-token + IFF interlocks above. A single-target (non
+    # broadcast) deploy MUST have a concrete, non-broadcast system id. Reject
+    # target_sys in (0, None) BEFORE building/sending any frame. (The explicit
+    # PL-010 swarm broadcast uses body.broadcast + target_sys=0 by design and
+    # is handled on the broadcast branch above, so it never reaches here.)
+    if detection is not None and target_sys in (0, None):
+        raise HTTPException(
+            422,
+            "Refusing targeted deploy: target detection has system_id 0/None, which in "
+            "MAVLink broadcasts the command to ALL craft in range and defeats the "
+            "target-bound gates. Re-detect the craft with a concrete system id, or use "
+            "the explicit broadcast payload if a swarm-wide effect is truly intended.",
+        )
+
+    # HONESTY GATE (DOC_CORRECTIONS_MEMO 3H) + F-3 FAIL-CLOSED for sustained
+    # RC-override takeover: RC_CHANNELS_OVERRIDE has NO effect against an
+    # encrypted/FHSS control link (ELRS/CRSF, DJI OcuSync, DSMX, hop-paired RC),
+    # so those are hard-refused. CRUCIALLY, an UNKNOWN/empty protocol also fails
+    # CLOSED (refused) UNLESS the operator explicitly attests the target is a
+    # legacy/unencrypted-MAVLink craft via target_link_legacy_mavlink=True — for
+    # a control override we never default an unknown link to "allowed". Broadcast
+    # is already excluded above.
     if getattr(spec, "sustained", False) and detection is not None:
         proto = detection.get("protocol")
-        if not _takeover_link_overridable(proto):
+        if not _codec_link_is_overridable(proto, legacy_attested=body.target_link_legacy_mavlink):
+            cls = classify_override_link(proto)
+            if cls == "encrypted":
+                reason = (
+                    f"target link '{proto}' is encrypted/frequency-hopping. "
+                    "RC_CHANNELS_OVERRIDE is ignored by such a craft — refusing to "
+                    "transmit uselessly."
+                )
+            else:  # unknown / empty, and no legacy attestation
+                reason = (
+                    f"target link protocol '{proto}' is unknown/unrecognized and the "
+                    "operator did not attest it is legacy MAVLink "
+                    "(target_link_legacy_mavlink=true). For a control override an "
+                    "unknown link type fails closed — refusing to transmit."
+                )
             await log_event(
                 "PAYLOAD",
                 f"Maneuver-takeover NOT APPLICABLE against {detection.get('callsign','?')} "
-                f"— link protocol '{proto}' is encrypted/FHSS; RC override is ignored by "
-                f"such a craft. No RF transmitted.",
+                f"— {reason} No RF transmitted.",
                 meta={"payload_id": spec.id, "target_detection_id": body.target_detection_id,
-                      "protocol": proto, "not_applicable": True},
+                      "protocol": proto, "classification": cls,
+                      "legacy_attested": body.target_link_legacy_mavlink,
+                      "not_applicable": True},
                 actor=user["email"],
             )
-            raise HTTPException(
-                422,
-                f"Maneuver-takeover not applicable: target link '{proto}' is "
-                f"encrypted/frequency-hopping. RC_CHANNELS_OVERRIDE only works against "
-                f"unencrypted/legacy MAVLink-over-RF craft — refusing to transmit uselessly.",
-            )
+            raise HTTPException(422, f"Maneuver-takeover not applicable: {reason}")
+
+    # F-2 (2026-08): BACKEND-SIDE range-authorization gate for /payloads/deploy.
+    # Every payload in this endpoint builds a MAVLink frame that is transmitted
+    # over the radio (sustained takeover AND the kinetic disarm/land/flight-
+    # termination one-shots), so all of them are RF-transmitting. The F4 fix
+    # added _require_range_authorized to /mavlink/broadcast, /payloads/jam and
+    # /gnss-spoof but NOT here, leaving deploy relying only on the bridge poll.
+    # Enforce the SAME 'mavlink'-effect lease server-side now, making it a true
+    # two-sided gate (backend 409 here + bridge live poll as defense in depth).
+    # 409 if the mavlink lease is off. This runs AFTER arm-token, IFF, the F-4
+    # target-id guard and the F-3 applicability gate, and BEFORE any frame is
+    # built/broadcast — so range-auth + IFF + arm-token are ALL enforced before
+    # any (sustained or one-shot) frame can be produced.
+    await _require_range_authorized("mavlink", user["email"])
 
     # target_sys/target_comp are already 0/0 for the broadcast case (set above),
     # so always pass them through — calling builder(seq=0) alone previously
@@ -3682,6 +3718,13 @@ async def deploy_payload(body: DeployPayloadBody,
         pkt["max_duration_s"] = spec.max_duration_s
         pkt["rc_rate_hz"] = spec.rc_rate_hz
         pkt["target_component"] = target_comp
+        # F-1/F-3: carry the (already-vetted) target protocol + legacy
+        # attestation into the packet so the bridge's OWN fail-closed
+        # applicability check can re-validate at TX time (encrypted links still
+        # refused there) without blocking a backend-approved legacy craft. The
+        # target protocol already passed the F-3 gate above, hence attested True.
+        pkt["target_protocol"] = detection.get("protocol") if detection is not None else None
+        pkt["target_link_legacy_mavlink"] = True
     await db.mav_packets.insert_one(pkt.copy())
     pkt.pop("_id", None)
 

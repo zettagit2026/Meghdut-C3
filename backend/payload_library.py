@@ -14,14 +14,11 @@ from mavlink_codec import (
     payload_gnss_denial,
     payload_maneuver_takeover,
     broadcast_takedown,
+    # F-7: the 30 s hard cap is now defined ONCE in mavlink_codec and imported
+    # here (and by server.py and field-bridge/mavlink_takeover.py) so a safety
+    # cap can never silently drift between modules.
+    MANEUVER_TAKEOVER_MAX_DURATION_S,
 )
-
-# Hard cap on the sustained RC_CHANNELS_OVERRIDE takeover (PL-011). The
-# controlled-landing stream re-emits the override frame at the RC update rate
-# for an operator-set duration, but NEVER longer than this — enforced both here
-# (documented) and in the sustained driver (field-bridge/mavlink_takeover.py).
-# This is a bounded engagement window, NOT transmit-forever.
-MANEUVER_TAKEOVER_MAX_DURATION_S = 30.0
 MANEUVER_TAKEOVER_DEFAULT_DURATION_S = 8.0
 MANEUVER_TAKEOVER_RC_RATE_HZ = 20.0  # typical RC override refresh cadence
 

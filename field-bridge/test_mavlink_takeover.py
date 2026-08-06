@@ -72,7 +72,8 @@ def test_encrypted_link_refused_no_transmit():
 def test_legacy_link_is_overridable():
     assert link_is_overridable("MAVLink-SiK")
     assert link_is_overridable("ArduPilot")
-    assert link_is_overridable(None)
+    # F-3: unknown/empty now fails CLOSED (was True before the fix).
+    assert not link_is_overridable(None)
     assert not link_is_overridable("ELRS 2.4")
 
 
@@ -98,12 +99,114 @@ def test_normal_bounded_window_frame_count():
     sent = []
     res = run_sustained_takeover(
         send_frame=sent.append, target_system=5, target_protocol="MAVLink",
-        duration_s=2.0, rc_rate_hz=20.0, now=clock.now, sleep=clock.sleep,
+        duration_s=2.0, rc_rate_hz=20.0, release_frames=3, now=clock.now, sleep=clock.sleep,
     )
     assert res.ok and not res.stopped_early
     # 2 s * 20 Hz ~= 40 frames
     assert 38 <= res.frames_sent <= 41, res.frames_sent
-    assert len(sent) == res.frames_sent
+    # F-5: normal completion appends a neutral release burst on top of the
+    # descent frames.
+    assert res.release_frames_sent == 3, res.release_frames_sent
+    assert len(sent) == res.frames_sent + res.release_frames_sent
+
+
+# ---- F-5: normal completion emits neutral release frames -----------------
+def test_normal_completion_emits_release_frames():
+    import mavlink_codec as mc
+    clock = FakeClock()
+    sent = []
+    res = run_sustained_takeover(
+        send_frame=sent.append, target_system=9, target_component=1,
+        target_protocol="MAVLink", duration_s=1.0, rc_rate_hz=10.0,
+        release_frames=3, now=clock.now, sleep=clock.sleep,
+    )
+    assert res.ok and not res.stopped_early
+    assert res.release_frames_sent == 3
+    # The last 3 frames must be RC_CHANNELS_OVERRIDE with ALL channels released
+    # (0 == "do not override this channel"), returning control to the craft.
+    for frame in sent[-3:]:
+        dec = mc.decode_rc_channels_override(frame)
+        assert dec["target_system"] == 9
+        assert all(c == mc.RC_OVERRIDE_RELEASE for c in dec["chan_raw"][:4]), dec
+
+
+# ---- F-5: abort does NOT transmit any release frame after tx-halt ---------
+def test_abort_emits_no_release_frames():
+    clock = FakeClock()
+    sent = []
+    halted = {"v": False}
+    def send(frame):
+        sent.append(frame)
+        if len(sent) == 4:
+            halted["v"] = True
+    res = run_sustained_takeover(
+        send_frame=send, target_system=5, target_protocol="MAVLink",
+        duration_s=30.0, rc_rate_hz=20.0, release_frames=3,
+        tx_halted=lambda: halted["v"], now=clock.now, sleep=clock.sleep,
+    )
+    assert res.stopped_early and res.ok, res
+    assert res.frames_sent == 4, res.frames_sent
+    # No release burst after an abort — nothing is transmitted post-halt.
+    assert res.release_frames_sent == 0, res.release_frames_sent
+    assert len(sent) == 4, len(sent)
+
+
+# ---- F-3: unknown protocol fails closed unless legacy-attested -----------
+def test_unknown_protocol_fails_closed_without_attestation():
+    sent = []
+    res = run_sustained_takeover(
+        send_frame=sent.append, target_system=5, target_protocol="SomeMysteryLink",
+        duration_s=5.0, rc_rate_hz=20.0,
+    )
+    assert res.not_applicable and not res.ok, res
+    assert sent == [], sent
+
+
+def test_unknown_protocol_allowed_with_legacy_attestation():
+    clock = FakeClock()
+    sent = []
+    res = run_sustained_takeover(
+        send_frame=sent.append, target_system=5, target_protocol="SomeMysteryLink",
+        target_link_legacy_mavlink=True,
+        duration_s=1.0, rc_rate_hz=10.0, now=clock.now, sleep=clock.sleep,
+    )
+    assert res.ok and not res.not_applicable, res
+    assert res.frames_sent > 0
+
+
+def test_empty_protocol_fails_closed():
+    for proto in (None, ""):
+        sent = []
+        res = run_sustained_takeover(
+            send_frame=sent.append, target_system=5, target_protocol=proto,
+            duration_s=5.0, rc_rate_hz=20.0,
+        )
+        assert res.not_applicable and not res.ok and sent == [], (proto, res)
+
+
+# ---- F-6: target_system 0 (broadcast) / invalid is refused ---------------
+def test_target_system_zero_refused_no_transmit():
+    for tsys in (0, -1):
+        sent = []
+        res = run_sustained_takeover(
+            send_frame=sent.append, target_system=tsys, target_protocol="MAVLink",
+            duration_s=5.0, rc_rate_hz=20.0,
+        )
+        assert res.not_applicable and not res.ok, (tsys, res)
+        assert sent == [], (tsys, sent)
+
+
+# ---- F-3: link_is_overridable fail-closed semantics ----------------------
+def test_link_is_overridable_fail_closed():
+    # recognized legacy MAVLink => overridable
+    assert link_is_overridable("MAVLink-SiK")
+    # encrypted => never, even if attested
+    assert not link_is_overridable("ELRS 2.4")
+    assert not link_is_overridable("ELRS 2.4", legacy_attested=True)
+    # unknown/empty => fail closed unless attested
+    assert not link_is_overridable(None)
+    assert not link_is_overridable("MysteryLink")
+    assert link_is_overridable("MysteryLink", legacy_attested=True)
 
 
 # ---- immediate abort: tx_halted mid-stream terminates the takeover -------

@@ -76,7 +76,7 @@ def _arm(auth_headers, effect, target=None):
     return r.json()["arm_token"]
 
 
-def _ingest(auth_headers, *, protocol=None, bearing_deg=None):
+def _ingest(auth_headers, *, protocol=None, bearing_deg=None, system_id=None):
     body = {
         "callsign": f"TKO-{uuid.uuid4().hex[:8]}",
         "model": f"Test UAV {uuid.uuid4().hex[:8]}",
@@ -88,6 +88,8 @@ def _ingest(auth_headers, *, protocol=None, bearing_deg=None):
     if bearing_deg is not None:
         body["bearing_deg"] = bearing_deg
         body["bearing_available"] = True
+    if system_id is not None:
+        body["system_id"] = system_id
     r = requests.post(f"{API}/detections/ingest", headers=auth_headers, json=body, timeout=15)
     assert r.status_code == 200, r.text
     return r.json(), body
@@ -115,11 +117,18 @@ def _enable_lease(auth_headers):
     # Best-effort: enable the range lease so we exercise the payload gates, not
     # a lease short-circuit. Enabling may require re-auth/phrase; ignore failures
     # (tests that must pass the lease assert on their own status codes).
-    for eff in ("deploy", "mavlink"):
+    for eff in ("mavlink",):
         requests.post(f"{API}/range-authorization", headers=auth_headers,
                       json={"effect": eff, "enabled": True,
                             "password": ADMIN_PASSWORD, "confirm_phrase": "AUTHORIZE RANGE"},
                       timeout=15)
+
+
+def _disable_lease(auth_headers, effect="mavlink"):
+    # Turn the range lease OFF so we can prove the F-2 backend-side gate rejects
+    # a deploy (409) even before any bridge is involved.
+    requests.post(f"{API}/range-authorization", headers=auth_headers,
+                  json={"effect": effect, "enabled": False}, timeout=15)
 
 
 # ---- PL-011 is CRITICAL => arm-token gated ------------------------------
@@ -239,6 +248,70 @@ class TestBoundedAndTargetBound:
         else:
             # lease off / policy => must be a controlled refusal, never a 500.
             assert r.status_code in (403, 409, 422), r.text
+
+
+# ---- F-2: /payloads/deploy has a BACKEND-SIDE range-auth gate ------------
+class TestRangeAuthGate:
+    def test_deploy_refused_when_mavlink_lease_off(self, auth_headers):
+        _resume(auth_headers)
+        det, _ = _ingest(auth_headers, protocol="MAVLink-SiK-Legacy")
+        _authorize(auth_headers, det["id"])
+        tok = _arm(auth_headers, "deploy", target=det["id"])
+        # Lease OFF => backend must 409 before any frame is built/broadcast,
+        # regardless of the bridge poll.
+        _disable_lease(auth_headers, "mavlink")
+        r = requests.post(f"{API}/payloads/deploy", headers=auth_headers,
+                          json={"payload_id": PL, "target_detection_id": det["id"],
+                                "arm_token": tok,
+                                "target_link_legacy_mavlink": True}, timeout=15)
+        assert r.status_code == 409, r.text
+        assert "range authorization" in r.text.lower()
+
+
+# ---- F-3: unknown-protocol fails closed unless legacy-attested ------------
+class TestUnknownProtocolFailClosed:
+    def test_unknown_protocol_without_attestation_refused(self, auth_headers):
+        _resume(auth_headers)
+        _enable_lease(auth_headers)
+        det, _ = _ingest(auth_headers, protocol="SomeMysteryLink-XYZ")
+        _authorize(auth_headers, det["id"])
+        tok = _arm(auth_headers, "deploy", target=det["id"])
+        r = requests.post(f"{API}/payloads/deploy", headers=auth_headers,
+                          json={"payload_id": PL, "target_detection_id": det["id"],
+                                "arm_token": tok}, timeout=15)
+        assert r.status_code == 422, r.text
+        assert "not applicable" in r.text.lower() or "unknown" in r.text.lower()
+
+    def test_unknown_protocol_with_attestation_passes_gate(self, auth_headers):
+        _resume(auth_headers)
+        _enable_lease(auth_headers)
+        det, _ = _ingest(auth_headers, protocol="SomeMysteryLink-XYZ")
+        _authorize(auth_headers, det["id"])
+        tok = _arm(auth_headers, "deploy", target=det["id"])
+        r = requests.post(f"{API}/payloads/deploy", headers=auth_headers,
+                          json={"payload_id": PL, "target_detection_id": det["id"],
+                                "arm_token": tok,
+                                "target_link_legacy_mavlink": True}, timeout=15)
+        # With the attestation the F-3 applicability gate must NOT be the thing
+        # blocking it — anything but a 422-not-applicable is acceptable (200 if
+        # the lease holds, or a controlled non-422 refusal otherwise).
+        assert r.status_code != 422, r.text
+
+
+# ---- F-4: target_system==0 targeted deploy is refused --------------------
+class TestBroadcastSystemIdRefused:
+    def test_system_id_zero_target_refused(self, auth_headers):
+        _resume(auth_headers)
+        _enable_lease(auth_headers)
+        det, _ = _ingest(auth_headers, protocol="MAVLink-SiK-Legacy", system_id=0)
+        _authorize(auth_headers, det["id"])
+        tok = _arm(auth_headers, "deploy", target=det["id"])
+        r = requests.post(f"{API}/payloads/deploy", headers=auth_headers,
+                          json={"payload_id": PL, "target_detection_id": det["id"],
+                                "arm_token": tok,
+                                "target_link_legacy_mavlink": True}, timeout=15)
+        assert r.status_code == 422, r.text
+        assert "system_id" in r.text.lower() or "broadcast" in r.text.lower()
 
 
 if __name__ == "__main__":
