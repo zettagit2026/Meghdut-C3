@@ -1,0 +1,22 @@
+[Unit]
+Description=CEMA MEGHDUT C3 Kismet server (passive BT/BLE, TP-Link hci1 dongle ONLY)
+Documentation=file:///etc/kismet/kismet_site.conf
+After=network.target bluetooth.service
+Wants=bluetooth.service
+
+[Service]
+User=biswajit
+Group=biswajit
+SupplementaryGroups=kismet
+Type=simple
+WorkingDirectory=/CEMA/joydipdemo/field-bridge/kismet-logs
+# Datasource is pinned to hci1 in /etc/kismet/kismet_site.conf (source=hci1...).
+# hci0 (onboard Intel) is deliberately NEVER listed; Kismet does not auto-add.
+ExecStart=/usr/bin/kismet --no-ncurses-wrapper
+KillMode=process
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

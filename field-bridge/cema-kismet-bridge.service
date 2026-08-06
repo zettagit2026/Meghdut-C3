@@ -1,0 +1,23 @@
+[Unit]
+Description=CEMA cUAS - Kismet REST -> detection-ingest bridge (passive BT/BLE via hci1 dongle)
+After=network-online.target docker.service cema-kismet.service
+Wants=network-online.target
+Requires=cema-kismet.service
+
+[Service]
+Type=simple
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# Host-specific values (CEMA_API_URL/EMAIL/PASSWORD, KISMET_URL, KISMET_APIKEY,
+# KISMET_POLL_INTERVAL_S) live in the EnvironmentFile, never hardcoded here.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+# venv-pinned per task #133/#149 (this .venv/bin/python3 currently symlinks to
+# the system interpreter, but pin it so a future real venv is honoured).
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u kismet_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/kismet_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/kismet_bridge.log
+
+[Install]
+WantedBy=multi-user.target

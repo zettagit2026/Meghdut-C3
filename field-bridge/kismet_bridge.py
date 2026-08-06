@@ -927,7 +927,12 @@ def main() -> int:
           "attached -- see module docstring.")
 
     seen_macs: Dict[str, float] = {}
-    last_time_t: Optional[int] = None
+    # CEMA compat (2026-08-06): Kismet 2025-09 removed GET /devices/all_devices.json
+    # (now 404). Its incremental route /devices/last-time/<n>/devices.json still
+    # exists and accepts a NEGATIVE value = 'last N seconds' (per this module's own
+    # docstring). Bootstrapping with -300 makes the FIRST poll target the surviving
+    # route instead of the removed all_devices.json. Detection logic is unchanged.
+    last_time_t: Optional[int] = -300
 
     # Idle-loop liveness heartbeat, same pattern as mavlink_sniffer.py's
     # IDLE_HEARTBEAT_INTERVAL_S (task #139). This loop is legitimately silent
