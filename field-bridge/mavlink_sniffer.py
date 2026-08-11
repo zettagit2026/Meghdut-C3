@@ -102,6 +102,25 @@ except ImportError:
           "field-bridge/requirements.txt).", file=sys.stderr)
     sys.exit(1)
 
+# Errors that mean "the serial device is absent / not openable / went away"
+# (radio unplugged, udev path not created yet, USB hang) -- as opposed to a
+# real misconfiguration. pyserial's SerialException subclasses OSError, and a
+# missing /dev node raises FileNotFoundError (also an OSError), but we import
+# and name SerialException explicitly so the intent is obvious. A device that
+# is merely ABSENT must make this process idle-and-retry, never exit(1) -- see
+# _open_serial_with_retry() and the reconnect loop in main(). This mirrors the
+# rest of the field-bridge fleet, which tolerates absent hardware and keeps the
+# service alive rather than crash-looping under systemd Restart=always (e.g.
+# hackrf_rx.py treats a busy/absent HackRF as a skipped pass and loops on).
+try:
+    import serial  # pyserial (a pymavlink dependency; see requirements.txt)
+    _SERIAL_ABSENT_ERRORS = (serial.SerialException, FileNotFoundError, OSError)
+except ImportError:  # pragma: no cover - pyserial ships with pymavlink
+    _SERIAL_ABSENT_ERRORS = (FileNotFoundError, OSError)
+
+# Bounded backoff between attempts to (re)open an absent serial device.
+DEVICE_RETRY_BACKOFF_S = 5.0
+
 # MAV_AUTOPILOT_ARDUPILOTMEGA is enum value 3 in the MAVLink common dialect.
 # Pulled from pymavlink's own generated dialect module rather than
 # hand-copied, so if pymavlink's dialect ever changes this stays correct.
@@ -285,6 +304,53 @@ def _post_with_reauth(console_url: str, path: str, json_body: dict, headers: dic
     return r
 
 
+def _open_serial_with_retry(serial_path: str, baud: int,
+                             idle_heartbeat_interval_s: float):
+    """Open the SiK/RFD900 serial link for passive RX, tolerating an ABSENT
+    device by idling and retrying forever instead of crashing.
+
+    This is the fix for a real deploy regression: the connection used to be
+    opened once, unguarded, so a missing device (radio unplugged, udev path
+    not yet created) raised serial.SerialException/FileNotFoundError straight
+    out of main() -> non-zero exit -> systemd Restart=always crash-loop. A
+    merely-absent device is a normal, expected state here (the radio may be
+    unplugged), so we log a clear "waiting for ... (sensor idle)" line on the
+    same cadence as the idle heartbeat (not silent, not spammy), sleep a
+    bounded backoff, and retry until the device appears. Returns the opened
+    mavutil connection once the device is present. Never returns on absence --
+    it keeps the process alive and idle, matching how the rest of the
+    field-bridge fleet degrades gracefully when its hardware is missing."""
+    last_idle_heartbeat = 0.0
+    announced = False
+    while True:
+        try:
+            mav = mavutil.mavlink_connection(
+                serial_path,
+                baud=baud,
+                # source_system/source_component identify US as a MAVLink
+                # participant if we ever needed to reply (we never send),
+                # matching rf-bridge/mavlink_bridge.py's RX path (255/190 =
+                # a GCS-class node).
+                source_system=255,
+                source_component=190,
+            )
+            print(f"Opened {serial_path} @ {baud} baud in RX-ONLY mode "
+                  f"(no transmission will occur).")
+            return mav
+        except _SERIAL_ABSENT_ERRORS as e:
+            now = time.time()
+            if not announced or now - last_idle_heartbeat >= idle_heartbeat_interval_s:
+                announced = True
+                last_idle_heartbeat = now
+                print(f"[heartbeat] waiting for MAVLink serial device {serial_path} "
+                      f"(sensor idle) -- not present/openable yet ({e}); process "
+                      f"alive, retrying every {DEVICE_RETRY_BACKOFF_S:.0f}s. This is "
+                      f"expected when the SiK/RFD900 radio is unplugged; sniffing "
+                      f"starts automatically once the device appears.",
+                      file=sys.stderr)
+            time.sleep(DEVICE_RETRY_BACKOFF_S)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -310,31 +376,11 @@ def main() -> int:
     token = login(args.console_url, args.email, args.password)
     headers = {"Authorization": f"Bearer {token}"}
 
-    print(f"Opening {args.serial} @ {args.baud} baud in RX-ONLY mode "
-          f"(no transmission will occur).")
     print("Passive MAVLink HEARTBEAT sniffer running. This posts a detection "
           "ONLY when a REAL, decoded MAVLink HEARTBEAT with "
           "autopilot=ARDUPILOTMEGA is received on this link. If no such "
           "traffic ever arrives, nothing is ever posted — there is no "
           "synthetic fallback, by design.")
-
-    # source_system/source_component here identify US as a MAVLink participant
-    # if we ever needed to reply (we never send), matching the convention used
-    # by rf-bridge/mavlink_bridge.py's RX path (255/190 = a GCS-class node).
-    mav = mavutil.mavlink_connection(
-        args.serial,
-        baud=args.baud,
-        source_system=255,
-        source_component=190,
-    )
-
-    # sysid -> last-confirmed-ts, so we don't spam /detections/ingest on every
-    # single HEARTBEAT (~1Hz) from the same real airframe. The backend itself
-    # also merges re-ingests of the same (source, model, protocol) within its
-    # own DETECTION_MERGE_WINDOW_S, so this is a light client-side throttle on
-    # top of that, not a replacement for it.
-    last_posted: Dict[int, float] = {}
-    REPOST_INTERVAL_S = 10.0
 
     # Task #139: idle-loop heartbeat print. This process is legitimately
     # silent for long stretches whenever no real MAVLink traffic is on the
@@ -346,13 +392,64 @@ def main() -> int:
     # "still listening" line on a fixed cadence -- independent of whether any
     # traffic was ever seen -- gives preflight.sh's log-freshness heartbeat
     # check (section 4) a genuine liveness signal for this bridge too,
-    # without inventing any detection/telemetry data.
+    # without inventing any detection/telemetry data. The same cadence is
+    # reused by _open_serial_with_retry() for the "waiting for device" line so
+    # an absent radio is equally visible to preflight.
     IDLE_HEARTBEAT_INTERVAL_S = 60.0
-    last_idle_heartbeat = 0.0
 
+    # Outer reconnect loop: (re)acquire the serial device -- idling+retrying if
+    # it is absent -- then sniff until the device goes away (hot-unplug), at
+    # which point we fall back here and wait for it to reappear rather than
+    # crashing. This makes an unplug/replug (the radio is being plugged in
+    # tomorrow while the service may already be running) survivable.
+    while True:
+        mav = _open_serial_with_retry(args.serial, args.baud,
+                                      IDLE_HEARTBEAT_INTERVAL_S)
+
+        # sysid -> last-confirmed-ts, so we don't spam /detections/ingest on
+        # every single HEARTBEAT (~1Hz) from the same real airframe. The
+        # backend itself also merges re-ingests of the same (source, model,
+        # protocol) within its own DETECTION_MERGE_WINDOW_S, so this is a light
+        # client-side throttle on top of that, not a replacement for it.
+        last_posted: Dict[int, float] = {}
+        REPOST_INTERVAL_S = 10.0
+        last_idle_heartbeat = 0.0
+
+        try:
+            if not _sniff_loop(mav, args, headers, last_posted, REPOST_INTERVAL_S,
+                               IDLE_HEARTBEAT_INTERVAL_S, last_idle_heartbeat):
+                # _sniff_loop returned False -> the device disappeared mid-run;
+                # loop back around to wait for it to come back.
+                continue
+        finally:
+            try:
+                mav.close()
+            except Exception:
+                pass
+
+    return 0  # unreachable; loop runs until process is killed/stopped
+
+
+def _sniff_loop(mav, args, headers: dict, last_posted: Dict[int, float],
+                REPOST_INTERVAL_S: float, IDLE_HEARTBEAT_INTERVAL_S: float,
+                last_idle_heartbeat: float) -> bool:
+    """Run the passive sniff loop against an already-open connection.
+
+    Returns False if the serial device disappeared mid-run (so the caller
+    should close and fall back to waiting for the device). Otherwise loops
+    forever (until the process is stopped). All present-device behaviour
+    (idle heartbeat, ArduPilot/MAVLink parsing, reauth-on-401 ingest) is
+    unchanged from before the graceful-degrade fix."""
     while True:
         try:
             m = mav.recv_match(blocking=True, timeout=1)
+        except _SERIAL_ABSENT_ERRORS as e:
+            # The device was unplugged / went away mid-run. Don't crash: bail
+            # out so the outer loop can idle-and-wait for it to reappear.
+            print(f"WARN: MAVLink serial device {args.serial} read error ({e}) -- "
+                  f"device may have been unplugged; closing and falling back to "
+                  f"wait-for-device (sensor idle).", file=sys.stderr)
+            return False
         except Exception as e:
             print(f"WARN: serial/mavlink recv error: {e}", file=sys.stderr)
             time.sleep(0.5)
