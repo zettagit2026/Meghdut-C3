@@ -1,0 +1,221 @@
+name: CI
+
+# MEGHDUT C3 -- CI safety gate.
+#
+# Context (2026-08-11): before this workflow existed there was NO CI at all.
+# Every safety property (RF-transmit authorization chain, arm-token binding,
+# TX-halt / EMERGENCY ABORT, IFF friendly-fire interlocks, audit-chain
+# tamper-evidence, track-manager state machine, engagement-planner "propose
+# only, never transmit" invariant) depended entirely on a human remembering
+# to run pytest before a manual scp deploy. That is not acceptable for code
+# whose regression can enable an unauthorized RF transmission.
+#
+# Two jobs:
+#   - safety-gate: pure-logic / adversarial-regression suites that need NO
+#     external services (no Mongo, no live backend, no RF hardware). These
+#     run in seconds and MUST block merge/deploy on failure. This is the set
+#     a branch-protection rule should require (see note at bottom of file).
+#   - backend-integration: best-effort suites that need a live FastAPI
+#     backend talking to a real Mongo instance (started here as a service
+#     container). Broader coverage, but some suites are still out of scope
+#     for CI (see the "NOT covered" note below) and this job does not gate
+#     merges by default -- promote it once it has proven stable.
+#
+# What is explicitly OUT of CI scope, honestly: any test that talks to real
+# RF hardware (HackRF/RTL-SDR captures, live SDR jam/DF hardware, LoRa IFF
+# beacon radios, CAN adapters for CANopen/DroneCAN) cannot run on a GitHub
+# Actions runner. Those remain manual, pre-deploy, on-hardware checks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ---------------------------------------------------------------------
+  # JOB A -- safety-gate + pure-logic tests (must-not-regress set).
+  # No Mongo, no live backend, no network, no RF hardware. Name is
+  # intentionally explicit so a branch-protection rule can require exactly
+  # this job ("safety-gate") before merge.
+  # ---------------------------------------------------------------------
+  safety-gate:
+    name: safety-gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Set up Python 3.11 (matches backend/Dockerfile python:3.11-slim)"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Install field-bridge dependencies (pure-Python-testable subset)
+        # Full field-bridge/requirements.txt pulls in hardware-blocked /
+        # data-blocked heavy deps (torch, torchvision, chromadb, python-can,
+        # canopen, dronecan) that are infrastructure for modules with no
+        # tests in the safety-gate set below. Installing the full file works
+        # too, but this keeps the safety-gate job fast and its dependency
+        # surface minimal and auditable. If a future safety-relevant test
+        # needs one of those, add it here explicitly.
+        working-directory: field-bridge
+        run: |
+          pip install requests==2.32.3 numpy scipy pyserial==3.5 pymavlink websocket-client Pillow
+
+      # backend/pytest.ini pins `addopts = -n 2 --dist loadscope` (pytest-xdist
+      # is a required_plugins entry there) -- installed above via
+      # requirements.txt. Do NOT pass -p no:xdist (it errors because addopts
+      # still injects -n/--dist); serial fallback if xdist ever misbehaves in
+      # CI is `-n 0`, per pytest.ini's own comment.
+      - name: Run safety-gate suites (backend, pure-logic / adversarial-regression)
+        working-directory: backend
+        env:
+          # Dummy-but-valid values only, never real secrets. These suites
+          # import server.py (module-level env reads) but never open a real
+          # Mongo connection (motor's client is lazy) or make live HTTP calls.
+          MONGO_URL: "mongodb://localhost:27017"
+          DB_NAME: "ci_unused"
+          JWT_SECRET: "ci-dummy-jwt-secret-not-a-real-secret"
+          ADMIN_EMAIL: "ci-admin@unused.local"
+          ADMIN_PASSWORD: "ci-dummy-password-not-real"
+          IFF_BRIDGE_API_KEY: "ci-dummy-iff-key-not-real"
+        run: |
+          pytest -v \
+            tests/test_audit_chain.py \
+            tests/test_engagement_planner.py \
+            tests/test_gnss_spoof_geodesic.py \
+            tests/test_jam_bluetooth_band.py \
+            tests/test_swarm_classifier.py \
+            tests/test_track_manager.py
+
+      - name: Run safety-gate suites (field-bridge, pure-Python)
+        working-directory: field-bridge
+        run: |
+          pytest -v -p no:cacheprovider \
+            test_mavlink_takeover.py \
+            test_direction_finding.py \
+            test_reauth_on_401.py \
+            test_crsf_cadence.py \
+            test_dshot_telemetry_parser.py \
+            test_flysky_afhds_parser.py \
+            test_frsky_accst_parser.py \
+            test_frsky_smartport_parser.py \
+            test_graupner_hott_parser.py \
+            test_ltm_parser.py \
+            test_spektrum_dsm_parser.py
+
+      # NOTE on what is deliberately NOT in this job:
+      #   - backend/tests/test_tx_authorization_holes.py and
+      #     test_maneuver_takeover_gates.py are the two MOST safety-critical
+      #     suites in the repo (they prove the RF-transmit authorization
+      #     chain's previously-open holes stay closed) but require a LIVE
+      #     backend (REACT_APP_BACKEND_URL) -- they skip cleanly with no
+      #     backend URL resolvable, so they do not fail here, they just don't
+      #     run. They DO run in the backend-integration job below once that
+      #     job stands up a live backend. Until backend-integration is
+      #     promoted to a required check, running these two suites manually
+      #     before any deploy remains mandatory -- see repo note below.
+      #   - field-bridge suites needing torch/canopen/dronecan/python-can are
+      #     excluded from this fast job for dependency-surface reasons, not
+      #     because they need hardware; they are picked up in
+      #     backend-integration's broader field-bridge install if enabled
+      #     there, or can be added to a future job.
+
+  # ---------------------------------------------------------------------
+  # JOB B -- backend integration tests against a real MongoDB service
+  # container + a live FastAPI backend. Best-effort / broader coverage.
+  # Does NOT currently gate merges (see recommendation below) until proven
+  # stable in CI -- promote by adding it to required status checks once
+  # green on `main` for a while.
+  # ---------------------------------------------------------------------
+  backend-integration:
+    name: backend-integration (best-effort)
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "echo 'db.runCommand(\"ping\").ok' | mongosh --quiet"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      MONGO_URL: "mongodb://localhost:27017"
+      DB_NAME: "ci_backend_integration"
+      JWT_SECRET: "ci-dummy-jwt-secret-not-a-real-secret"
+      ADMIN_EMAIL: "ci-admin@unused.local"
+      ADMIN_PASSWORD: "ci-dummy-password-Ab1!"
+      IFF_BRIDGE_API_KEY: "ci-dummy-iff-key-not-real"
+      REACT_APP_BACKEND_URL: "http://127.0.0.1:8001"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install backend dependencies
+        working-directory: backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start backend (uvicorn, background, against the Mongo service container)
+        working-directory: backend
+        run: |
+          nohup uvicorn server:app --host 127.0.0.1 --port 8001 > /tmp/uvicorn.log 2>&1 &
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8001/api/ 2>/dev/null || curl -sf http://127.0.0.1:8001/docs 2>/dev/null; then
+              echo "backend is up"
+              break
+            fi
+            sleep 1
+          done
+
+      - name: Run backend request-tests against the live backend + Mongo
+        working-directory: backend
+        run: |
+          pytest -v -n 2 --dist loadscope \
+            tests/test_backend.py \
+            tests/test_new_endpoints.py \
+            tests/test_login_lockout.py \
+            tests/test_iff_revocation.py \
+            tests/test_tracks_endpoint.py \
+            tests/test_swarm_clusters_endpoint.py \
+            tests/test_tx_authorization_holes.py \
+            tests/test_maneuver_takeover_gates.py \
+            tests/test_iq_export.py \
+            tests/test_e2e_deploy_bridge.py
+        continue-on-error: true
+        # continue-on-error: this job is explicitly best-effort while it is
+        # being proven out in CI (uvicorn-in-background + service-container
+        # Mongo can be flaky in ways the safety-gate job is not). Remove
+        # continue-on-error once this job has run green on `main` reliably,
+        # THEN add it as a required status check alongside safety-gate.
+
+      - name: Dump backend log on failure
+        if: failure()
+        run: cat /tmp/uvicorn.log || true
+
+# ---------------------------------------------------------------------
+# Branch protection recommendation (apply in GitHub repo settings, this
+# workflow cannot set it): require the "safety-gate" status check to pass
+# before merging to main. That is the must-not-regress set proven to run
+# standalone (see local verification note in the PR/commit that introduced
+# this file). Do NOT require "backend-integration (best-effort)" until it
+# has been observed green on main consistently -- it is included now for
+# coverage and visibility, not yet as a hard gate.
+#
+# Explicitly out of CI scope, and will remain manual/pre-deploy: any test
+# requiring real RF hardware (HackRF/RTL-SDR, SDR jam/DF, LoRa IFF beacon
+# radios, CAN adapters for CANopen/DroneCAN). No GitHub Actions runner has
+# this hardware.
