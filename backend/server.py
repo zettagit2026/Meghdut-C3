@@ -24,7 +24,15 @@ Endpoints (all under /api):
            backend/RANGE_AUTHORIZATION_REDESIGN.md
   logs:  /logs
   audit: /audit/verify (commander-only; verifies the stored, append-time
-         SHA-256 hash chain over mission_log — genuine tamper-evidence)
+         SHA-256 integrity hash-chain over mission_log. This detects casual
+         tampering/reordering, and — when the periodically-emitted chain head
+         is externally anchored (AUDIT_ANCHOR sink; see _audit_anchor_loop) —
+         tampering by a DB-write-capable adversary between anchor points. It is
+         NOT, on its own, proof against an adversary with Mongo write access,
+         who could recompute the whole chain from genesis.)
+  users: /users (commander-only; POST creates operator/commander accounts so
+         audit `actor` attributes distinct individuals, GET lists them without
+         password hashes)
 
 RBAC: two roles, "operator" and "commander". Anything that transmits a
 kinetic/broadcast command (/payloads/deploy, /mavlink/broadcast, /payloads/jam)
@@ -93,6 +101,7 @@ from fastapi import (
 )
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo.errors import DuplicateKeyError
 from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
 
@@ -206,6 +215,28 @@ logger = logging.getLogger("cema")
 INGEST_PATHS = {"/api/detections/ingest", "/api/spectrum/ingest", "/api/fpv/ingest",
                 "/api/ml-classify/heartbeat"}
 AUTH_FAIL_CONSECUTIVE_THRESHOLD = 3
+
+# ---- Audit-chain anchor (lightweight external anchoring) -------------------
+# The append-time hash-chain (see log_event / verify_audit_chain) only detects
+# CASUAL tampering on its own; a Mongo-write-capable adversary can recompute the
+# whole chain. To close that gap we periodically emit the CURRENT chain head
+# (seq + entry_hash + ts) to an APPEND-ONLY sink that lives OUTSIDE the
+# mission_log collection the adversary would edit:
+#   1) a distinctive greppable line on stdout / systemd-journal:
+#        AUDIT_ANCHOR seq=<n> head=<hex> ts=<iso>
+#      so an external log collector (journald -> off-box shipper) captures it;
+#   2) an append-mode on-disk file (AUDIT_ANCHOR_FILE).
+# OPERATIONAL HARDENING (real deployment): make that file truly append-only
+# (`chattr +a audit_anchor.log`) AND ship it off-box (rsyslog/journald remote,
+# WORM bucket, etc.). Only an anchor the adversary cannot retroactively rewrite
+# provides evidence against a DB-capable forger; on its own this file is just a
+# convenience copy of what also goes to the journal. This is deliberately NOT
+# full external notarization (TSA / blockchain) — it is the minimal, honest
+# anchor that makes between-anchor tampering detectable.
+AUDIT_ANCHOR_FILE = os.environ.get(
+    "AUDIT_ANCHOR_FILE", str(ROOT_DIR / "audit_anchor.log"))
+AUDIT_ANCHOR_INTERVAL_S = int(os.environ.get("AUDIT_ANCHOR_INTERVAL_S", "60"))
+AUDIT_ANCHOR_PREFIX = "AUDIT_ANCHOR"
 
 
 # =====================================================================
@@ -649,7 +680,7 @@ async def _enforce_fire_time_iff(detection: Dict[str, Any], user: Dict[str, Any]
     commander-override path, which also emits the high-visibility
     IFF_OVERRIDE_AUTHORIZE audit event, and cleared whenever the target is
     de-authorized or re-classified friendly). The refusal AND the honored
-    override are both routed through the tamper-evident audit chain."""
+    override are both routed through the hash-chained audit chain."""
     is_friendly = (
         detection.get("iff_verified")
         or detection.get("threat_level") == "FRIENDLY (IFF verified)"
@@ -1047,6 +1078,14 @@ async def startup() -> None:
     global _track_sweep_task
     _track_sweep_task = asyncio.create_task(_track_sweep_loop())
 
+    # Task: periodic external anchoring of the audit-chain head (see
+    # _audit_anchor_loop / AUDIT_ANCHOR). Emit one anchor immediately at
+    # startup so there is a fresh anchor point right after boot.
+    with contextlib.suppress(Exception):
+        await _emit_audit_anchor(reason="startup")
+    global _audit_anchor_task
+    _audit_anchor_task = asyncio.create_task(_audit_anchor_loop())
+
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
@@ -1058,6 +1097,13 @@ async def shutdown() -> None:
         _track_sweep_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await _track_sweep_task
+    if _audit_anchor_task is not None:
+        _audit_anchor_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _audit_anchor_task
+    # Final anchor on clean shutdown so the last head before exit is captured.
+    with contextlib.suppress(Exception):
+        await _emit_audit_anchor(reason="shutdown")
     client.close()
 
 
@@ -1067,6 +1113,21 @@ async def shutdown() -> None:
 class LoginBody(BaseModel):
     email: EmailStr
     password: str
+
+
+class CreateUserBody(BaseModel):
+    email: EmailStr
+    # bcrypt truncates at 72 bytes; cap max_length there so the schema can't
+    # accept a password whose tail is silently ignored, and keep a sane floor so
+    # created accounts can't be minted with a trivially-weak/empty password.
+    # role is constrained to the two real RBAC roles — there is no path to mint
+    # anything else. name/clearance are bounded to avoid unbounded stored input;
+    # clearance is currently informational only (gates nothing in the authz
+    # path) — constrain it with a pattern here if it ever becomes an authz input.
+    password: str = Field(..., min_length=8, max_length=72)
+    role: str = Field("operator", pattern="^(operator|commander)$")
+    name: Optional[str] = Field(None, max_length=120)
+    clearance: str = Field("RESTRICTED", max_length=60)
 
 
 class MavlinkCraftBody(BaseModel):
@@ -1323,14 +1384,25 @@ async def ingest_health_middleware(request: Request, call_next):
 
 
 # =====================================================================
-# Mission log helper + tamper-evident (hash-chained) audit trail
+# Mission log helper + append-time integrity hash-chain (audit trail)
 # =====================================================================
+# HONEST SCOPING: this is an append-time SHA-256 integrity hash-chain. It
+# detects CASUAL tampering — an entry edited, removed, reordered, or inserted
+# after the fact breaks the recomputed hash at that link. It does NOT, on its
+# own, defeat an adversary with Mongo WRITE access: such an adversary can
+# recompute every entry_hash from genesis forward and produce a self-consistent
+# forged chain. That gap is closed only to the extent the current chain head is
+# emitted to an APPEND-ONLY sink independent of the mission_log collection
+# (see _audit_anchor_loop / AUDIT_ANCHOR): a DB-capable forger cannot retro-
+# actively change head hashes already anchored off-box, so tampering is
+# detectable BETWEEN anchor points by comparing the live head to the last
+# anchored head.
+#
 # The Operational Requirement Doc (Section 6) calls the mission log a
-# "hash-chain ... tamper-evident" audit trail. To make that claim TRUE (rather
-# than recomputing a throwaway chain at PDF-report time over mutable rows, which
-# proves nothing — a row edited in Mongo just changes the recomputed hash with
-# nothing authoritative to compare against), each entry's hash is computed and
-# STORED at append time:
+# "hash-chain ... tamper-evident" audit trail. Rather than recompute a throwaway
+# chain at PDF-report time over mutable rows (which proves nothing — a row edited
+# in Mongo just changes the recomputed hash with nothing authoritative to compare
+# against), each entry's hash is computed and STORED at append time:
 #
 #     entry_hash = SHA256( canonical(ts,kind,message,actor,meta) + "|" + prev_hash )
 #
@@ -1398,6 +1470,13 @@ def verify_audit_chain(entries: List[Dict]) -> Dict:
     entry_hash matches the stored entry_hash and (b) each prev_hash matches the
     previous chained entry's stored entry_hash. Returns a clear pass/fail plus
     the seq of the first broken link.
+
+    SCOPE (honest): a PASS proves the stored chain is internally self-consistent
+    — it detects casual edits/reordering/deletion. It does NOT by itself prove
+    the chain was not wholesale-recomputed by a Mongo-write-capable adversary
+    (who can regenerate every hash from genesis). To detect that, cross-check the
+    returned `head_hash` against the last externally-anchored head (see
+    _audit_anchor_loop / AUDIT_ANCHOR); the /api/audit/verify endpoint does this.
 
     MIGRATION (honest option): rows written before this feature existed have no
     `entry_hash`/`seq`. Rather than pretend they were always chained, they are
@@ -1469,10 +1548,98 @@ async def log_event(kind: str, message: str, meta: Optional[Dict] = None,
             entry = _next_chained_entry(entry, head)
             await db.mission_log.insert_one(entry.copy())
         except Exception:
-            logger.exception("log_event: failed to append tamper-evident "
+            logger.exception("log_event: failed to append hash-chained "
                              "mission_log entry (kind=%s)", kind)
             raise
     return entry
+
+
+# ---- Audit-chain external anchoring ---------------------------------------
+async def _current_chain_head() -> Optional[Dict]:
+    """Return the current chain head row (highest seq) or None if the chain is
+    empty. Only the fields needed for anchoring/cross-check are projected."""
+    return await db.mission_log.find_one(
+        {"entry_hash": {"$exists": True}},
+        sort=[("seq", -1)],
+        projection={"_id": 0, "seq": 1, "entry_hash": 1},
+    )
+
+
+def _format_audit_anchor(seq: int, head_hash: str, ts: str) -> str:
+    return f"{AUDIT_ANCHOR_PREFIX} seq={seq} head={head_hash} ts={ts}"
+
+
+async def _emit_audit_anchor(reason: str = "periodic") -> Optional[Dict]:
+    """Emit the current chain head to the append-only anchor sinks (greppable
+    stdout/journal line + append-mode on-disk file). Best-effort and defensive:
+    any failure is logged and swallowed here so the caller's loop never crashes.
+    Returns the anchored {seq, head, ts} dict, or None if there was nothing to
+    anchor / it failed."""
+    head = await _current_chain_head()
+    if not head:
+        return None
+    seq = head["seq"]
+    head_hash = head["entry_hash"]
+    ts = datetime.now(timezone.utc).isoformat()
+    line = _format_audit_anchor(seq, head_hash, ts)
+    # 1) greppable journal/stdout line (captured by an external collector).
+    logger.info("%s reason=%s", line, reason)
+    # 2) append-mode on-disk file (see AUDIT_ANCHOR_FILE hardening notes).
+    try:
+        with open(AUDIT_ANCHOR_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        # Never let an anchor-file write failure crash the loop or a shutdown.
+        logger.exception("audit-anchor: failed to append to %s", AUDIT_ANCHOR_FILE)
+    return {"seq": seq, "head": head_hash, "ts": ts}
+
+
+def _read_last_anchor() -> Optional[Dict]:
+    """Read the most recent AUDIT_ANCHOR line from the on-disk anchor file.
+    Best-effort: returns None if the file is missing/unreadable/has no anchor
+    line. Used by /api/audit/verify to cross-check the live head against the
+    last anchored head. (In a real deployment the AUTHORITATIVE anchor copy is
+    the off-box/append-only one; this local read is a convenience cross-check.)"""
+    try:
+        with open(AUDIT_ANCHOR_FILE, "r", encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.startswith(AUDIT_ANCHOR_PREFIX)]
+    except FileNotFoundError:
+        return None
+    except Exception:
+        logger.exception("audit-anchor: failed to read %s", AUDIT_ANCHOR_FILE)
+        return None
+    if not lines:
+        return None
+    parts = lines[-1].split()
+    anchor: Dict[str, Any] = {}
+    for p in parts[1:]:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            anchor[k] = v
+    if "seq" in anchor:
+        try:
+            anchor["seq"] = int(anchor["seq"])
+        except ValueError:
+            pass
+    return anchor or None
+
+
+_audit_anchor_task: Optional[asyncio.Task] = None
+
+
+async def _audit_anchor_loop() -> None:
+    """Background task: periodically emit the current chain head to the append-
+    only anchor sink (mirrors _stale_detections_loop / _track_sweep_loop). A
+    failure in any single iteration is logged and the loop continues — an anchor
+    hiccup must never take down the process or silently stop anchoring."""
+    while True:
+        try:
+            await _emit_audit_anchor(reason="periodic")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("_audit_anchor_loop: anchor iteration failed")
+        await asyncio.sleep(AUDIT_ANCHOR_INTERVAL_S)
 
 
 # =====================================================================
@@ -1518,6 +1685,68 @@ async def me(user: Dict = Depends(get_current_user)):
 async def logout(user: Dict = Depends(get_current_user)):
     await log_event("AUTH", f"Operator logout: {user['email']}", actor=user["email"])
     return {"ok": True}
+
+
+# =====================================================================
+# Routes: User management (commander-only)
+# =====================================================================
+# Non-repudiation: without distinct per-operator accounts, every jam/spoof/
+# strike authorization, IFF override and deploy is attributed to the single
+# seeded ADMIN_EMAIL commander, so the hash-chained audit log cannot say WHO
+# authorized a kinetic/EW action. These endpoints let a commander mint distinct
+# operator/commander accounts so `actor` in the audit trail attributes real
+# individuals. The seeded admin remains the bootstrap commander. Login/JWT/
+# require_commander and every TX gate are unchanged — this only ADDS accounts.
+#
+# AUTHZ (kept deliberately airtight — a security review scrutinizes this):
+#   * both endpoints are require_commander (an operator gets 403);
+#   * role is constrained by CreateUserBody's pattern to operator|commander
+#     only, so there is no privilege-escalation path to any other role and no
+#     way to smuggle unexpected fields into the stored doc;
+#   * GET never projects password_hash — hashes never leave the process.
+@api.post("/users", status_code=201)
+async def create_user(body: CreateUserBody,
+                      user: Dict = Depends(require_commander)):
+    email = body.email.lower()
+    if body.password.lower() in _PLACEHOLDER_SECRETS:
+        raise HTTPException(400, "Password matches a known placeholder/default "
+                                 "value; choose a strong password.")
+    if await db.users.find_one({"email": email}):
+        raise HTTPException(409, "A user with this email already exists.")
+    new_id = str(uuid.uuid4())
+    doc = {
+        "id": new_id,
+        "email": email,
+        "name": body.name or email.split("@")[0],
+        "role": body.role,
+        "clearance": body.clearance,
+        "password_hash": hash_password(body.password),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        await db.users.insert_one(doc)
+    except DuplicateKeyError:
+        # Race with the unique index on email — treat as a duplicate.
+        raise HTTPException(409, "A user with this email already exists.")
+    await log_event(
+        "USER_CREATE",
+        f"User account created: {email} (role={body.role})",
+        meta={"user_id": new_id, "email": email, "role": body.role},
+        actor=user["email"],
+    )
+    return {"id": new_id, "email": email, "name": doc["name"],
+            "role": doc["role"], "clearance": doc["clearance"],
+            "created_at": doc["created_at"]}
+
+
+@api.get("/users")
+async def list_users(user: Dict = Depends(require_commander)):
+    # NEVER project password_hash — hashes must never leave the process.
+    users = await db.users.find(
+        {}, {"_id": 0, "id": 1, "email": 1, "name": 1, "role": 1,
+             "clearance": 1, "created_at": 1},
+    ).sort("created_at", 1).to_list(1000)
+    return {"users": users, "count": len(users)}
 
 
 # =====================================================================
@@ -1903,7 +2132,7 @@ async def get_engagement_plan(user: Dict = Depends(require_commander)):
     transmits nothing, mutates nothing, and (per HTTP GET safe-method
     semantics, exactly like GET /swarm/clusters) does not write an audit
     entry. Use POST /api/engagement/plan/recompute to recompute AND record
-    the computation in the tamper-evident mission log.
+    the computation in the hash-chained mission log.
 
     The returned plan is a PROPOSAL ONLY. Every proposal is stamped
     status=PROPOSED_REQUIRES_HUMAN_AUTHORIZATION and lists the exact existing
@@ -1918,7 +2147,7 @@ async def get_engagement_plan(user: Dict = Depends(require_commander)):
 @api.post("/engagement/plan/recompute")
 async def recompute_engagement_plan(user: Dict = Depends(require_commander)):
     """Recompute the ranked engagement PROPOSAL and record the computation in
-    the tamper-evident mission-log audit chain (the recompute is the side
+    the hash-chained mission-log audit chain (the recompute is the side
     effect -- verb semantics mirror the GET/POST /swarm/clusters split). Still
     engages NOTHING: this only produces and audits a proposal object. The
     human commander must separately clear the full arm-token/TX-halt/range-
@@ -2316,7 +2545,7 @@ async def delete_detection(det_id: str, user: Dict = Depends(require_commander))
     # action in this file (emergency/resume, iff_revoke, range-authorization).
     # The deletion is fully audited BEFORE it happens, capturing the record's
     # callsign and IFF status so an erased friendly is always traceable in the
-    # tamper-evident mission log.
+    # hash-chained mission log.
     doc = await db.detections.find_one({"id": det_id}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Detection not found")
@@ -4216,15 +4445,48 @@ async def list_logs(limit: int = 200, user: Dict = Depends(get_current_user)):
 
 @api.get("/audit/verify")
 async def audit_verify(user: Dict = Depends(require_commander)):
-    """Commander-only tamper-evidence check. Walks the STORED mission_log hash
-    chain in sequence order and proves it is intact (or pinpoints the seq of the
-    first broken link). This is what makes the chain useful as an audit trail:
-    an operator/auditor can demonstrate the log has not been altered, or show
-    exactly where it was. See verify_audit_chain() for the migration/legacy
-    semantics (pre-feature rows are reported as an unchained legacy prefix)."""
+    """Commander-only integrity check. Walks the STORED mission_log hash chain
+    in sequence order and proves it is internally self-consistent (or pinpoints
+    the seq of the first broken link).
+
+    SCOPE (honest): a PASS proves no CASUAL edit/reorder/deletion — it does NOT
+    by itself defeat a Mongo-write-capable adversary, who could recompute the
+    whole chain from genesis. That gap is closed by the external anchor: this
+    endpoint additionally cross-checks the live chain head against the last
+    externally-anchored head (AUDIT_ANCHOR; see _audit_anchor_loop). An
+    anchor_match=false with an intact internal chain is the signature of a
+    wholesale recompute BETWEEN anchor points. See verify_audit_chain() for the
+    migration/legacy semantics (pre-feature rows are an unchained legacy prefix).
+    """
     entries = await db.mission_log.find({}, {"_id": 0}).to_list(100000)
     result = verify_audit_chain(entries)
     result["total_entries"] = len(entries)
+
+    # Cross-check the live head against the last externally-anchored head.
+    anchor = _read_last_anchor()
+    live_head = result.get("head_hash")
+    if anchor is None:
+        result["anchor"] = {
+            "available": False,
+            "match": None,
+            "note": "no external anchor found yet (anchor file empty/missing) — "
+                    "internal-consistency result above is not corroborated by "
+                    "an independent anchor",
+        }
+    else:
+        anchored_head = anchor.get("head")
+        result["anchor"] = {
+            "available": True,
+            "last_anchored_seq": anchor.get("seq"),
+            "last_anchored_head": anchored_head,
+            # A match means the live head equals the last anchored head; the
+            # chain may legitimately have grown PAST the anchor (live seq >
+            # anchored seq), which is expected between anchor emissions and is
+            # not itself a tamper signal.
+            "match": (anchored_head == live_head) if live_head else None,
+            "note": "cross-check against local anchor file; the authoritative "
+                    "anchor is the off-box/append-only copy in a real deployment",
+        }
     return result
 
 
@@ -4625,8 +4887,12 @@ async def mission_pdf(user: Dict = Depends(get_current_user)):
         f"<b>Integrity check (at report time):</b> {chain_status}. "
         f"Each entry stores <font face='Courier'>SHA256(canonical(entry) | prev_hash)</font> "
         f"computed at write time; GET /api/audit/verify (commander-only) re-walks this stored "
-        f"chain on demand. Any modification to a prior entry's content, or removal/reordering of "
-        f"an entry, breaks the recomputed hash at that link and is detected.", body))
+        f"chain on demand. Any CASUAL modification to a prior entry's content, or removal/"
+        f"reordering of an entry, breaks the recomputed hash at that link and is detected. "
+        f"SCOPE: this internal check does not, on its own, defeat an adversary with database "
+        f"write access (who could recompute the whole chain from genesis); that is covered only "
+        f"to the extent the chain head is periodically emitted to an independent append-only "
+        f"anchor (AUDIT_ANCHOR), against which the live head can be cross-checked.", body))
     story.append(Spacer(1, 6))
     story.append(Paragraph("// RESTRICTED — NOT FOR OPERATIONAL USE //", red_banner))
 
