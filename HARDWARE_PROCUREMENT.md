@@ -10,17 +10,21 @@ going forward.
 Status legend: **Pending** (not yet procured) · **Partial** (some units on hand,
 insufficient for full spec) · **Procured** (on hand, unblocks the linked task).
 
+_Last reconciled 2026-08-12 against the live deploy host (172.16.16.196)._
+
 ---
 
 ## RF Front-End / Transceivers
 
 | Item | Spec / Notes | Blocks | Status |
 |---|---|---|---|
-| Directional antennas (2+ matched) | For amplitude-comparison direction-finding | #20 | Pending |
+| USB Bluetooth adapter (HCI-class) | **TP-Link UB500, Realtek RTL8761 (USB 2357:0604), dual-mode BLE + Classic.** Recognized natively by the Linux `btusb` driver (kernel ≥5.16; box runs 6.8), firmware in `linux-firmware`. Kismet BT/BLE passive scanning live on primary as `hci1` (pinned via `kismet_site.conf`), real BLE device detected end-to-end. NOTE: BLE + Bluetooth Classic only — has **no** dedicated non-Bluetooth capability. Two earlier wrong buys (ESP32-S3, nRF52840 Sense) are superseded by this. | #63, #132 | **Procured** |
+| SiK / RFD900-class MAVLink radio (915MHz) | Serial (CP210x/FTDI) telemetry radio for the MAVLink RX sniffer (`cema-mavlink-sniffer`) AND the TX takeover bridge (`cema-rf-bridge`, RC-override / maneuver-takeover). **Currently physically ABSENT** (`/dev/cema-sik-adapter` not present; `lsusb` shows no USB-serial radio). Both services degrade gracefully (sniffer idles waiting-for-device; rf-bridge staged dormant). udev rule `99-cema-sik-adapter.rules` pins a CP210x `10c4:ea60 serial=0001` → `/dev/cema-sik-adapter`; a different chip/serial needs a rule tweak (see `rf-bridge/ACTIVATION.md`). | #132, RC-override takeover (B7) | **Pending** (expected ~2026-08-13; was on-hand earlier, now unplugged) |
+| Directional antennas (2+ matched) | For amplitude-comparison direction-finding. DF math (RSSI-ratio monopulse) now built (`field-bridge/direction_finding.py`) + honest "UNKNOWN (no DF array)" state — purely hardware-blocked | #20 | Pending |
 | USB GPS module | For auto-detecting sensor position (Option A) | #24 | Pending |
-| USB WiFi monitor-mode adapter | Alfa AWUS036NHA or similar, ~$30-35 | #70 | Pending |
-| ANTSDR (or equivalent) | For real DJI DroneID decode validation | #81 | Pending |
-| LoRa transceiver modules | Asset-side low-power module(s) (e.g. RFM95/SX1276-class) + interrogator-side bidirectional module, for IFF challenge-response/beacon — sized to friendly-asset count | #60, #126, #128 | Pending |
+| USB WiFi monitor-mode adapter | Alfa AWUS036NHA or similar, ~$30-35. For passive WiFi (802.11) drone/OUI detection — SEPARATE from the Bluetooth adapter above | #70 | Pending |
+| ANTSDR (or equivalent) | For real DJI DroneID decode validation. Decoder built + CRC-checked; only live-hardware validation blocked | #81 | Pending |
+| LoRa transceiver modules | Asset-side low-power module(s) (e.g. RFM95/SX1276-class) + interrogator-side bidirectional module, for IFF challenge-response/beacon — sized to friendly-asset count. IFF crypto/beacon software fully built + hardened; purely hardware-blocked | #60, #126, #128 | Pending |
 | Antenna array + multi-channel exciter | Full array design, not yet scoped in hardware terms | #120 | Pending (design first) |
 
 ## Power / Amplification
