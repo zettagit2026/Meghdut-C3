@@ -37,9 +37,26 @@ bridge-side range-auth poll. Tamper-evident (append-time hash-chain) audit log w
 append-only anchor. All three offensive capabilities (B1 engagement planner, B7 RC-override
 takeover) are human-in-the-loop, adversarially reviewed, and were built to this standard.
 
+## MIGRATION IN PROGRESS (new hardware — Lenovo ST550 — arriving 2026-08-20)
+- Repo was **renamed on GitHub**: `joydipdemo` → **`Meghdut-C3`** (`github.com/zettagit2026/Meghdut-C3`).
+  Local remote repointed via SSH alias `github-meghdut` (fresh deploy key `~/.ssh/meghdut_c3_ed25519`,
+  write-scoped, authenticating). `main` fully synced at `88b3634` — nothing unpushed as of the rename.
+  NOTE: local working dir is still named `joydipdemo/` (cosmetic; git unaffected).
+- New box = **Lenovo ST550, pre-used rental** = Tier-A-class BRIDGE host (dual Xeon octa @ 2.10 GHz,
+  32 GB ECC, 3×1.2 TB SAS HDD + RAID, USB-only, no GPU, PCIe-expandable). Two honest deviations vs spec:
+  spinning SAS (not NVMe) and low single-thread clock (backend is single-thread-bound). B-upgradable later.
+- **Two new planning docs drive tomorrow** (read both before cutover):
+  - `MIGRATION_RUNBOOK.md` — ST550-specific cutover: provisioning, state migration (Mongo/Caddy CA/
+    .env/udev/venv+model), deploy+rebuild, bring-up ordering (TX fail-closed, 6 dormant units stay inert),
+    a PASS/FAIL validation gate, rollback (old host stays live until green), and open decisions.
+  - `CAPABILITY_ROADMAP.md` — honest ledger (12 BUILT / 6 HW-gated / 2 PARTIAL / 4 DESIGNED / 1 NOT-STARTED)
+    + phased plan. Key finds: RC-takeover/1.11 is BUILT (RFI draft is stale — reconcile up); compliance
+    docs OVERCLAIM power/range/band (reconcile down); GNSS-spoof DSP is a stub; OB-06 FPGA intent (throughput
+    vs deterministic-latency/SWaP-C) is the decisive open question. Demo target: user confirms post-migration.
+
 ## OPEN ITEMS (what the next session should pick up)
-1. **`git push`** — local is **6 commits ahead of origin/main** (no credential helper here; the
-   user pushes manually). Commits `1c22fb3`..`fe5f04f`.
+1. **`git push`** — after the rename, push to `github-meghdut` remote (no credential helper here; the
+   user pushes manually). At handoff-update time local == origin at `88b3634`.
 2. **SiK / RFD900 MAVLink radio** — still PHYSICALLY ABSENT on primary (`/dev/cema-sik-adapter`
    not present). `cema-mavlink-sniffer` idles gracefully (waiting-for-device, survives hot-plug now);
    `cema-rf-bridge` (the RC-override TX bridge) is staged **dormant** (disabled+stopped). When the
