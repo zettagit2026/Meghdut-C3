@@ -189,6 +189,13 @@ Effort: **S** ≤ few days · **M** ~1–2 weeks · **L** multi-week/multi-perso
 | 0.2 | Reconcile `RFI_RESPONSE_DRAFT.md` + compliance docs (1.11 up; range/power/band/bandwidth down to honest figures; FHSS + encrypted caveats in) | none | S | code-reviewer (doc-vs-code) | Technical Writer → critic |
 | 0.3 | Re-run full field-bridge + backend test suite on new hardware; confirm real `hackrf_sweep` ingest live | 0.1 | S | verifier | test-engineer → verifier |
 | 0.4 | Split USB topology per `lsusb -t`; give HackRF its own root hub; add spinning-disk mitigations (Mongo retention + split IQ-capture volume off OS/DB disk) | ST550 USB + HDD | S | verifier | DevOps Automator |
+| 0.5 | Reconcile ungoverned break-glass TX CLIs (`sik_mavlink_bridge.py` + `hackrf_jam.py`) — retire or bring under tx-halt + live-lease gate; correct the SESSION_HANDOFF invariant | security decision (retire vs govern) | S (retire) / M (govern) | RF-TX: human-in-loop + adversarial + verifier (already reviewed x2) | security-reviewer (done x2) → executor → verifier |
+
+Note: two independent security reviews CONFIRMED the "every RF-transmit path is gated"
+invariant is currently false — both `sik_mavlink_bridge.py` and `hackrf_jam.py` transmit
+real RF outside the spine via the same gap (static env var + confirm flag + prompt, no
+tx-halt/lease/arm-token/IFF). This is one gap class across two files, not two unrelated
+findings — treat 0.5 as a single reconciliation, not two separate patches.
 
 ### Phase 1 — Software-only capability closure (runs on ST550, no add-ons)
 
@@ -358,11 +365,18 @@ Placeholders left in the RFI are marked.
    docs contradict the code (1.11 understated) and each other (range/power/band).
    Cheapest, highest-leverage risk reduction; an evaluator will find the
    overclaims otherwise.
-2. **Front-load the software-only wins on Tier-A hardware (Phase 1)** — GNSS synth
-   DSP, DF bridge wiring, passive-radar recorded-IQ validation, and the
-   shared-state refactor turn already-written scaffolding into demonstrable
-   capability at software cost, and pre-clear the 40–50-target bottleneck.
-3. **Treat the Tier-B SDR/GPSDO + FPGA card as the pacing item and start its
-   procurement + FPGA-engineer hiring now** — passive radar, multi-target scale,
-   OB-05 beamforming, and OB-06 (Army-CRITICAL) all wait on it; its multi-month
-   lead time, not coding effort, is the critical path.
+2. **Front-load the software-only wins — they all run on the ST550 as delivered
+   (Phase 1)** — GNSS synth DSP, DF bridge wiring, passive-radar recorded-IQ
+   validation, and the shared-state refactor turn already-written scaffolding
+   into demonstrable capability at software cost with no add-on. On this box the
+   shared-state refactor is doubly urgent: the 2.10 GHz single-thread core means
+   it, not the RAM buy, is what actually unblocks 40–50 targets.
+3. **Order the bolt-ons in unlock order and start the FPGA pole now** — the ST550
+   is PCIe-upgradable, so each capability is a bolt-on: **2nd SDR/GPSDO (USB)**
+   first (passive radar + DF), then **64 GB RAM** (after the refactor), **GPU
+   (PCIe)** for multi-domain ML, and the long pole **PCIe FPGA card + an
+   FPGA/RTL engineer** for OB-06 (Army-CRITICAL) — its multi-month board
+   procurement + hiring lead time, not coding, is the critical path, so start it
+   in parallel with Phase 1. **Separately: pick a demo target from §4b** — our
+   recommendation is RC-manoeuvre takeover (1.11) + telemetry spoof (1.7), both
+   BUILT and both running on the ST550's single HackRF.

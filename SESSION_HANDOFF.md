@@ -37,6 +37,20 @@ bridge-side range-auth poll. Tamper-evident (append-time hash-chain) audit log w
 append-only anchor. All three offensive capabilities (B1 engagement planner, B7 RC-override
 takeover) are human-in-the-loop, adversarially reviewed, and were built to this standard.
 
+**KNOWN EXCEPTION (as of 2026-08-19, confirmed by two independent security reviews):**
+the "every RF-transmit path is gated" statement above is FALSE as written. Two interactive
+break-glass CLIs — `field-bridge/sik_mavlink_bridge.py` (opens the SiK serial radio directly
+and emits MAVLink command-injection frames) and `field-bridge/hackrf_jam.py` (shells out to
+`hackrf_transfer` for real jamming and GNSS-spoof RF) — transmit real RF **outside** the
+above spine. They are gated only by a static `CEMA_AUTHORIZED_RANGE=1` env var, an
+`--i-confirm-authorized-range` flag, and an interactive TRANSMIT prompt: no `tx_halt` check,
+no live range-auth lease poll, no arm token, no fire-time IFF interlock. The master tx-halt
+kill switch does **not** stop these paths. Severity: Medium-High, local attack surface only
+(not network-remote). A retire-vs-bring-under-spine decision is **PENDING** — see
+`CAPABILITY_ROADMAP.md` Phase 0. (The governed equivalents — `rf-bridge/mavlink_bridge.py`,
+`jam_bridge.py`, `gnss_spoof_bridge.py` — do honor the full spine; `mavlink_takeover.py` is a
+governed library, not an ungoverned path.)
+
 ## MIGRATION IN PROGRESS (new hardware — Lenovo ST550 — arriving 2026-08-20)
 - Repo was **renamed on GitHub**: `joydipdemo` → **`Meghdut-C3`** (`github.com/zettagit2026/Meghdut-C3`).
   Local remote repointed via SSH alias `github-meghdut` (fresh deploy key `~/.ssh/meghdut_c3_ed25519`,
