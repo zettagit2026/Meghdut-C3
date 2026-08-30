@@ -121,7 +121,12 @@ from hackrf_rx import (  # gate math reused verbatim from the live energy-detect
     _post_with_reauth,  # shared 401-retry-once helper -- see hackrf_rx.py for rationale
 )
 from gamutrf_infer import GamutRFClassifier, load_sigmf
-from ml_calibration import load_calibration, is_ood
+from ml_calibration import (
+    load_calibration,
+    is_ood,
+    DEFAULT_MIN_TOP2_MARGIN,
+    DEFAULT_MAX_NORMALIZED_ENTROPY,
+)
 
 # Default lives under the project directory, not /tmp -- /tmp is wiped on
 # reboot and would silently strand this checkpoint (same
@@ -166,6 +171,33 @@ DEFAULT_CHECKPOINT = os.path.join(
 UNCLASSIFIED_MAX_CONFIDENCE = float(
     os.environ.get("CEMA_ML_UNCLASSIFIED_MAX_CONFIDENCE", "0.6")
 )
+
+# DEMO-CREDIBILITY REJECT FLOOR (2026-08-30): the 0.60 value above is
+# intentionally coupled to backend/server.py's ML_RECLASSIFY_MIN_CONFIDENCE
+# for the wifi-reclassification display path (see the long comment above) and
+# must not drift from it. But 0.60 is too permissive as the bar for surfacing
+# a confident *drone/threat* label: a "drone" prediction at, say, 0.62 on
+# ambient / non-target RF that merely cleared the energy gate would otherwise
+# display as a confident DRONE. In front of RF-literate evaluators a single
+# false "DRONE - HIGH" from ambient energy badly undermines credibility.
+#
+# This is an ADDITIONAL, higher floor applied ON TOP OF the coherence value:
+# the effective unclassified threshold passed to is_ood() is the MAX of
+# UNCLASSIFIED_MAX_CONFIDENCE (wifi-display coherence) and this reject floor,
+# so a winning class below REJECT_CONF_THRESHOLD is honestly reported as
+# unclassified_signal rather than a confident label. A genuinely strong,
+# low-entropy, decisively-won prediction (>= this floor) still comes through
+# unchanged -- real detection is preserved, not neutered. Env-tunable so it
+# can be adjusted on-site; the calibration layer can still only RAISE the
+# effective threshold above this, never lower it. Set equal to
+# UNCLASSIFIED_MAX_CONFIDENCE (0.6) to restore the previous behavior.
+REJECT_CONF_THRESHOLD = float(
+    os.environ.get("CEMA_ML_REJECT_CONF_THRESHOLD", "0.75")
+)
+
+# Effective default floor handed to is_ood(): the more conservative (higher)
+# of the wifi-display coherence value and the demo reject floor.
+EFFECTIVE_REJECT_THRESHOLD = max(UNCLASSIFIED_MAX_CONFIDENCE, REJECT_CONF_THRESHOLD)
 
 # CALIBRATION LAYER (2026-07-24): see ml_calibration.py's module docstring
 # for the full rationale. In short -- UNCLASSIFIED_MAX_CONFIDENCE above is a
@@ -306,7 +338,11 @@ def main() -> None:
               f"(see ml_calibration.py)")
     else:
         print("[ml_classify_bridge] no noise-floor calibration file found -- "
-              f"using fixed UNCLASSIFIED_MAX_CONFIDENCE={UNCLASSIFIED_MAX_CONFIDENCE} only "
+              f"using fixed reject floor={EFFECTIVE_REJECT_THRESHOLD} "
+              f"(CEMA_ML_REJECT_CONF_THRESHOLD={REJECT_CONF_THRESHOLD}, "
+              f"UNCLASSIFIED_MAX_CONFIDENCE={UNCLASSIFIED_MAX_CONFIDENCE}), "
+              f"min top-2 margin={DEFAULT_MIN_TOP2_MARGIN}, "
+              f"max normalized entropy={DEFAULT_MAX_NORMALIZED_ENTROPY} "
               "(run collect_noise_calibration.py on this hardware to build one)")
 
     token = login(args.console_url, args.email, args.password)
@@ -388,7 +424,7 @@ def main() -> None:
                 # rather than picking a label nobody is confident in.
                 ood = is_ood(
                     ml_confidence, all_probs, NOISE_CALIBRATION_STATS,
-                    default_confidence_threshold=UNCLASSIFIED_MAX_CONFIDENCE,
+                    default_confidence_threshold=EFFECTIVE_REJECT_THRESHOLD,
                 )
                 is_unclassified = ood["unclassified"]
                 if is_unclassified:
@@ -396,6 +432,7 @@ def main() -> None:
                           f"{ml_label} @ {ml_confidence:.4f}, reason={ood['reason']}, "
                           f"effective_threshold={ood['effective_confidence_threshold']:.4f}, "
                           f"normalized_entropy={ood['normalized_entropy']:.4f}, "
+                          f"top2_margin={ood['top2_margin']:.4f} (min {ood['min_top2_margin']:.4f}), "
                           f"calibration_source={ood['calibration_source']} "
                           f"n={ood['calibration_n']}) -- "
                           f"reporting as unclassified_signal, not forcing a label")
@@ -461,6 +498,7 @@ def main() -> None:
                     "ml_ood_reason": ood["reason"],
                     "ml_ood_threshold": round(ood["effective_confidence_threshold"], 4),
                     "ml_ood_entropy": round(ood["normalized_entropy"], 4),
+                    "ml_ood_margin": round(ood["top2_margin"], 4),
                     "ml_ood_calibration_n": ood["calibration_n"],
                 }
                 try:

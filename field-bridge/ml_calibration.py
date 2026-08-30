@@ -111,6 +111,32 @@ DEFAULT_MAX_NORMALIZED_ENTROPY = float(
     os.environ.get("CEMA_ML_MAX_NORMALIZED_ENTROPY", "0.85")
 )
 
+# TOP-2 MARGIN CHECK (2026-08-30): a third, independent OOD signal alongside
+# the top-1 confidence and softmax-entropy checks above. Even when the winning
+# class edges past the confidence bar and the overall distribution is not fully
+# uniform, a SMALL gap between the #1 and #2 class probabilities means the
+# model is nearly torn between two of its three known classes -- it is not
+# decisively picking one. On a closed-world 3-class model with no reject class,
+# that "barely-won" state is exactly the ambiguous / non-target energy case we
+# must not surface as a confident label (e.g. a false "drone" on ambient RF).
+# If (top1 - top2) < this margin, report unclassified_signal. Env-tunable;
+# set to 0.0 to disable this specific check (the confidence + entropy checks
+# still apply).
+DEFAULT_MIN_TOP2_MARGIN = float(
+    os.environ.get("CEMA_ML_REJECT_MIN_MARGIN", "0.15")
+)
+
+
+def top2_margin(all_probs: Dict[str, float]) -> float:
+    """Gap between the largest and second-largest softmax probabilities.
+    0.0 for a degenerate (<2 class) distribution. A large margin means the
+    model decisively preferred one class; a small margin means it was nearly
+    tied between its top two known classes."""
+    probs = sorted(all_probs.values(), reverse=True)
+    if len(probs) < 2:
+        return 0.0
+    return probs[0] - probs[1]
+
 
 def softmax_entropy(all_probs: Dict[str, float]) -> float:
     """Shannon entropy (nats) of the classifier's softmax output."""
@@ -239,36 +265,55 @@ def is_ood(
     stats: NoiseCalibrationStats,
     default_confidence_threshold: float,
     max_normalized_entropy: float = DEFAULT_MAX_NORMALIZED_ENTROPY,
+    min_top2_margin: float = DEFAULT_MIN_TOP2_MARGIN,
 ) -> Dict[str, object]:
     """Decide whether a gated-in, energy-confirmed prediction should still be
     reported as unclassified_signal, and why. Returns a dict (not just a
     bool) so callers can log/ingest the reasoning honestly:
       {
         "unclassified": bool,
-        "reason": "low_confidence" | "high_entropy" | "low_confidence+high_entropy" | None,
+        "reason": "low_confidence" | "high_entropy" | "low_margin" | combinations
+                   joined with "+" | None,
         "effective_confidence_threshold": float,
         "normalized_entropy": float,
+        "top2_margin": float,
+        "min_top2_margin": float,
         "calibration_source": "none" | "file",
         "calibration_n": int,
       }
+
+    Three independent, additive OOD signals, ANY of which flags the prediction
+    as unclassified_signal (a closed-world 3-class model with no reject class
+    must not surface an uncertain guess as a confident label):
+      1. low_confidence -- top-1 softmax prob below the effective threshold.
+      2. high_entropy   -- softmax distribution near-uniform across classes.
+      3. low_margin     -- top-1 and top-2 class probs nearly tied (the model
+                            could not decisively pick one of its known classes).
     """
     threshold = effective_confidence_threshold(stats, default_confidence_threshold)
     ent = normalized_entropy(all_probs)
+    margin = top2_margin(all_probs)
 
     low_conf = confidence < threshold
     high_entropy = ent > max_normalized_entropy
+    # margin check only fires when a positive margin bar is set (0.0 disables it)
+    low_margin = min_top2_margin > 0.0 and margin < min_top2_margin
 
     reasons: List[str] = []
     if low_conf:
         reasons.append("low_confidence")
     if high_entropy:
         reasons.append("high_entropy")
+    if low_margin:
+        reasons.append("low_margin")
 
     return {
-        "unclassified": bool(low_conf or high_entropy),
+        "unclassified": bool(low_conf or high_entropy or low_margin),
         "reason": "+".join(reasons) if reasons else None,
         "effective_confidence_threshold": threshold,
         "normalized_entropy": ent,
+        "top2_margin": margin,
+        "min_top2_margin": min_top2_margin,
         "calibration_source": stats.source if stats.n > 0 else "none",
         "calibration_n": stats.n,
     }
