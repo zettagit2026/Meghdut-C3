@@ -435,7 +435,7 @@ export default function Dashboard() {
                             {src}
                           </span>
                         </td>
-                        <td className="p-2 text-white">{d.callsign}</td>
+                        <td className="p-2 text-white font-bold" style={{ color: "var(--text-primary)" }}>{d.callsign}</td>
                         <td className="p-2 text-slate-300">
                           {d.model}
                           {showUnconfirmedTag && <UnconfirmedTag />}
@@ -549,7 +549,7 @@ export default function Dashboard() {
                 <div key={d.id}
                      className={`tactical-border p-3 ${staticCritical ? "threat-critical-static" : ""} ${recentCritical ? "threat-critical-flash" : ""}`}>
                   <div className="flex items-center justify-between mb-2">
-                    <span className="font-mono text-xs text-white">{d.callsign}</span>
+                    <span className="font-mono text-xs text-white font-bold" style={{ color: "var(--text-primary)" }}>{d.callsign}</span>
                     <span className="px-2 py-0.5 tactical-border font-mono font-bold text-[10px]"
                           style={{
                             color: THREAT_COLOR[d.threat_level],

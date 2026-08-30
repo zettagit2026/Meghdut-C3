@@ -4,7 +4,10 @@ import { ClassificationBanner } from "@/components/ClassificationBanner";
 import RangeAuthorizationBanner from "@/components/RangeAuthorizationBanner";
 import EmergencyAbort from "@/components/EmergencyAbort";
 import ErrorBoundary from "@/components/ErrorBoundary";
-import ThemeToggle from "@/components/ThemeToggle";
+// ThemeToggle hidden for the demo (fielded EW console is locked to dark --
+// see design_guidelines.json). Logic kept intact in ThemeContext/ThemeToggle
+// so the toggle can be restored later by re-adding this import + <ThemeToggle />.
+// import ThemeToggle from "@/components/ThemeToggle";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import {
@@ -132,7 +135,7 @@ export default function Layout() {
               <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
                 MISSION-ID: <span style={{ color: "var(--text-primary)" }}>CEMA-cUAS-{year}-A</span>
               </div>
-              <ThemeToggle />
+              {/* <ThemeToggle /> hidden for the demo -- see import note above */}
               <EmergencyAbort />
             </div>
           </div>

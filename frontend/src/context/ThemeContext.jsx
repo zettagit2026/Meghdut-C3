@@ -22,11 +22,14 @@ function readInitialTheme() {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved && VALID.has(saved)) return saved;
   } catch { /* localStorage unavailable -- fall through */ }
-  try {
-    if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
-      return "light";
-    }
-  } catch { /* matchMedia unavailable */ }
+  // OS-level prefers-color-scheme auto-detection disabled for the demo: the
+  // console is locked to dark (ThemeToggle hidden in Layout.jsx). Restore the
+  // block below alongside the toggle to re-enable light-mode auto-detection.
+  // try {
+  //   if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
+  //     return "light";
+  //   }
+  // } catch { /* matchMedia unavailable */ }
   return "dark";
 }
 

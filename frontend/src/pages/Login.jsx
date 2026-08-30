@@ -7,7 +7,7 @@ import { toast } from "sonner";
 
 export default function Login() {
   const { user, login, loading } = useAuth();
-  const [email, setEmail] = useState("operator@cema.mil");
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const nav = useNavigate();
@@ -109,6 +109,7 @@ export default function Login() {
                 onChange={(e) => setEmail(e.target.value)}
                 required
                 autoComplete="email"
+                placeholder="operator@…"
                 className="w-full bg-black/50 tactical-border px-3 py-2 font-mono text-sm text-white focus:outline-none focus-accent-info"
               />
             </label>
