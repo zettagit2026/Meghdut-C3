@@ -7,19 +7,26 @@
 
 	# Browsers/curl never send SNI when connecting to a bare IP literal
 	# (RFC 6066 forbids IP addresses in the SNI server_name field). Since
-	# operators will mostly type https://172.16.16.196 directly, ClientHellos
+	# operators will mostly type https://172.16.16.186 directly, ClientHellos
 	# will arrive with an empty SNI. Without a default, Caddy can't pick
 	# which certificate to present for an unrecognized/empty SNI and the
 	# handshake fails with a TLS internal_error alert. This pins the IP as
-	# the fallback identity for name-less connections.
-	default_sni 172.16.16.196
+	# the fallback identity for name-less connections. Point this at the
+	# appliance's OWN primary IP: on a bare-IP HTTPS connect Caddy presents
+	# this leaf, and the request Host must also match a site block below or
+	# Caddy answers with an empty 200 (no matching route).
+	default_sni 172.16.16.186
 }
 
 :80 {
 	redir https://{host}{uri} permanent
 }
 
-172.16.16.196, localhost, 127.0.0.1 {
+# Every identity an operator may use to reach THIS appliance must be listed
+# here, or Caddy has no matching site for that Host and returns an empty 200
+# (blank page). Keep this list in sync with CORS_ORIGINS in .env. 172.16.16.196
+# is the retired primary and is retained only for migration overlap.
+172.16.16.186, meghdut-srv02, 172.16.16.196, localhost, 127.0.0.1 {
 	tls internal
 
 	reverse_proxy frontend:3000
