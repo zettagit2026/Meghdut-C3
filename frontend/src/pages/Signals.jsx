@@ -97,8 +97,9 @@ export default function Signals() {
                 data-testid={`select-${d.id}`}
                 onClick={() => setSelected(d.id)}
                 className={`w-full text-left p-3 tactical-border-b font-mono text-xs transition-colors ${
-                  d.id === selected ? "bg-[#0F1626] text-[#00F0FF]" : "text-slate-400 hover:bg-[#0F1626] hover:text-white"
+                  d.id === selected ? "" : "text-slate-400 hover-surface hover:text-white"
                 }`}
+                style={d.id === selected ? { background: "var(--hover-surface)", color: "var(--accent-info)" } : undefined}
               >
                 <div className="flex items-center justify-between">
                   <span>{d.callsign}</span>
@@ -121,9 +122,18 @@ export default function Signals() {
             <>
               <div className="flex items-start justify-between mb-6">
                 <div>
-                  <div className="font-heading font-black text-3xl tracking-tighter uppercase">
-                    {current.callsign} <span className="text-slate-500">·</span>{" "}
-                    <span style={{ color: "var(--accent-info)" }}>{current.model}</span>
+                  <div className="font-heading font-black text-3xl tracking-tighter uppercase flex items-center gap-3 flex-wrap">
+                    <span>
+                      {current.callsign} <span className="text-slate-500">·</span>{" "}
+                      <span style={{ color: "var(--accent-info)" }}>{current.model}</span>
+                    </span>
+                    <span
+                      className="font-mono text-xs font-bold uppercase tracking-widest px-2 py-1 tactical-border"
+                      style={{ color: "var(--accent-info)", borderColor: "var(--accent-info)" }}
+                    >
+                      {STAGES[current.cema_stage_index]?.key || "COMPLETE"}
+                      {" "}{Math.min(current.cema_stage_index + 1, STAGES.length)}/{STAGES.length}
+                    </span>
                   </div>
                   <div className="font-mono text-xs text-slate-500 mt-1">
                     PROTOCOL: <span className="text-slate-300">{current.protocol}</span> · SYS-ID: <span className="text-slate-300">{current.system_id}</span> ·
@@ -134,7 +144,7 @@ export default function Signals() {
                 <button
                   data-testid="cema-advance-btn"
                   onClick={advance}
-                  className="flex items-center gap-2 px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest hover:bg-[#00F0FF] hover:text-black transition-colors scanline-btn"
+                  className="flex items-center gap-2 px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest hover-accent-info transition-colors scanline-btn"
                   style={{ color: "var(--accent-info)", borderColor: "var(--accent-info)" }}
                 >
                   ADVANCE STAGE <ChevronRight size={14} strokeWidth={1.5} />
@@ -145,27 +155,26 @@ export default function Signals() {
                 {STAGES.map((s, i) => {
                   const done = i < current.cema_stage_index;
                   const active = i === current.cema_stage_index;
+                  const stageColor = done ? "var(--accent-success)" : active ? "var(--accent-info)" : undefined;
                   return (
                     <div key={s.key}
-                         className={`p-4 tactical-border-b last:border-b-0 flex items-start gap-4 ${
-                           active ? "bg-[#0F1626]" : ""
-                         }`}>
-                      <div className={`w-10 h-10 tactical-border flex items-center justify-center font-heading font-black text-lg ${
-                        done ? "text-[#39FF14] border-[#39FF14]"
-                        : active ? "text-[#00F0FF] border-[#00F0FF]"
-                        : "text-slate-600"
-                      }`}>
+                         className="p-4 tactical-border-b last:border-b-0 flex items-start gap-4"
+                         style={active ? {
+                           borderLeft: "3px solid var(--accent-info)",
+                           background: "color-mix(in srgb, var(--accent-info) 12%, var(--bg-surface))",
+                         } : undefined}>
+                      <div className={`w-10 h-10 tactical-border flex items-center justify-center font-heading font-black text-lg ${!done && !active ? "text-slate-600" : ""}`}
+                           style={{ color: stageColor, borderColor: stageColor }}>
                         {done ? <CheckCircle2 size={18} strokeWidth={1.5}/> : i + 1}
                       </div>
                       <div className="flex-1">
                         <div className="flex items-center gap-3">
-                          <span className={`font-heading font-black text-lg uppercase tracking-tighter ${
-                            active ? "text-[#00F0FF]" : done ? "text-[#39FF14]" : "text-slate-500"
-                          }`}>
+                          <span className={`font-heading font-black text-lg uppercase tracking-tighter ${!active && !done ? "text-slate-500" : ""}`}
+                                style={{ color: stageColor }}>
                             {s.key}
                           </span>
                           {active && <span className="font-mono text-[10px] text-slate-500 blink">● PROCESSING</span>}
-                          {done && <span className="font-mono text-[10px] text-[#39FF14]">✓ COMPLETE</span>}
+                          {done && <span className="font-mono text-[10px]" style={{ color: "var(--accent-success)" }}>✓ COMPLETE</span>}
                         </div>
                         <div className="font-mono text-xs text-slate-300 mt-1">{s.what}</div>
                         <div className="font-mono text-[10px] text-slate-500 mt-0.5">{s.how}</div>

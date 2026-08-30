@@ -328,7 +328,7 @@ export default function Payloads() {
             data-testid="target-select"
             value={target}
             onChange={(e) => setTarget(e.target.value)}
-            className="bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+            className="bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus-accent-info"
           >
             {dets.length === 0 && <option value="">— NO ACTIVE TARGETS —</option>}
             {dets.map((d) => (
@@ -362,7 +362,7 @@ export default function Payloads() {
 
       <RangeAuthorizationControl effect="mavlink" label="MAVLINK PAYLOAD DEPLOY" />
 
-      <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "#1A0A08" }}>
+      <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "color-mix(in srgb, var(--accent-critical) 10%, var(--bg-surface))" }}>
         <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
         <div className="font-mono text-xs text-slate-300">
           <span className="font-bold" style={{ color: "var(--accent-critical)" }}>WARNING:</span>{" "}
@@ -405,19 +405,30 @@ export default function Payloads() {
               <div>DURATION: <span className="text-slate-300">{p.duration_ms} ms</span>
                 {" "}· REVERSIBLE: <span className="text-slate-300">{p.reversible ? "YES" : "NO"}</span></div>
             </div>
+            {p.id === "PL-010" && (
+              <div className="mt-4 -mb-1 flex justify-end">
+                <span
+                  className="px-2 py-0.5 tactical-border font-mono text-[9px] uppercase tracking-widest"
+                  style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}
+                >
+                  Broadcast-only
+                </span>
+              </div>
+            )}
             <div className="mt-4 grid grid-cols-2 gap-0 tactical-border">
               <button
                 data-testid={`deploy-target-${p.id}`}
                 onClick={() => deploy(p, false)}
                 disabled={p.id === "PL-010"}
-                className="tactical-border-r px-3 py-2 font-mono text-[10px] uppercase tracking-widest hover:bg-[#00F0FF] hover:text-black transition-colors scanline-btn disabled:opacity-30"
+                title={p.id === "PL-010" ? "Broadcast-only payload — no single-target mode" : undefined}
+                className="tactical-border-r px-3 py-2 font-mono text-[10px] uppercase tracking-widest hover-accent-info transition-colors scanline-btn disabled:opacity-30 disabled:cursor-not-allowed"
               >
                 DEPLOY → TGT
               </button>
               <button
                 data-testid={`deploy-broadcast-${p.id}`}
                 onClick={() => deploy(p, true)}
-                className="px-3 py-2 font-mono text-[10px] uppercase tracking-widest hover:bg-[#FF3B30] hover:text-black transition-colors scanline-btn"
+                className="px-3 py-2 font-mono text-[10px] uppercase tracking-widest hover-accent-critical transition-colors scanline-btn"
                 style={{ color: "var(--accent-critical)" }}
               >
                 BROADCAST

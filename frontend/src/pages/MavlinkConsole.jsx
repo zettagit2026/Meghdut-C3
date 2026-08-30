@@ -37,6 +37,11 @@ export default function MavlinkConsole() {
   const [preview, setPreview] = useState(null);
   const [stream, setStream] = useState([]);
   const [broadcastFlag, setBroadcastFlag] = useState(false);
+  // Broadcast TX is a kinetic, ungated-in-the-protocol action (target_sys=0
+  // hits every vehicle on the link). Gate it behind an arm->confirm two-step,
+  // mirroring EmergencyAbort, so a single stray click can't blast a broadcast
+  // COMMAND_LONG. Single-target TX (broadcastFlag off) fires directly.
+  const [broadcastArmed, setBroadcastArmed] = useState(false);
   const [wsStatus, setWsStatus] = useState("connecting"); // connecting | open | reconnecting | no-auth | closed
   const wsRef = useRef(null);
   const reconnectTimerRef = useRef(null);
@@ -135,6 +140,21 @@ export default function MavlinkConsole() {
   useEffect(() => { craftPreview(); /* refresh preview on change */ // eslint-disable-next-line
   }, [form, broadcastFlag]);
 
+  // Disarm the broadcast confirm after 4s of inactivity, or whenever the
+  // operator toggles broadcast mode off.
+  useEffect(() => {
+    if (!broadcastArmed) return;
+    const t = setTimeout(() => setBroadcastArmed(false), 4000);
+    return () => clearTimeout(t);
+  }, [broadcastArmed]);
+  useEffect(() => { if (!broadcastFlag) setBroadcastArmed(false); }, [broadcastFlag]);
+
+  const transmit = () => {
+    // Two-step arm->confirm only for broadcast (target_sys=0) TX.
+    if (broadcastFlag && !broadcastArmed) { setBroadcastArmed(true); return; }
+    broadcast();
+  };
+
   const broadcast = async () => {
     try {
       const body = { ...form };
@@ -142,6 +162,7 @@ export default function MavlinkConsole() {
       await api.post("/mavlink/broadcast", body);
       toast.success("Packet transmitted", { description: `msgid=${body.message_id} → sys=${body.target_system}` });
     } catch (e) { toast.error("Broadcast failed", { description: formatApiError(e) }); }
+    finally { setBroadcastArmed(false); }
   };
 
   const copy = async (text) => {
@@ -168,7 +189,7 @@ export default function MavlinkConsole() {
               type="checkbox"
               checked={broadcastFlag}
               onChange={(e) => setBroadcastFlag(e.target.checked)}
-              className="accent-[#FF3B30]"
+              style={{ accentColor: "var(--accent-critical)" }}
             />
             <span className="font-mono text-[10px] uppercase tracking-widest text-slate-300">
               BROADCAST (target_sys=0)
@@ -176,13 +197,27 @@ export default function MavlinkConsole() {
           </label>
           <button
             data-testid="broadcast-btn"
-            onClick={broadcast}
-            className={`flex items-center gap-2 px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest hover:text-black transition-colors scanline-btn ${
-              broadcastFlag ? "text-[#FF3B30] border-[#FF3B30] hover:bg-[#FF3B30]" : "text-[#00F0FF] border-[#00F0FF] hover:bg-[#00F0FF]"
-            }`}
+            onClick={transmit}
+            className={`flex items-center gap-2 px-4 py-2 tactical-border font-mono text-xs font-bold uppercase tracking-widest transition-colors scanline-btn ${
+              broadcastArmed ? "text-white pulse-crit" : "hover:text-black"
+            } ${broadcastFlag ? "hover-accent-critical" : "hover-accent-info"}`}
+            style={
+              broadcastArmed
+                ? { background: "var(--accent-critical)", borderColor: "var(--accent-critical)" }
+                : broadcastFlag
+                ? { color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }
+                : { color: "var(--accent-info)", borderColor: "var(--accent-info)" }
+            }
+            title={broadcastFlag
+              ? "Broadcast TX (target_sys=0) — arm, then confirm to transmit to all vehicles"
+              : "Transmit crafted packet to the single target system"}
           >
-            <Zap size={14} strokeWidth={1.5} /> TRANSMIT
+            <Zap size={14} strokeWidth={1.5} />
+            {broadcastArmed ? "CONFIRM BROADCAST TX" : "TRANSMIT"}
           </button>
+          <span data-testid="broadcast-arm-status" role="status" aria-live="assertive" className="sr-only">
+            {broadcastArmed ? "Broadcast transmit armed — activate again to confirm" : ""}
+          </span>
         </div>
       </div>
 
@@ -235,7 +270,7 @@ export default function MavlinkConsole() {
         <div className="tactical-border" style={{ background: "var(--bg-terminal)" }}>
           <div className="tactical-border-b px-4 py-3 flex items-center justify-between">
             <span className="font-mono text-xs uppercase tracking-widest" style={{ color: "var(--text-term)" }}>
-              hex · binary preview
+              Hex Preview
             </span>
             {preview && (
               <button
@@ -275,12 +310,15 @@ export default function MavlinkConsole() {
           <span
             data-testid="ws-status"
             className={`font-mono text-[10px] uppercase tracking-widest ${
-              wsStatus === "open"
-                ? "text-[#00F0FF] blink"
-                : wsStatus === "no-auth"
-                ? "text-[#FF3B30]"
-                : "text-slate-500"
+              wsStatus === "open" ? "blink" : wsStatus !== "no-auth" ? "text-slate-500" : ""
             }`}
+            style={
+              wsStatus === "open"
+                ? { color: "var(--accent-info)" }
+                : wsStatus === "no-auth"
+                ? { color: "var(--accent-critical)" }
+                : undefined
+            }
             title={
               wsStatus === "open"
                 ? "WebSocket connected"
@@ -306,7 +344,7 @@ export default function MavlinkConsole() {
             <div className="p-4 text-slate-600">no packets transmitted<span className="term-caret" /></div>
           )}
           {stream.map((p) => (
-            <div key={p.id} data-testid={`pkt-${p.id}`} className="tactical-border-b p-3 hover:bg-[#0F1626]">
+            <div key={p.id} data-testid={`pkt-${p.id}`} className="tactical-border-b p-3 hover-surface">
               <div className="flex items-center justify-between mb-1">
                 <span className="text-slate-500">{p.ts?.replace("T", " ").split(".")[0]}</span>
                 <span className="text-[10px] uppercase tracking-widest text-slate-400">
@@ -315,12 +353,44 @@ export default function MavlinkConsole() {
                   {p.payload_name && <> · <span style={{color:"var(--accent-warning)"}}>{p.payload_name}</span></>}
                 </span>
               </div>
-              <div className="text-[11px] break-all" style={{ color: "var(--text-term)" }}>
-                {p.hex}
-              </div>
+              <HexBytes hex={p.hex} />
             </div>
           ))}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// Renders a MAVLink frame hex as space-separated byte pairs on a single
+// horizontally-scrolling line (never wrapping mid-byte), with the final two
+// bytes — the MAVLink CRC-16/MCRF4XX checksum — highlighted and captioned so
+// the "CRC-16 MCRF4XX" beat in the walkthrough has something to point at.
+function HexBytes({ hex }) {
+  if (!hex) return null;
+  const bytes = String(hex).replace(/[^0-9a-fA-F]/g, "").match(/.{1,2}/g) || [];
+  const hasCrc = bytes.length >= 2;
+  const body = hasCrc ? bytes.slice(0, -2) : bytes;
+  const crc = hasCrc ? bytes.slice(-2) : [];
+  return (
+    <div className="overflow-x-auto">
+      <div className="text-[11px] whitespace-nowrap tabular-nums" style={{ color: "var(--text-term)" }}>
+        <span>{body.join(" ")}</span>
+        {hasCrc && (
+          <>
+            {" "}
+            <span
+              className="font-bold"
+              style={{ color: "var(--accent-warning)" }}
+              title="CRC-16/MCRF4XX frame checksum (final 2 bytes)"
+            >
+              {crc.join(" ")}
+            </span>
+            <span className="ml-2 uppercase tracking-widest text-[9px]" style={{ color: "var(--accent-warning)" }}>
+              ◄ CRC
+            </span>
+          </>
+        )}
       </div>
     </div>
   );
@@ -344,7 +414,7 @@ function NumField({ label, val, onChange, disabled, step = "1", float = false, t
         value={val}
         disabled={disabled}
         onChange={(e) => onChange(float ? parseFloat(e.target.value || "0") : parseInt(e.target.value || "0"))}
-        className="w-full bg-black/50 tactical-border px-2 py-1 text-white focus:outline-none focus:border-[#00F0FF] disabled:opacity-40"
+        className="w-full bg-black/50 tactical-border px-2 py-1 text-white focus:outline-none focus-accent-info disabled:opacity-40"
       />
     </Field>
   );

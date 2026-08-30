@@ -8,7 +8,7 @@ import { toast } from "sonner";
 export default function Login() {
   const { user, login, loading } = useAuth();
   const [email, setEmail] = useState("operator@cema.mil");
-  const [password, setPassword] = useState("cema@2026");
+  const [password, setPassword] = useState("");
   const [busy, setBusy] = useState(false);
   const nav = useNavigate();
 
@@ -109,7 +109,7 @@ export default function Login() {
                 onChange={(e) => setEmail(e.target.value)}
                 required
                 autoComplete="email"
-                className="w-full bg-black/50 tactical-border px-3 py-2 font-mono text-sm text-white focus:outline-none focus:border-[#00F0FF]"
+                className="w-full bg-black/50 tactical-border px-3 py-2 font-mono text-sm text-white focus:outline-none focus-accent-info"
               />
             </label>
 
@@ -122,7 +122,7 @@ export default function Login() {
                 onChange={(e) => setPassword(e.target.value)}
                 required
                 autoComplete="current-password"
-                className="w-full bg-black/50 tactical-border px-3 py-2 font-mono text-sm text-white focus:outline-none focus:border-[#00F0FF]"
+                className="w-full bg-black/50 tactical-border px-3 py-2 font-mono text-sm text-white focus:outline-none focus-accent-info"
               />
             </label>
 
@@ -130,16 +130,11 @@ export default function Login() {
               data-testid="login-submit"
               type="submit"
               disabled={busy}
-              className="w-full flex items-center justify-center gap-2 py-3 tactical-border font-mono text-xs uppercase tracking-widest hover:bg-[#00F0FF] hover:text-black transition-colors scanline-btn disabled:opacity-50"
+              className="w-full flex items-center justify-center gap-2 py-3 tactical-border font-mono text-xs uppercase tracking-widest hover-accent-info transition-colors scanline-btn disabled:opacity-50"
               style={{ color: "var(--accent-info)", borderColor: "var(--accent-info)" }}
             >
               {busy ? "AUTHENTICATING…" : "ESTABLISH CHANNEL"} <ChevronRight size={14} strokeWidth={1.5} />
             </button>
-
-            <div className="mt-6 pt-6 tactical-border-t font-mono text-[10px] uppercase tracking-widest text-slate-600">
-              Default eval account:<br />
-              <span className="text-slate-400">operator@cema.mil / cema@2026</span>
-            </div>
           </form>
         </div>
       </div>

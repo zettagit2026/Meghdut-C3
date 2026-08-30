@@ -140,6 +140,13 @@ html, body, #root {
   border-left-color: var(--accent-info);
 }
 .hover-surface:hover { background: var(--hover-surface); }
+/* Token-routed accent hovers so action buttons don't hard-code raw neon hex
+   (retired #00F0FF / #FF3B30) for their :hover fill. */
+.hover-accent-info:hover { background: var(--accent-info); color: #000; }
+.hover-accent-critical:hover { background: var(--accent-critical); color: #000; }
+.focus-accent-info:focus { border-color: var(--accent-info); outline: none; }
+.focus-accent-critical:focus { border-color: var(--accent-critical); outline: none; }
+.border-accent-critical { border-color: var(--accent-critical); }
 .elev-surface { box-shadow: var(--elev-shadow); }
 
 /* App-wide muted-text remap for light mode.

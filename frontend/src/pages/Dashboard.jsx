@@ -194,7 +194,11 @@ function Waterfall() {
             style={{
               color: pollStale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",
               borderColor: pollStale ? "var(--accent-critical)" : isReal ? "var(--accent-success)" : "var(--accent-warning)",
-              background: pollStale ? "rgba(255,59,48,0.08)" : isReal ? "rgba(57,255,20,0.08)" : "rgba(255,214,10,0.06)",
+              background: pollStale
+                ? "color-mix(in srgb, var(--accent-critical) 8%, transparent)"
+                : isReal
+                ? "color-mix(in srgb, var(--accent-success) 8%, transparent)"
+                : "color-mix(in srgb, var(--accent-warning) 6%, transparent)",
             }}
           >
             {pollStale ? "◌ STALE" : isReal ? "● HACKRF LIVE" : "◌ NO SIGNAL"}
@@ -277,7 +281,7 @@ export default function Dashboard() {
   useEffect(() => {
     const cancelledRef = { current: false };
     load(cancelledRef);
-    const id = setInterval(() => load(cancelledRef), 60000);
+    const id = setInterval(() => load(cancelledRef), 2500);
     return () => { cancelledRef.current = true; clearInterval(id); };
   }, []);
 
@@ -328,7 +332,7 @@ export default function Dashboard() {
                 style={{
                   color: "var(--accent-success)",
                   borderColor: "var(--accent-success)",
-                  background: "rgba(57,255,20,0.08)",
+                  background: "color-mix(in srgb, var(--accent-success) 8%, transparent)",
                 }}
               >
                 ● {Array.from(liveSources).join(" + ")} LIVE
@@ -423,7 +427,7 @@ export default function Dashboard() {
                     const staticCritical = isStaticCritical(d);
                     return (
                       <tr key={d.id} data-testid={`row-${d.id}`}
-                          className={`tactical-border-b hover:bg-[#0F1626] transition-colors ${staticCritical ? "threat-critical-static" : ""} ${recentCritical ? "threat-critical-flash" : ""}`}>
+                          className={`tactical-border-b hover-surface transition-colors ${staticCritical ? "threat-critical-static" : ""} ${recentCritical ? "threat-critical-flash" : ""}`}>
                         <td className="p-2">
                           <span data-testid={`src-${d.id}`}
                                 className="px-1.5 py-0.5 tactical-border font-bold text-[9px]"

@@ -1,8 +1,11 @@
-import { NavLink, Outlet, useNavigate } from "react-router-dom";
+import { useEffect, useState } from "react";
+import { NavLink, Outlet, useNavigate, useLocation } from "react-router-dom";
 import { ClassificationBanner } from "@/components/ClassificationBanner";
 import RangeAuthorizationBanner from "@/components/RangeAuthorizationBanner";
 import EmergencyAbort from "@/components/EmergencyAbort";
+import ErrorBoundary from "@/components/ErrorBoundary";
 import ThemeToggle from "@/components/ThemeToggle";
+import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import {
   Radar, Waves, Radio, Bomb, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History, MapPin, BookOpen,
@@ -26,6 +29,29 @@ const NAV = [
 export default function Layout() {
   const { user, logout } = useAuth();
   const nav = useNavigate();
+  const location = useLocation();
+
+  // Real backend-sourced link/RX status for the header strip. Only surface
+  // status the /health endpoint actually reports — no fabricated datalinks.
+  const [health, setHealth] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const { data } = await api.get("/health");
+        if (!cancelled) setHealth(data);
+      } catch {
+        if (!cancelled) setHealth(null);
+      }
+    };
+    load();
+    const id = setInterval(load, 3000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  const sikUp = !!health?.sik_radio;
+  const hackrfUp = !!health?.hackrf;
+  const year = new Date().getFullYear();
 
   return (
     <div className="min-h-screen flex flex-col" style={{ background: "var(--bg-base)" }}>
@@ -76,7 +102,7 @@ export default function Layout() {
             <button
               data-testid="logout-btn"
               onClick={async () => { await logout(); nav("/login"); }}
-              className="mt-3 w-full flex items-center justify-center gap-2 px-3 py-2 tactical-border font-mono text-[10px] uppercase tracking-widest hover:bg-[#FF3B30] hover:text-black transition-colors scanline-btn"
+              className="mt-3 w-full flex items-center justify-center gap-2 px-3 py-2 tactical-border font-mono text-[10px] uppercase tracking-widest hover-accent-critical transition-colors scanline-btn"
             >
               <LogOut size={12} strokeWidth={1.5} />
               LOG OUT
@@ -90,17 +116,21 @@ export default function Layout() {
             className="tactical-border-b px-8 py-3 flex items-center justify-between gap-4"
             style={{ background: "var(--bg-surface)" }}
           >
-            <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 min-w-0 truncate">
+            <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 min-w-0 truncate flex items-center">
               <Terminal size={12} className="inline mr-2" strokeWidth={1.5} />
-              <span className="text-slate-300">SECURE CHANNEL</span>
+              <span style={{ color: sikUp ? "var(--accent-success)" : "var(--accent-critical)" }}>
+                ● SiK LINK {sikUp ? "UP" : "DOWN"}
+              </span>
               <span className="mx-3">|</span>
-              <span style={{ color: "var(--accent-success)" }}>● LINK-16 UP</span>
+              <span style={{ color: hackrfUp ? "var(--accent-success)" : "var(--accent-critical)" }}>
+                ● HackRF RX {hackrfUp ? "UP" : "DOWN"}
+              </span>
               <span className="mx-3">|</span>
-              <span style={{ color: "var(--accent-info)" }}>SDR: HACKRF · 1MHz–6GHz</span>
+              <span style={{ color: "var(--accent-info)" }}>WS CLIENTS: {health?.ws_clients ?? "—"}</span>
             </div>
             <div className="flex items-center gap-4 shrink-0">
               <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-                MISSION-ID: <span style={{ color: "var(--text-primary)" }}>CEMA-2026-{new Date().getFullYear()}-A</span>
+                MISSION-ID: <span style={{ color: "var(--text-primary)" }}>CEMA-cUAS-{year}-A</span>
               </div>
               <ThemeToggle />
               <EmergencyAbort />
@@ -108,7 +138,13 @@ export default function Layout() {
           </div>
 
           <div className="p-8 flex-1">
-            <Outlet />
+            {/* Per-page fault isolation: a render throw in a routed module shows
+                a tactical MODULE FAULT card here while the console chrome and
+                EmergencyAbort stay live. Keyed on pathname so navigating away
+                clears a faulted state. */}
+            <ErrorBoundary key={location.pathname}>
+              <Outlet />
+            </ErrorBoundary>
           </div>
         </main>
       </div>

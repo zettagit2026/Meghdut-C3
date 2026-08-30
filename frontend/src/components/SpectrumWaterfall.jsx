@@ -123,7 +123,7 @@ export default function SpectrumWaterfall() {
                 opacity: stale ? 0.35 : 1,
               }}
             />
-            <div className="flex flex-col justify-between font-mono text-[9px] text-slate-500 tabular-nums">
+            <div className="flex flex-col justify-between font-mono text-[11px] text-slate-500 tabular-nums">
               <span>{SPECTRUM_CEIL_DBM}</span>
               <span className="text-slate-600">dBm</span>
               <span>{SPECTRUM_FLOOR_DBM}</span>

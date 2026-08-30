@@ -132,7 +132,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
             data-testid={`range-auth-disable-btn-${effect}`}
             onClick={disableNow}
             disabled={disabling}
-            className="w-full px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors hover:bg-[#FF3B30] hover:text-black disabled:opacity-50"
+            className="w-full px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors hover-accent-critical disabled:opacity-50"
             style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
           >
             DISABLE RANGE AUTHORIZATION
@@ -205,7 +205,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
                   autoComplete="off"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#FF3B30]"
+                  className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus-accent-critical"
                   placeholder="Password"
                   required
                 />
@@ -222,7 +222,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
                   value={phrase}
                   onChange={(e) => setPhrase(e.target.value)}
                   className={`mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none ${
-                    phrase && !phraseMatches ? "border-[#FF3B30]" : "focus:border-[#FF3B30]"
+                    phrase && !phraseMatches ? "border-accent-critical" : "focus-accent-critical"
                   }`}
                   placeholder={CONFIRM_PHRASE}
                   required
@@ -245,9 +245,9 @@ export default function RangeAuthorizationControl({ effect, label }) {
                   className={`flex items-center gap-2 px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors ${
                     submitting || !password || !phraseMatches
                       ? "opacity-30 border-slate-700 text-slate-600 cursor-not-allowed"
-                      : "text-white border-[#FF3B30]"
+                      : "text-white border-accent-critical"
                   }`}
-                  style={!(submitting || !password || !phraseMatches) ? { background: "#FF3B30" } : undefined}
+                  style={!(submitting || !password || !phraseMatches) ? { background: "var(--accent-critical)" } : undefined}
                 >
                   <AlertOctagon size={14} strokeWidth={1.5} />
                   AUTHORIZE LIVE RANGE

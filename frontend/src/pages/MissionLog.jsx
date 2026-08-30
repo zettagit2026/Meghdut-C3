@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, formatApiError, API_BASE } from "@/lib/api";
 import { toast } from "sonner";
-import { ScrollText, FileDown } from "lucide-react";
+import { ScrollText, FileDown, Loader2, Link2 } from "lucide-react";
 
 const KIND_COLOR = {
   AUTH: "var(--accent-info)",
@@ -20,6 +20,7 @@ const STALE_THRESHOLD_MS = POLL_INTERVAL_MS * 4;
 
 export default function MissionLog() {
   const [logs, setLogs] = useState([]);
+  const [exporting, setExporting] = useState(false);
   const [lastSuccessAt, setLastSuccessAt] = useState(null);
   const [consecutiveFailures, setConsecutiveFailures] = useState(0);
   const [now, setNow] = useState(() => Date.now());
@@ -55,6 +56,8 @@ export default function MissionLog() {
   const tailingStale = staleByAge || staleByFailures || neverSucceeded;
 
   const downloadPdf = async () => {
+    if (exporting) return;
+    setExporting(true);
     try {
       toast.info("Generating classified report…");
       const token = localStorage.getItem("cema_token");
@@ -64,16 +67,22 @@ export default function MissionLog() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const blob = await res.blob();
       const url = URL.createObjectURL(blob);
+      const filename = `cema-mission-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.pdf`;
       const a = document.createElement("a");
       a.href = url;
-      a.download = `cema-mission-${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)}.pdf`;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       a.remove();
       URL.revokeObjectURL(url);
-      toast.success("Mission report downloaded");
+      const sizeKb = Math.max(1, Math.round(blob.size / 1024));
+      toast.success("Mission report downloaded", {
+        description: `${filename} · ${sizeKb} KB · ${new Date().toISOString().slice(0, 19)}Z`,
+      });
     } catch (e) {
       toast.error("Report failed", { description: e.message });
+    } finally {
+      setExporting(false);
     }
   };
 
@@ -91,10 +100,14 @@ export default function MissionLog() {
         <button
           data-testid="report-pdf-btn"
           onClick={downloadPdf}
-          className="flex items-center gap-2 px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest hover:bg-[#00F0FF] hover:text-black transition-colors scanline-btn"
+          disabled={exporting}
+          aria-busy={exporting}
+          className="flex items-center gap-2 px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest hover-accent-info transition-colors scanline-btn disabled:opacity-50 disabled:cursor-wait"
           style={{ color: "var(--accent-info)", borderColor: "var(--accent-info)" }}
         >
-          <FileDown size={14} strokeWidth={1.5} /> EXPORT MISSION REPORT (PDF)
+          {exporting
+            ? <><Loader2 size={14} strokeWidth={1.5} className="animate-spin" /> GENERATING…</>
+            : <><FileDown size={14} strokeWidth={1.5} /> EXPORT MISSION REPORT (PDF)</>}
         </button>
       </div>
 
@@ -120,7 +133,7 @@ export default function MissionLog() {
           )}
           {logs.map((l) => (
             <div key={l.id} data-testid={`log-${l.id}`}
-                 className="px-4 py-2 tactical-border-b flex flex-col md:flex-row md:items-center gap-2 hover:bg-[#0F1626]">
+                 className="px-4 py-2 tactical-border-b flex flex-col md:flex-row md:items-center gap-2 hover-surface">
               <span className="text-slate-500 shrink-0">{l.ts?.replace("T", " ").split(".")[0]}Z</span>
               <span className="uppercase tracking-widest text-[10px] shrink-0"
                     style={{ color: KIND_COLOR[l.kind] || "var(--text-primary)" }}>
@@ -128,6 +141,24 @@ export default function MissionLog() {
               </span>
               <span className="text-slate-300 flex-1">{l.message}</span>
               <span className="text-slate-600 text-[10px]">{l.actor}</span>
+              {l.entry_hash ? (
+                <span
+                  data-testid={`log-hash-${l.id}`}
+                  className="shrink-0 inline-flex items-center gap-1 text-[10px] tracking-wider tabular-nums"
+                  style={{ color: "var(--accent-info)" }}
+                  title={`SHA-256 hash-chain link · seq ${l.seq}\nentry_hash: ${l.entry_hash}\nprev_hash:  ${l.prev_hash}`}
+                >
+                  <Link2 size={10} strokeWidth={2} />
+                  {l.entry_hash.slice(0, 10)}
+                </span>
+              ) : (
+                <span
+                  className="shrink-0 text-[10px] tracking-wider text-slate-700"
+                  title="Legacy entry written before the audit hash-chain existed (unchained)."
+                >
+                  unchained
+                </span>
+              )}
             </div>
           ))}
         </div>

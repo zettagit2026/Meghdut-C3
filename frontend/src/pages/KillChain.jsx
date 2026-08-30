@@ -250,7 +250,7 @@ export default function KillChain() {
             }}
           />
         )}
-        <div className="px-4 pb-3 pt-1 font-mono text-[9px] uppercase tracking-widest text-slate-600 flex gap-4 flex-wrap">
+        <div className="px-4 pb-3 pt-1 font-mono text-[11px] uppercase tracking-widest text-slate-600 flex gap-4 flex-wrap">
           <span><span style={{ color: "var(--threat-info)" }}>●</span> in-progress</span>
           <span><span style={{ color: "var(--threat-critical)" }}>◆</span> neutralized</span>
           <span><span style={{ color: "var(--threat-medium)" }}>⬡</span> awaiting ack</span>
@@ -302,7 +302,7 @@ export default function KillChain() {
                   <button
                     data-testid={`kc-advance-${d.id}`}
                     onClick={() => advance(d.id)}
-                    className="flex items-center gap-2 px-3 py-1.5 tactical-border font-mono text-[10px] uppercase tracking-widest hover:bg-[#00F0FF] hover:text-black transition-colors scanline-btn"
+                    className="flex items-center gap-2 px-3 py-1.5 tactical-border font-mono text-[10px] uppercase tracking-widest hover-accent-info transition-colors scanline-btn"
                     style={{ color: "var(--accent-info)", borderColor: "var(--accent-info)" }}
                   >
                     ADVANCE <ChevronRight size={12} strokeWidth={1.5} />
