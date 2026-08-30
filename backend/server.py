@@ -1024,6 +1024,12 @@ async def startup() -> None:
     await db.ingest_health.create_index("bridge", unique=True)
     await db.iff_revocations.create_index("asset_id", unique=True)
     await db.detections.create_index([("status", 1), ("last_seen", 1), ("source", 1)])
+    # WiFi identification-confidence fusion ground-truth store (see
+    # DETECTION_WIFI_FUSION_ENABLED / wifi_reference_ingest). Reference data
+    # cross-referenced by detection_ingest -- NOT detection/board contacts.
+    # Bounded by distinct-MAC count (upsert-by-MAC, latest-seen wins).
+    await db.wifi_ground_truth.create_index("mac", unique=True)
+    await db.wifi_ground_truth.create_index([("center_freq_ghz", 1), ("last_seen", 1)])
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
     if existing is None:
         await db.users.insert_one({
@@ -2700,6 +2706,28 @@ class DetectionIngestBody(BaseModel):
     confidence_type: Optional[str] = None
 
 
+class WifiReferenceIngestBody(BaseModel):
+    """One Kismet 802.11 ground-truth device presence, forwarded by
+    field-bridge/kismet_bridge.py. Stored in db.wifi_ground_truth as REFERENCE
+    data the WiFi fusion cross-references (see DETECTION_WIFI_FUSION_ENABLED) --
+    explicitly NOT a detection/board contact. A WiFi AP is reference data, never
+    a threat contact; keeping these out of db.detections is what prevents the
+    board being flooded with ~20-50 ambient WiFi 'contacts'."""
+    mac: str
+    oui: Optional[str] = None
+    manuf: Optional[str] = None
+    ssid: Optional[str] = None
+    device_type: Optional[str] = None
+    phyname: str = "IEEE802.11"
+    frequency_khz: Optional[float] = None
+    center_freq_ghz: float
+    rssi_dbm: Optional[float] = None
+    # kismet_bridge.py computes this (MAC OUI in DRONE_MANUFACTURER_OUIS). A
+    # drone-OUI 802.11 device corroborates a co-channel RF candidate rather than
+    # re-attributing it to ordinary WiFi.
+    is_drone_oui: bool = False
+
+
 # =====================================================================
 # Routes: analog FPV video bridge ingest (field-bridge/fpv_video_bridge.py)
 # =====================================================================
@@ -2922,6 +2950,43 @@ DETECTION_STALE_TIMEOUT_S = 600  # (10 min) NOT the same thing as the merge
                                # remain in the Mission Log / audit history.
 
 
+# =====================================================================
+# WiFi identification-confidence fusion (RF <-> Kismet 802.11 ground truth).
+#
+# The 2.4GHz ISM band is shared by DJI OcuSync/video control links AND ordinary
+# WiFi. The RSSI/persistence heuristic (hackrf_rx.py) and the closed-world ML
+# classifier (ml_classify_bridge.py) both routinely flag ambient WiFi APs as
+# "DJI Mini (candidate)" -- the live board shows ~20 such candidates that are
+# actually WiFi. This fusion cross-references a real Kismet WiFi monitor
+# (AR9271, phyname "IEEE802.11") as GROUND TRUTH: a co-channel ordinary WiFi
+# device RE-ATTRIBUTES the candidate to WiFi (LOW / advisory), a co-channel
+# drone-OUI (DJI/Parrot/Autel) WiFi device CORROBORATES it (multidomain_fused).
+#
+# FEATURE-FLAGGED: DETECTION_WIFI_FUSION_ENABLED. Default true for the demo;
+# set to a falsy value ("false"/"0"/"no"/"off") to fully disable -- when off,
+# detection_ingest behaves EXACTLY as it did before this fusion existed (no
+# re-attribution, no ground-truth query). Read once at import; toggling it
+# requires a backend restart (docker compose up -d backend).
+DETECTION_WIFI_FUSION_ENABLED = (
+    os.environ.get("DETECTION_WIFI_FUSION_ENABLED", "true").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+# 2.4GHz ISM band edges (GHz). The AR9271 monitor is 2.4GHz-only, and re-
+# attribution is confined to this band: a 5.8GHz DJI candidate has no 2.4GHz
+# WiFi ground truth to cross-check and must remain a candidate (honest -- we
+# do not claim to segregate a band we have no WiFi monitor on).
+WIFI_FUSION_BAND_24_LO_GHZ = 2.400
+WIFI_FUSION_BAND_24_HI_GHZ = 2.500
+# In-band tolerance matching a candidate's peak center frequency against a
+# Kismet 802.11 device's channel center (~one 20MHz channel half-width + slop).
+WIFI_FUSION_FREQ_TOLERANCE_GHZ = 0.015  # +/- 15 MHz
+# How fresh a Kismet ground-truth device must be to count. Deliberately DECOUPLED
+# from (and longer than) DETECTION_MERGE_WINDOW_S: kismet_bridge.py re-posts each
+# device on its own throttle, and a continuously-beaconing AP must stay "present"
+# across the gaps so a re-attributed contact does not flicker back to "drone".
+WIFI_FUSION_GROUND_TRUTH_FRESH_S = 60
+
+
 ML_RECLASSIFY_MIN_CONFIDENCE = 0.60
 # When the ML classify bridge's REAL inference explicitly says "wifi_2_4" or
 # "wifi_5" -- i.e. NOT "drone" -- at or above this confidence, we correct the
@@ -3025,6 +3090,126 @@ def _heuristic_display(model: Optional[str], confidence_type: Optional[str]):
     if confidence_type != "heuristic_binary":
         return None
     return HEURISTIC_GENERIC_DISPLAY.get(model)
+
+
+# =====================================================================
+# WiFi identification-confidence fusion helpers (see DETECTION_WIFI_FUSION_ENABLED
+# and the constant block above). These implement the RF<->Kismet-802.11 cross-
+# reference used by detection_ingest to segregate real drones from ambient
+# 2.4GHz WiFi. Same wire/display split as the ML/heuristic overrides above: the
+# raw (immutable) model on the wire is never changed; the honest attribution is
+# substituted into the DISPLAYED fields + confidence_type here, server-side.
+# =====================================================================
+
+# Raw (wire) model strings that hackrf_rx.py / ml_classify_bridge.py POST for a
+# 2.4GHz drone CANDIDATE. "DJI Mini (candidate)" is the only 2.4GHz entry in
+# hackrf_rx.py's BAND_DETECTION_META (the live board clutter); the others
+# (MAVLink/LRS/FPV craft) live in 915MHz/433/868/1.3GHz bands the 2.4GHz band
+# gate already excludes.
+DRONE_CANDIDATE_WIRE_MODELS_24 = {"DJI Mini (candidate)"}
+
+
+def _is_24ghz_drone_candidate(raw_model, center_freq_ghz, ml_label,
+                              confidence_type, protocol_confirmed) -> bool:
+    """True when this detection is an UNCONFIRMED 2.4GHz drone candidate that
+    the WiFi fusion is allowed to re-attribute. Covers BOTH the RSSI-heuristic
+    path (hackrf_rx.py: heuristic_binary "DJI Mini (candidate)") and the ML path
+    (ml_classify_bridge.py: ml_label=="drone", or a weak unclassified_signal
+    read). Deliberately excludes anything CONFIRMED by a real protocol decode
+    (protocol_confirmed / confidence_type=="protocol_verified") -- a decoded
+    drone is real and must NEVER be suppressed by a co-channel WiFi AP. Also a
+    no-op when the feature flag is off, so callers need no extra guard."""
+    if not DETECTION_WIFI_FUSION_ENABLED:
+        return False
+    if protocol_confirmed or confidence_type == "protocol_verified":
+        return False
+    if center_freq_ghz is None:
+        return False
+    if not (WIFI_FUSION_BAND_24_LO_GHZ <= center_freq_ghz <= WIFI_FUSION_BAND_24_HI_GHZ):
+        return False
+    # ML path: the classifier itself called it "drone". NOTE: that closed-world
+    # model is known to hallucinate "drone" on noise (see DetectionIngestBody),
+    # which is precisely why corroborating it against real WiFi ground truth is
+    # valuable rather than trusting it outright.
+    if ml_label == "drone":
+        return True
+    # RSSI-heuristic / unclassified path: a bare candidate whose RAW wire model
+    # is a known 2.4GHz drone-candidate string (or any "(candidate)" model that
+    # reached the 2.4GHz band gate above).
+    if confidence_type in (None, "heuristic_binary", "unclassified_signal"):
+        if raw_model in DRONE_CANDIDATE_WIRE_MODELS_24:
+            return True
+        if isinstance(raw_model, str) and "candidate" in raw_model.lower():
+            return True
+    return False
+
+
+async def _wifi_fusion_lookup(center_freq_ghz):
+    """Cross-reference recent Kismet 802.11 ground truth in-band. Returns
+    (drone_oui_device, non_drone_device); either may be None (strongest-signal
+    wins within each class). A drone-OUI device (DJI/Parrot/Autel MAC)
+    CORROBORATES; a non-drone device (ordinary AP/client) RE-ATTRIBUTES the
+    candidate to WiFi."""
+    if not DETECTION_WIFI_FUSION_ENABLED or center_freq_ghz is None:
+        return None, None
+    since = (datetime.now(timezone.utc)
+             - timedelta(seconds=WIFI_FUSION_GROUND_TRUTH_FRESH_S)).isoformat()
+    lo = center_freq_ghz - WIFI_FUSION_FREQ_TOLERANCE_GHZ
+    hi = center_freq_ghz + WIFI_FUSION_FREQ_TOLERANCE_GHZ
+    cursor = db.wifi_ground_truth.find({
+        "last_seen": {"$gt": since},
+        "center_freq_ghz": {"$gte": lo, "$lte": hi},
+    })
+    drone_dev, non_drone_dev = None, None
+    async for dev in cursor:
+        rssi = dev.get("rssi_dbm")
+        rssi = rssi if rssi is not None else -999.0
+        if dev.get("is_drone_oui"):
+            if drone_dev is None or rssi > (drone_dev.get("rssi_dbm") or -999.0):
+                drone_dev = dev
+        else:
+            if non_drone_dev is None or rssi > (non_drone_dev.get("rssi_dbm") or -999.0):
+                non_drone_dev = dev
+    return drone_dev, non_drone_dev
+
+
+def _wifi_attribution_override(drone_dev, non_drone_dev):
+    """Given the in-band Kismet ground truth for a 2.4GHz drone candidate,
+    return the {confidence_type, threat_level, [model, protocol], wifi_fusion}
+    override to apply, or None. A drone-OUI device takes precedence: a specific
+    DJI/Parrot/Autel MAC seen on-channel is a stronger corroboration than merely
+    'some AP is also in-band'."""
+    if drone_dev is not None:
+        manuf = drone_dev.get("manuf") or drone_dev.get("oui") or "drone-OUI device"
+        return {
+            "confidence_type": "multidomain_fused",
+            "threat_level": "HIGH",
+            "wifi_fusion": {
+                "verdict": "corroborated_drone",
+                "matched_manuf": manuf,
+                "matched_mac_oui": drone_dev.get("oui"),
+                "matched_ssid": drone_dev.get("ssid"),
+                "source": "kismet_ieee80211",
+            },
+        }
+    if non_drone_dev is not None:
+        manuf = non_drone_dev.get("manuf") or "Wi-Fi device"
+        ssid = non_drone_dev.get("ssid")
+        label = f"Wi-Fi — {manuf}" + (f" ({ssid})" if ssid else "")
+        return {
+            "confidence_type": "wifi_attributed",
+            "threat_level": "LOW",
+            "model": label,
+            "protocol": "Wi-Fi 802.11",
+            "wifi_fusion": {
+                "verdict": "attributed_wifi",
+                "matched_manuf": manuf,
+                "matched_mac_oui": non_drone_dev.get("oui"),
+                "matched_ssid": ssid,
+                "source": "kismet_ieee80211",
+            },
+        }
+    return None
 
 
 # =====================================================================
@@ -3416,6 +3601,35 @@ async def detection_ingest(body: DetectionIngestBody,
                 updates["original_protocol"] = existing.get("original_protocol") or existing.get("protocol")
                 updates["model"], updates["protocol"] = heuristic_display
 
+        # WiFi identification-confidence fusion (feature-flagged --
+        # DETECTION_WIFI_FUSION_ENABLED; _is_24ghz_drone_candidate() is a no-op
+        # when off). Cross-reference this 2.4GHz drone CANDIDATE against recent
+        # Kismet 802.11 ground truth to segregate real drones from ambient WiFi.
+        # Keys off the RAW/immutable match_model, never the display-overridden
+        # one, and never re-attributes a protocol_verified decode. Applied AFTER
+        # the ML/heuristic display overrides above so a real WiFi ground-truth
+        # match (a stronger signal than a bare heuristic or a weak/hallucinated
+        # ML "drone") takes precedence; runs BEFORE IFF so a verified friendly
+        # still wins.
+        raw_model_for_fusion = (existing.get("match_model")
+                                or existing.get("original_model")
+                                or existing.get("model"))
+        if _is_24ghz_drone_candidate(raw_model_for_fusion, body.center_freq_ghz,
+                                     updates.get("ml_label"),
+                                     updates.get("confidence_type"),
+                                     updates.get("protocol_confirmed")):
+            drone_dev, non_drone_dev = await _wifi_fusion_lookup(body.center_freq_ghz)
+            fusion_override = _wifi_attribution_override(drone_dev, non_drone_dev)
+            if fusion_override:
+                updates["original_model"] = existing.get("original_model") or existing.get("model")
+                updates["original_protocol"] = existing.get("original_protocol") or existing.get("protocol")
+                if "model" in fusion_override:
+                    updates["model"] = fusion_override["model"]
+                    updates["protocol"] = fusion_override["protocol"]
+                updates["threat_level"] = fusion_override["threat_level"]
+                updates["confidence_type"] = fusion_override["confidence_type"]
+                updates["wifi_fusion"] = fusion_override["wifi_fusion"]
+
         # IFF suppression (task #60): a fresh, bearing-consistent verified
         # friendly beacon downgrades this detection's threat_level rather
         # than deleting/hiding the record -- see _check_iff_friendly_match
@@ -3507,6 +3721,24 @@ async def detection_ingest(body: DetectionIngestBody,
         if heuristic_display:
             original_model, original_protocol = body.model, body.protocol
             model, protocol = heuristic_display
+
+    # WiFi identification-confidence fusion, applied on first-ever creation too
+    # (see the identical merge/update-path comment above). body.model is the raw
+    # wire model here == the match_model captured just below, so the candidate
+    # check keys off the immutable identity.
+    wifi_fusion_meta = None
+    if _is_24ghz_drone_candidate(body.model, body.center_freq_ghz, body.ml_label,
+                                 confidence_type, body.protocol_confirmed):
+        drone_dev, non_drone_dev = await _wifi_fusion_lookup(body.center_freq_ghz)
+        fusion_override = _wifi_attribution_override(drone_dev, non_drone_dev)
+        if fusion_override:
+            if original_model is None:
+                original_model, original_protocol = body.model, body.protocol
+            if "model" in fusion_override:
+                model, protocol = fusion_override["model"], fusion_override["protocol"]
+            threat_level = fusion_override["threat_level"]
+            confidence_type = fusion_override["confidence_type"]
+            wifi_fusion_meta = fusion_override["wifi_fusion"]
     det.update({
         "callsign": body.callsign or det["callsign"],
         "model": model,
@@ -3545,6 +3777,10 @@ async def detection_ingest(body: DetectionIngestBody,
         "ml_confidence": body.ml_confidence,
         "ml_gated": body.ml_gated,
         "confidence_type": confidence_type,
+        # WiFi fusion attribution metadata (matched Kismet 802.11 manuf/SSID/
+        # verdict), or None when the fusion did not fire. Additive display-only
+        # field; consumers ignore it when absent.
+        "wifi_fusion": wifi_fusion_meta,
     })
 
     # IFF suppression (task #60) -- see identical comment in the
@@ -3567,6 +3803,37 @@ async def detection_ingest(body: DetectionIngestBody,
     # detection. Additive — does not alter the detection record.
     await _observe_track_for_detection(det, user["email"])
     return det
+
+
+@api.post("/detections/wifi-reference")
+async def wifi_reference_ingest(body: WifiReferenceIngestBody,
+                                user: Dict = Depends(get_current_user)):
+    """Upsert one Kismet 802.11 device into the WiFi ground-truth reference
+    store (db.wifi_ground_truth). This deliberately does NOT create a detection
+    or board contact: these devices are cross-referenced by detection_ingest's
+    WiFi fusion (see DETECTION_WIFI_FUSION_ENABLED) to segregate real drones from
+    ambient 2.4GHz WiFi. Keyed by MAC (latest-seen wins), same 'upsert current
+    state' pattern as /iff/beacons/ingest -- so the store is bounded by the count
+    of distinct MACs ever seen, not by poll cadence. When the fusion feature is
+    off this store simply goes unread; forwarding it is harmless."""
+    now = datetime.now(timezone.utc).isoformat()
+    doc = {
+        "mac": body.mac,
+        "oui": body.oui,
+        "manuf": body.manuf,
+        "ssid": body.ssid,
+        "device_type": body.device_type,
+        "phyname": body.phyname,
+        "frequency_khz": body.frequency_khz,
+        "center_freq_ghz": body.center_freq_ghz,
+        "rssi_dbm": body.rssi_dbm,
+        "is_drone_oui": body.is_drone_oui,
+        "last_seen": now,
+    }
+    await db.wifi_ground_truth.update_one(
+        {"mac": body.mac}, {"$set": doc}, upsert=True,
+    )
+    return {"stored": True, "mac": body.mac, "last_seen": now}
 
 
 

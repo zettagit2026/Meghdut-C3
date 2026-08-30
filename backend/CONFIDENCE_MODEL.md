@@ -36,7 +36,8 @@ renderer* is honest for this row.
 # backend/server.py, DetectionIngestBody
 confidence_type: Optional[str] = None
 # One of: "heuristic_binary", "ml_probability", "protocol_verified",
-# "advisory_only", "unclassified_signal", "bistatic_radar_detection".
+# "advisory_only", "unclassified_signal", "bistatic_radar_detection",
+# "multidomain_fused", "wifi_attributed".
 # Optional/None for any source that hasn't been updated yet (backward
 # compatible — absence means "render as before"). `source: str` and
 # `confidence_type: Optional[str]` have no enum constraint at the Pydantic
@@ -55,7 +56,8 @@ confidence_type: Optional[str] = None
 | `advisory_only` | Presence heuristic, explicitly not an identity or threat claim. | Plain neutral "advisory" tag, distinct styling from confirmed detections, no percentage. |
 | `unclassified_signal` | Real, energy-gated RF confirmed present (same gate as `ml_probability`), but the classifier's own winning-class softmax probability was below `CEMA_ML_UNCLASSIFIED_MAX_CONFIDENCE` (default **0.6**, aligned with `ML_RECLASSIFY_MIN_CONFIDENCE` — see coherence note below) — i.e. it could not confidently place the signal in any of its 3 known classes (drone/wifi_2_4/wifi_5). This is cheap, zero-new-dependency logic added directly in `ml_classify_bridge.py`, computed from softmax probabilities the classifier already produces — no new model or OOT dependency (e.g. gr-inspector) required. | Distinct "UNCLASSIFIED" tag (not "flagged", not a trusted probability) showing the weak top-guess percentage for context, distinct styling from `ml_probability`. Also counts as an "unconfirmed" detection for `isUnconfirmedDetection()`/`UnconfirmedTag` (2026-07-23 fix) — an explicit "I don't know" from the classifier is at least as uncertain as `heuristic_binary`, and that function previously only checked for `heuristic_binary`, silently missing this case. |
 | `bistatic_radar_detection` | A CFAR-thresholded cross-ambiguity-function (CAF) peak from `field-bridge/passive_radar_bridge.py` (task #43, C10) — a real physical-layer detection statistic derived from bistatic range-Doppler processing against an illuminator of opportunity (broadcast TV/FM/cellular), not an RSSI heuristic, not an ML softmax, not a protocol decode. Its own distinct epistemic category; see `field-bridge/PASSIVE_RADAR_ARCHITECTURE.md` §4 for the full field mapping (`distance_m`/`distance_estimated=False` since it's a genuine time-of-flight-derived range, `bearing_deg` from antenna boresight only, `speed_ms` from the CAF's Doppler bin, `rssi_dbm`/`snr_db` repurposed as CAF peak SNR). | Distinct "bistatic radar" tag/badge, showing peak SNR, with an explicit bearing-accuracy caveat (boresight-only until a rotator or antenna array exists, task #57+) — never conflated with `ml_probability`'s bar or `protocol_verified`'s checkmark. |
-| `multidomain_fused` | A DERIVED confidence produced by `field-bridge/multidomain_fusion.py` (task #123) combining two or more independent modalities' (RF/thermal/optical/acoustic) own confidence values via weighted log-likelihood-ratio (log-odds) summation — see that module's docstring for the full justification of this fusion rule over a plain weighted average. Genuinely distinct from every other value above: it is not any single sensor's raw probability, decode result, or heuristic — it is a combination of others, and can additionally carry a `conflict_detected` flag with no analogue in any single-sensor confidence type. **NOT WIRED INTO ANY LIVE INGEST PATH as of this writing** — see honesty note below. | Distinct "fused" tag/badge showing the combined probability AND, when `conflict_detected=True`, an explicit disagreement warning distinguishing it from an ordinary medium-confidence single-sensor read (not yet implemented in the frontend since nothing produces this value in production yet). |
+| `multidomain_fused` | A DERIVED confidence combining two or more independent sensing modalities. Two realizations exist: (a) `field-bridge/multidomain_fusion.py` (task #123), a generic RF/thermal/optical/acoustic log-odds combiner — still not wired into any live ingest path; and (b) **RF↔Kismet-WiFi fusion (2026-08, WIRED)** in `backend/server.py` `detection_ingest()`: a 2.4GHz RF drone-candidate (RSSI-heuristic or ML) that is CORROBORATED by a co-channel drone-OUI (DJI/Parrot/Autel) IEEE802.11 device seen by the Kismet WiFi monitor (AR9271) is raised to `multidomain_fused` (two independent sensors — the SDR sweep and the WiFi monitor — agree). Distinct from every single-sensor value: it is a combination of others. Gated by `DETECTION_WIFI_FUSION_ENABLED` (default on). | Distinct "FUSED / CORROBORATED" badge (see `ConfidenceTypeBadge.jsx`), threat raised to HIGH, with the matched WiFi manufacturer surfaced from the `wifi_fusion` metadata. |
+| `wifi_attributed` | **RF↔Kismet-WiFi fusion (2026-08, WIRED)** in `backend/server.py` `detection_ingest()`. The inverse of the corroboration case above: a 2.4GHz RF drone-candidate (the live board's "possible DJI Mini (candidate)" clutter — from BOTH hackrf_rx.py's RSSI heuristic and ml_classify_bridge.py's closed-world ML) is RE-ATTRIBUTED to ordinary WiFi because the Kismet WiFi monitor sees a co-channel (±15 MHz), recently-seen (`WIFI_FUSION_GROUND_TRUTH_FRESH_S`) non-drone-OUI IEEE802.11 device in-band. The detection is NOT deleted — it is honestly re-attributed: `threat_level` → LOW, displayed `model` → "Wi-Fi — <manuf> (<ssid>)", with the raw heuristic guess preserved in `original_model`. NEVER fires for a `protocol_verified`/`protocol_confirmed` decode (a decoded drone is real and must not be suppressed). Gated by `DETECTION_WIFI_FUSION_ENABLED` (default on; false = exact prior behavior). | Neutral blue "Wi-Fi (identified)" badge (see `ConfidenceTypeBadge.jsx`), non-threat styling, tooltip naming the matched WiFi manuf/SSID. Not treated as an "unconfirmed drone" — it is an identified WiFi emitter, not a drone. |
 
 ### Bridge -> enum mapping
 
@@ -67,6 +69,7 @@ confidence_type: Optional[str] = None
 | `field-bridge/droneid_decode_bridge.py`, `det` | after `payload.check_crc()` passes (~line 257) | `"protocol_verified"` |
 | `field-bridge/ml_classify_bridge.py`, `det` | when winning-class softmax < `UNCLASSIFIED_MAX_CONFIDENCE` (see `is_unclassified` in `gated_capture_and_classify` caller) | `"unclassified_signal"` |
 | `field-bridge/passive_radar_bridge.py`, `det` | after CFAR/top-K peak-picking (`detector.py`) over the CAF range-Doppler map | `"bistatic_radar_detection"` |
+| `field-bridge/kismet_bridge.py` (802.11 ground truth) → `backend/server.py` `detection_ingest()` | reference devices POSTed to `/api/detections/wifi-reference` (stored in `db.wifi_ground_truth`, NOT the detections board), then cross-referenced in `detection_ingest()`'s WiFi fusion | `"wifi_attributed"` (co-channel non-drone WiFi in-band → re-attribute) or `"multidomain_fused"` (co-channel drone-OUI WiFi in-band → corroborate). Gated by `DETECTION_WIFI_FUSION_ENABLED`. |
 
 Notes:
 - `field-bridge/mavlink_sniffer.py` (real MAVLink HEARTBEAT decode, sets
@@ -96,6 +99,27 @@ Notes:
   that hardware exists AND a real correlation key is designed, per this
   document's and the scope document's "don't manufacture false precision /
   false correlation" discipline.
+- **RF↔Kismet-WiFi fusion (2026-08, WIRED — distinct from `multidomain_fusion.py`
+  above).** The caution above forbids wiring `multidomain_fused` "until a real
+  correlation key is designed". That key now genuinely exists for ONE specific,
+  physically-justified case, and only that case is wired: a 2.4GHz RF drone-
+  candidate and a Kismet WiFi-monitor 802.11 device are correlated by **in-band
+  co-channel frequency (±`WIFI_FUSION_FREQ_TOLERANCE_GHZ` = 15 MHz) within a
+  freshness window (`WIFI_FUSION_GROUND_TRUTH_FRESH_S`)** — two independent real
+  sensors (the HackRF SDR sweep and the AR9271 WiFi monitor) observing the same
+  physical band at the same time. This is NOT the generic `multidomain_fusion.py`
+  log-odds combiner (that stays unwired); it is a direct re-attribution/
+  corroboration in `detection_ingest()`, computed server-side off real Kismet
+  ground truth. It re-attributes ambient WiFi (`wifi_attributed`) or corroborates
+  a real drone (`multidomain_fused`), never fabricating a contact and never
+  suppressing a `protocol_verified` decode. **Honest limitation:** an OcuSync
+  drone whose control link does NOT present a drone-OUI 802.11 MAC to Kismet, if
+  co-channel with an ordinary AP, would be `wifi_attributed` (a false negative on
+  a bare RF-heuristic candidate). This is the accepted trade to clear ~20 ambient
+  WiFi false positives; it is feature-flagged (`DETECTION_WIFI_FUSION_ENABLED`),
+  advisory (LOW, not deleted), and cannot affect any protocol-decoded drone (the
+  dedicated droneid/remoteid/mavlink bridges set `protocol_confirmed`, which the
+  fusion explicitly excludes).
 - `field-bridge/rf_features.py` (spectral-feature RandomForest classifier,
   backlog C13, added 2026-07-23) is a FUTURE sixth source and would use a
   NEW enum value, `"spectral_features_ml"` (a real probability from a
@@ -149,6 +173,8 @@ Do NOT try to render one universal "confidence meter." Branch on
 - `heuristic_binary` -> plain "flagged" tag, no number.
 - `advisory_only` -> plain neutral "advisory" tag, no number.
 - `unclassified_signal` -> distinct "unclassified" tag with the (weak) top-guess percentage for context, never styled as a trusted result.
+- `wifi_attributed` -> neutral blue "Wi-Fi (identified)" tag, non-threat styling, tooltip naming the matched WiFi manuf/SSID (from `wifi_fusion`). Not a drone; not an "unconfirmed drone".
+- `multidomain_fused` -> "FUSED / CORROBORATED" badge (two sensors agree), highest-alert styling, matched WiFi manuf surfaced from `wifi_fusion`.
 - absent/unknown -> fall back to current behavior (just `threat_level`), so older rows or not-yet-wired sources don't break.
 
 ### On gr-inspector (evaluated, not integrated)

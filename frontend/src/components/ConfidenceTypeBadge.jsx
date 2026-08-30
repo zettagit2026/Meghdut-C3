@@ -11,6 +11,11 @@
 //   model's winning softmax probability was too weak to trust any of its
 //   known classes -- distinct from ml_probability (a trusted class guess)
 // - advisory_only     -> plain neutral "advisory" tag, no number
+// - wifi_attributed   -> neutral "Wi-Fi (identified)" tag: an RF 2.4GHz drone-
+//   candidate re-attributed to ordinary WiFi because the Kismet WiFi monitor
+//   saw a co-channel IEEE802.11 device (ground-truth fusion). Not a drone.
+// - multidomain_fused -> "FUSED / CORROBORATED": RF candidate corroborated by a
+//   co-channel drone-OUI (DJI/Parrot/Autel) WiFi device (ground-truth fusion).
 // - absent/unknown    -> render nothing (falls back to existing threat_level display)
 export default function ConfidenceTypeBadge({ detection }) {
   const type = detection?.confidence_type;
@@ -77,6 +82,38 @@ export default function ConfidenceTypeBadge({ detection }) {
           ADVISORY
         </span>
       );
+    case "wifi_attributed": {
+      // RF drone-candidate re-attributed to ordinary WiFi because a co-channel
+      // IEEE802.11 device was seen by the Kismet WiFi monitor (ground truth).
+      // Neutral, non-threat styling -- this is not a drone.
+      const wf = detection.wifi_fusion || {};
+      const manuf = wf.matched_manuf || "Wi-Fi device";
+      const ssid = wf.matched_ssid ? ` (${wf.matched_ssid})` : "";
+      return (
+        <span
+          className={common}
+          style={{ color: "#5FA8D3", borderColor: "#2F5A73", background: "rgba(47,90,115,0.18)" }}
+          title={`Cross-referenced against the Kismet WiFi monitor: a co-channel IEEE802.11 device (${manuf}${ssid}) is present in-band, so this 2.4GHz contact is attributed to ordinary WiFi, not a drone. Reference data, downgraded to LOW/advisory -- not deleted.`}
+        >
+          Wi-Fi (identified)
+        </span>
+      );
+    }
+    case "multidomain_fused": {
+      // RF drone-candidate CORROBORATED by a co-channel drone-OUI
+      // (DJI/Parrot/Autel) IEEE802.11 device seen by the Kismet WiFi monitor.
+      const wf = detection.wifi_fusion || {};
+      const manuf = wf.matched_manuf ? ` (${wf.matched_manuf})` : "";
+      return (
+        <span
+          className={common}
+          style={{ color: "#0F1626", borderColor: "var(--accent-danger, #E5484D)", background: "var(--accent-danger, #E5484D)" }}
+          title={`Multi-domain fusion: the RF detection is corroborated by a co-channel drone-manufacturer WiFi device${manuf} seen by the Kismet WiFi monitor. Two independent sensors agree -- confidence raised.`}
+        >
+          ✓ FUSED / CORROBORATED
+        </span>
+      );
+    }
     default:
       return null;
   }

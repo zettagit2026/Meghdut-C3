@@ -67,6 +67,13 @@ services:
       SENSOR_LAT: "${SENSOR_LAT:-}"
       SENSOR_LON: "${SENSOR_LON:-}"
       SENSOR_LABEL: "${SENSOR_LABEL:-}"
+      # WiFi identification-confidence fusion (RF <-> Kismet 802.11 ground
+      # truth). Default "true" for the demo; set to "false"/"0" in the .env
+      # file (then `docker compose up -d backend`) to fully disable and restore
+      # exact prior behavior on stage. Must be listed here explicitly -- Compose
+      # does NOT auto-inject top-level .env values into the container (see the
+      # SENSOR_LAT deploy-incident note above).
+      DETECTION_WIFI_FUSION_ENABLED: "${DETECTION_WIFI_FUSION_ENABLED:-true}"
     ports:
       # Hotfix (task #95 regression): TLS cutover changed this from a
       # published port to `expose: 8001`, which closed backend:8001 to the

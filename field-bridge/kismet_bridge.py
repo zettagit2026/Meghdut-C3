@@ -797,11 +797,56 @@ def to_detection(device: Dict, drone_manuf: Optional[str]) -> Dict:
     return detection
 
 
+def to_wifi_reference(device: Dict) -> Dict:
+    """Translate one Kismet IEEE802.11 device into a /api/detections/wifi-
+    reference body -- GROUND-TRUTH reference data for the backend's WiFi
+    identification-confidence fusion, NOT a detection/board contact. Pure
+    translation from Kismet's own fields (mirrors to_detection() above, which
+    is the separate detection-forwarding path used only for drone-OUI matches).
+
+    The backend stores this in db.wifi_ground_truth and cross-references it in
+    detection_ingest to segregate real drones from ambient 2.4GHz WiFi: an
+    ordinary co-channel AP/client re-attributes an RF drone-candidate to WiFi;
+    a drone-OUI (DJI/Parrot/Autel) co-channel device corroborates it. Forwarding
+    non-drone WiFi to this REFERENCE endpoint (rather than /detections/ingest)
+    is what lets the fusion 'know about' ambient WiFi without flooding the
+    operator board with ~20-50 WiFi contacts."""
+    mac = device.get("kismet.device.base.macaddr", "UNKNOWN")
+    manuf = device.get("kismet.device.base.manuf") or "unknown"
+    dtype = device.get("kismet.device.base.type", "unknown")
+    freq_khz = device.get("kismet.device.base.frequency") or 0
+    signal_obj = device.get("kismet.device.base.signal") or {}
+    last_signal = signal_obj.get("kismet.common.signal.last_signal")
+    # Kismet uses the device name for an AP's SSID; fall back to the beaconed
+    # SSID field. Suppress the "name == MAC" placeholder Kismet emits when it
+    # has no better label, so the backend does not render "(AA:BB:...)".
+    ssid = (device.get("kismet.device.base.name")
+            or device.get("dot11.device/dot11.device.last_beaconed_ssid"))
+    if ssid and ssid.replace(":", "").upper() == mac.replace(":", "").upper():
+        ssid = None
+    center_freq_ghz = (freq_khz / 1_000_000.0) if freq_khz else 2.437
+    drone_manuf = match_drone_oui(mac)
+    return {
+        "mac": mac,
+        "oui": mac_oui(mac),
+        "manuf": manuf,
+        "ssid": ssid,
+        "device_type": dtype,
+        "phyname": device.get("kismet.device.base.phyname", "IEEE802.11"),
+        "frequency_khz": float(freq_khz) if freq_khz else None,
+        "center_freq_ghz": round(center_freq_ghz, 6),
+        "rssi_dbm": float(last_signal) if last_signal is not None else None,
+        "is_drone_oui": drone_manuf is not None,
+    }
+
+
 def poll_once(console_url: str, headers: Dict, email: str, password: str,
              devices: List[Dict], forward_all: bool, seen_macs: Dict[str, float],
              repost_interval_s: float, check_wifibroadcast: bool = False,
              kismet_url: Optional[str] = None, kismet_apikey: Optional[str] = None,
-             pcapng_max_frames: int = 25, pcapng_max_seconds: float = 3.0) -> int:
+             pcapng_max_frames: int = 25, pcapng_max_seconds: float = 3.0,
+             forward_wifi_reference: bool = False,
+             wifi_ref_repost_s: float = 10.0) -> int:
     posted = 0
     now = time.time()
     for device in devices:
@@ -809,6 +854,29 @@ def poll_once(console_url: str, headers: Dict, email: str, password: str,
         if not mac:
             continue
         drone_manuf = match_drone_oui(mac)
+
+        # WiFi identification-confidence fusion ground truth: forward EVERY
+        # IEEE802.11 device to the backend's REFERENCE store (not the detections
+        # board) so the fusion can cross-reference it against RF drone-
+        # candidates. Independent of, and runs BEFORE, the drone-OUI detection-
+        # forwarding skip below -- ordinary (non-drone) WiFi is exactly what the
+        # fusion needs to know about, and it must reach the reference store even
+        # though it is (correctly) never forwarded as a board contact. Uses a
+        # separate seen-key + its own shorter throttle so a continuously-
+        # beaconing AP stays "fresh" inside the backend's fusion window.
+        if (forward_wifi_reference
+                and device.get("kismet.device.base.phyname") == "IEEE802.11"):
+            ref_key = "wifiref:" + mac
+            if now - seen_macs.get(ref_key, 0.0) >= wifi_ref_repost_s:
+                seen_macs[ref_key] = now
+                try:
+                    r = _post_with_reauth(console_url, "/api/detections/wifi-reference",
+                                          to_wifi_reference(device), headers,
+                                          email, password, timeout=5)
+                    r.raise_for_status()
+                except requests.RequestException as e:
+                    print(f"wifi-reference ingest failed for {mac}: {e}", file=sys.stderr)
+
         if not forward_all and drone_manuf is None:
             continue  # default: only forward OUI-matched (likely-drone) devices
         if now - seen_macs.get(mac, 0.0) < repost_interval_s:
@@ -875,6 +943,25 @@ def main() -> int:
     ap.add_argument("--forward-all-devices", action="store_true",
                     help="Forward every Kismet-seen device as an advisory_only "
                          "detection, not just drone-OUI matches. Expect high volume.")
+    ap.add_argument("--no-wifi-reference", dest="wifi_reference",
+                    action="store_false",
+                    help="Disable forwarding IEEE802.11 devices to the backend's "
+                         "WiFi ground-truth reference store "
+                         "(/api/detections/wifi-reference). By default (or when "
+                         "KISMET_WIFI_REFERENCE_ENABLED is truthy) every WiFi "
+                         "device Kismet sees is forwarded there as REFERENCE data "
+                         "for the backend's drone-vs-WiFi fusion -- NOT as a board "
+                         "contact. Turn this off to revert the bridge to "
+                         "drone-OUI-only behavior.")
+    ap.set_defaults(wifi_reference=(
+        os.environ.get("KISMET_WIFI_REFERENCE_ENABLED", "true").strip().lower()
+        in ("1", "true", "yes", "on")))
+    ap.add_argument("--wifi-reference-repost-s", type=float,
+                    default=float(os.environ.get("KISMET_WIFI_REF_REPOST_S", "10")),
+                    help="Min seconds between re-posting the same WiFi device to "
+                         "the reference store. Kept well under the backend's WiFi "
+                         "fusion freshness window so a beaconing AP stays 'present' "
+                         "and a re-attributed contact does not flicker.")
     ap.add_argument("--check-wifibroadcast-signature", action="store_true",
                     help="Task #116: for each drone-OUI-matched IEEE802.11 device, also "
                          "open a bounded live pcapng stream from Kismet's real "
@@ -921,7 +1008,8 @@ def main() -> int:
     headers = {"Authorization": f"Bearer {token}"}
 
     print(f"Polling Kismet REST API at {args.kismet_url} every "
-          f"{args.poll_interval_s}s. forward_all_devices={args.forward_all_devices}.")
+          f"{args.poll_interval_s}s. forward_all_devices={args.forward_all_devices}, "
+          f"wifi_reference={args.wifi_reference}.")
     print("HARDWARE-BLOCKED NOTICE: this bridge only produces real output if the "
           "Kismet server it polls has a real monitor-mode WiFi/BT datasource "
           "attached -- see module docstring.")
@@ -956,7 +1044,9 @@ def main() -> int:
                  check_wifibroadcast=args.check_wifibroadcast_signature,
                  kismet_url=args.kismet_url, kismet_apikey=args.kismet_apikey,
                  pcapng_max_frames=args.pcapng_max_frames,
-                 pcapng_max_seconds=args.pcapng_max_seconds)
+                 pcapng_max_seconds=args.pcapng_max_seconds,
+                 forward_wifi_reference=args.wifi_reference,
+                 wifi_ref_repost_s=args.wifi_reference_repost_s)
 
         now_idle = time.time()
         if now_idle - last_idle_heartbeat >= IDLE_HEARTBEAT_INTERVAL_S:

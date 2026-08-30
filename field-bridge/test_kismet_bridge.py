@@ -144,6 +144,76 @@ class PollOnceFilteringTests(unittest.TestCase):
         self.assertEqual(second_posted, 0)
         self.assertEqual(post.call_count, 3)  # only from the first poll
 
+    def test_wifi_reference_off_by_default(self):
+        # forward_wifi_reference defaults False, so no reference posts happen and
+        # the detection-forwarding behavior is unchanged (existing tests above).
+        devices = kismet_bridge.build_test_fixture()
+        with mock.patch.object(kismet_bridge, "_post_with_reauth",
+                              return_value=self._fake_response()) as post:
+            kismet_bridge.poll_once(
+                "http://console", {}, "e@x.com", "pw", devices,
+                forward_all=False, seen_macs={}, repost_interval_s=60.0)
+        paths = [c.args[1] for c in post.call_args_list]
+        self.assertNotIn("/api/detections/wifi-reference", paths)
+
+    def test_wifi_reference_forwarded_for_ieee80211_only(self):
+        # With forwarding on, BOTH IEEE802.11 fixture devices (Samsung client +
+        # DJI AP) are forwarded to the reference store; the Bluetooth device is
+        # not. The drone-OUI IEEE802.11 device ALSO still posts as a detection.
+        devices = kismet_bridge.build_test_fixture()
+        with mock.patch.object(kismet_bridge, "_post_with_reauth",
+                              return_value=self._fake_response()) as post:
+            kismet_bridge.poll_once(
+                "http://console", {}, "e@x.com", "pw", devices,
+                forward_all=False, seen_macs={}, repost_interval_s=60.0,
+                forward_wifi_reference=True)
+        paths = [c.args[1] for c in post.call_args_list]
+        ref_paths = [p for p in paths if p == "/api/detections/wifi-reference"]
+        self.assertEqual(len(ref_paths), 2)
+        self.assertIn("/api/detections/ingest", paths)
+
+    def test_wifi_reference_repost_throttled(self):
+        # A second immediate poll re-posts nothing to the reference store (per-
+        # MAC throttle), same latch pattern as the detection repost throttle.
+        devices = kismet_bridge.build_test_fixture()
+        seen: dict = {}
+        with mock.patch.object(kismet_bridge, "_post_with_reauth",
+                              return_value=self._fake_response()) as post:
+            kismet_bridge.poll_once(
+                "http://console", {}, "e@x.com", "pw", devices,
+                forward_all=False, seen_macs=seen, repost_interval_s=60.0,
+                forward_wifi_reference=True, wifi_ref_repost_s=60.0)
+            first_refs = sum(1 for c in post.call_args_list
+                             if c.args[1] == "/api/detections/wifi-reference")
+            kismet_bridge.poll_once(
+                "http://console", {}, "e@x.com", "pw", devices,
+                forward_all=False, seen_macs=seen, repost_interval_s=60.0,
+                forward_wifi_reference=True, wifi_ref_repost_s=60.0)
+        total_refs = sum(1 for c in post.call_args_list
+                         if c.args[1] == "/api/detections/wifi-reference")
+        self.assertEqual(first_refs, 2)
+        self.assertEqual(total_refs, 2)  # second poll added no reference posts
+
+
+class ToWifiReferenceTests(unittest.TestCase):
+    """to_wifi_reference(): pure Kismet-device -> reference-body translation."""
+
+    def test_maps_non_drone_wifi_fields(self):
+        dev = kismet_bridge.build_test_fixture()[0]  # Samsung client @ 2437 MHz
+        ref = kismet_bridge.to_wifi_reference(dev)
+        self.assertEqual(ref["mac"], "3C:5A:B4:11:22:33")
+        self.assertEqual(ref["oui"], "3C:5A:B4")
+        self.assertEqual(ref["phyname"], "IEEE802.11")
+        self.assertAlmostEqual(ref["center_freq_ghz"], 2.437, places=3)
+        self.assertEqual(ref["ssid"], "Galaxy-S23")
+        self.assertFalse(ref["is_drone_oui"])
+
+    def test_flags_drone_oui_and_drops_empty_ssid(self):
+        dev = kismet_bridge.build_test_fixture()[2]  # DJI AP, name ""
+        ref = kismet_bridge.to_wifi_reference(dev)
+        self.assertTrue(ref["is_drone_oui"])
+        self.assertIsNone(ref["ssid"])
+
 
 class DbRawV2SignatureTests(unittest.TestCase):
     """Task #105: DroneBridge WifiBroadcast raw-v2 protocol signature match,

@@ -98,6 +98,13 @@ export function getOriginalModelAnnotation(d) {
         "Unconfirmed RF pattern match only -- the RSSI/persistence heuristic guessed this specific model, but no ML classification or protocol decode confirms it. Could be any in-band emitter.",
     };
   }
+  if (d.confidence_type === "wifi_attributed" || d.confidence_type === "multidomain_fused") {
+    return {
+      label: "was",
+      title:
+        "Original RSSI/ML drone-candidate guess, superseded by Kismet WiFi ground-truth fusion (a co-channel 802.11 device was observed in-band).",
+    };
+  }
   return {
     label: "was",
     title: "Original RSSI-heuristic guess, superseded by ML reclassification",
