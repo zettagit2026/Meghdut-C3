@@ -3630,6 +3630,23 @@ async def detection_ingest(body: DetectionIngestBody,
                 updates["confidence_type"] = fusion_override["confidence_type"]
                 updates["wifi_fusion"] = fusion_override["wifi_fusion"]
 
+        # Keep threat_level consistent with a PERSISTED fusion attribution on
+        # EVERY merge, not just the ingest that first set it. Once a record is
+        # confidence_type "wifi_attributed"/"multidomain_fused", later hackrf_rx.py
+        # re-confirmations re-seed updates["threat_level"] from body.threat_level
+        # (=MEDIUM) at the top of this branch AND no longer satisfy the drone-
+        # candidate gate above (confidence_type is no longer a candidate type),
+        # so the fusion block does not re-fire -- without this the MEDIUM would
+        # silently clobber the LOW/HIGH the attribution set on a prior cycle.
+        # Force it off the RESOLVED confidence_type so the downgrade/upgrade is
+        # sticky. Runs BEFORE the IFF block so a verified friendly can still
+        # override to FRIENDLY.
+        _resolved_ct = updates.get("confidence_type")
+        if _resolved_ct == "wifi_attributed":
+            updates["threat_level"] = "LOW"
+        elif _resolved_ct == "multidomain_fused":
+            updates["threat_level"] = "HIGH"
+
         # IFF suppression (task #60): a fresh, bearing-consistent verified
         # friendly beacon downgrades this detection's threat_level rather
         # than deleting/hiding the record -- see _check_iff_friendly_match
@@ -3739,6 +3756,14 @@ async def detection_ingest(body: DetectionIngestBody,
             threat_level = fusion_override["threat_level"]
             confidence_type = fusion_override["confidence_type"]
             wifi_fusion_meta = fusion_override["wifi_fusion"]
+
+    # Symmetric with the merge path: threat_level must match a fusion
+    # attribution regardless of how confidence_type got its value, so the
+    # downgrade/upgrade is guaranteed on both ingest paths.
+    if confidence_type == "wifi_attributed":
+        threat_level = "LOW"
+    elif confidence_type == "multidomain_fused":
+        threat_level = "HIGH"
     det.update({
         "callsign": body.callsign or det["callsign"],
         "model": model,
