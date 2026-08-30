@@ -48,6 +48,14 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 # committed to the repo. Restrict its permissions: chmod 600.
 EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
+# Cold-boot readiness gate (eliminate the first-try status=1 boot race that
+# tripped Restart= ~6s later): wait up to 30s for the SiK CP210x udev symlink
+# /dev/cema-sik-adapter to appear before starting. ALWAYS exit 0 after the
+# timeout so an absent-adapter box still brings the unit up idle
+# (mavlink_sniffer.py already tolerates an absent serial device by idling --
+# see test_mavlink_sniffer_device_absent.py) -- this removes the boot-race
+# FAILURE without converting genuinely-absent hardware into a hard failure.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do [ -e /dev/cema-sik-adapter ] && exit 0; sleep 1; done; exit 0'
 ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u mavlink_sniffer.py
 Restart=always
 RestartSec=5

@@ -47,6 +47,16 @@ EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 # earlier version of this unit pointed ExecStart at /usr/bin/python3, which
 # crash-looped with ModuleNotFoundError: No module named 'torch' for ~24h
 # after a host reboot before being caught and fixed. Do not regress this.
+# Cold-boot readiness gate (robustness -- this unit was NRestarts=0 at the
+# reboot gate, but it shares the SAME two dependencies as the units that DID
+# lose the boot race: the HackRF device and the backend API. Gate it on both
+# for the same first-try-clean guarantee). Wait up to 60s for the HackRF USB
+# device (non-claiming lsusb 1d50:6089 probe, never contends with
+# cema-hackrf-rx) AND the backend on 127.0.0.1:8001 (curl WITHOUT -f, any HTTP
+# response counts, no credentials needed). ALWAYS exit 0 after the timeout so
+# an absent-hardware box still brings the unit up idle (the energy gate idles
+# on no signal) rather than failing.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do lsusb -d 1d50:6089 >/dev/null 2>&1 && curl -s -o /dev/null http://127.0.0.1:8001/ && exit 0; sleep 1; done; exit 0'
 ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u ml_classify_bridge.py
 Restart=always
 RestartSec=5

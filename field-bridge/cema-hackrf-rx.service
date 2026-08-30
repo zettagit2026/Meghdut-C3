@@ -35,6 +35,15 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 # committed to the repo. Restrict its permissions: chmod 600.
 EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
+# Cold-boot readiness gate (eliminate the first-try status=1 boot race that
+# tripped Restart= ~6s later): wait up to 30s for the HackRF USB device to
+# enumerate before starting. Uses a NON-claiming lsusb VID:PID probe
+# (1d50:6089 = HackRF One), NOT hackrf_info, so it never contends with a
+# sibling HackRF consumer for the device. ALWAYS exit 0 after the timeout so
+# an absent-hardware box still brings the unit up idle (hackrf_rx.py already
+# tolerates a missing board by idling) -- this removes the boot-race FAILURE
+# without converting genuinely-absent hardware into a hard failure.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do lsusb -d 1d50:6089 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 0'
 ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u hackrf_rx.py --interval-s 3
 Restart=always
 RestartSec=5

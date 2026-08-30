@@ -13,6 +13,15 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 # venv-pinned per task #133/#149 (this .venv/bin/python3 currently symlinks to
 # the system interpreter, but pin it so a future real venv is honoured).
+# Cold-boot readiness gate (eliminate the first-try status=1 boot race that
+# tripped Restart= ~6s later): this bridge logs into BOTH the backend and the
+# Kismet REST API, so wait up to 60s for BOTH 127.0.0.1:8001 (backend) and
+# 127.0.0.1:2501 (Kismet REST) to accept a connection before starting. Plain
+# reachability probes (curl WITHOUT -f, so an auth-gated response still counts
+# as "up", no credentials needed). ALWAYS exit 0 after the timeout so the unit
+# still comes up and idle-retries rather than failing. Requires=/After=
+# cema-kismet.service already order this behind the Kismet server unit.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8001/ && curl -s -o /dev/null http://127.0.0.1:2501/ && exit 0; sleep 1; done; exit 0'
 ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u kismet_bridge.py
 Restart=always
 RestartSec=3

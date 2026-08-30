@@ -51,6 +51,16 @@ EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 # capture — the entire point of this unit. The one-shot/--loop CLI modes
 # documented in fpv_video_bridge.py's module docstring remain available for
 # manual/ad-hoc use; this service intentionally does not use them.
+# Cold-boot readiness gate (eliminate the first-try status=1 boot race that
+# tripped Restart= ~6s later): this bridge polls the backend API for
+# operator-initiated capture requests, so wait up to 60s for the backend on
+# 127.0.0.1:8001 to accept a connection before starting. Uses a plain
+# reachability probe (curl WITHOUT -f, so any HTTP response -- incl. an
+# auth-gated 401/404 -- counts as "port up", no credentials needed). ALWAYS
+# exit 0 after the timeout so the unit still comes up and idles-polling rather
+# than failing. After=docker.service already orders this behind the backend
+# container.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8001/ && exit 0; sleep 1; done; exit 0'
 ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u fpv_video_bridge.py --poll --channel 5800_R1
 Restart=always
 RestartSec=5
