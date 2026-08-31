@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Dict, Tuple
 
 import numpy as np
@@ -170,6 +171,39 @@ def make_spectrogram_image(samples: np.ndarray, sample_rate: float, nfft: int,
     return transform(np.float32(rgb_img))
 
 
+def resolve_device() -> "torch.device":
+    """Resolve the inference device from env CEMA_ML_DEVICE (auto|cuda|cpu).
+
+    DEVICE-AUTO WITH HARD CPU FALLBACK (2026-08-31): this project's GPU host
+    (.186, RTX 3060 / Ampere sm_86) runs a CUDA torch build so the ResNet18
+    forward can run on the GPU, but the ML pass is the live CEMA detection
+    path and MUST NEVER be broken by a GPU problem. This selector only
+    chooses WHERE the tensor math runs; the spectrogram pipeline, the class
+    labels, the softmax/confidence and the energy gate are all unchanged.
+
+      "auto" (default): cuda:0 iff torch.cuda.is_available(), else cpu.
+      "cuda"/"gpu":     force cuda:0 if available, else warn + fall back to cpu.
+      "cpu":            force cpu (used to prove the fallback path / demo-safe).
+
+    A CUDA *runtime* failure at inference time is handled separately, and even
+    more defensively, in GamutRFClassifier (see _infer_probs) -- resolving to
+    cuda here never commits the process to the GPU; it can still fall back."""
+    choice = (os.environ.get("CEMA_ML_DEVICE", "auto") or "auto").strip().lower()
+    if choice == "cpu":
+        return torch.device("cpu")
+    if choice in ("cuda", "gpu"):
+        if torch.cuda.is_available():
+            return torch.device("cuda:0")
+        print("[gamutrf_infer] WARNING: CEMA_ML_DEVICE=cuda requested but "
+              "torch.cuda.is_available() is False -- falling back to cpu.",
+              file=sys.stderr)
+        return torch.device("cpu")
+    if choice not in ("auto", ""):
+        print(f"[gamutrf_infer] WARNING: unrecognized CEMA_ML_DEVICE={choice!r} "
+              "-- treating as 'auto'.", file=sys.stderr)
+    return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
 class GamutRFClassifier:
     """Loads a GamutRF-style ResNet18 checkpoint ONCE and exposes repeated
     classify_window() calls against it -- the whole point of factoring this
@@ -178,13 +212,42 @@ class GamutRFClassifier:
     every gated-in cycle."""
 
     def __init__(self, checkpoint_path: str):
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = resolve_device()  # env CEMA_ML_DEVICE (auto|cuda|cpu)
         self.checkpoint = safe_load_checkpoint(checkpoint_path)
         self.sample_secs = self.checkpoint["sample_secs"]
         self.nfft = self.checkpoint["nfft"]
         self.idx_to_class: Dict = self.checkpoint["dataset_idx_to_class"]
-        self.model = build_model(self.checkpoint, self.device)
+        # LOAD-TIME CUDA FALLBACK: if building/moving the model onto the GPU
+        # throws (driver/runtime fault, out-of-memory at load), never crash the
+        # bridge -- log it and permanently drop this process to cpu so real
+        # detection still runs.
+        try:
+            self.model = build_model(self.checkpoint, self.device)
+        except Exception as e:
+            if self.device.type == "cuda":
+                print(f"[gamutrf_infer] WARNING: failed to load model on "
+                      f"{self.device} ({e}) -- falling back to cpu for this "
+                      "process; detection continues.", file=sys.stderr)
+                self.device = torch.device("cpu")
+                self.model = build_model(self.checkpoint, self.device)
+            else:
+                raise
         self.checkpoint_path = checkpoint_path
+        self._log_resolved_device()
+
+    def _log_resolved_device(self) -> None:
+        """Log the resolved inference device at startup (task requirement)."""
+        if self.device.type == "cuda":
+            try:
+                name = torch.cuda.get_device_name(self.device.index or 0)
+            except Exception:
+                name = "CUDA device"
+            print(f"[gamutrf_infer] ML inference device = {self.device} ({name})")
+        else:
+            print("[gamutrf_infer] ML inference device = cpu (fallback)"
+                  if os.environ.get("CEMA_ML_DEVICE", "auto").strip().lower()
+                  not in ("cpu",)
+                  else "[gamutrf_infer] ML inference device = cpu")
 
     def min_window_samples(self, sample_rate_hz: float) -> int:
         return int(sample_rate_hz * self.sample_secs)
@@ -214,11 +277,7 @@ class GamutRFClassifier:
             )
         window = samples[:window_n]
         data = make_spectrogram_image(window, sample_rate_hz, self.nfft, event_gate=event_gate)
-        data = data.unsqueeze(0).to(self.device)
-
-        with torch.no_grad():
-            out = self.model(data)
-            probs = torch.softmax(out, dim=1).cpu().numpy()[0]
+        probs = self._infer_probs(data)
         pred_idx = int(np.argmax(probs))
 
         all_probs = {}
@@ -228,3 +287,46 @@ class GamutRFClassifier:
 
         pred_cls = self.idx_to_class.get(pred_idx, self.idx_to_class.get(str(pred_idx), f"class_{pred_idx}"))
         return pred_cls, float(probs[pred_idx]), all_probs
+
+    def _forward_softmax(self, data: "torch.Tensor",
+                         device: "torch.device") -> np.ndarray:
+        """Run the ResNet18 forward + softmax on `device` and return the class
+        probability vector as a host (cpu) numpy array. The math here is
+        byte-for-byte the original CPU path -- only the tensor device changed:
+        the input is moved to `device`, the softmax output is moved back to cpu
+        for the existing numpy argmax/labeling path."""
+        x = data.unsqueeze(0).to(device)
+        with torch.no_grad():
+            out = self.model(x)
+            return torch.softmax(out, dim=1).cpu().numpy()[0]
+
+    def _infer_probs(self, data: "torch.Tensor") -> np.ndarray:
+        """Device-aware inference with a HARD CUDA->CPU runtime fallback.
+
+        CRITICAL SAFETY PROPERTY (the whole point of the 2026-08-31 GPU change):
+        if self.device is CUDA and ANY part of the GPU forward raises -- OOM,
+        driver/runtime fault, device lost, a bad-cast edge case -- this logs a
+        warning, PERMANENTLY drops this process to cpu (moves the model to cpu
+        so every subsequent classify_window() also runs on cpu), and re-runs
+        the SAME inference on cpu. The classification result, class labels,
+        softmax and confidence are identical either way (modulo GPU/CPU
+        float-rounding well under the calibration thresholds); only WHERE the
+        tensors live changes. A GPU problem can therefore degrade performance
+        but can NEVER break detection -- the live demo path stays up."""
+        try:
+            return self._forward_softmax(data, self.device)
+        except Exception as e:  # noqa: BLE001 -- deliberate: never let GPU break detection
+            if self.device.type == "cuda":
+                print(f"[gamutrf_infer] WARNING: CUDA inference failed on "
+                      f"{self.device} ({e}) -- permanently falling back to cpu "
+                      "for the rest of this process; detection continues.",
+                      file=sys.stderr)
+                self.device = torch.device("cpu")
+                try:
+                    self.model = self.model.to(self.device)
+                except Exception as move_err:  # noqa: BLE001
+                    print(f"[gamutrf_infer] WARNING: could not move model to cpu "
+                          f"after CUDA failure ({move_err}); retrying on cpu "
+                          "anyway.", file=sys.stderr)
+                return self._forward_softmax(data, self.device)
+            raise

@@ -7,7 +7,23 @@
 requests==2.32.3
 numpy>=1.26.0
 scipy>=1.11.0  # gamutrf_infer.py (signal.spectrogram) and event_gating.py (find_peaks/peak_widths burst gating, 2026-07-24) — was already a de facto dependency of gamutrf_infer.py's spectrogram path; now pinned explicitly since event_gating.py depends on it directly
-torch==2.13.0  # gamutrf_infer.py — direct top-level `import torch` (torch.load/nn/softmax); was previously only referenced in the timm/chromadb comment below, never actually declared here. GPU-less/edge-compute target: install from the PyTorch CPU index, e.g. `pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu` — a plain PyPI install pulls a mismatched build. Validated pairing (Stage-1, Debian 13): torch==2.13.0+cpu.
+# GPU-HOST NOTE (2026-08-31): the version PINS below never change between
+# CPU and GPU hosts — only WHICH PyTorch index the wheel comes from. On a host
+# with a working NVIDIA driver + CUDA-capable GPU (e.g. .186: RTX 3060, Ampere
+# sm_86, driver 595.84 / max CUDA 13.2), install the CUDA build from a cuXXX
+# index whose toolkit is <= the driver's max CUDA and supports the GPU's compute
+# capability, pinning the explicit local tag so pip actually replaces a prior
+# +cpu wheel (a plain `torch==2.13.0` is treated as already satisfied by
+# 2.13.0+cpu and is NOT reinstalled):
+#     pip install torch==2.13.0+cu126 torchvision==0.28.0+cu126 \
+#         --index-url https://download.pytorch.org/whl/cu126
+# Keep numpy pinned at 1.26.4 (the CUDA wheels do not require numpy>=2; do not
+# let anything bump it). Validated on .186: torch==2.13.0+cu126,
+# torchvision==0.28.0+cu126, torch.version.cuda=12.6, cuda.is_available()=True.
+# The bridge auto-selects the device via env CEMA_ML_DEVICE (auto[default]|cuda|
+# cpu); "auto" uses CUDA iff available and falls back to CPU on any GPU error,
+# so CPU-only hosts and the CPU install path below are unaffected.
+torch==2.13.0  # gamutrf_infer.py — direct top-level `import torch` (torch.load/nn/softmax); was previously only referenced in the timm/chromadb comment below, never actually declared here. GPU-less/edge-compute target: install from the PyTorch CPU index, e.g. `pip install torch==2.13.0 torchvision==0.28.0 --index-url https://download.pytorch.org/whl/cpu` — a plain PyPI install pulls a mismatched build. Validated pairing (Stage-1, Debian 13): torch==2.13.0+cpu. GPU hosts: see the GPU-HOST NOTE just above (same pin, cuXXX index).
 torchvision==0.28.0  # gamutrf_infer.py — direct top-level `from torchvision import models, transforms`. MUST come from the same PyTorch CPU index as torch above (see comment on that line) — timm (below) otherwise transitively pulls the default PyPI torchvision, whose compiled C++ ops fail against +cpu torch with `RuntimeError: operator torchvision::nms does not exist`. Validated pairing (Stage-1, Debian 13): torchvision==0.28.0+cpu.
 matplotlib>=3.8  # gamutrf_infer.py — unguarded top-level `import matplotlib` (Agg backend) for spectrogram rendering; was missing from this file entirely. Left unpinned above 3.8 (not pinned higher) to stay compatible with the numpy<2 constraint above. Validated (Stage-1, Debian 13): matplotlib==3.11.1, which installed cleanly and kept numpy at 1.26.4.
 pyserial==3.5
