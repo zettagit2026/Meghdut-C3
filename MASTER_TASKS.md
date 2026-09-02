@@ -9,13 +9,10 @@ _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 need
 - Every shipped unit: independent verifier sign-off; no fake data / no fake-green.
 - TX device pinning: TX=`…930c` (PA), RX/detection=`…a063`.
 
-## Next queue (all software, no hardware; sequence deploys)
-- ⏸ **Passive-radar software/GPU** — dual-channel wiring + GPU CAF port (`caf_fft_batched`→torch.fft/cupy, bit-accuracy vs `caf_bruteforce`); list GPSDO+illuminator gap.
+## Next queue (backend-touching software; sequence deploys on server.py)
 - ⏸ **Control-link RF classification** — ELRS/CRSF/DSMX/DJI signature typing (identifies any drone incl. MSP/CAN).
 - ⏸ **RemoteID ingest** (Kismet Wi-Fi/BLE, software) + **DJI DroneID** (cued capture on the RX radio).
 - ⏸ **FPV OSD → backend wiring** — POST decoded telemetry to a new `/api/fpv/osd-telemetry`; surface in console.
-- ⏸ **UI light-mode finish** — GnssSpoof, MavlinkConsole, DetectionHistory, ProtocolLibrary, KillChain.
-- ⏸ **Strip external analytics** (emergent.sh + PostHog) — sovereignty. _(chip task_50fc5d7f)_
 - ⏸ **GNSS fidelity phase** — solved ephemeris + GPS-time + Doppler dynamics; then real-receiver validation (bench).
 
 ## Queued (software, no user needed)
@@ -49,6 +46,7 @@ _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 need
 - 📋 **GPU CAF as OB-06 Phase-1** — throughput reading only; true FPGA still needed for deterministic-latency/SWaP-C/cert.
 
 ## Shipped (verified)
+- **GPU CAF port + frontend finish deployed (`5999bb9`):** GPU passive-radar CAF (torch.fft, `CEMA_CAF_DEVICE`, CPU-default / GPU-opt-in) — **bit-accurate vs the `caf_bruteforce` oracle** (~3e-7, independently re-verified on the RTX 3060), 124× / 154 ms per block, on-box GPU tests 7/7. Frontend light-mode complete + **external analytics STRIPPED** (console loads **zero** external scripts — render-verified air-gap-clean). _(GPU CAF path opt-in until a live-radar workstream; a live detection still needs 2nd SDR+GPSDO+illuminator.)_
 - **Batch `46e647e` deployed to .186 (2026-09-02, independently reviewed):** `bridge_hello` identity (`CEMA_BRIDGE_TOKEN` set 3× on host) · **IFF friendly-fire fratricide interlock** — a confirmed friendly is hard-blocked; only path is a commander-minted single-use target-bound audited ack (silent standing override removed) · **frontend fratricide-override UI** (commander-only, verbatim-phrase gate) · **GNSS-spoof v1 DSP** · **FPV OSD extractor** · ungoverned-CLI TX `-d` pinning. Deploy verified: plane undisturbed, `tx_halted` True, bridges dormant, new bundle renders clean. _(Full fratricide-UI render pending a confirmed-friendly target — bench.)_
 - Stack migrated to `.186` (i7/128GB/NVMe/RTX-3060); byte-faithful data parity; reboot-survival.
 - Encrypted backups, verified restorable (`~/MEGHDUT-C3-Backups/`).
