@@ -10,8 +10,15 @@ _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 need
 - TX device pinning: TX=`…930c` (PA), RX/detection=`…a063`.
 
 ## In progress
-- 🔄 **Security hardening + gate tests** — `bridge_hello` identity credential + ungoverned-CLI `-d` pinning; run 3 backend integration tests (test_e2e_deploy_bridge / tx_authorization_holes / maneuver_takeover_gates) on throwaway backend; deploy + verify plane. _(agent running)_
-- 🔄 **GNSS-spoof** — v1 DSP built (Gold codes/NAV/BPSK, 34 tests). NEXT: review+verifier; fix 1 contradicted bridge test; fidelity phase (solved ephemeris + GPS-time + Doppler dynamics); real-receiver validation. **Honest: valid signal, NOT yet a proven lock.**
+- 🔄 **IFF friendly-fire override — deliberate rebuild** — ROE decision: commander override STAYS, but rebuilt as an explicit, single-use, commander-only, per-target friendly-fire ack (loud audit) replacing the silent standing `iff_override_authorized` flag → no accidental fratricide, and the gate test passes. _(agent running; server.py)_
+
+## Staged — pending ONE batched .186 deploy (backend + rf-bridge + field-bridge + docker-compose.yml)
+_Prereq: generate + set the SAME `CEMA_BRIDGE_TOKEN` on .186 (backend + each TX-bridge `.env`). Deploy after the IFF override lands + is verified; then verify plane + bridge_hello reject + tx_halt True + bridges dormant._
+- ✅ **Security hardening** — `bridge_hello` identity credential (backend + jam/mavlink bridges) + ungoverned-CLI `-d` pinning. Isolation-verified (tx_authorization_holes 12/12; CLI pinning 3/3).
+- ✅ **GNSS-spoof v1 DSP** — real L1 C/A (Gold codes/NAV/BPSK), 63 tests, INDEPENDENT REVIEW PASS. **Honest: valid signal, NOT yet a proven lock** — real-receiver validation is a later bench step. (Doc `GNSS_SIGNAL_SYNTH_HANDOFF.md` stale → update.)
+- ✅ **FPV OSD extractor** — MAX7456 glyph-match (numpy-only), 22 tests, no-fabrication guard. Backend ingest wiring deferred (server.py, after batch).
+- ⬜ **IFF friendly-fire override** — lands with the running agent + verifier.
+- ⬜ **1 pre-existing gate-test failure** (maneuver_takeover) — resolved by the IFF override rebuild (was the test that surfaced the hole).
 
 ## Queued (software, no user needed)
 - ⏸ **Passive radar software/GPU** — dual-channel wiring + GPU CAF port (`caf_fft_batched`→torch.fft/cupy) with bit-accuracy vs `caf_bruteforce`; list GPSDO+illuminator hardware gap. _(starts after security deploy)_
