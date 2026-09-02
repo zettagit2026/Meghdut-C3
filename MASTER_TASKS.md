@@ -19,12 +19,18 @@ _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 need
 - ⏸ **Strip external analytics** — remove emergent.sh + PostHog scripts from frontend build (sovereignty). _(chip: task_50fc5d7f)_
 - ⏸ **Secrets hygiene** — chmod 600 `.186` `field-bridge/.env`; rotate if host shared.
 
-## Blocked on hardware — protocol decoders (all RX-only proven; awaiting user procurement)
-- 🧱 **DroneID (DJI)** — needs 3rd HackRF (RTL-SDR too narrow) OR build time-share on existing HackRF.
-- 🧱 **RemoteID** — build Kismet-feed extract ingest (software, no HW) OR dedicated monitor-Wi-Fi + BLE-5 dongle.
-- 🧱 **CRSF** — 3.3V USB-UART (CP2102/FT232, 400k+ baud) tapping Pixhawk/FPV FC UART.
-- 🧱 **MSP** — USB-UART tap to FC MSP UART + build ingest loop.
-- 🧱 **DroneCAN** — CANable 2.0 (gs_usb) / PEAK PCAN-USB on the drone CAN bus.
+## Protocol coverage — OVER-THE-AIR (design: ONE RF front-end → software demux; no per-protocol radios; no airborne wire-tap)
+**Principle:** a flying drone is countered by its RF EMISSIONS (control link + video + telemetry), NEVER by reading its internal MSP UART / CAN bus (physically impossible remotely for anyone). MSP/DroneCAN drones ARE in scope — via RF.
+- 🔄 **FPV OSD extraction** — glyph-match the demodulated analog video OSD → recover MSP-class telemetry (callsign/GPS/battery) over the air. The real "MSP airborne" path. _(building; analog only — digital video encrypted → jam it)_
+- ⏸ **Control-link RF classification** — type ELRS/CRSF/DSMX/DJI from signature so any drone is identified. _(band heuristics exist; fine-grained ID a build; after security deploy)_
+- ⏸ **RemoteID ingest** — pull Wi-Fi/BLE RemoteID from the EXISTING Kismet feed. Software, no hardware. _(after security deploy — touches server.py)_
+- ⏸ **DJI DroneID** — detect-sweep CUES a capture window on the RX radio → decode. No dedicated radio (wideband SDR e.g. USRP B210 = clean future upgrade, NOT required now). _(after security deploy)_
+- **Bench/forensic only (labeled, NOT airborne):** MSP + DroneCAN wire-parsers — exercise on a tethered test drone to prove the parser; never presented as airborne detection.
+- **Takedown of MSP/DroneCAN drones** = JAM the control/video band (universal, deployed) + MAVLink takeover (unencrypted-MAVLink) + GNSS spoof (GPS-reliant). Validate in live-fire.
+
+## Deferred hardware (optional upgrades, not required now)
+- 📋 Wideband capture SDR (USRP B210-class ~56 MHz) — removes DJI-DroneID time-slice on the sweep radio.
+- 📋 ELRS-capable RX / SDR demod — for CRSF-over-air (harder; FHSS).
 
 ## Needs user — bench session (drones + commander)
 - 🧑 **Live-fire test** — dummy-load spine test (50Ω) first → live MAVLink force-land/RTH/disarm/takeover on **Pixhawk** + jams on **DJI/FPV**. Needs targets powered, SiK link, dummy load, commander arming; I verify each shot (correct radio, real ack, abort).
