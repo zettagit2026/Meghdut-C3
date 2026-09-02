@@ -180,7 +180,7 @@ function Waterfall() {
   const isReal = source === "HACKRF" && !pollStale;
 
   return (
-    <div data-testid="rf-waterfall" className="tactical-border" style={{ background: "var(--bg-terminal)" }}>
+    <div data-testid="rf-waterfall" className="tactical-border term-surface" style={{ background: "var(--bg-terminal)" }}>
       <div className="flex items-center justify-between px-3 py-2 tactical-border-b">
         <div className="flex items-center gap-2">
           <Signal size={12} strokeWidth={1.5} style={{ color: "var(--accent-info)" }} />
@@ -350,7 +350,7 @@ export default function Dashboard() {
           title={alertMuted
             ? "Critical-contact audio cue is muted. Click to unmute."
             : "Audio cue plays once per newly-detected CRITICAL contact. Click to mute."}
-          className="tactical-border px-2.5 py-1.5 flex items-center gap-2 font-mono text-[10px] uppercase tracking-widest text-slate-400 hover:text-white transition-colors"
+          className="tactical-border px-2.5 py-1.5 flex items-center gap-2 font-mono text-[10px] uppercase tracking-widest text-slate-400 hover:text-[var(--text-primary)] transition-colors"
         >
           {alertMuted ? <VolumeX size={13} strokeWidth={1.5} /> : <Volume2 size={13} strokeWidth={1.5} />}
           Critical Alert Tone {alertMuted ? "Muted" : "On"}
@@ -512,8 +512,8 @@ export default function Dashboard() {
                               data-testid={`iq-export-${d.id}`}
                               onClick={() => exportIqCapture(d)}
                               title="Export the associated SigMF IQ capture (.sigmf-data + .sigmf-meta) for manual RE analysis in URH -- fails honestly with a 404 if no capture has been attached to this contact yet"
-                              className="px-1.5 py-0.5 tactical-border font-mono uppercase tracking-wide hover:bg-[#1A2436] transition-colors"
-                              style={{ color: "#C77D3D", borderColor: "#8A5A2C" }}
+                              className="px-1.5 py-0.5 tactical-border font-mono uppercase tracking-wide hover-surface transition-colors"
+                              style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}
                             >
                               Export IQ
                             </button>

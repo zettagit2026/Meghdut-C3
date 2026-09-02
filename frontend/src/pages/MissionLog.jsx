@@ -111,7 +111,7 @@ export default function MissionLog() {
         </button>
       </div>
 
-      <div className="tactical-border" style={{ background: "var(--bg-terminal)" }}>
+      <div className="tactical-border term-surface" style={{ background: "var(--bg-terminal)" }}>
         <div className="tactical-border-b px-4 py-3 flex items-center justify-between">
           <span className="font-mono text-xs uppercase tracking-widest" style={{ color: "var(--text-term)" }}>
             /var/log/cema-cuas.jsonl

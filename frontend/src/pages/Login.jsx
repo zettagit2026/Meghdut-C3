@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useNavigate, Navigate } from "react-router-dom";
 import { useAuth } from "@/context/AuthContext";
 import { ClassificationBanner } from "@/components/ClassificationBanner";
+import ThemeToggle from "@/components/ThemeToggle";
 import { Shield, LockKeyhole, Terminal, ChevronRight } from "lucide-react";
 import { toast } from "sonner";
 
@@ -31,6 +32,13 @@ export default function Login() {
   return (
     <div className="min-h-screen flex flex-col" style={{ background: "var(--bg-base)" }}>
       <ClassificationBanner position="top" />
+
+      {/* Display control available pre-auth: dark is default, but an operator
+          can flip to the low-glare light theme right from the login screen and
+          the choice persists (see ThemeContext). */}
+      <div className="flex justify-end px-4 py-2">
+        <ThemeToggle />
+      </div>
 
       <div className="flex-1 grid grid-cols-1 lg:grid-cols-2">
         {/* Left brand column */}
@@ -110,7 +118,7 @@ export default function Login() {
                 required
                 autoComplete="email"
                 placeholder="operator@…"
-                className="w-full bg-black/50 tactical-border px-3 py-2 font-mono text-sm text-white focus:outline-none focus-accent-info"
+                className="w-full tactical-input tactical-border px-3 py-2 font-mono text-sm focus:outline-none focus-accent-info"
               />
             </label>
 
@@ -123,7 +131,7 @@ export default function Login() {
                 onChange={(e) => setPassword(e.target.value)}
                 required
                 autoComplete="current-password"
-                className="w-full bg-black/50 tactical-border px-3 py-2 font-mono text-sm text-white focus:outline-none focus-accent-info"
+                className="w-full tactical-input tactical-border px-3 py-2 font-mono text-sm focus:outline-none focus-accent-info"
               />
             </label>
 

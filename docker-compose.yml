@@ -56,6 +56,15 @@ services:
       # see backend/server.py's IFF_BRIDGE_API_KEY docstring. Must match the
       # value configured on the field-bridge/iff_beacon_bridge.py host.
       IFF_BRIDGE_API_KEY: "${IFF_BRIDGE_API_KEY}"
+      # Shared bridge-identity secret gating the diagnostic bridge_hello
+      # TX-consumer registration (see backend/server.py's BRIDGE_HELLO_TOKEN
+      # docstring). MUST be listed here explicitly or the container never sees
+      # it (Compose does NOT auto-inject top-level .env values -- same
+      # deploy-incident note as SENSOR_LAT below). Optional: if unset the
+      # backend fails CLOSED (bridge_hello refused, honest signal defaults to
+      # "no TX bridge subscribed"); set the SAME value in the TX-bridge hosts'
+      # .env to enable registration. Never gates/authorizes an actual transmit.
+      CEMA_BRIDGE_TOKEN: "${CEMA_BRIDGE_TOKEN:-}"
       # Optional -- real surveyed sensor GPS coordinates for the Map page.
       # Unset by default (server.py treats missing/empty as "not configured"
       # and reports that honestly rather than falling back to a fake

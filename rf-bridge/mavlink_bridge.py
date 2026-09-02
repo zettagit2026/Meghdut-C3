@@ -152,6 +152,15 @@ class MavlinkBridge:
         self.serial_path = cfg("MAVLINK_SERIAL", "/dev/ttyUSB0")
         self.baud = cfg_int("MAVLINK_BAUD", 57600)
         self.rx_enabled = cfg_int("MAVLINK_RX_ENABLED", 1) == 1
+        # Bridge-identity secret proving this is a REAL MAVLink TX bridge (not a
+        # browser session) when we advertise ourselves as the "mavlink" TX
+        # consumer via bridge_hello. Loaded from the bridge host's .env
+        # (CEMA_BRIDGE_TOKEN); the backend validates it before trusting our
+        # self-advertisement, so a console session cannot forge a fake TX
+        # consumer to mask the "NO TX BRIDGE SUBSCRIBED" warning (TX-review
+        # MEDIUM). Optional — unset simply means the backend won't register us
+        # and defaults to warning "no TX bridge". Never gates the TX path below.
+        self.bridge_token = cfg("CEMA_BRIDGE_TOKEN", "") or None
 
         self.ser: Optional[serial.Serial] = None
         self.ws: Optional[websocket.WebSocketApp] = None
@@ -287,6 +296,23 @@ class MavlinkBridge:
 
         def on_open(ws):
             log.info("WS connected to app for MAVLink TX subscription.")
+            # Announce this connection as the MAVLink TX consumer so the backend
+            # can honestly report "a TX bridge IS subscribed" at fire time — and,
+            # crucially, warn the operator when NONE is (closing the false-green
+            # gap where a deploy with no bridge looked 'in flight' until an 8s
+            # TX_TIMEOUT). Browsers/telemetry viewers never send this, so they
+            # never count as a TX consumer. Includes the shared bridge-identity
+            # secret (CEMA_BRIDGE_TOKEN) so the backend accepts THIS
+            # self-advertisement but rejects a browser/console session forging
+            # the same message (TX-review MEDIUM). Best-effort: a failure here
+            # does not affect the RX or TX gating below.
+            try:
+                hello = {"type": "bridge_hello", "consumers": ["mavlink"]}
+                if self.bridge_token:
+                    hello["token"] = self.bridge_token
+                ws.send(json.dumps(hello))
+            except Exception as e:
+                log.warning("failed to send bridge_hello: %s", e)
 
         def on_message(_ws, msg):
             try:

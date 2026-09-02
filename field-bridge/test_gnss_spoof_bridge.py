@@ -248,10 +248,22 @@ def test_emergency_abort_terminates_active_stop_event():
 # ---------------------------------------------------------------------
 # gnss_signal_synth.py stub
 # ---------------------------------------------------------------------
-def test_synthesize_iq_file_raises_notimplemented_by_default(monkeypatch):
+def test_synthesize_iq_file_default_produces_real_nonsilent_signal(monkeypatch):
+    # v1: the default path now synthesizes a REAL L1 C/A signal (previously a stub
+    # that raised GnssSynthNotImplemented). Exact-size + code/NAV correctness are
+    # covered in test_gnss_signal_synth.py; here we just assert the bridge-facing
+    # default no longer raises and emits a non-silent interleaved-int8 IQ file.
     monkeypatch.delenv("GNSS_SPOOF_ALLOW_PLACEHOLDER_IQ", raising=False)
-    with pytest.raises(synth.GnssSynthNotImplemented):
-        synth.synthesize_iq_file(0, 0, 0, 0, 0, 0, 1.0)
+    path = synth.synthesize_iq_file(28.6, 77.2, 200, 28.62, 77.21, 200,
+                                    duration_s=0.01, sample_rate=4_000_000)
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+        assert len(data) > 0 and len(data) % 2 == 0
+        assert any(b != 0 for b in data), \
+            "default must produce a real (non-silent) signal, not zero IQ"
+    finally:
+        os.unlink(path)
 
 
 def test_synthesize_iq_file_placeholder_mode_produces_correct_size(monkeypatch):

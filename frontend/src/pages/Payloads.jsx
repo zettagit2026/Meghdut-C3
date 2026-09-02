@@ -1,10 +1,26 @@
 import { useEffect, useRef, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Bomb, AlertTriangle, Target as TargetIcon, ShieldCheck, ShieldOff, Signal } from "lucide-react";
+import { Bomb, AlertTriangle, Target as TargetIcon, ShieldCheck, ShieldOff, Signal, ShieldAlert } from "lucide-react";
 import SafetyGate, { SAFETY_GATED } from "@/components/SafetyGate";
 import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
 import { THREAT_COLOR } from "@/lib/threatLevels";
+import { useAuth } from "@/context/AuthContext";
+
+// A contact is a CONFIRMED FRIENDLY exactly when IFF interrogation has replied
+// and the backend has stamped it so — mirrors the server-side test in
+// backend/server.py (_enforce_fire_time_iff / mint_friendly_fire_ack). Firing
+// on one is FRATRICIDE and is refused (403) on the routine authorize/deploy
+// path; the only licensed path is the deliberate commander friendly-fire ack.
+const isFriendly = (d) =>
+  !!d && (d.iff_verified === true || d.threat_level === "FRIENDLY (IFF verified)");
+
+// Recognise the backend's fratricide-interlock 403 so a routine deploy that
+// races into a freshly-friendly target surfaces the explicit override path,
+// not a raw error string.
+const isFratricideRefusal = (e) =>
+  e?.response?.status === 403 &&
+  /FRATRICIDE|CONFIRMED-FRIENDLY|friendly-fire ack/i.test(formatApiError(e) || "");
 
 const CAT_LABEL = {
   kinetic: "KINETIC",
@@ -154,7 +170,7 @@ function FpvVideoPanel() {
           </div>
         )}
         {captureError && (
-          <div className="font-mono text-[10px] text-red-400">{captureError}</div>
+          <div className="font-mono text-[10px]" style={{ color: "var(--accent-critical)" }}>{captureError}</div>
         )}
         {available ? (
           <>
@@ -190,10 +206,12 @@ function FpvVideoPanel() {
 }
 
 export default function Payloads() {
+  const { user } = useAuth();
+  const isCommander = user?.role === "commander";
   const [payloads, setPayloads] = useState([]);
   const [dets, setDets] = useState([]);
   const [target, setTarget] = useState("");
-  const [gate, setGate] = useState({ open: false, pl: null, broadcast: false });
+  const [gate, setGate] = useState({ open: false, pl: null, broadcast: false, fratricide: false });
   const [authorizing, setAuthorizing] = useState(false);
 
   const load = async () => {
@@ -230,6 +248,7 @@ export default function Payloads() {
   useEffect(() => { load(); const id = setInterval(load, 5000); return () => clearInterval(id); }, []); // eslint-disable-line
 
   const selectedDet = dets.find((d) => d.id === target);
+  const friendlySelected = isFriendly(selectedDet);
 
   // Friendly-fire interlock: an explicit, visible commander action distinct
   // from "deploy" itself. Calls the real backend endpoint that flips
@@ -237,6 +256,16 @@ export default function Payloads() {
   // server-enforced check in /payloads/deploy.
   const toggleAuthorize = async () => {
     if (!selectedDet) return;
+    // Routine target authorization can NEVER license firing on a confirmed
+    // friendly — the backend refuses it with 403. Don't even attempt it; the
+    // deliberate fratricide-override flow is the only path (see the override
+    // control rendered in place of this toggle for friendly contacts).
+    if (friendlySelected) {
+      toast.error("Confirmed FRIENDLY — cannot authorize as target", {
+        description: "Use the deliberate commander fratricide override to engage a confirmed friendly.",
+      });
+      return;
+    }
     setAuthorizing(true);
     try {
       const nextAuthorized = !selectedDet.authorized_target;
@@ -252,9 +281,14 @@ export default function Payloads() {
     }
   };
 
-  const doDeploy = async (pl, broadcast) => {
+  // `iffAck`, when present, is a single-use commander friendly-fire ack minted
+  // for THIS target (see doDeployFriendlyOverride). It is the ONLY thing that
+  // lets a deploy engage a confirmed friendly; the backend re-verifies it at
+  // fire time. When it is present we skip the routine authorized_target gate
+  // (a friendly can never satisfy that gate by design).
+  const doDeploy = async (pl, broadcast, iffAck) => {
     if (!broadcast && !target) { toast.error("No active target selected"); return; }
-    if (!broadcast && selectedDet && !selectedDet.authorized_target) {
+    if (!broadcast && !iffAck && selectedDet && !selectedDet.authorized_target) {
       toast.error("Target not authorized", {
         description: "Friendly-fire interlock: authorize this target before deploying.",
       });
@@ -285,12 +319,23 @@ export default function Payloads() {
         target_detection_id: broadcast ? null : target,
         broadcast,
         arm_token,
+        // Only ever set for a deliberate, commander-authorized fratricide
+        // engagement. Omitted entirely for every routine (non-friendly) deploy.
+        ...(iffAck ? { iff_friendly_fire_ack: iffAck } : {}),
       });
       // The server no longer claims success the instant the frame hits the
       // WS — it now reports AWAITING_ACK until the rf-bridge confirms it
       // actually wrote the frame to the real serial radio. Reflect that
       // honestly here instead of a blanket "DEPLOYED" toast.
-      if (data.status === "AWAITING_ACK") {
+      if (data.tx_bridge_subscribed === false) {
+        // Honest false-green guard: the backend accepted the request (HTTP 200,
+        // AWAITING_ACK) but NO cema-rf-bridge is subscribed, so nothing was
+        // written to any radio — it will TX_TIMEOUT. Surface that as an explicit
+        // error, never a hopeful "sent"/green toast.
+        toast.error(`${pl.name}: NO TX BRIDGE SUBSCRIBED`, {
+          description: `Nothing was transmitted — start cema-rf-bridge on the transmit host. Request ${data.request_id?.slice(0, 8)} will TX_TIMEOUT.`,
+        });
+      } else if (data.status === "AWAITING_ACK") {
         toast.info(`${pl.name} SENT — awaiting bridge ACK`, {
           description: `pkt ${data.length}B · ${broadcast ? "BROADCAST" : `tgt sys=${data.target_system}`} · req ${data.request_id?.slice(0, 8)}`,
         });
@@ -300,12 +345,51 @@ export default function Payloads() {
         });
       }
       load();
-    } catch (e) { toast.error("Deploy failed", { description: formatApiError(e) }); }
+    } catch (e) {
+      // Graceful handling of the backend fratricide interlock: if a routine
+      // deploy is refused because the target is a confirmed friendly (e.g. it
+      // flipped to IFF-verified between selection and fire), surface the
+      // explicit commander override path instead of a raw error toast.
+      if (!iffAck && !broadcast && isFratricideRefusal(e)) {
+        toast.error("FRATRICIDE INTERLOCK — routine fire refused", {
+          description: "Target is IFF-CONFIRMED FRIENDLY. Engage only via the deliberate commander friendly-fire override.",
+        });
+        setGate({ open: true, pl, broadcast: false, fratricide: true });
+        return;
+      }
+      toast.error("Deploy failed", { description: formatApiError(e) });
+    }
+  };
+
+  // Deliberate, commander-only fratricide override. Called ONLY from the
+  // fratricide SafetyGate's confirm (typed ack + checkbox + commander role
+  // already enforced there). Mints a single-use, target-bound friendly-fire
+  // ack, then deploys carrying it. This is the one path that can engage a
+  // confirmed friendly — it is never reachable by clicking the normal buttons.
+  const doDeployFriendlyOverride = async (pl) => {
+    if (!selectedDet) return;
+    let ackToken;
+    try {
+      const { data } = await api.post(`/detections/${selectedDet.id}/friendly-fire-ack`);
+      ackToken = data.iff_friendly_fire_ack;
+    } catch (e) {
+      toast.error("Friendly-fire ack refused", { description: formatApiError(e) });
+      return;
+    }
+    await doDeploy(pl, false, ackToken);
   };
 
   const deploy = (pl, broadcast) => {
+    // A single-target deploy against a CONFIRMED FRIENDLY can never take the
+    // routine path — route it into the deliberate, commander-only fratricide
+    // override gate. (Broadcast is target-agnostic — target_detection_id is
+    // null — so it is unaffected and keeps its existing flow.)
+    if (!broadcast && friendlySelected) {
+      setGate({ open: true, pl, broadcast: false, fratricide: true });
+      return;
+    }
     if (SAFETY_GATED.has(pl.id)) {
-      setGate({ open: true, pl, broadcast });
+      setGate({ open: true, pl, broadcast, fratricide: false });
       return;
     }
     doDeploy(pl, broadcast);
@@ -328,17 +412,19 @@ export default function Payloads() {
             data-testid="target-select"
             value={target}
             onChange={(e) => setTarget(e.target.value)}
-            className="bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus-accent-info"
+            className="tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
           >
             {dets.length === 0 && <option value="">— NO ACTIVE TARGETS —</option>}
             {dets.map((d) => (
               <option key={d.id} value={d.id}>
                 {d.callsign} · {d.model} · sys={d.system_id}
-                {d.authorized_target ? "" : " (NOT AUTHORIZED)"}
+                {isFriendly(d)
+                  ? " ⚠ IFF-CONFIRMED FRIENDLY"
+                  : d.authorized_target ? "" : " (NOT AUTHORIZED)"}
               </option>
             ))}
           </select>
-          {selectedDet && (
+          {selectedDet && !friendlySelected && (
             <button
               data-testid="authorize-target-toggle"
               onClick={toggleAuthorize}
@@ -357,10 +443,48 @@ export default function Payloads() {
               {selectedDet.authorized_target ? "TARGET AUTHORIZED" : "AUTHORIZE TARGET"}
             </button>
           )}
+          {selectedDet && friendlySelected && (
+            // Routine authorize is impossible for a confirmed friendly — show a
+            // hard fratricide indicator here instead of the authorize toggle.
+            <span
+              data-testid="friendly-target-indicator"
+              className="flex items-center gap-2 px-3 py-2 border-2 font-mono text-[10px] font-bold uppercase tracking-widest"
+              style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
+              title="IFF-confirmed friendly — engaging is fratricide and requires the deliberate commander override."
+            >
+              <ShieldAlert size={14} strokeWidth={1.75} />
+              IFF-CONFIRMED FRIENDLY
+            </span>
+          )}
         </div>
       </div>
 
       <RangeAuthorizationControl effect="mavlink" label="MAVLINK PAYLOAD DEPLOY" />
+
+      {friendlySelected && (
+        <div
+          data-testid="fratricide-banner"
+          className="p-4 flex items-start gap-3 border-2"
+          style={{
+            borderColor: "var(--accent-critical)",
+            background: "color-mix(in srgb, var(--accent-critical) 16%, var(--bg-surface))",
+          }}
+        >
+          <ShieldAlert size={22} strokeWidth={1.75} style={{ color: "var(--accent-critical)", flexShrink: 0 }} />
+          <div className="font-mono text-xs" style={{ color: "var(--text-primary)" }}>
+            <div className="font-heading font-black text-base uppercase tracking-tight" style={{ color: "var(--accent-critical)" }}>
+              ⚠ TARGET IFF-CONFIRMED FRIENDLY — ENGAGING WILL BE FRATRICIDE
+            </div>
+            <div className="mt-1 text-slate-300">
+              <span className="font-bold" style={{ color: "var(--text-primary)" }}>{selectedDet?.callsign}</span>{" "}
+              has replied to IFF interrogation. Routine authorize and single-target deploy are refused for this
+              contact. {isCommander
+                ? "A single-target DEPLOY below opens the deliberate, single-use commander friendly-fire override — it is not a normal deploy."
+                : "Only a commander may deliberately override this; your role cannot engage a confirmed friendly."}
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "color-mix(in srgb, var(--accent-critical) 10%, var(--bg-surface))" }}>
         <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
@@ -420,10 +544,19 @@ export default function Payloads() {
                 data-testid={`deploy-target-${p.id}`}
                 onClick={() => deploy(p, false)}
                 disabled={p.id === "PL-010"}
-                title={p.id === "PL-010" ? "Broadcast-only payload — no single-target mode" : undefined}
-                className="tactical-border-r px-3 py-2 font-mono text-[10px] uppercase tracking-widest hover-accent-info transition-colors scanline-btn disabled:opacity-30 disabled:cursor-not-allowed"
+                title={
+                  p.id === "PL-010"
+                    ? "Broadcast-only payload — no single-target mode"
+                    : friendlySelected
+                      ? "Target is IFF-confirmed friendly — opens the deliberate commander fratricide override"
+                      : undefined
+                }
+                className={`tactical-border-r px-3 py-2 font-mono text-[10px] uppercase tracking-widest transition-colors scanline-btn disabled:opacity-30 disabled:cursor-not-allowed ${
+                  friendlySelected ? "hover-accent-critical" : "hover-accent-info"
+                }`}
+                style={friendlySelected ? { color: "var(--accent-critical)" } : undefined}
               >
-                DEPLOY → TGT
+                {friendlySelected ? "⚠ FRATRICIDE DEPLOY" : "DEPLOY → TGT"}
               </button>
               <button
                 data-testid={`deploy-broadcast-${p.id}`}
@@ -441,11 +574,18 @@ export default function Payloads() {
         open={gate.open}
         payloadName={gate.pl?.name}
         severity={gate.pl?.severity}
-        onClose={() => setGate({ open: false, pl: null, broadcast: false })}
+        fratricide={gate.fratricide}
+        isCommander={isCommander}
+        friendlyCallsign={gate.fratricide ? selectedDet?.callsign : undefined}
+        onClose={() => setGate({ open: false, pl: null, broadcast: false, fratricide: false })}
         onConfirm={() => {
-          const { pl, broadcast } = gate;
-          setGate({ open: false, pl: null, broadcast: false });
-          doDeploy(pl, broadcast);
+          const { pl, broadcast, fratricide } = gate;
+          setGate({ open: false, pl: null, broadcast: false, fratricide: false });
+          if (fratricide) {
+            doDeployFriendlyOverride(pl);
+          } else {
+            doDeploy(pl, broadcast);
+          }
         }}
       />
     </div>

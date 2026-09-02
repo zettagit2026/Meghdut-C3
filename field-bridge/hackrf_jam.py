@@ -29,6 +29,27 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from hackrf_device_lock import HackrfDeviceBusy, hackrf_device_lock  # shared device mutex, see that module's docstring
 
+# TX DEVICE PINNING (task #TX-pin): reserve the PA/antenna HackRF for TX only.
+# When HACKRF_TX_SERIAL is set (jam_bridge.py's systemd EnvironmentFile sets it
+# to the TX unit's serial), EVERY hackrf_transfer invocation below is (a)
+# addressed to that specific unit via `-d <serial>` so a burst leaves the TX
+# antenna and never index-0/whichever-responds-first, and (b) serialized behind
+# that unit's OWN per-serial device lock (hackrf_device_lock(serial=...)), NOT
+# the shared/default lock the RX consumers (hackrf_rx.py sweep, ml_classify_
+# bridge.py gate-sweep/IQ capture on the SEPARATE RX unit) use. With RX pinned
+# to the RX serial and TX pinned here to the TX serial, the two physical units
+# never contend at all. Unset/empty (default) preserves the original
+# "whichever HackRF responds first" behavior + shared default lock, so existing
+# single-device deployments and the test suite (which never sets this) are
+# byte-for-byte unaffected.
+HACKRF_TX_SERIAL = os.environ.get("HACKRF_TX_SERIAL") or None
+
+
+def _tx_device_args() -> list:
+    """`-d <serial>` for hackrf_transfer when a TX unit is pinned, else []."""
+    return ["-d", HACKRF_TX_SERIAL] if HACKRF_TX_SERIAL else []
+
+
 MAX_DURATION_S = 10.0
 SAMPLE_RATE_HZ = 20_000_000  # 20 Msps, matches /CEMA/drone-kit/dronev5/cema/cema_base.py's
                               # proven RATE for these same bands.
@@ -168,37 +189,51 @@ def transmit_iq_file(
         "-s", str(SAMPLE_RATE_HZ),
         "-x", str(tx_gain),
         "-a", "1",
+        *_tx_device_args(),  # `-d <TX serial>` when a TX unit is pinned (see HACKRF_TX_SERIAL)
     ]
+    # TX device pinning (task #TX-pin): serialize this TX burst behind the TX
+    # unit's OWN per-serial lock so it can never collide with the RX consumers
+    # on the SEPARATE RX unit, nor with a concurrent jam burst on this same TX
+    # unit. Mirrors transmit_burst()'s lock discipline; previously this shared
+    # helper took NO device lock at all — a latent collision gap for the
+    # gnss_spoof path, which also drives the (now TX-pinned) HackRF.
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    except FileNotFoundError:
-        return {"ok": False, "error": "hackrf_transfer not found (install the `hackrf` package)",
-                 "stopped_early": False}
-
-    if on_started:
-        on_started(proc)
-
-    deadline = time.time() + duration_s + 5  # matches transmit_burst()'s timeout=duration+5 margin
-    stopped_early = False
-    while True:
-        ret = proc.poll()
-        if ret is not None:
-            break
-        if stop_event is not None and stop_event.is_set():
-            proc.terminate()
+        with hackrf_device_lock(serial=HACKRF_TX_SERIAL):
             try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-            stopped_early = True
-            break
-        if time.time() > deadline:
-            # Same as transmit_burst()'s expected TimeoutExpired boundary:
-            # the bounded burst ran its full duration; this is success, not
-            # failure.
-            proc.kill()
-            break
-        time.sleep(0.1)
+                proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            except FileNotFoundError:
+                return {"ok": False, "error": "hackrf_transfer not found (install the `hackrf` package)",
+                         "stopped_early": False}
+
+            if on_started:
+                on_started(proc)
+
+            deadline = time.time() + duration_s + 5  # matches transmit_burst()'s timeout=duration+5 margin
+            stopped_early = False
+            while True:
+                ret = proc.poll()
+                if ret is not None:
+                    break
+                if stop_event is not None and stop_event.is_set():
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                    stopped_early = True
+                    break
+                if time.time() > deadline:
+                    # Same as transmit_burst()'s expected TimeoutExpired boundary:
+                    # the bounded burst ran its full duration; this is success, not
+                    # failure.
+                    proc.kill()
+                    break
+                time.sleep(0.1)
+    except HackrfDeviceBusy as e:
+        # Another TX/RX consumer holds this device — treat like any other
+        # TX-side failure (never crash the caller), same convention as
+        # transmit_burst().
+        return {"ok": False, "error": f"HackRF device busy: {e}", "stopped_early": False}
 
     if stopped_early:
         return {"ok": True, "error": None, "stopped_early": True}
@@ -314,9 +349,15 @@ def transmit_burst(
             "-s", str(SAMPLE_RATE_HZ),
             "-x", str(tx_gain),
             "-a", "1",
+            *_tx_device_args(),  # `-d <TX serial>` when a TX unit is pinned (see HACKRF_TX_SERIAL)
         ]
         try:
-            with hackrf_device_lock():
+            # TX device pinning (task #TX-pin): hold the TX unit's OWN per-serial
+            # lock (not the shared/RX default) so a jam burst on the TX HackRF
+            # can never collide with the RX-sweep / ML-classify consumers pinned
+            # to the separate RX HackRF. serial=None (unset) keeps the original
+            # shared-default-lock behavior the test suite relies on.
+            with hackrf_device_lock(serial=HACKRF_TX_SERIAL):
                 try:
                     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                 except FileNotFoundError:
@@ -427,29 +468,46 @@ def main() -> None:
             "-s", str(SAMPLE_RATE_HZ),
             "-x", str(args.tx_gain),
             "-a", "1",
+            *_tx_device_args(),  # `-d <TX serial>` when a TX unit is pinned (see HACKRF_TX_SERIAL)
         ]
         print("Running:", " ".join(cmd))
         if args.continuous:
             print("TRANSMITTING CONTINUOUSLY — press Ctrl+C at any time to stop.")
             total_bursts = 0
             try:
-                while True:
-                    try:
-                        subprocess.run(cmd, timeout=duration + 5, check=True)
-                    except subprocess.TimeoutExpired:
-                        pass  # expected per-burst boundary, loop continues
-                    total_bursts += 1
-                    print(f"  ...burst #{total_bursts} complete, continuing "
-                          f"({total_bursts * duration:.0f}s transmitted so far)")
+                # TX device pinning (task #TX-pin): hold the TX unit's OWN
+                # per-serial lock for the whole continuous session so these
+                # ungoverned-CLI bursts address the pinned TX unit (`-d` above)
+                # and can never key the RX antenna or collide with the RX
+                # consumers (hackrf_rx.py sweep / ml_classify_bridge.py) on the
+                # separate RX unit. serial=None (HACKRF_TX_SERIAL unset) keeps
+                # the original shared-default behavior single-radio hosts rely on.
+                with hackrf_device_lock(serial=HACKRF_TX_SERIAL):
+                    while True:
+                        try:
+                            subprocess.run(cmd, timeout=duration + 5, check=True)
+                        except subprocess.TimeoutExpired:
+                            pass  # expected per-burst boundary, loop continues
+                        total_bursts += 1
+                        print(f"  ...burst #{total_bursts} complete, continuing "
+                              f"({total_bursts * duration:.0f}s transmitted so far)")
             except KeyboardInterrupt:
                 print(f"\nStopped by operator after {total_bursts} bursts "
                       f"(~{total_bursts * duration:.0f}s total transmission).")
             except FileNotFoundError:
                 print("ERROR: hackrf_transfer not found. Install the `hackrf` package.", file=sys.stderr)
                 sys.exit(1)
+            except HackrfDeviceBusy as e:
+                print(f"ERROR: HackRF TX device busy (another TX/RX consumer holds it): {e}",
+                      file=sys.stderr)
+                sys.exit(1)
         else:
             try:
-                subprocess.run(cmd, timeout=duration + 5, check=True)
+                # Same TX device pinning as the continuous branch: address the
+                # pinned TX unit and serialize behind its own per-serial lock so
+                # this ungoverned single burst cannot key the RX antenna.
+                with hackrf_device_lock(serial=HACKRF_TX_SERIAL):
+                    subprocess.run(cmd, timeout=duration + 5, check=True)
             except FileNotFoundError:
                 print("ERROR: hackrf_transfer not found. Install the `hackrf` package.", file=sys.stderr)
                 sys.exit(1)
@@ -458,6 +516,10 @@ def main() -> None:
                 sys.exit(1)
             except subprocess.TimeoutExpired:
                 pass  # expected — the burst is bounded, this just means it ran the full duration
+            except HackrfDeviceBusy as e:
+                print(f"ERROR: HackRF TX device busy (another TX/RX consumer holds it): {e}",
+                      file=sys.stderr)
+                sys.exit(1)
 
     print("Transmission window complete.")
 

@@ -132,9 +132,18 @@ export default function Jamming() {
         arm_token: arm.arm_token,
         jam_confirm_token: confirm.jam_confirm_token,
       });
-      toast.info(`JAM REQUESTED — awaiting bridge ACK`, {
-        description: `${data.freq_mhz} MHz · ${data.duration_s}s · req ${data.request_id?.slice(0, 8)}`,
-      });
+      if (data.tx_bridge_subscribed === false) {
+        // Honest false-green guard: request accepted (HTTP 200, AWAITING_ACK)
+        // but NO cema-jam-bridge is subscribed, so nothing will radiate — it
+        // will TX_TIMEOUT. Surface as an explicit error, not a hopeful toast.
+        toast.error(`NO JAM TX BRIDGE SUBSCRIBED`, {
+          description: `Nothing will radiate — start cema-jam-bridge on the transmit host. Request ${data.request_id?.slice(0, 8)} will TX_TIMEOUT.`,
+        });
+      } else {
+        toast.info(`JAM REQUESTED — awaiting bridge ACK`, {
+          description: `${data.freq_mhz} MHz · ${data.duration_s}s · req ${data.request_id?.slice(0, 8)}`,
+        });
+      }
       loadStatus();
     } catch (e) {
       toast.error("Jam request failed", { description: formatApiError(e) });
@@ -154,7 +163,7 @@ export default function Jamming() {
         </h1>
       </div>
 
-      <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "#1A0A08" }}>
+      <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "var(--surface-critical)" }}>
         <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
         <div className="font-mono text-xs text-slate-300">
           <span className="font-bold" style={{ color: "var(--accent-critical)" }}>WARNING:</span>{" "}
@@ -169,7 +178,7 @@ export default function Jamming() {
       <RangeAuthorizationControl effect="jam" label="RF JAMMING" />
 
       {isGnssTarget && (
-        <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "#1A0A08" }}>
+        <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "var(--surface-critical)" }}>
           <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
           <div className="font-mono text-xs text-slate-300">
             <span className="font-bold" style={{ color: "var(--accent-critical)" }}>
@@ -195,7 +204,7 @@ export default function Jamming() {
               data-testid="jam-band-select"
               value={band}
               onChange={(e) => setBand(e.target.value)}
-              className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
             >
               {BANDS.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
             </select>
@@ -210,7 +219,7 @@ export default function Jamming() {
               type="number" min={1} max={MAX_DURATION_S} step={0.5}
               value={durationS}
               onChange={(e) => setDurationS(Math.min(MAX_DURATION_S, Math.max(1, Number(e.target.value))))}
-              className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
             />
           </label>
 
@@ -221,7 +230,7 @@ export default function Jamming() {
               type="number" min={50} max={5000} step={50}
               value={bandwidthKhz}
               onChange={(e) => setBandwidthKhz(Number(e.target.value))}
-              className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
             />
           </label>
 
@@ -232,7 +241,7 @@ export default function Jamming() {
               type="number" min={0} max={47}
               value={txGain}
               onChange={(e) => setTxGain(Number(e.target.value))}
-              className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
             />
           </label>
 
@@ -243,8 +252,9 @@ export default function Jamming() {
             className={`w-full flex items-center justify-center gap-2 px-4 py-3 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors ${
               active || submitting
                 ? "opacity-30 border-slate-700 text-slate-600 cursor-not-allowed"
-                : "text-[#FF3B30] border-[#FF3B30] hover:bg-[#FF3B30] hover:text-black"
+                : "hover-accent-critical"
             }`}
+            style={active || submitting ? undefined : { color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
           >
             ARM JAMMER
           </button>

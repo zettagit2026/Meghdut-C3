@@ -1,6 +1,16 @@
 import { useEffect, useState } from "react";
 import * as AlertDialogPrimitive from "@radix-ui/react-alert-dialog";
-import { AlertTriangle, X, ShieldCheck } from "lucide-react";
+import { AlertTriangle, X, ShieldCheck, ShieldAlert, Skull } from "lucide-react";
+
+// The EXACT phrase a commander must type, verbatim, to license engaging a
+// target that IFF has CONFIRMED FRIENDLY. Kept as an exported constant so the
+// input's placeholder, the on-screen instruction, and the match check can
+// never drift apart. This is the deliberate, un-fat-fingerable acknowledgment
+// that (together with commander role + the normal safety checklist) is the
+// ONLY way the fratricide-override confirm button unlocks — it must be
+// impossible to engage a confirmed friendly by just clicking through.
+export const FRIENDLY_FIRE_ACK_PHRASE =
+  "I am knowingly engaging a target confirmed FRIENDLY";
 
 // Payloads that require the safety gate before firing (irreversible / kinetic).
 export const SAFETY_GATED = new Set([
@@ -53,18 +63,42 @@ export default function SafetyGate({
   checks = CHECKS,
   actionLabel = "FIRE",
   irreversibleNote = "irreversible",
+  // FRATRICIDE-OVERRIDE mode. When `fratricide` is true the selected target has
+  // been IFF-CONFIRMED FRIENDLY, and this gate becomes the ONE deliberate,
+  // commander-only path that can license the engagement (backend refuses the
+  // routine authorize/deploy path with 403). It layers, on top of the normal
+  // checklist: (a) a conspicuous fratricide warning, (b) a hard commander-role
+  // wall for anyone else, and (c) an explicit typed acknowledgment + checkbox.
+  // Non-fratricide callers (Jamming.jsx, GnssSpoof.jsx, non-friendly payloads)
+  // pass nothing and get exactly the prior behavior.
+  fratricide = false,
+  isCommander = false,
+  friendlyCallsign,
 }) {
   const [ticks, setTicks] = useState(() => checks.map(() => false));
   const [confirming, setConfirming] = useState(false);
+  const [ackChecked, setAckChecked] = useState(false);
+  const [typedAck, setTypedAck] = useState("");
 
   useEffect(() => {
-    if (open) { setTicks(checks.map(() => false)); setConfirming(false); }
+    if (open) {
+      setTicks(checks.map(() => false));
+      setConfirming(false);
+      setAckChecked(false);
+      setTypedAck("");
+    }
   }, [open, checks]);
 
   const allTicked = ticks.every(Boolean);
+  // In fratricide mode the confirm is gated behind commander role AND both the
+  // explicit checkbox and the verbatim typed phrase — never just the checklist.
+  const fratricideReady =
+    !fratricide ||
+    (isCommander && ackChecked && typedAck.trim() === FRIENDLY_FIRE_ACK_PHRASE);
+  const canFire = allTicked && fratricideReady;
 
   const handleFire = () => {
-    if (!allTicked) return;
+    if (!canFire) return;
     if (!confirming) { setConfirming(true); return; }
     onConfirm();
   };
@@ -83,22 +117,49 @@ export default function SafetyGate({
         >
           <div
             className="px-5 py-3 tactical-border-b flex items-center justify-between"
-            style={{ background: "rgba(255,59,48,0.08)" }}
+            style={{ background: fratricide ? "color-mix(in srgb, var(--accent-critical) 22%, var(--bg-surface))" : "rgba(255,59,48,0.08)" }}
           >
             <div className="flex items-center gap-2">
-              <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
+              {fratricide
+                ? <Skull size={16} strokeWidth={1.75} style={{ color: "var(--accent-critical)" }} />
+                : <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />}
               <AlertDialogPrimitive.Title asChild>
-                <span className="font-heading font-black text-lg uppercase tracking-tighter" style={{ color: "var(--text-primary)" }}>
-                  Pre-Flight Safety Gate
+                <span className="font-heading font-black text-lg uppercase tracking-tighter"
+                      style={{ color: fratricide ? "var(--accent-critical)" : "var(--text-primary)" }}>
+                  {fratricide ? "Fratricide Override — Confirmed Friendly" : "Pre-Flight Safety Gate"}
                 </span>
               </AlertDialogPrimitive.Title>
             </div>
             <button data-testid="safety-close" onClick={onClose}
-                    className="text-slate-400 hover:text-white">
+                    className="text-slate-400 hover:text-[var(--text-primary)]">
               <X size={16} />
             </button>
           </div>
           <div className="p-4 space-y-4">
+            {fratricide && (
+              <div
+                data-testid="fratricide-warning"
+                className="p-3 flex items-start gap-3 border-2"
+                style={{
+                  borderColor: "var(--accent-critical)",
+                  background: "color-mix(in srgb, var(--accent-critical) 16%, var(--bg-surface))",
+                }}
+              >
+                <ShieldAlert size={20} strokeWidth={1.75} style={{ color: "var(--accent-critical)", flexShrink: 0 }} />
+                <div className="font-mono text-xs" style={{ color: "var(--text-primary)" }}>
+                  <div className="font-heading font-black text-sm uppercase tracking-tight" style={{ color: "var(--accent-critical)" }}>
+                    ⚠ TARGET IFF-CONFIRMED FRIENDLY — ENGAGING WILL BE FRATRICIDE
+                  </div>
+                  <div className="mt-1 text-slate-300">
+                    {friendlyCallsign
+                      ? <><span className="font-bold" style={{ color: "var(--text-primary)" }}>{friendlyCallsign}</span> has replied to IFF interrogation and is a confirmed friendly asset. </>
+                      : "This contact has replied to IFF interrogation and is a confirmed friendly asset. "}
+                    There is <span className="font-bold" style={{ color: "var(--accent-critical)" }}>no standing override</span>.
+                    Proceeding mints a single-use, one-engagement fratricide ack and is loudly audited.
+                  </div>
+                </div>
+              </div>
+            )}
             <AlertDialogPrimitive.Description asChild>
               <div className="font-mono text-xs">
                 You are about to arm <span className="font-bold" style={{ color: "var(--text-primary)" }}>{payloadName}</span>{" "}
@@ -126,6 +187,66 @@ export default function SafetyGate({
                 </label>
               ))}
             </div>
+            {fratricide && !isCommander && (
+              <div
+                data-testid="fratricide-commander-required"
+                className="p-3 border-2 font-mono text-xs"
+                style={{
+                  borderColor: "var(--accent-critical)",
+                  background: "color-mix(in srgb, var(--accent-critical) 10%, var(--bg-surface))",
+                  color: "var(--accent-critical)",
+                }}
+              >
+                <span className="font-bold uppercase tracking-widest">Commander role required.</span>{" "}
+                <span className="text-slate-300">
+                  Only a commander may authorize engaging a target confirmed FRIENDLY. This account
+                  cannot proceed — no fratricide override is available to your role.
+                </span>
+              </div>
+            )}
+            {fratricide && isCommander && (
+              <div className="space-y-3">
+                <label
+                  data-testid="fratricide-ack-checkbox"
+                  className="flex items-start gap-3 p-2 border-2 cursor-pointer"
+                  style={{ borderColor: "var(--accent-critical)", background: "color-mix(in srgb, var(--accent-critical) 8%, var(--bg-surface))" }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={ackChecked}
+                    onChange={(e) => setAckChecked(e.target.checked)}
+                    className="mt-0.5"
+                    style={{ accentColor: "var(--accent-critical)" }}
+                  />
+                  <span className="font-mono text-xs font-bold" style={{ color: "var(--text-primary)" }}>
+                    {FRIENDLY_FIRE_ACK_PHRASE}.
+                  </span>
+                </label>
+                <div className="space-y-1">
+                  <div className="font-mono text-[10px] uppercase tracking-widest text-slate-400">
+                    Type the acknowledgment verbatim to unlock:
+                  </div>
+                  <input
+                    data-testid="fratricide-ack-input"
+                    type="text"
+                    value={typedAck}
+                    onChange={(e) => setTypedAck(e.target.value)}
+                    placeholder={FRIENDLY_FIRE_ACK_PHRASE}
+                    autoComplete="off"
+                    spellCheck={false}
+                    className="tactical-input tactical-border w-full px-3 py-2 font-mono text-xs focus:outline-none"
+                    style={{
+                      borderColor:
+                        typedAck.length === 0
+                          ? undefined
+                          : typedAck.trim() === FRIENDLY_FIRE_ACK_PHRASE
+                            ? "var(--accent-success)"
+                            : "var(--accent-critical)",
+                    }}
+                  />
+                </div>
+              </div>
+            )}
             <div className="tactical-border-t pt-3 flex items-center justify-between">
               <AlertDialogPrimitive.Cancel asChild>
                 <button
@@ -138,25 +259,27 @@ export default function SafetyGate({
               </AlertDialogPrimitive.Cancel>
               <button
                 data-testid="safety-fire"
-                disabled={!allTicked}
+                disabled={!canFire}
                 onClick={handleFire}
                 className={`flex items-center gap-2 px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors ${
-                  !allTicked
+                  !canFire
                     ? "opacity-30 border-slate-700 text-slate-600 cursor-not-allowed"
                     : confirming
                       ? "text-white pulse-crit"
                       : ""
                 }`}
                 style={
-                  !allTicked
+                  !canFire
                     ? undefined
                     : confirming
                       ? { background: "var(--accent-critical)", borderColor: "var(--accent-critical)" }
                       : { color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }
                 }
               >
-                <ShieldCheck size={14} strokeWidth={1.5} />
-                {confirming ? `CONFIRM ${actionLabel}` : `ARM & ${actionLabel}`}
+                {fratricide ? <Skull size={14} strokeWidth={1.75} /> : <ShieldCheck size={14} strokeWidth={1.5} />}
+                {fratricide
+                  ? (confirming ? "CONFIRM FRATRICIDE" : "MINT ACK & ENGAGE FRIENDLY")
+                  : (confirming ? `CONFIRM ${actionLabel}` : `ARM & ${actionLabel}`)}
               </button>
             </div>
           </div>

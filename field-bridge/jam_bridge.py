@@ -142,6 +142,14 @@ class JamBridge:
         self.email = _cfg("CEMA_EMAIL")
         self.password = _cfg("CEMA_PASSWORD")
         self.token: Optional[str] = None
+        # Bridge-identity secret proving this is a REAL jam bridge (not a browser
+        # session) when we advertise ourselves as the jam TX consumer via
+        # bridge_hello. Loaded from the systemd EnvironmentFile (field-bridge/
+        # .env: CEMA_BRIDGE_TOKEN); the backend validates it before trusting our
+        # self-advertisement. Optional — if unset here, the backend simply won't
+        # register us and its honest signal defaults to "no TX bridge subscribed"
+        # (over-warns, never falsely reassures). Never gates our OWN jam gates.
+        self.bridge_token: Optional[str] = os.environ.get("CEMA_BRIDGE_TOKEN") or None
 
         self.ws: Optional[websocket.WebSocketApp] = None
         self.stop_flag = threading.Event()
@@ -331,6 +339,21 @@ class JamBridge:
 
         def on_open(_ws):
             log.info("WS connected — jam bridge ready.")
+            # Announce this connection as the JAM TX consumer so the backend can
+            # honestly report at fire time whether a jam bridge is actually
+            # subscribed (and warn the operator when none is) — see the MAVLink
+            # bridge's identical bridge_hello and backend WSManager handling.
+            # Includes the shared bridge-identity secret (CEMA_BRIDGE_TOKEN) so
+            # the backend accepts THIS self-advertisement but rejects a browser/
+            # console session forging the same message (TX-review MEDIUM).
+            # Best-effort; never gates the independent bridge-side jam gates.
+            try:
+                hello = {"type": "bridge_hello", "consumers": ["jam"]}
+                if self.bridge_token:
+                    hello["token"] = self.bridge_token
+                _ws.send(json.dumps(hello))
+            except Exception as e:
+                log.warning("failed to send bridge_hello: %s", e)
 
         def on_message(ws, raw):
             try:

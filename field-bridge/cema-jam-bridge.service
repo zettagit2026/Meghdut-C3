@@ -19,6 +19,15 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 #   CEMA_API_URL=http://localhost:8001
 #   CEMA_EMAIL=operator@meghaduta.mil
 #   CEMA_PASSWORD=<this host's current admin password>
+# and SHOULD define (to enable the honest "TX bridge subscribed" signal):
+#   CEMA_BRIDGE_TOKEN=<same shared secret as the backend + rf-bridge .env>
+# CEMA_BRIDGE_TOKEN is the bridge-identity secret this bridge presents in its
+# bridge_hello so the backend trusts it as the real "jam" TX consumer (and a
+# browser/console session cannot forge one to mask the "NO TX BRIDGE SUBSCRIBED"
+# warning). It is DIAGNOSTIC-ONLY — it never gates a transmit; unset simply
+# means the backend keeps warning "no jam TX bridge subscribed".
+# On the pinned dual-radio TX host also set HACKRF_TX_SERIAL=<TX unit serial> so
+# every hackrf_transfer is addressed to (and locked on) the TX antenna only.
 #
 # =====================================================================
 # CEMA_AUTHORIZED_RANGE — DELIBERATELY NOT SET IN THIS UNIT FILE.

@@ -4,10 +4,10 @@ import { ClassificationBanner } from "@/components/ClassificationBanner";
 import RangeAuthorizationBanner from "@/components/RangeAuthorizationBanner";
 import EmergencyAbort from "@/components/EmergencyAbort";
 import ErrorBoundary from "@/components/ErrorBoundary";
-// ThemeToggle hidden for the demo (fielded EW console is locked to dark --
-// see design_guidelines.json). Logic kept intact in ThemeContext/ThemeToggle
-// so the toggle can be restored later by re-adding this import + <ThemeToggle />.
-// import ThemeToggle from "@/components/ThemeToggle";
+// Display control: dark is the console's default, but the operator can flip to
+// the low-glare light theme from the top status bar; the choice persists
+// (localStorage, see ThemeContext).
+import ThemeToggle from "@/components/ThemeToggle";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import {
@@ -98,7 +98,7 @@ export default function Layout() {
 
           <div className="tactical-border-t p-4">
             <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 mb-1">Operator</div>
-            <div className="font-mono text-xs text-white break-all">{user?.email}</div>
+            <div className="font-mono text-xs break-all" style={{ color: "var(--text-primary)" }}>{user?.email}</div>
             <div className="font-mono text-[10px] uppercase tracking-widest mt-1" style={{ color: "var(--accent-success)" }}>
               ● {user?.clearance || "RESTRICTED"}
             </div>
@@ -135,7 +135,7 @@ export default function Layout() {
               <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
                 MISSION-ID: <span style={{ color: "var(--text-primary)" }}>CEMA-cUAS-{year}-A</span>
               </div>
-              {/* <ThemeToggle /> hidden for the demo -- see import note above */}
+              <ThemeToggle />
               <EmergencyAbort />
             </div>
           </div>

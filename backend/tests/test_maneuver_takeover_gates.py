@@ -120,7 +120,7 @@ def _enable_lease(auth_headers):
     for eff in ("mavlink",):
         requests.post(f"{API}/range-authorization", headers=auth_headers,
                       json={"effect": eff, "enabled": True,
-                            "password": ADMIN_PASSWORD, "confirm_phrase": "AUTHORIZE RANGE"},
+                            "password": ADMIN_PASSWORD, "confirm_phrase": "AUTHORIZE LIVE RANGE"},
                       timeout=15)
 
 
@@ -129,6 +129,23 @@ def _disable_lease(auth_headers, effect="mavlink"):
     # a deploy (409) even before any bridge is involved.
     requests.post(f"{API}/range-authorization", headers=auth_headers,
                   json={"effect": effect, "enabled": False}, timeout=15)
+
+
+def _mint_ff_ack(auth_headers, det_id):
+    r = requests.post(f"{API}/detections/{det_id}/friendly-fire-ack",
+                      headers=auth_headers, json={}, timeout=15)
+    assert r.status_code == 200, r.text
+    return r.json()["iff_friendly_fire_ack"]
+
+
+def _find_override_log(auth_headers, det_id):
+    r = requests.get(f"{API}/logs", headers=auth_headers, params={"limit": 500}, timeout=15)
+    assert r.status_code == 200, r.text
+    for e in r.json():
+        if e.get("kind") == "IFF_FRIENDLY_FIRE_OVERRIDE" and \
+                (e.get("meta") or {}).get("detection_id") == det_id:
+            return e
+    return None
 
 
 # ---- PL-011 is CRITICAL => arm-token gated ------------------------------
@@ -203,13 +220,18 @@ class TestEncryptedLinkRefused:
 # ---- IFF friendly interlock (inherits F2) -------------------------------
 class TestIFFFriendlyRefused:
     def test_friendly_target_refused(self, auth_headers):
+        """Plain commander authorize-target + deploy with NO explicit friendly-fire
+        ack → still 403 (FRATRICIDE INTERLOCK). This is the gate test that was
+        failing under the old SILENT standing-override, and now passes: a
+        confirmed friendly cannot be fired on without the deliberate per-
+        engagement ack."""
         _resume(auth_headers)
         bearing = 123.0
         _ingest_friendly_beacon(auth_headers, bearing)
         det, _ = _ingest(auth_headers, bearing_deg=bearing)
         assert det.get("iff_verified") is True, det
-        # authorize-target on a friendly needs commander override; then fire-time
-        # IFF check must still refuse the actual deploy.
+        # Routine authorize on a friendly is itself refused now (no standing
+        # override); the request is harmless and licenses nothing.
         requests.post(f"{API}/detections/{det['id']}/authorize-target",
                       headers=auth_headers, json={"authorized": True}, timeout=15)
         tok = _arm(auth_headers, "deploy", target=det["id"])
@@ -217,6 +239,87 @@ class TestIFFFriendlyRefused:
                           json={"payload_id": PL, "target_detection_id": det["id"],
                                 "arm_token": tok}, timeout=15)
         assert r.status_code == 403, r.text
+        assert "fratricide" in r.text.lower()
+
+
+# ---- Deliberate friendly-fire override: the ONLY path to engage a friendly ---
+class TestFriendlyFireAckOverride:
+    def test_ack_allows_deploy_and_loudly_audits(self, auth_headers):
+        """The explicit, single-use, commander-minted, target-bound friendly-fire
+        ack IS the sanctioned override: with it (plus the full spine — commander
+        role, arm token, range lease, tx not halted) the deploy proceeds
+        (200 / AWAITING_ACK), and a LOUD IFF_FRIENDLY_FIRE_OVERRIDE event is
+        written to the hash-chained mission log."""
+        _resume(auth_headers)
+        _enable_lease(auth_headers)
+        # Bearing chosen >15deg (IFF_BEARING_TOLERANCE_DEG) from every other
+        # bearing used across this shared-backend suite so friendly beacons from
+        # other tests can't cross-match this contact.
+        bearing = 250.0
+        _ingest_friendly_beacon(auth_headers, bearing)
+        det, _ = _ingest(auth_headers, protocol="MAVLink-SiK-Legacy",
+                         bearing_deg=bearing, system_id=17)
+        assert det.get("iff_verified") is True, det
+        ack = _mint_ff_ack(auth_headers, det["id"])
+        tok = _arm(auth_headers, "deploy", target=det["id"])
+        r = requests.post(f"{API}/payloads/deploy", headers=auth_headers,
+                          json={"payload_id": PL, "target_detection_id": det["id"],
+                                "arm_token": tok, "iff_friendly_fire_ack": ack,
+                                "target_link_legacy_mavlink": True}, timeout=15)
+        assert r.status_code == 200, r.text
+        assert r.json().get("status") == "AWAITING_ACK", r.json()
+        # The loud, un-missable audit event must be present.
+        ev = _find_override_log(auth_headers, det["id"])
+        assert ev is not None, "IFF_FRIENDLY_FIRE_OVERRIDE audit event missing"
+        assert "CONFIRMED-FRIENDLY" in ev.get("message", "")
+        assert (ev.get("meta") or {}).get("engaged_by")
+
+    def test_ack_for_target_a_refused_on_target_b(self, auth_headers):
+        """An ack minted for friendly A cannot be replayed onto friendly B — it is
+        bound to A's detection id. Deploy on B with A's ack → 403 FRATRICIDE."""
+        _resume(auth_headers)
+        _enable_lease(auth_headers)
+        b_a, b_b = 150.0, 300.0  # well-separated (>15deg) from each other and other tests
+        _ingest_friendly_beacon(auth_headers, b_a)
+        det_a, _ = _ingest(auth_headers, protocol="MAVLink-SiK-Legacy", bearing_deg=b_a, system_id=17)
+        _ingest_friendly_beacon(auth_headers, b_b)
+        det_b, _ = _ingest(auth_headers, protocol="MAVLink-SiK-Legacy", bearing_deg=b_b, system_id=17)
+        assert det_a.get("iff_verified") and det_b.get("iff_verified")
+        ack_a = _mint_ff_ack(auth_headers, det_a["id"])
+        tok = _arm(auth_headers, "deploy", target=det_b["id"])
+        r = requests.post(f"{API}/payloads/deploy", headers=auth_headers,
+                          json={"payload_id": PL, "target_detection_id": det_b["id"],
+                                "arm_token": tok, "iff_friendly_fire_ack": ack_a,
+                                "target_link_legacy_mavlink": True}, timeout=15)
+        assert r.status_code == 403, r.text
+        assert "fratricide" in r.text.lower()
+
+    def test_ack_is_single_use(self, auth_headers):
+        """The ack is burned on first use. A second deploy re-presenting the same
+        ack (with a fresh arm token) is refused 403 — no replay of one override
+        across two engagements."""
+        _resume(auth_headers)
+        _enable_lease(auth_headers)
+        bearing = 330.0
+        _ingest_friendly_beacon(auth_headers, bearing)
+        det, _ = _ingest(auth_headers, protocol="MAVLink-SiK-Legacy",
+                         bearing_deg=bearing, system_id=17)
+        assert det.get("iff_verified") is True, det
+        ack = _mint_ff_ack(auth_headers, det["id"])
+        tok1 = _arm(auth_headers, "deploy", target=det["id"])
+        r1 = requests.post(f"{API}/payloads/deploy", headers=auth_headers,
+                           json={"payload_id": PL, "target_detection_id": det["id"],
+                                 "arm_token": tok1, "iff_friendly_fire_ack": ack,
+                                 "target_link_legacy_mavlink": True}, timeout=15)
+        assert r1.status_code == 200, r1.text
+        # Second attempt: fresh arm token, SAME (now-burned) ack -> refused.
+        tok2 = _arm(auth_headers, "deploy", target=det["id"])
+        r2 = requests.post(f"{API}/payloads/deploy", headers=auth_headers,
+                           json={"payload_id": PL, "target_detection_id": det["id"],
+                                 "arm_token": tok2, "iff_friendly_fire_ack": ack,
+                                 "target_link_legacy_mavlink": True}, timeout=15)
+        assert r2.status_code == 403, r2.text
+        assert "fratricide" in r2.text.lower()
 
 
 # ---- bounded: cannot broadcast; duration clamped to cap -----------------

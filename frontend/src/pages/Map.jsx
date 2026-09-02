@@ -7,20 +7,107 @@ import { MapPin, AlertTriangle, ShieldAlert } from "lucide-react";
 import { getThreatHex } from "@/lib/threatLevels";
 import { useTheme } from "@/context/ThemeContext";
 
-// CARTO raster basemaps per theme -- a dark basemap under a light UI (or vice
-// versa) is jarring and hurts contrast against the threat-colored contacts.
-const BASEMAP_TILES = {
-  dark: [
-    "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-    "https://b.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-    "https://c.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png",
-  ],
-  light: [
-    "https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-    "https://b.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-    "https://c.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
-  ],
-};
+// ---------------------------------------------------------------------------
+// BASEMAP STRATEGY (offline-first, graceful, never a blank/"API key" tile)
+// ---------------------------------------------------------------------------
+// The map picks a basemap in strict precedence, always beneath the tactical
+// graticule grid and all overlays (sensor marker, range rings, contact
+// markers, popups):
+//
+//   1. OFFLINE bundled tiles (SOVEREIGN / air-gapped path): if the operator
+//      has dropped a local raster tileset under the frontend's public/basemap/
+//      directory (described same-origin by /basemap/tiles.json), it is used and
+//      the map makes ZERO external requests. This is what the FIELDED
+//      AIR-GAPPED APPLIANCE must use. See public/basemap/README.md.
+//   2. OSM online tiles (DEMO ONLY): on a networked demo box with no bundled
+//      tiles, the map falls back to OpenStreetMap raster so it shows real
+//      geography instead of a bare grid. This path reaches the public internet
+//      and MUST NOT be relied on by the sovereign appliance (which is why (1)
+//      takes precedence and is tried first).
+//   3. GRID fallback (guaranteed): a MapLibre `background` fill + GeoJSON
+//      graticule, drawn with ZERO assets and ZERO network. If BOTH raster
+//      paths are unavailable (air-gapped with no bundled tiles, or OSM blocked/
+//      offline) the map simply degrades to this grid -- it NEVER shows an "API
+//      key Required" error or a blank bland tile.
+//
+// Legibility: OSM standard tiles are light and busy, so in DARK mode a
+// semi-transparent dark scrim is layered above the raster (below the grid +
+// overlays) to keep tactical markers/rings/threat colors readable; in LIGHT
+// mode the scrim is transparent and the tiles show through.
+// ---------------------------------------------------------------------------
+
+// Tactical basemap fill per theme (from index.css --bg tokens; maplibre paint
+// props can't read CSS vars, so the hex is mirrored here per theme).
+const BASEMAP_BG = { dark: "#060B14", light: "#DFE4EC" };
+// Graticule / grid line stroke per theme.
+const GRID_COLOR = { dark: "#17263D", light: "#9FADBF" };
+// Same-origin metadata file an operator drops in to enable the offline
+// geographic raster basemap (see public/basemap/README.md). Same-origin only.
+const OFFLINE_BASEMAP_META_URL = "/basemap/tiles.json";
+
+// DEMO ONLINE basemap: OpenStreetMap raster tiles. Used ONLY when no bundled
+// offline tiles are present (see precedence note in the header comment). The
+// fielded air-gapped appliance must ship /basemap tiles so this is never hit.
+const OSM_TILES = ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"];
+const OSM_ATTRIBUTION = "© OpenStreetMap contributors";
+// Dark-mode scrim opacity over the (light, busy) raster so tactical overlays
+// stay legible; light mode lets the tiles show through.
+const SCRIM_OPACITY = { dark: 0.55, light: 0.0 };
+const SCRIM_COLOR = "#050810";
+
+// Pick a "nice" graticule spacing (degrees) for the current zoom so the grid
+// stays legible (a handful of lines) at any scale from world view to site view.
+function niceGridStep(zoom) {
+  if (zoom >= 13) return 0.005;
+  if (zoom >= 11) return 0.01;
+  if (zoom >= 9) return 0.05;
+  if (zoom >= 7) return 0.1;
+  if (zoom >= 5) return 0.5;
+  if (zoom >= 3) return 1;
+  return 5;
+}
+
+// Build a graticule (FeatureCollection of lat/lon lines) covering the current
+// map bounds, padded by one step so lines still fill the viewport after a pan.
+// Every 5th line is flagged `major` for a heavier tactical stroke. The step is
+// widened if the viewport would otherwise need too many lines (keeps it cheap).
+function buildGraticule(bounds, zoom) {
+  let step = niceGridStep(zoom);
+  const west = bounds.getWest();
+  const east = bounds.getEast();
+  const south = bounds.getSouth();
+  const north = bounds.getNorth();
+  // Clamp total line count for very wide viewports.
+  let guard = 0;
+  while (((east - west) / step + (north - south) / step) > 160 && guard < 12) {
+    step *= 2;
+    guard += 1;
+  }
+  const w = Math.floor(west / step) * step - step;
+  const e = Math.ceil(east / step) * step + step;
+  const s = Math.max(Math.floor(south / step) * step - step, -85);
+  const n = Math.min(Math.ceil(north / step) * step + step, 85);
+  const eps = step / 1e6;
+  const features = [];
+  for (let x = w; x <= e + eps; x += step) {
+    const idx = Math.round(x / step);
+    features.push({
+      type: "Feature",
+      properties: { major: idx % 5 === 0 },
+      geometry: { type: "LineString", coordinates: [[x, s], [x, n]] },
+    });
+  }
+  for (let y = s; y <= n + eps; y += step) {
+    const idx = Math.round(y / step);
+    features.push({
+      type: "Feature",
+      properties: { major: idx % 5 === 0 },
+      geometry: { type: "LineString", coordinates: [[w, y], [e, y]] },
+    });
+  }
+  return { type: "FeatureCollection", features };
+}
+
 // Context ring stroke (the non-threat reference rings) per theme.
 const CTX_RING_COLOR = { dark: "#1E2A3F", light: "#94A3B8" };
 
@@ -139,23 +226,119 @@ export default function MapView() {
 
     const map = new maplibregl.Map({
       container: mapContainer.current,
+      // Fully self-contained style: no external tile/glyph/sprite/style URL.
+      // Just a tactical background fill; the grid + optional offline raster are
+      // added on load below. This is what kills the "API key Required" tiles.
       style: {
         version: 8,
-        sources: {
-          "carto": {
-            type: "raster",
-            tiles: BASEMAP_TILES[theme] || BASEMAP_TILES.dark,
-            tileSize: 256,
-            attribution: "© OpenStreetMap contributors © CARTO",
+        sources: {},
+        layers: [
+          {
+            id: "tactical-bg",
+            type: "background",
+            paint: { "background-color": BASEMAP_BG[theme] || BASEMAP_BG.dark },
           },
-        },
-        layers: [{ id: "carto-layer", type: "raster", source: "carto" }],
+        ],
       },
       center,
       zoom,
     });
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
     mapRef.current = map;
+
+    // Draw / refresh the coordinate graticule to cover the current viewport.
+    const updateGrid = () => {
+      if (!map.getSource("grid")) return;
+      map.getSource("grid").setData(buildGraticule(map.getBounds(), map.getZoom()));
+    };
+
+    // Insert a raster basemap BENEATH the given beforeId, offline-first then
+    // OSM (demo). Returns nothing; on total failure the grid remains.
+    const setupBasemap = async () => {
+      const beforeRaster = () =>
+        map.getLayer("basemap-scrim") ? "basemap-scrim" : (map.getLayer("grid") ? "grid" : undefined);
+
+      // (1) OFFLINE bundled tiles (sovereign / air-gapped). Same-origin probe;
+      // if present we use them and NEVER touch the network.
+      try {
+        const res = await fetch(OFFLINE_BASEMAP_META_URL, { cache: "no-store" });
+        if (res.ok && mapRef.current) {
+          const meta = await res.json();
+          if (!map.getSource("offline-basemap")) {
+            map.addSource("offline-basemap", {
+              type: "raster",
+              tiles: meta.tiles || ["/basemap/{z}/{x}/{y}.png"],
+              tileSize: meta.tileSize || 256,
+              minzoom: meta.minzoom ?? 0,
+              maxzoom: meta.maxzoom ?? 19,
+              attribution: meta.attribution || "",
+            });
+            map.addLayer(
+              { id: "offline-basemap", type: "raster", source: "offline-basemap", paint: { "raster-opacity": 1 } },
+              beforeRaster()
+            );
+          }
+          return; // offline tiles win -> do NOT fall through to online OSM
+        }
+      } catch {
+        /* no offline tiles present -> try OSM online below */
+      }
+
+      if (!mapRef.current) return;
+
+      // (2) OSM online tiles (DEMO ONLY). If these fail to load (offline /
+      // blocked) maplibre just renders no raster and the grid + scrim remain --
+      // it never shows an "API key Required" error or a blank bland tile.
+      try {
+        if (!map.getSource("osm-basemap")) {
+          map.addSource("osm-basemap", {
+            type: "raster",
+            tiles: OSM_TILES,
+            tileSize: 256,
+            minzoom: 0,
+            maxzoom: 19,
+            attribution: OSM_ATTRIBUTION, // rendered by the default AttributionControl
+          });
+          map.addLayer(
+            { id: "osm-basemap", type: "raster", source: "osm-basemap", paint: { "raster-opacity": 1 } },
+            beforeRaster()
+          );
+        }
+      } catch {
+        /* stay on the grid */
+      }
+    };
+
+    const onLoad = () => {
+      map.addSource("grid", { type: "geojson", data: buildGraticule(map.getBounds(), map.getZoom()) });
+      map.addLayer({
+        id: "grid",
+        type: "line",
+        source: "grid",
+        paint: {
+          "line-color": GRID_COLOR[theme] || GRID_COLOR.dark,
+          "line-width": ["case", ["get", "major"], 1.1, 0.5],
+          "line-opacity": ["case", ["get", "major"], 0.9, 0.45],
+        },
+      });
+      // Dark-mode legibility scrim: sits directly beneath the grid and above
+      // whatever raster loads, so a busy light basemap doesn't wash out the
+      // tactical overlays. Transparent in light mode (toggled on theme flip).
+      map.addLayer(
+        {
+          id: "basemap-scrim",
+          type: "background",
+          paint: {
+            "background-color": SCRIM_COLOR,
+            "background-opacity": SCRIM_OPACITY[theme] ?? SCRIM_OPACITY.dark,
+          },
+        },
+        "grid"
+      );
+      setupBasemap();
+    };
+    map.on("load", onLoad);
+    map.on("moveend", updateGrid);
 
     return () => {
       map.remove();
@@ -164,14 +347,24 @@ export default function MapView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sensor === null]);
 
-  // Swap the basemap tiles + reference-ring color in place when the theme
-  // flips, without tearing down the map (keeps zoom/pan).
+  // Recolor the tactical basemap (background fill + graticule + optional
+  // offline-raster dimming + reference-ring stroke) in place when the theme
+  // flips, without tearing down the map (keeps zoom/pan). No network involved.
   useEffect(() => {
     const map = mapRef.current;
     if (!map) return;
     const apply = () => {
-      const src = map.getSource("carto");
-      if (src && src.setTiles) src.setTiles(BASEMAP_TILES[theme] || BASEMAP_TILES.dark);
+      if (map.getLayer("tactical-bg")) {
+        map.setPaintProperty("tactical-bg", "background-color", BASEMAP_BG[theme] || BASEMAP_BG.dark);
+      }
+      if (map.getLayer("grid")) {
+        map.setPaintProperty("grid", "line-color", GRID_COLOR[theme] || GRID_COLOR.dark);
+      }
+      // Legibility scrim: opaque-ish in dark to tame the busy OSM raster,
+      // transparent in light so the tiles show through.
+      if (map.getLayer("basemap-scrim")) {
+        map.setPaintProperty("basemap-scrim", "background-opacity", SCRIM_OPACITY[theme] ?? SCRIM_OPACITY.dark);
+      }
       (map.getStyle()?.layers || []).forEach((l) => {
         if (l.id.startsWith("ring-ctx-") && map.getLayer(l.id)) {
           map.setPaintProperty(l.id, "line-color", CTX_RING_COLOR[theme] || CTX_RING_COLOR.dark);

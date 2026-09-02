@@ -6,8 +6,8 @@ import { createContext, useContext, useEffect, useState, useCallback } from "rea
 //
 // Resolution order on first paint:
 //   1. explicit user choice persisted in localStorage ("cema_theme")
-//   2. OS-level prefers-color-scheme
-//   3. dark (the console's native/default theme)
+//   2. dark (the console's native/default theme) — a fresh visitor always
+//      lands in dark; OS prefers-color-scheme is deliberately NOT consulted.
 // The resolved value is written to <html data-theme="..."> so every CSS
 // token block in index.css ([data-theme="light"] / dark) resolves correctly,
 // and non-CSS-var consumers (maplibre paint props, ECharts, cytoscape) can
@@ -22,14 +22,11 @@ function readInitialTheme() {
     const saved = localStorage.getItem(STORAGE_KEY);
     if (saved && VALID.has(saved)) return saved;
   } catch { /* localStorage unavailable -- fall through */ }
-  // OS-level prefers-color-scheme auto-detection disabled for the demo: the
-  // console is locked to dark (ThemeToggle hidden in Layout.jsx). Restore the
-  // block below alongside the toggle to re-enable light-mode auto-detection.
-  // try {
-  //   if (window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches) {
-  //     return "light";
-  //   }
-  // } catch { /* matchMedia unavailable */ }
+  // A fresh visitor (no persisted choice) ALWAYS lands in dark — the console's
+  // native theme. OS-level prefers-color-scheme auto-detection stays disabled
+  // on purpose so first paint is deterministic dark on any operator's machine;
+  // the ThemeToggle (Layout.jsx) is how a user opts into light, and that choice
+  // is what gets persisted above and restored on reload.
   return "dark";
 }
 

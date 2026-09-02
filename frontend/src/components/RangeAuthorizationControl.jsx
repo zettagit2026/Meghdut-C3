@@ -107,7 +107,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
             <div className="font-mono text-xs">
               <span className="font-bold blink" style={{ color: "var(--accent-critical)" }}>● RANGE LIVE</span>
               <span className="text-slate-400 ml-3">
-                expires in <span data-testid={`range-auth-control-countdown-${effect}`} className="text-white tnum">{fmtRemaining(remaining)}</span>
+                expires in <span data-testid={`range-auth-control-countdown-${effect}`} className="tnum" style={{ color: "var(--text-primary)" }}>{fmtRemaining(remaining)}</span>
               </span>
             </div>
           </div>
@@ -180,7 +180,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
                   </div>
                 </div>
               </div>
-              <button type="button" data-testid={`range-auth-modal-close-${effect}`} onClick={closeModal} className="text-slate-400 hover:text-white">
+              <button type="button" data-testid={`range-auth-modal-close-${effect}`} onClick={closeModal} className="text-slate-400 hover:text-[var(--text-primary)]">
                 <X size={18} />
               </button>
             </div>
@@ -205,7 +205,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
                   autoComplete="off"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus-accent-critical"
+                  className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-critical"
                   placeholder="Password"
                   required
                 />
@@ -221,7 +221,7 @@ export default function RangeAuthorizationControl({ effect, label }) {
                   autoComplete="off"
                   value={phrase}
                   onChange={(e) => setPhrase(e.target.value)}
-                  className={`mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none ${
+                  className={`mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none ${
                     phrase && !phraseMatches ? "border-accent-critical" : "focus-accent-critical"
                   }`}
                   placeholder={CONFIRM_PHRASE}

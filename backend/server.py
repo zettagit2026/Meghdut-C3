@@ -190,6 +190,40 @@ if IFF_BRIDGE_API_KEY.lower() in _PLACEHOLDER_SECRETS or IFF_BRIDGE_API_KEY.lowe
         "boundary from ordinary JWT auth."
     )
 
+# CEMA_BRIDGE_TOKEN: the bridge-identity secret for the TX-consumer registration
+# (bridge_hello) trust boundary — the SAME kind of "prove you are the real
+# bridge, not a console session" secret as IFF_BRIDGE_API_KEY above, but scoped
+# ONLY to the diagnostic bridge_hello message on ws /api/ws/mavlink.
+#
+# WHY (TX-review MEDIUM / false-green class): a TX bridge advertises itself via
+# {"type":"bridge_hello","consumers":[...]} so the backend can honestly warn an
+# operator when NO TX bridge is subscribed to carry a deploy/jam. Without this
+# secret, ANY authenticated console session (every JWT is an operator or
+# commander — the only two roles) could send that same bridge_hello and register
+# as a FAKE TX consumer, suppressing the "NO TX BRIDGE SUBSCRIBED" warning — a
+# false-green vector. So the backend now accepts a bridge_hello ONLY when it
+# carries this shared secret; the real bridges (rf-bridge/mavlink_bridge.py,
+# field-bridge/jam_bridge.py) load it from their host .env and include it.
+#
+# This is a DIAGNOSTIC trust boundary ONLY: it never gates or authorizes TX
+# (require_commander / arm-token / range-auth / tx_halt and the AWAITING_ACK/
+# tx_ack machinery remain the sole authorities). It is OPTIONAL so the backend
+# still boots without it — but then it FAILS CLOSED: bridge_hello is refused and
+# the honest signal simply defaults to "no TX bridge subscribed" (it over-warns,
+# never falsely reassures). Set it (identically here and in the bridge hosts'
+# .env) to enable TX-consumer registration.
+BRIDGE_HELLO_TOKEN = os.environ.get("CEMA_BRIDGE_TOKEN", "").strip()
+if BRIDGE_HELLO_TOKEN and (
+    BRIDGE_HELLO_TOKEN.lower() in _PLACEHOLDER_SECRETS
+    or BRIDGE_HELLO_TOKEN.lower().startswith("change-me")
+):
+    raise RuntimeError(
+        "CEMA_BRIDGE_TOKEN matches a known placeholder/default value. Generate a "
+        "real secret (e.g. `openssl rand -hex 32`) and set it via a gitignored "
+        ".env file — identically on the backend and on each TX-bridge host — or "
+        "leave it unset to disable TX-consumer registration entirely."
+    )
+
 # ---------- Mongo ----------
 mongo_url = os.environ["MONGO_URL"]
 client = AsyncIOMotorClient(mongo_url)
@@ -363,6 +397,62 @@ def _consume_arm_token(token: Optional[str], effect: str,
             "Arm token target mismatch: this token was armed for a different "
             "target detection. Request a fresh POST /api/arm for this target.",
         )
+
+
+# ---- Friendly-fire override ack (fratricide interlock, DELIBERATE single-use) ----
+# The ONLY thing that can license firing on a CONFIRMED-FRIENDLY (IFF-verified)
+# contact. Modeled on the arm-token pattern above (short-TTL, single-use,
+# target-bound, atomic pop) but DELIBERATELY a separate token type so a friendly
+# engagement can never be authorized by a token minted for anything else.
+#
+# This REPLACES the previous SILENT standing `iff_override_authorized=True` flag
+# that authorize_target set once and left on the detection forever — a per-
+# target-forever license that risked silent, accidental fratricide on any later
+# deploy. The commander's ability to override IFF is RETAINED, but it is now a
+# deliberate, explicit, single-use, per-engagement action that is LOUDLY audited
+# at both mint time and fire time (see mint_friendly_fire_ack /
+# _enforce_fire_time_iff). It must be minted by a COMMANDER (require_commander)
+# and is bound to the exact detection id so it can never be replayed onto a
+# different target, and can be spent exactly once.
+IFF_FF_ACK_TTL_S = 60
+# token -> {"expiry": datetime, "target_detection_id": str, "minted_by": str}
+_iff_ff_acks: Dict[str, Dict[str, Any]] = {}
+
+
+def _issue_iff_ff_ack(target_detection_id: str, minted_by: str) -> Dict[str, Any]:
+    token = str(uuid.uuid4())
+    _iff_ff_acks[token] = {
+        "expiry": datetime.now(timezone.utc) + timedelta(seconds=IFF_FF_ACK_TTL_S),
+        "target_detection_id": target_detection_id,
+        "minted_by": minted_by,
+    }
+    return {
+        "iff_friendly_fire_ack": token,
+        "expires_in_s": IFF_FF_ACK_TTL_S,
+        "target_detection_id": target_detection_id,
+    }
+
+
+def _consume_iff_ff_ack(token: Optional[str],
+                        target_detection_id: str) -> Optional[Dict[str, Any]]:
+    """Atomic single-use burn of a commander-minted friendly-fire ack, verifying
+    it is bound to THIS target. Returns the burned record on success, or None if
+    the token is missing / expired / bound to a different target — ALL of which
+    are fire-time refusals (a friendly stays hard-blocked).
+
+    ATOMICITY: the lookup-and-pop is a single synchronous dict.pop with NO
+    `await` between the read and the removal — this is what makes the ack
+    genuinely single-use and immune to a double-spend race. A binding mismatch
+    still burns the token (the pop already happened) — a mismatch is a
+    security-relevant event, not a retryable one — mirroring _consume_arm_token."""
+    if not token:
+        return None
+    rec = _iff_ff_acks.pop(token, None)  # atomic single-use burn — no await around this
+    if not rec or datetime.now(timezone.utc) > rec["expiry"]:
+        return None
+    if rec.get("target_detection_id") != target_detection_id:
+        return None
+    return rec
 
 
 # ---- Jam-confirm token (SEPARATE from arm_token — the digital equivalent
@@ -665,50 +755,63 @@ async def _require_range_authorized(effect: str, actor: str) -> None:
 
 
 async def _enforce_fire_time_iff(detection: Dict[str, Any], user: Dict[str, Any],
-                                 *, context: str) -> None:
+                                 *, context: str,
+                                 friendly_fire_ack: Optional[str] = None) -> None:
     """F1/F2 (2026-08): fire-time friendly-fire interlock, re-evaluated at the
     exact moment of transmission (not just at authorize-target time).
 
-    IFF status can flip AFTER a target was authorized: detection_ingest() can
-    re-classify a previously-authorized-while-hostile contact to
-    iff_verified=True / threat_level="FRIENDLY (IFF verified)". Checking only
-    detection.authorized_target at fire time is therefore a TOCTOU fratricide
-    hole. This re-check refuses (403) any kinetic/targeted effect against a
-    contact that is CURRENTLY IFF-verified friendly, UNLESS an explicit
-    commander IFF override is recorded on the detection
-    (iff_override_authorized=True — set ONLY by authorize_target's
-    commander-override path, which also emits the high-visibility
-    IFF_OVERRIDE_AUTHORIZE audit event, and cleared whenever the target is
-    de-authorized or re-classified friendly). The refusal AND the honored
-    override are both routed through the hash-chained audit chain."""
+    A CONFIRMED-FRIENDLY contact (iff_verified=True / threat_level="FRIENDLY
+    (IFF verified)") is HARD-BLOCKED (403) at fire time by DEFAULT — there is no
+    standing per-target license any more. The ONLY thing that lets the fire
+    proceed is an explicit, single-use, short-TTL, target-bound friendly-fire
+    ack carried on THIS deploy request and minted for THIS exact detection by a
+    COMMANDER (POST /api/detections/{id}/friendly-fire-ack —
+    _consume_iff_ff_ack). This replaces the previous SILENT standing
+    `iff_override_authorized` flag, which licensed firing on a friendly per-
+    target-forever after a single authorize and risked accidental fratricide.
+
+    IFF status can also FLIP after a target was authorized while hostile
+    (detection_ingest() re-classifies it friendly) — checking only
+    detection.authorized_target at fire time is a TOCTOU fratricide hole, which
+    this re-check closes for the non-friendly-when-authorized case too.
+
+    When the valid ack IS present the engagement is allowed AND a LOUD
+    IFF_FRIENDLY_FIRE_OVERRIDE event is written to the hash-chained mission log;
+    the refusal is likewise audited. Both are un-missable in the audit trail."""
     is_friendly = (
         detection.get("iff_verified")
         or detection.get("threat_level") == "FRIENDLY (IFF verified)"
     )
     if not is_friendly:
         return
-    if not detection.get("iff_override_authorized"):
+    det_id = detection.get("id")
+    ack_rec = _consume_iff_ff_ack(friendly_fire_ack, det_id)  # atomic single-use burn
+    if ack_rec is None:
         await log_event(
             "IFF_FIRE_REFUSED",
             f"FRATRICIDE INTERLOCK: {context} against {detection.get('callsign')} REFUSED — "
-            f"target is currently IFF-verified FRIENDLY with no standing commander override. "
-            f"Re-authorize via POST /api/detections/{{id}}/authorize-target (commander) to override.",
-            meta={"detection_id": detection.get("id"), "callsign": detection.get("callsign"),
+            f"target is a CONFIRMED-FRIENDLY (IFF-verified) contact and this deploy carried no "
+            f"valid single-use commander friendly-fire ack for it. Mint one via "
+            f"POST /api/detections/{{id}}/friendly-fire-ack (commander) to deliberately override.",
+            meta={"detection_id": det_id, "callsign": detection.get("callsign"),
                   "asset_id": detection.get("iff_asset_id"), "context": context},
             actor=user["email"],
         )
         raise HTTPException(
             403,
-            "Fire refused — target is currently IFF-verified as FRIENDLY. Its prior target "
-            "authorization is no longer valid after the friendly re-classification. A commander "
-            "must explicitly re-authorize it (POST /api/detections/{id}/authorize-target) to override.",
+            "FRATRICIDE INTERLOCK — fire refused: target is CONFIRMED-FRIENDLY (IFF-verified). "
+            "Firing on a friendly requires an explicit, single-use, per-engagement commander "
+            "friendly-fire ack minted for THIS target "
+            "(POST /api/detections/{id}/friendly-fire-ack) and presented on this deploy. "
+            "There is no standing override.",
         )
     await log_event(
-        "IFF_OVERRIDE_AUTHORIZE",
-        f"COMMANDER OVERRIDE honored at fire time ({context}): {detection.get('callsign')} "
-        f"engaged despite being IFF-verified FRIENDLY",
-        meta={"detection_id": detection.get("id"), "callsign": detection.get("callsign"),
-              "asset_id": detection.get("iff_asset_id"), "context": context},
+        "IFF_FRIENDLY_FIRE_OVERRIDE",
+        f"COMMANDER ENGAGED A CONFIRMED-FRIENDLY TARGET — {detection.get('callsign')} "
+        f"({det_id}) via single-use friendly-fire ack ({context})",
+        meta={"detection_id": det_id, "callsign": detection.get("callsign"),
+              "asset_id": detection.get("iff_asset_id"), "context": context,
+              "ack_minted_by": ack_rec.get("minted_by"), "engaged_by": user["email"]},
         actor=user["email"],
     )
 
@@ -1170,6 +1273,12 @@ class DeployPayloadBody(BaseModel):
     # backend's own protocol check — an encrypted/FHSS protocol is refused
     # regardless of this flag.
     target_link_legacy_mavlink: bool = False
+    # DELIBERATE fratricide override: a single-use, commander-minted, target-bound
+    # friendly-fire ack (see POST /api/detections/{id}/friendly-fire-ack). Required
+    # — and consumed exactly once — ONLY when the target is currently
+    # IFF-verified FRIENDLY. Never a bypass of the arm-token/range-lease/tx-halt
+    # spine; an EXTRA gate on top. See _enforce_fire_time_iff.
+    iff_friendly_fire_ack: Optional[str] = None
 
 
 class AuthorizeTargetBody(BaseModel):
@@ -1266,16 +1375,105 @@ class GnssSpoofConfirmBody(BaseModel):
 class WSManager:
     def __init__(self) -> None:
         self.clients: List[WebSocket] = []
+        # Per-connection advertised CONSUMER ROLES (false-green hardening). A
+        # browser/telemetry viewer connects to the SAME /api/ws/mavlink socket
+        # as the real TX bridges but never advertises a role, so len(clients)
+        # can NOT distinguish "a real TX bridge is subscribed" from "only a
+        # browser tab is open". A TX bridge instead sends
+        # {"type":"bridge_hello","consumers":[...]} on connect (rf-bridge/
+        # mavlink_bridge.py -> ["mavlink"], field-bridge/jam_bridge.py ->
+        # ["jam"]); we record that here so has_tx_consumer(effect) can answer
+        # "is a bridge that will actually transmit THIS effect subscribed right
+        # now?" at fire time. This is a HONEST-SIGNAL layer ONLY — it never
+        # gates/authorizes TX (require_commander/arm-token/range-auth/tx_halt
+        # and the AWAITING_ACK/tx_ack machinery remain the sole authorities);
+        # it exists so an operator is never told a fire is "in flight" when
+        # there is no consumer subscribed to carry it.
+        self.consumers: Dict[WebSocket, set] = {}
+        # Per-connection JWT identity (role/email), captured at connect time from
+        # the authenticated token. Used ONLY to make bridge_hello rejections
+        # legible/auditable (which console user tried to forge a TX-consumer
+        # identity) — see check_bridge_hello(). Never used to gate/authorize TX.
+        self.identities: Dict[WebSocket, Dict[str, Optional[str]]] = {}
         self.lock = asyncio.Lock()
 
-    async def connect(self, ws: WebSocket) -> None:
+    async def connect(self, ws: WebSocket, identity: Optional[Dict[str, Optional[str]]] = None) -> None:
         await ws.accept()
         async with self.lock:
             self.clients.append(ws)
+            if identity:
+                self.identities[ws] = identity
 
     def disconnect(self, ws: WebSocket) -> None:
         if ws in self.clients:
             self.clients.remove(ws)
+        # Drop any advertised roles too, so a disconnected bridge stops counting
+        # as a subscribed TX consumer immediately (fails safe toward "none").
+        self.consumers.pop(ws, None)
+        self.identities.pop(ws, None)
+
+    def check_bridge_hello(self, ws: WebSocket, incoming: Dict) -> tuple:
+        """Authorize a bridge_hello BEFORE registering its advertised TX
+        consumers (TX-review MEDIUM / false-green hardening). Returns
+        (ok: bool, reason: str).
+
+        A bridge_hello registers a TX-consumer identity that SUPPRESSES the
+        "NO TX BRIDGE SUBSCRIBED" honest-signal warning, so only a REAL field
+        bridge may send it — never a browser/console session forging one.
+
+        (a) IDENTITY SECRET: the sender must present the shared BRIDGE_HELLO_TOKEN
+            (CEMA_BRIDGE_TOKEN), which the genuine bridges load from their host
+            .env. Compared with hmac.compare_digest (constant-time). If the
+            backend has no token configured, bridge_hello is refused outright
+            (fail-closed — the honest signal defaults to "no TX bridge").
+        (b) HUMAN-ROLE REJECTION: every /api/ws/mavlink connection authenticates
+            with an operator or commander JWT (the only two roles), and the real
+            bridges themselves log in as an operator — so ROLE alone cannot tell
+            a bridge from a browser; the secret in (a) is the true discriminator.
+            The connection's role/email are recorded here purely so a refused
+            attempt is logged as the specific human session it came from.
+
+        This NEVER gates or authorizes TX — it only decides whether to trust a
+        diagnostic self-advertisement."""
+        ident = self.identities.get(ws) or {}
+        role = ident.get("role") or "unknown"
+        email = ident.get("email") or "unknown"
+        if not BRIDGE_HELLO_TOKEN:
+            return (False, f"backend has no CEMA_BRIDGE_TOKEN configured; "
+                           f"refusing bridge_hello from role={role} ({email})")
+        presented = incoming.get("token")
+        if not isinstance(presented, str) or not presented:
+            return (False, f"bridge_hello missing bridge token from role={role} ({email})")
+        if not hmac.compare_digest(presented, BRIDGE_HELLO_TOKEN):
+            return (False, f"bridge_hello with INVALID bridge token from role={role} ({email})")
+        return (True, f"bridge identity verified (role={role})")
+
+    def register_consumers(self, ws: WebSocket, roles: Any) -> None:
+        """Record the CONSUMER ROLES a client advertised via bridge_hello.
+        Accepts a list/tuple of strings; anything else is ignored — a
+        malformed/absent hello simply leaves the client counting as a
+        non-consumer (fails safe toward 'no TX bridge subscribed')."""
+        if not isinstance(roles, (list, tuple)):
+            return
+        clean = {str(r).strip().lower() for r in roles if isinstance(r, str) and r.strip()}
+        if clean:
+            self.consumers[ws] = clean
+
+    def has_tx_consumer(self, effect: str) -> bool:
+        """True iff at least one CURRENTLY-CONNECTED client advertised itself as
+        a TX bridge for `effect` ('mavlink' or 'jam'). Used only to surface an
+        honest 'no TX bridge subscribed' signal — never to gate a request."""
+        eff = (effect or "").strip().lower()
+        return any(eff in roles for roles in self.consumers.values())
+
+    def tx_consumers(self) -> List[str]:
+        """Sorted union of all advertised consumer roles across connected
+        clients — for /system/health, so an operator sees WHICH TX bridges are
+        subscribed, not just a raw ws_clients count that also includes browsers."""
+        out: set = set()
+        for roles in self.consumers.values():
+            out |= roles
+        return sorted(out)
 
     async def broadcast_json(self, data: Dict) -> None:
         stale: List[WebSocket] = []
@@ -2374,49 +2572,39 @@ async def authorize_target(det_id: str, body: AuthorizeTargetBody,
     IFF INTERLOCK: if the detection is currently iff_verified (i.e. its
     threat_level has been set to "FRIENDLY (IFF verified)" by
     _check_iff_friendly_match() -- see detection_ingest()/kc_advance() where
-    that field is populated), authorizing it as a kinetic target is blocked
-    for ordinary operators (403). A commander MAY still override this and
-    authorize anyway (mirroring this codebase's existing commander-override
-    pattern for other CRITICAL/security-sensitive actions -- see
-    require_commander, deploy_jam, deploy_gnss_spoof), but the override is
-    logged as a distinct, high-visibility IFF_OVERRIDE_AUTHORIZE audit event
-    so there is always a clear trail if this is ever invoked. De-authorizing
-    (body.authorized=False) is never blocked by this interlock -- it only
-    ever makes the system safer."""
+    that field is populated), authorizing it as a kinetic target is HARD-REFUSED
+    for EVERY role (403), commanders included. Routine target authorization can
+    never — silently or otherwise — license firing on a confirmed friendly.
+    This deliberately removes the old SILENT standing `iff_override_authorized`
+    flag that a commander authorize used to set once and leave on the detection
+    forever (a per-target-forever license that risked accidental fratricide on
+    any later deploy). A commander who deliberately intends a fratricide override
+    must instead mint an explicit, single-use, per-engagement friendly-fire ack
+    (POST /api/detections/{id}/friendly-fire-ack) and present it on the deploy;
+    that is the ONLY path, and it is loudly audited at mint and fire time.
+    De-authorizing (body.authorized=False) is never blocked by this interlock --
+    it only ever makes the system safer."""
     doc = await db.detections.find_one({"id": det_id})
     if not doc:
         raise HTTPException(404, "Detection not found")
 
-    # F2 (2026-08): iff_override_authorized is the STANDING record that a
-    # commander deliberately overrode the friendly-fire interlock for THIS
-    # target. It is the only thing that lets a currently-IFF-friendly contact
-    # be fired on at fire time (see _enforce_fire_time_iff). It is set True
-    # ONLY on the commander-override path below, and forced False otherwise
-    # (normal authorize of a non-friendly, or any de-authorize) so it can never
-    # linger as a stale license after the reason for the override is gone.
-    iff_override = False
+    # Fratricide interlock: a CONFIRMED-FRIENDLY contact can NEVER be authorized
+    # as a kinetic target through this routine path — no role, no flag, produces
+    # nothing that by itself permits the fire. Deliberate friendly engagement is
+    # exclusively via a single-use commander friendly-fire ack (see docstring).
     if body.authorized and doc.get("iff_verified"):
-        if user.get("role") != "commander":
-            raise HTTPException(
-                403,
-                "Cannot authorize a target currently IFF-verified as friendly "
-                "(threat_level=FRIENDLY (IFF verified)). Commander role "
-                "required to override this friendly-fire interlock.",
-            )
-        iff_override = True
-        await log_event(
-            "IFF_OVERRIDE_AUTHORIZE",
-            f"COMMANDER OVERRIDE: {doc['callsign']} authorized as kinetic target "
-            f"despite being IFF-verified FRIENDLY",
-            meta={"detection_id": det_id, "asset_id": doc.get("asset_id"),
-                  "callsign": doc.get("callsign")},
-            actor=user["email"],
+        raise HTTPException(
+            403,
+            "Refusing to authorize a CONFIRMED-FRIENDLY (IFF-verified) contact as a kinetic "
+            "target. Routine target authorization can never license firing on a friendly. "
+            "A commander who deliberately intends a fratricide override must mint an explicit, "
+            "single-use, per-engagement friendly-fire ack "
+            "(POST /api/detections/{id}/friendly-fire-ack) and present it on the deploy.",
         )
 
     await db.detections.update_one(
         {"id": det_id},
-        {"$set": {"authorized_target": body.authorized,
-                  "iff_override_authorized": iff_override}},
+        {"$set": {"authorized_target": body.authorized}},
     )
     await log_event(
         "TARGETING",
@@ -2425,6 +2613,47 @@ async def authorize_target(det_id: str, body: AuthorizeTargetBody,
         actor=user["email"],
     )
     return {"ok": True, "detection_id": det_id, "authorized_target": body.authorized}
+
+
+@api.post("/detections/{det_id}/friendly-fire-ack")
+async def mint_friendly_fire_ack(det_id: str, user: Dict = Depends(require_commander)):
+    """Mint a SINGLE-USE, short-TTL (IFF_FF_ACK_TTL_S), target-bound friendly-fire
+    override ack for a CONFIRMED-FRIENDLY (IFF-verified) contact. This is the ONLY
+    thing that can let a subsequent /payloads/deploy engage a confirmed friendly,
+    and it is deliberate, explicit, single-use and per-engagement — NOT a standing
+    flag. COMMANDER role required (require_commander); the ack is bound to THIS
+    exact detection id so it can never be replayed onto a different target, and it
+    is burned on first use.
+
+    The mint itself is LOUDLY audited (IFF_FRIENDLY_FIRE_ACK_MINTED) so the
+    deliberate decision to prepare a fratricide override is un-missable in the
+    hash-chained trail even if the ack is never spent. It is NOT a bypass of the
+    arm-token / range-lease / tx-halt spine — those all still apply at deploy;
+    this is an EXTRA gate layered on top."""
+    doc = await db.detections.find_one({"id": det_id})
+    if not doc:
+        raise HTTPException(404, "Detection not found")
+    is_friendly = (
+        doc.get("iff_verified")
+        or doc.get("threat_level") == "FRIENDLY (IFF verified)"
+    )
+    if not is_friendly:
+        raise HTTPException(
+            400,
+            "This detection is not CONFIRMED-FRIENDLY (IFF-verified) — no friendly-fire ack "
+            "is applicable. Engage a non-friendly target via the routine "
+            "authorize-target + arm-token path.",
+        )
+    out = _issue_iff_ff_ack(det_id, user["email"])
+    await log_event(
+        "IFF_FRIENDLY_FIRE_ACK_MINTED",
+        f"COMMANDER MINTED a single-use friendly-fire override ack for CONFIRMED-FRIENDLY "
+        f"{doc.get('callsign')} ({det_id}) — valid {IFF_FF_ACK_TTL_S}s, one engagement only",
+        meta={"detection_id": det_id, "callsign": doc.get("callsign"),
+              "asset_id": doc.get("iff_asset_id"), "minted_by": user["email"]},
+        actor=user["email"],
+    )
+    return out
 
 
 class AttachIqCaptureBody(BaseModel):
@@ -3661,9 +3890,12 @@ async def detection_ingest(body: DetectionIngestBody,
             updates["iff_callsign"] = iff_friendly["callsign"]
             # F2 (2026-08): a contact re-classified as IFF-friendly must NOT
             # keep a stale kinetic authorization granted while it was hostile
-            # (fire-time TOCTOU fratricide hole). Clear both the authorization
-            # and any prior commander override — engaging it again now requires
-            # a fresh, explicit commander override via authorize-target.
+            # (fire-time TOCTOU fratricide hole). Clear the authorization —
+            # engaging it again now requires a fresh, explicit, single-use
+            # commander friendly-fire ack (POST .../friendly-fire-ack) at fire
+            # time (there is no standing override flag any more). Also defensively
+            # clear any legacy iff_override_authorized left on old records so it
+            # can never be mistaken for a license.
             if existing.get("authorized_target") or existing.get("iff_override_authorized"):
                 await log_event(
                     "IFF_AUTHORIZATION_CLEARED",
@@ -3674,7 +3906,7 @@ async def detection_ingest(body: DetectionIngestBody,
                     actor=user["email"],
                 )
             updates["authorized_target"] = False
-            updates["iff_override_authorized"] = False
+            updates["iff_override_authorized"] = False  # legacy field: force-cleared, never a license
         await db.detections.update_one(
             {"id": existing["id"]},
             {
@@ -4017,7 +4249,21 @@ async def ws_mavlink(ws: WebSocket):
     except jwt.PyJWTError:
         await ws.close(code=1008)
         return
-    await ws_manager.connect(ws)
+    # Resolve the connection's JWT identity (role/email) so a rejected
+    # bridge_hello can be logged as the specific console session it came from
+    # (the JWT itself carries no role claim — role lives on the user doc). Best
+    # effort: a lookup miss just yields role/email="unknown" and never blocks
+    # the connection (this is diagnostics only, not a TX gate).
+    ws_identity: Dict[str, Optional[str]] = {"role": None, "email": None}
+    try:
+        _sub = payload.get("sub")
+        if _sub:
+            _u = await db.users.find_one({"id": _sub}, {"_id": 0, "role": 1, "email": 1})
+            if _u:
+                ws_identity = {"role": _u.get("role"), "email": _u.get("email")}
+    except Exception:
+        pass
+    await ws_manager.connect(ws, identity=ws_identity)
     try:
         await ws.send_json({"type": "hello", "ts": datetime.now(timezone.utc).isoformat()})
         while True:
@@ -4039,6 +4285,30 @@ async def ws_mavlink(ws: WebSocket):
             elif isinstance(incoming, dict) and incoming.get("type") == "gnss_spoof_ack":
                 # From field-bridge/gnss_spoof_bridge.py — see _handle_gnss_spoof_ack.
                 await _handle_gnss_spoof_ack(incoming)
+            elif isinstance(incoming, dict) and incoming.get("type") == "bridge_hello":
+                # A TX bridge announcing which effect(s) it will actually
+                # transmit (rf-bridge -> "mavlink", jam_bridge -> "jam"). Lets
+                # deploy/jam surface an honest "no TX bridge subscribed" signal
+                # at fire time instead of firing into the void and only finding
+                # out via the delayed TX_TIMEOUT.
+                #
+                # SECURITY (TX-review MEDIUM): registering a TX consumer here
+                # SUPPRESSES the "NO TX BRIDGE SUBSCRIBED" warning, so it is
+                # gated on the shared bridge-identity secret — a browser/console
+                # session (which lacks CEMA_BRIDGE_TOKEN) can no longer forge a
+                # fake TX consumer to mask that warning. Still diagnostic-only:
+                # this never gates or authorizes an actual transmit.
+                ok, reason = ws_manager.check_bridge_hello(ws, incoming)
+                if ok:
+                    ws_manager.register_consumers(ws, incoming.get("consumers"))
+                else:
+                    await log_event(
+                        "SYSTEM",
+                        f"REJECTED bridge_hello (TX-consumer registration refused): {reason}. "
+                        f"No TX consumer registered; honest signal stays 'no TX bridge subscribed'.",
+                        meta={"event": "bridge_hello_rejected"},
+                        actor="SYSTEM",
+                    )
     except WebSocketDisconnect:
         pass
     finally:
@@ -4109,21 +4379,31 @@ async def deploy_payload(body: DeployPayloadBody,
         detection = await db.detections.find_one({"id": body.target_detection_id})
         if not detection:
             raise HTTPException(404, "Target detection not found")
-        # #4: friendly-fire interlock — refuse to engage anything not
-        # explicitly authorized as a target (see /detections/{id}/authorize-target).
-        if not detection.get("authorized_target"):
+        is_friendly = (
+            detection.get("iff_verified")
+            or detection.get("threat_level") == "FRIENDLY (IFF verified)"
+        )
+        # #4: friendly-fire interlock — refuse to engage anything not explicitly
+        # authorized as a target (see /detections/{id}/authorize-target). A
+        # CONFIRMED-FRIENDLY contact is deliberately EXEMPT from this routine
+        # authorized_target check because a friendly can never be authorized
+        # through that path any more — its ONLY licence is the single-use
+        # commander friendly-fire ack enforced (consumed + loudly audited) in
+        # _enforce_fire_time_iff just below, which hard-refuses (403) if the ack
+        # is absent/invalid. So a friendly with no ack still cannot fire.
+        if not is_friendly and not detection.get("authorized_target"):
             raise HTTPException(
                 403,
                 "Target not authorized — friendly-fire interlock: "
                 "POST /api/detections/{id}/authorize-target first.",
             )
-        # F2 (2026-08): belt-and-suspenders fire-time IFF re-check. Even though
-        # ingest now clears authorized_target when a contact flips to friendly,
-        # re-evaluate IFF status HERE at the instant of transmission: refuse if
-        # the target is currently IFF-verified friendly with no standing
-        # commander override. Closes the TOCTOU where a target authorized while
-        # hostile later became IFF-friendly.
-        await _enforce_fire_time_iff(detection, user, context="payload deploy")
+        # F2 (2026-08): fire-time IFF re-check at the instant of transmission.
+        # For a CONFIRMED-FRIENDLY target this is the SOLE authorization gate and
+        # requires the single-use, target-bound commander friendly-fire ack from
+        # this request (consumed here); for a non-friendly it closes the TOCTOU
+        # where a target authorized while hostile later became IFF-friendly.
+        await _enforce_fire_time_iff(detection, user, context="payload deploy",
+                                     friendly_fire_ack=body.iff_friendly_fire_ack)
         target_sys = detection.get("system_id", 1)
         target_comp = detection.get("component_id", 1)
 
@@ -4295,6 +4575,28 @@ async def deploy_payload(body: DeployPayloadBody,
         "broadcast": body.broadcast,
     }
 
+    # ---- Honest "no TX bridge subscribed" signal (false-green hardening) ----
+    # The AWAITING_ACK/tx_ack machinery above ALREADY guarantees a fire is never
+    # marked NEUTRALIZED without a real bridge ack (and lazily flips to
+    # TX_TIMEOUT if none arrives) — so this does NOT gate/deny the deploy and
+    # the status stays AWAITING_ACK / HTTP stays 200 (the regression contract in
+    # test_e2e_deploy_bridge.py). What it ADDS is the ability to tell the
+    # operator, AT FIRE TIME, that nothing is subscribed to carry this frame —
+    # instead of it looking "in flight" until the 8s timeout. Unlike ws_clients
+    # (which counts browsers), has_tx_consumer() is true only when a real
+    # cema-rf-bridge advertised itself. The frontend renders tx_bridge_subscribed
+    # == False as an explicit warning rather than a hopeful "sent" toast.
+    tx_bridge_subscribed = ws_manager.has_tx_consumer("mavlink")
+    if not tx_bridge_subscribed:
+        await log_event(
+            "PAYLOAD",
+            f"WARNING: NO MAVLink TX bridge subscribed — deploy request {request_id} "
+            f"({spec.name}) will not reach any radio and will TX_TIMEOUT. Start "
+            f"cema-rf-bridge on the transmit host before engaging.",
+            meta={"request_id": request_id, "tx_bridge_subscribed": False},
+            actor="SYSTEM",
+        )
+
     await ws_manager.broadcast_json({"type": "packet", "packet": pkt})
     await log_event(
         "PAYLOAD",
@@ -4312,6 +4614,10 @@ async def deploy_payload(body: DeployPayloadBody,
     )
 
     pkt["status"] = "AWAITING_ACK"
+    # Additive, informational field (never changes status/HTTP code): False here
+    # means "nothing was transmitted — no TX bridge is subscribed"; the console
+    # surfaces it as an explicit warning. See has_tx_consumer() above.
+    pkt["tx_bridge_subscribed"] = tx_bridge_subscribed
     return pkt
 
 
@@ -4433,6 +4739,26 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
     )
     await ws_manager.broadcast_json({"type": "jam_status", "request_id": request_id, "status": "AWAITING_ACK"})
 
+    # ---- Honest "no jam TX bridge subscribed" signal (false-green hardening) --
+    # Same rationale as /payloads/deploy: the AWAITING_ACK -> jam_ack ->
+    # JAM_ACTIVE/JAM_COMPLETE (or lazy TX_TIMEOUT) state machine already prevents
+    # a silent false success, and this neither gates the request nor changes the
+    # status/HTTP code. It only lets the console warn AT FIRE TIME that no
+    # cema-jam-bridge is subscribed to actually radiate — instead of the request
+    # looking "in flight" until the timeout. has_tx_consumer('jam') is true only
+    # when a real jam bridge advertised itself (not merely when a browser is on
+    # the same WS).
+    tx_bridge_subscribed = ws_manager.has_tx_consumer("jam")
+    if not tx_bridge_subscribed:
+        await log_event(
+            "JAM",
+            f"WARNING: NO jam TX bridge subscribed — jam request {request_id} will not "
+            f"radiate and will TX_TIMEOUT. Start cema-jam-bridge on the transmit host "
+            f"before engaging.",
+            meta={"request_id": request_id, "tx_bridge_subscribed": False},
+            actor="SYSTEM",
+        )
+
     return {
         "request_id": request_id,
         "status": "AWAITING_ACK",
@@ -4440,6 +4766,9 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
         "bandwidth_khz": body.bandwidth_khz,
         "duration_s": duration_s,
         "tx_gain": body.tx_gain,
+        # Additive, informational (never changes status/HTTP code): False means
+        # "nothing will radiate — no jam bridge subscribed". Console warns on it.
+        "tx_bridge_subscribed": tx_bridge_subscribed,
     }
 
 
@@ -4939,6 +5268,12 @@ async def system_health(user: Dict = Depends(get_current_user)):
         "ml_classify_bridge_live": ml_classify_bridge_live,
         "sik_radio": sik_count > 0,
         "ws_clients": len(ws_manager.clients),
+        # WHICH TX bridges are actually subscribed right now (advertised via
+        # bridge_hello) — distinct from ws_clients, which also counts browser
+        # viewers. Empty list = no TX bridge is subscribed, so any deploy/jam
+        # fired now would TX_TIMEOUT (see has_tx_consumer / the deploy+jam
+        # tx_bridge_subscribed responses).
+        "tx_bridge_consumers": ws_manager.tx_consumers(),
         "ws_upgrade_capable": WS_UPGRADE_CAPABLE,
         "active_targets": active_targets,
         # Track-manager summary (OB-04). active_tracks/tracks_confirmed reflect

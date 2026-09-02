@@ -97,7 +97,7 @@ export default function Signals() {
                 data-testid={`select-${d.id}`}
                 onClick={() => setSelected(d.id)}
                 className={`w-full text-left p-3 tactical-border-b font-mono text-xs transition-colors ${
-                  d.id === selected ? "" : "text-slate-400 hover-surface hover:text-white"
+                  d.id === selected ? "" : "text-slate-400 hover-surface hover:text-[var(--text-primary)]"
                 }`}
                 style={d.id === selected ? { background: "var(--hover-surface)", color: "var(--accent-info)" } : undefined}
               >
