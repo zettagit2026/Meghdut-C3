@@ -9,16 +9,14 @@ _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 need
 - Every shipped unit: independent verifier sign-off; no fake data / no fake-green.
 - TX device pinning: TX=`…930c` (PA), RX/detection=`…a063`.
 
-## In progress
-- 🔄 **IFF friendly-fire override — deliberate rebuild** — ROE decision: commander override STAYS, but rebuilt as an explicit, single-use, commander-only, per-target friendly-fire ack (loud audit) replacing the silent standing `iff_override_authorized` flag → no accidental fratricide, and the gate test passes. _(agent running; server.py)_
-
-## Staged — pending ONE batched .186 deploy (backend + rf-bridge + field-bridge + docker-compose.yml)
-_Prereq: generate + set the SAME `CEMA_BRIDGE_TOKEN` on .186 (backend + each TX-bridge `.env`). Deploy after the IFF override lands + is verified; then verify plane + bridge_hello reject + tx_halt True + bridges dormant._
-- ✅ **Security hardening** — `bridge_hello` identity credential (backend + jam/mavlink bridges) + ungoverned-CLI `-d` pinning. Isolation-verified (tx_authorization_holes 12/12; CLI pinning 3/3).
-- ✅ **GNSS-spoof v1 DSP** — real L1 C/A (Gold codes/NAV/BPSK), 63 tests, INDEPENDENT REVIEW PASS. **Honest: valid signal, NOT yet a proven lock** — real-receiver validation is a later bench step. (Doc `GNSS_SIGNAL_SYNTH_HANDOFF.md` stale → update.)
-- ✅ **FPV OSD extractor** — MAX7456 glyph-match (numpy-only), 22 tests, no-fabrication guard. Backend ingest wiring deferred (server.py, after batch).
-- ⬜ **IFF friendly-fire override** — lands with the running agent + verifier.
-- ⬜ **1 pre-existing gate-test failure** (maneuver_takeover) — resolved by the IFF override rebuild (was the test that surfaced the hole).
+## Next queue (all software, no hardware; sequence deploys)
+- ⏸ **Passive-radar software/GPU** — dual-channel wiring + GPU CAF port (`caf_fft_batched`→torch.fft/cupy, bit-accuracy vs `caf_bruteforce`); list GPSDO+illuminator gap.
+- ⏸ **Control-link RF classification** — ELRS/CRSF/DSMX/DJI signature typing (identifies any drone incl. MSP/CAN).
+- ⏸ **RemoteID ingest** (Kismet Wi-Fi/BLE, software) + **DJI DroneID** (cued capture on the RX radio).
+- ⏸ **FPV OSD → backend wiring** — POST decoded telemetry to a new `/api/fpv/osd-telemetry`; surface in console.
+- ⏸ **UI light-mode finish** — GnssSpoof, MavlinkConsole, DetectionHistory, ProtocolLibrary, KillChain.
+- ⏸ **Strip external analytics** (emergent.sh + PostHog) — sovereignty. _(chip task_50fc5d7f)_
+- ⏸ **GNSS fidelity phase** — solved ephemeris + GPS-time + Doppler dynamics; then real-receiver validation (bench).
 
 ## Queued (software, no user needed)
 - ⏸ **Passive radar software/GPU** — dual-channel wiring + GPU CAF port (`caf_fft_batched`→torch.fft/cupy) with bit-accuracy vs `caf_bruteforce`; list GPSDO+illuminator hardware gap. _(starts after security deploy)_
@@ -51,6 +49,7 @@ _Prereq: generate + set the SAME `CEMA_BRIDGE_TOKEN` on .186 (backend + each TX-
 - 📋 **GPU CAF as OB-06 Phase-1** — throughput reading only; true FPGA still needed for deterministic-latency/SWaP-C/cert.
 
 ## Shipped (verified)
+- **Batch `46e647e` deployed to .186 (2026-09-02, independently reviewed):** `bridge_hello` identity (`CEMA_BRIDGE_TOKEN` set 3× on host) · **IFF friendly-fire fratricide interlock** — a confirmed friendly is hard-blocked; only path is a commander-minted single-use target-bound audited ack (silent standing override removed) · **frontend fratricide-override UI** (commander-only, verbatim-phrase gate) · **GNSS-spoof v1 DSP** · **FPV OSD extractor** · ungoverned-CLI TX `-d` pinning. Deploy verified: plane undisturbed, `tx_halted` True, bridges dormant, new bundle renders clean. _(Full fratricide-UI render pending a confirmed-friendly target — bench.)_
 - Stack migrated to `.186` (i7/128GB/NVMe/RTX-3060); byte-faithful data parity; reboot-survival.
 - Encrypted backups, verified restorable (`~/MEGHDUT-C3-Backups/`).
 - Console: blank → fielded-instrument (render-verified); real `/health`, ErrorBoundary, honest labels.
