@@ -230,14 +230,14 @@ export default function MavlinkConsole() {
           <div className="p-4 grid grid-cols-2 gap-4 font-mono text-xs">
             <Field label="VERSION" testid="fld-version">
               <select value={form.version} onChange={(e) => upd("version", e.target.value)}
-                      className="w-full bg-black/50 tactical-border px-2 py-1 text-white">
+                      className="w-full tactical-input tactical-border px-2 py-1">
                 <option value="v2">v2 (0xFD)</option>
                 <option value="v1">v1 (0xFE)</option>
               </select>
             </Field>
             <Field label="MESSAGE_ID" testid="fld-msgid">
               <select value={form.message_id} onChange={(e) => upd("message_id", parseInt(e.target.value))}
-                      className="w-full bg-black/50 tactical-border px-2 py-1 text-white">
+                      className="w-full tactical-input tactical-border px-2 py-1">
                 {MSG_IDS.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
               </select>
             </Field>
@@ -251,7 +251,7 @@ export default function MavlinkConsole() {
               <>
                 <Field label="MAV_CMD" testid="fld-cmd">
                   <select value={form.command} onChange={(e) => upd("command", parseInt(e.target.value))}
-                          className="w-full bg-black/50 tactical-border px-2 py-1 text-white">
+                          className="w-full tactical-input tactical-border px-2 py-1">
                     {MAV_CMD_OPTIONS.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
                   </select>
                 </Field>
@@ -267,7 +267,7 @@ export default function MavlinkConsole() {
         </div>
 
         {/* Preview */}
-        <div className="tactical-border" style={{ background: "var(--bg-terminal)" }}>
+        <div className="tactical-border term-surface" style={{ background: "var(--bg-terminal)" }}>
           <div className="tactical-border-b px-4 py-3 flex items-center justify-between">
             <span className="font-mono text-xs uppercase tracking-widest" style={{ color: "var(--text-term)" }}>
               Hex Preview
@@ -301,11 +301,11 @@ export default function MavlinkConsole() {
       </div>
 
       {/* Live stream */}
-      <div className="tactical-border" style={{ background: "var(--bg-surface)" }}>
+      <div className="tactical-border term-surface" style={{ background: "var(--bg-terminal)" }}>
         <div className="tactical-border-b px-4 py-3 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <RadioTower size={14} strokeWidth={1.5} style={{ color: "var(--accent-info)" }} />
-            <span className="font-mono text-xs uppercase tracking-widest">Live MAVLink Broadcast Stream</span>
+            <span className="font-mono text-xs uppercase tracking-widest text-slate-300">Live MAVLink Broadcast Stream</span>
           </div>
           <span
             data-testid="ws-status"
@@ -414,7 +414,7 @@ function NumField({ label, val, onChange, disabled, step = "1", float = false, t
         value={val}
         disabled={disabled}
         onChange={(e) => onChange(float ? parseFloat(e.target.value || "0") : parseInt(e.target.value || "0"))}
-        className="w-full bg-black/50 tactical-border px-2 py-1 text-white focus:outline-none focus-accent-info disabled:opacity-40"
+        className="w-full tactical-input tactical-border px-2 py-1 focus:outline-none focus-accent-info disabled:opacity-40"
       />
     </Field>
   );

@@ -82,7 +82,7 @@ function CadencePanel({ detectionId }) {
   const gStats = cross_session.gap_stats;
 
   return (
-    <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-4 bg-[#0B111D]">
+    <div className="p-4 grid grid-cols-1 md:grid-cols-2 gap-4" style={{ background: "var(--bg-base)" }}>
       <div>
         <div className="text-[10px] uppercase tracking-widest text-slate-500 mb-1">
           Re-confirmation cadence (this contact)
@@ -236,11 +236,12 @@ export default function DetectionHistory() {
               data-testid={`filter-${s}`}
               onClick={() => { setStatusFilter(s); setVisibleCount(ROW_CAP); }}
               className={`px-3 py-1.5 tactical-border font-mono text-[10px] uppercase tracking-widest transition-colors ${
-                isActive ? "bg-[#1A2235]" : "hover:bg-[#0F1626]"
+                isActive ? "" : "hover-surface"
               }`}
               style={{
                 color: style?.color || "var(--text-muted)",
-                borderColor: isActive ? (style?.color || "var(--text-muted)") : "var(--border-color, #1E2A3F)",
+                background: isActive ? "var(--active-surface)" : undefined,
+                borderColor: isActive ? (style?.color || "var(--text-muted)") : "var(--border-col)",
               }}
             >
               {s} ({counts[s] || 0})
@@ -299,7 +300,7 @@ export default function DetectionHistory() {
                   <Fragment key={d.id}>
                   <tr data-testid={`hist-row-${d.id}`}
                       onClick={() => setExpandedId(isExpanded ? null : d.id)}
-                      className={`tactical-border-b hover:bg-[#0F1626] transition-colors cursor-pointer ${staticCritical ? "threat-critical-static" : ""}`}>
+                      className={`tactical-border-b hover-surface transition-colors cursor-pointer ${staticCritical ? "threat-critical-static" : ""}`}>
                     <td className="p-2">
                       <span data-testid={`hist-status-${d.id}`}
                             className="px-2 py-0.5 tactical-border font-bold text-[9px]"
@@ -313,7 +314,7 @@ export default function DetectionHistory() {
                         {src}
                       </span>
                     </td>
-                    <td className="p-2 text-white">{d.callsign}</td>
+                    <td className="p-2" style={{ color: "var(--text-primary)" }}>{d.callsign}</td>
                     <td className="p-2 text-slate-300">
                       {d.model}
                       {showUnconfirmedTag && <UnconfirmedTag />}
@@ -402,7 +403,7 @@ export default function DetectionHistory() {
             <button
               data-testid="load-more-btn"
               onClick={() => setVisibleCount((c) => c + ROW_CAP)}
-              className="px-4 py-2 tactical-border font-mono text-[10px] uppercase tracking-widest hover:bg-[#00F0FF] hover:text-black transition-colors scanline-btn"
+              className="px-4 py-2 tactical-border font-mono text-[10px] uppercase tracking-widest hover-accent-info transition-colors scanline-btn"
               style={{ color: "var(--accent-info)", borderColor: "var(--accent-info)" }}
             >
               LOAD MORE ({filtered.length - visible.length} remaining)

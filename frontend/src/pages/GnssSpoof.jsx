@@ -186,7 +186,7 @@ export default function GnssSpoof() {
         </h1>
       </div>
 
-      <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "#1A0A08" }}>
+      <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "var(--surface-critical)" }}>
         <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
         <div className="font-mono text-xs text-slate-300">
           <span className="font-bold" style={{ color: "var(--accent-critical)" }}>WARNING:</span>{" "}
@@ -217,7 +217,7 @@ export default function GnssSpoof() {
                 value={trueLat}
                 onChange={(e) => setTrueLat(e.target.value)}
                 placeholder="28.613900"
-                className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
               />
             </label>
             <label className="block">
@@ -228,7 +228,7 @@ export default function GnssSpoof() {
                 value={trueLon}
                 onChange={(e) => setTrueLon(e.target.value)}
                 placeholder="77.209000"
-                className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
               />
             </label>
           </div>
@@ -240,7 +240,7 @@ export default function GnssSpoof() {
               type="number" step="1"
               value={trueAltM}
               onChange={(e) => setTrueAltM(e.target.value)}
-              className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
             />
           </label>
 
@@ -256,7 +256,7 @@ export default function GnssSpoof() {
                 type="number" min={1} step={10}
                 value={fakeOffsetM}
                 onChange={(e) => setFakeOffsetM(Number(e.target.value))}
-                className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
               />
             </label>
             <label className="block">
@@ -266,7 +266,7 @@ export default function GnssSpoof() {
                 type="number" min={0} max={359} step={1}
                 value={fakeBearingDeg}
                 onChange={(e) => setFakeBearingDeg(Number(e.target.value))}
-                className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
               />
             </label>
           </div>
@@ -283,7 +283,7 @@ export default function GnssSpoof() {
             )}
             {!previewLoading && preview && (
               <>
-                <div className="text-white font-bold mb-1">LIVE PREVIEW — FABRICATED POSITION</div>
+                <div className="font-bold mb-1" style={{ color: "var(--text-primary)" }}>LIVE PREVIEW — FABRICATED POSITION</div>
                 <div className="text-slate-300">{preview.distance_description}</div>
                 <div className="text-slate-500 mt-1">
                   fake: {preview.fake_lat?.toFixed(6)}, {preview.fake_lon?.toFixed(6)} (alt {preview.fake_alt_m}m)
@@ -301,7 +301,7 @@ export default function GnssSpoof() {
               type="number" min={0.5} max={MAX_DURATION_S} step={0.5}
               value={durationS}
               onChange={(e) => setDurationS(Math.min(MAX_DURATION_S, Math.max(0.5, Number(e.target.value))))}
-              className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
             />
           </label>
 
@@ -312,7 +312,7 @@ export default function GnssSpoof() {
               type="number" min={0} max={47}
               value={txGain}
               onChange={(e) => setTxGain(Number(e.target.value))}
-              className="mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none focus:border-[#00F0FF]"
+              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
             />
           </label>
 
@@ -326,8 +326,8 @@ export default function GnssSpoof() {
               onChange={(e) => setAttestation(e.target.value)}
               rows={3}
               placeholder="Confirmed: no friendly GPS-dependent assets (own drones/vehicles) within [radius] of target position. Reviewed friendly asset tracker at [time]."
-              className={`mt-1 w-full bg-black/50 tactical-border px-3 py-2 font-mono text-xs text-white focus:outline-none ${
-                attestation && !attestationValid ? "border-[#FF3B30]" : "focus:border-[#00F0FF]"
+              className={`mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none ${
+                attestation && !attestationValid ? "border-accent-critical" : "focus-accent-info"
               }`}
             />
           </label>
@@ -339,8 +339,9 @@ export default function GnssSpoof() {
             className={`w-full flex items-center justify-center gap-2 px-4 py-3 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors ${
               !canArm
                 ? "opacity-30 border-slate-700 text-slate-600 cursor-not-allowed"
-                : "text-[#FF3B30] border-[#FF3B30] hover:bg-[#FF3B30] hover:text-black"
+                : "hover-accent-critical"
             }`}
+            style={!canArm ? undefined : { color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
           >
             ARM GNSS SPOOF
           </button>

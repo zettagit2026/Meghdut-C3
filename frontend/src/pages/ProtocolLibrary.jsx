@@ -177,8 +177,8 @@ function SignatureDbPanel() {
           </thead>
           <tbody className="font-mono">
             {shown.map((d) => (
-              <tr key={d.device_id} className="tactical-border-b hover:bg-[#0F1626] transition-colors">
-                <td className="px-4 py-2 text-slate-200">{d.name}</td>
+              <tr key={d.device_id} className="tactical-border-b hover-surface transition-colors">
+                <td className="px-4 py-2 text-slate-300">{d.name}</td>
                 <td className="px-4 py-2 text-slate-400">{d.manufacturer || "—"}</td>
                 <td className="px-4 py-2 text-slate-400">{d.category || "—"}</td>
                 <td className="px-4 py-2 text-slate-400">{d.modulation || "—"}</td>
@@ -201,7 +201,7 @@ function SignatureDbPanel() {
         <div className="tactical-border-t p-3 flex justify-center">
           <button
             onClick={() => setPage((p) => p + 1)}
-            className="px-4 py-2 tactical-border font-mono text-[10px] uppercase tracking-widest hover:bg-[#00F0FF] hover:text-black transition-colors scanline-btn"
+            className="px-4 py-2 tactical-border font-mono text-[10px] uppercase tracking-widest hover-accent-info transition-colors scanline-btn"
           >
             Load more ({filtered.length - shown.length} remaining)
           </button>
