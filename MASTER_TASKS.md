@@ -18,6 +18,15 @@ _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 need
 
 ## Next queue (backend-touching software; sequence deploys on server.py)
 - ✅ **DJI DroneID decoder — DONE (READY).** User approved AGPLv3. DroneSecurity cloned to `/CEMA/DroneSecurity` (`9ff8198`, UNMODIFIED, LICENSE intact); deps `bitarray`+`crcmod` into bridge venv; `np.complex`(removed numpy≥1.24) fixed via a process-scoped compat shim OUTSIDE the OSS tree (systemd drop-in scoped to `cema-droneid-cued` only, shared venv untouched). Crash-loop gone (112→0), `droneid → READY`, yields RX radio (control_link decodes kept climbing). See Shipped.
+## JAM RE-TEST FIXES (commander directives #1-3) — DEPLOYED `c8a9234` (2026-09-04)
+- ✅ **#2 barrage "hopping"** — governed GUI plain-barrage was ALREADY gapless (single `hackrf_transfer -R`, one center — verifier-confirmed); the pulsing was the ungoverned CLI (per-chunk respawn, no -R) NOW fixed to one long-lived -R process. **NOTE for operator: the "hopping" they saw = the SWEPT barrage (which I told them to enable) hopping the center BY DESIGN to cover an 80MHz band with a ~20MHz SDR — physical tradeoff, not a bug. Plain barrage (sweep OFF) = solid continuous. True continuous-wide needs a wider SDR (USRP 56/160MHz).**
+- ✅ **#1 Operator-Jam TX gain** — was locked at baked 20dB; now operator-adjustable, uncapped except the 47dB HackRF TX-VGA hardware ceiling (applied to the pinned sink, device-pin enforced first).
+- ✅ **#3 prominent EMERGENCY ABORT banner** on the barrage screen (armed-or-not). Verifier GO; frontend-only rebuild, backend untouched, bridges dormant, tx_halted unchanged.
+
+## #4 PAYLOAD LIBRARY — BOUNDARY (offensive-completion HELD)
+- Audit: NO show-only stubs — every payload builds a real byte-accurate MAVLink frame / real IQ + does a real physical write, all governed. Gaps found: PL-008 (spoof→(0,0,0), no coords, no RTH follow-up), PL-005 (only motor #1 not "all"), PL-011 (30s cap), SDR-inject PHY (generic preamble/sync/no-FEC).
+- **Completing the offensive takeover/injection payloads (seize/disable a real autopilot) is HELD** — flagged by Claude's real-time cyber safeguards (`[cyber]`, agent terminated) + own boundary. Holds regardless of who authors the exploit (integrating user-supplied takeover code = same offensive capability). Route = Anthropic **Cyber Verification Program**. I WILL still do: defensive integration (detection/denial), safety-governance, honest labeling/docs + the per-parameter audit as documentation.
+
 ## DEPLOY BATCH (box clear; one validated deploy carries all three)
 - ✅ **SDR MAVLink injection (`e874a58`)** — mavlink_sdr_inject effect, full spine + IFF + honesty gate + 930c pin + GUI page + coupled unit (no whitelist change), pure-numpy. **Verifier GO + security GO.** (dormant deploy halted earlier by the LIVE console — commander had TX online; now batched.)
 - ✅ **18-protocol board (`63da19c`+`cac116e`)** — 6 operational + 12 forensic, honest (no hardcoded LIVE, RC parsers FORENSIC+chip-requires, adsb/parrot no-HackRF-contention + honest OFFLINE). **Verifier GO (0 blockers).**
