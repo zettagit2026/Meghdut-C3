@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import sys
 import threading
+import types
 from pathlib import Path
 
 import pytest
@@ -100,6 +101,109 @@ def test_make_pinned_sink_forces_serial_even_with_no_args():
     pinned = w._make_pinned_sink(fake_orig, TX_SERIAL)
     pinned()  # defaults to the known-hardcoded hackrf=0, still forced to serial
     assert captured["dev"] == f"hackrf={TX_SERIAL}"
+
+
+# --------------------------------------------------------------------------
+# Safety override #1 (self-enforcing pin): the pin must be PROVEN applied, or
+# the wrapper FAILS CLOSED — regardless of how the operator's code imported the
+# osmosdr `sink` name. These exercise the construction window without any real
+# GNU Radio, using a fake osmosdr module + a fake CEMA_Jammer.
+# --------------------------------------------------------------------------
+class FakeSink:
+    """Stand-in for a gr-osmosdr sink; remembers the device string it was built
+    with. Exposes NO serial-introspection accessor, so read-back is ambiguous
+    and correctly SKIPPED (the sentinel remains the guarantee)."""
+    def __init__(self, dev):
+        self.dev = dev
+
+
+def _fake_osmosdr():
+    """A fake `osmosdr` module whose module-attribute `sink` is what the pinned
+    wrapper monkeypatches — exactly like the real gr-osmosdr module."""
+    mod = types.SimpleNamespace()
+    mod.sink = lambda dev="hackrf=0": FakeSink(dev)
+    return mod
+
+
+def test_pin_import_form_bypass_is_caught_fail_closed():
+    # Simulate `from osmosdr import sink`: the operator's __init__ binds a
+    # reference to the ORIGINAL osmosdr.sink at import time — BEFORE the wrapper
+    # patches the module attribute — and calls THAT captured reference with the
+    # raw index selector. The monkeypatch on osmosdr.sink is therefore never hit,
+    # so the sentinel stays at zero invocations and the wrapper must refuse.
+    osmo = _fake_osmosdr()
+    captured_before_patch = osmo.sink  # <- the `from osmosdr import sink` binding
+
+    class FakeJammerImportForm:
+        def __init__(self, freq, rate):
+            # Bypasses the patched module attribute entirely.
+            self.sink = captured_before_patch("hackrf=0")
+
+    with pytest.raises(w.OperatorJamUnavailable) as ei:
+        w._construct_with_device_pin(osmo, FakeJammerImportForm,
+                                     915e6, 20e6, TX_SERIAL)
+    assert "refusing to transmit" in str(ei.value)
+    # And the original factory was restored (no lingering monkeypatch).
+    assert osmo.sink("hackrf=0").dev == "hackrf=0"
+
+
+def test_pin_happy_path_module_attribute_form_records_pinned_serial():
+    # Their REAL form: `self.sink = osmosdr.sink("hackrf=0")` — the module
+    # attribute is read at CALL time, so the wrapper's patch intercepts it. The
+    # sink must come back forced to the pinned serial, the block constructs, and
+    # (implicitly) the sentinel confirmed the pin so no exception is raised.
+    osmo = _fake_osmosdr()
+
+    class FakeJammerModuleForm:
+        def __init__(self, freq, rate):
+            self.sink = osmo.sink("hackrf=0")  # module-attribute form (real)
+
+    tb = w._construct_with_device_pin(osmo, FakeJammerModuleForm,
+                                      915e6, 20e6, TX_SERIAL)
+    assert isinstance(tb, FakeJammerModuleForm)
+    # The pin actually forced the serial (no false positive on the happy path).
+    assert tb.sink.dev == f"hackrf={TX_SERIAL}"
+    assert tb.sink.dev != "hackrf=0"
+    # Factory restored after the construction window.
+    assert osmo.sink("hackrf=0").dev == "hackrf=0"
+
+
+def test_pin_readback_definite_mismatch_fails_closed():
+    # Belt-and-suspenders: if a sink DOES expose its bound serial via
+    # introspection and it definitely disagrees with the pin, refuse — even
+    # though the patched sink was invoked. (Simulates a sink that ignored the
+    # forced args and bound the wrong radio.)
+    osmo = types.SimpleNamespace()
+
+    class LyingSink:
+        def __init__(self, dev):
+            self.dev = dev
+        def get_device_serial(self):
+            return "0000000000000000a063"  # the RX radio serial, NOT the TX pin
+
+    osmo.sink = lambda dev="hackrf=0": LyingSink(dev)
+
+    class FakeJammer:
+        def __init__(self, freq, rate):
+            self.sink = osmo.sink("hackrf=0")
+
+    with pytest.raises(w.OperatorJamUnavailable) as ei:
+        w._construct_with_device_pin(osmo, FakeJammer, 915e6, 20e6, TX_SERIAL)
+    assert "read-back mismatch" in str(ei.value)
+
+
+def test_pin_readback_ambiguous_is_skipped_not_failed():
+    # If introspection is unavailable/ambiguous (no serial accessor), read-back
+    # must be SKIPPED silently — the sentinel is the real guarantee. FakeSink has
+    # no serial accessor, so a correctly-pinned build must still succeed.
+    osmo = _fake_osmosdr()
+
+    class FakeJammer:
+        def __init__(self, freq, rate):
+            self.sink = osmo.sink("hackrf=0")
+
+    tb = w._construct_with_device_pin(osmo, FakeJammer, 915e6, 20e6, TX_SERIAL)
+    assert tb.sink.dev == f"hackrf={TX_SERIAL}"
 
 
 # --------------------------------------------------------------------------

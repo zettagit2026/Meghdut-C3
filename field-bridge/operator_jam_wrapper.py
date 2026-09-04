@@ -155,12 +155,50 @@ def _extract_device_arg(args: tuple, kwargs: dict) -> str:
     return "hackrf=0"
 
 
-def _make_pinned_sink(orig_sink: Callable[..., Any], serial: str) -> Callable[..., Any]:
+class _PinSentinel:
+    """Records whether the wrapper's OWN device-pinned sink was ACTUALLY invoked
+    during the operator flowgraph construction, and the exact forced device
+    string(s) it was called with.
+
+    This is the import-form-independent proof that safety override #1 (the
+    device pin) took effect. The monkeypatch on ``osmosdr.sink`` only fires for
+    the module-attribute call form ``osmosdr.sink(...)``. If the operator's file
+    were ever edited to ``from osmosdr import sink`` (binding the name at import,
+    BEFORE this wrapper patches the module attribute), that call would bypass the
+    patch silently — an unmodified ``hackrf=0`` could then reach a dual-radio
+    host and key the RX detection radio. Only the pinned sink writes here, so a
+    bypass leaves ``invocations == 0`` and the wrapper FAILS CLOSED regardless of
+    how their code imported ``sink``. Guarded by a lock — cheap and correct for
+    the single-construction window (constructions never overlap in practice)."""
+
+    __slots__ = ("_lock", "invocations", "forced_device", "sinks")
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.invocations = 0
+        self.forced_device: Optional[str] = None
+        self.sinks: list = []
+
+    def record(self, forced: str, sink: Any) -> None:
+        with self._lock:
+            self.invocations += 1
+            self.forced_device = forced
+            self.sinks.append(sink)
+
+
+def _make_pinned_sink(orig_sink: Callable[..., Any], serial: str,
+                      sentinel: Optional["_PinSentinel"] = None) -> Callable[..., Any]:
     """Wrap osmosdr.sink so EVERY constructed sink is forced onto the pinned TX
     serial. This is the single interception point for safety override #1: their
     unmodified code calls osmosdr.sink("hackrf=0"); we transparently rebuild it
     as osmosdr.sink("hackrf=<serial>"). Never lets an index-based selector
-    through."""
+    through.
+
+    When a ``sentinel`` is supplied, every invocation is recorded (count + the
+    exact forced device string + the constructed sink object) so the caller can
+    PROVE the pin actually took — see _enforce_device_pin. The sentinel is
+    optional so existing unit tests that call this factory directly are
+    unaffected."""
     def pinned(*args, **kwargs):
         requested = _extract_device_arg(args, kwargs)
         forced = _pin_device_string(requested, serial)
@@ -169,8 +207,86 @@ def _make_pinned_sink(orig_sink: Callable[..., Any], serial: str) -> Callable[..
                 "Operator Jam device pin: rewriting osmosdr sink device %r -> %r "
                 "(forcing the pinned TX unit, never index-0/RX radio).",
                 requested, forced)
-        return orig_sink(forced)
+        sink = orig_sink(forced)
+        if sentinel is not None:
+            sentinel.record(forced, sink)
+        return sink
     return pinned
+
+
+def _readback_serial(sink: Any) -> Optional[str]:
+    """Best-effort: recover the serial/device string the gr-osmosdr sink actually
+    bound to, via common introspection accessors. Returns a non-empty string when
+    an accessor yields one, else None (introspection unavailable/ambiguous — the
+    sentinel remains the real guarantee, so a None here is NOT a failure). Fully
+    guarded: no accessor error can escape."""
+    for name in ("get_device_serial", "get_serial", "get_device_name",
+                 "get_device_args", "device_serial", "serial", "device"):
+        try:
+            attr = getattr(sink, name, None)
+            if attr is None:
+                continue
+            val = attr() if callable(attr) else attr
+            if isinstance(val, bytes):
+                val = val.decode(errors="replace")
+            if isinstance(val, str) and val.strip():
+                return val
+        except Exception:
+            continue
+    return None
+
+
+def _enforce_device_pin(sentinel: "_PinSentinel", serial: str) -> None:
+    """FAIL CLOSED unless the device pin is PROVEN applied. Import-form-independent:
+    it relies on the sentinel recorded by the wrapper's own pinned sink, not on
+    how the operator's code imported ``sink``.
+
+      * patched sink invoked ZERO times -> the pin did not apply (import-form
+        bypass, or their code built the sink some other way) -> refuse.
+      * invoked, but the forced string does NOT carry the pinned TX serial ->
+        refuse.
+      * belt-and-suspenders read-back: if a sink exposes its bound device/serial
+        via introspection AND it definitely mismatches the pinned serial ->
+        refuse. If introspection is unavailable/ambiguous, SKIP silently.
+
+    Never proceeds to transmit on a pin that cannot be proven."""
+    if sentinel.invocations == 0:
+        raise OperatorJamUnavailable(
+            "device-pin not applied — refusing to transmit "
+            "(the pinned osmosdr sink was never invoked; the operator's code may "
+            "have bound `sink` before the patch via `from osmosdr import sink`, "
+            "bypassing the device pin — an unpinned build could key the RX radio)")
+    if serial not in (sentinel.forced_device or ""):
+        raise OperatorJamUnavailable(
+            "device-pin not applied — refusing to transmit "
+            f"(pinned sink was invoked but its forced device "
+            f"{sentinel.forced_device!r} does not carry the TX serial)")
+    for sink in sentinel.sinks:
+        rb = _readback_serial(sink)
+        if rb is not None and serial not in rb:
+            raise OperatorJamUnavailable(
+                "device-pin read-back mismatch — refusing to transmit "
+                f"(sink reports bound device {rb!r}, not the pinned TX serial)")
+
+
+def _construct_with_device_pin(osmosdr_module: Any, block_cls: Any,
+                               freq_hz: float, rate_hz: float, serial: str):
+    """The device-pin construction window (safety override #1), factored out so
+    it is unit-testable without real GNU Radio. Monkeypatches
+    ``osmosdr_module.sink`` to the pinned+recording sink for the duration of the
+    block construction, ENFORCES that the pin was actually applied (fail-closed,
+    import-form-independent), then restores the original sink factory in finally
+    exactly as before — the smallest possible window, the ONLY change imposed on
+    their flowgraph."""
+    orig_sink = osmosdr_module.sink
+    sentinel = _PinSentinel()
+    osmosdr_module.sink = _make_pinned_sink(orig_sink, serial, sentinel)
+    try:
+        tb = _construct_operator_block(block_cls, freq_hz, rate_hz)
+        _enforce_device_pin(sentinel, serial)
+    finally:
+        osmosdr_module.sink = orig_sink
+    return tb
 
 
 # ---------------------------------------------------------------------------
@@ -253,17 +369,12 @@ def _build_operator_flowgraph(freq_mhz: float, serial: str):
     import cema_base
 
     freq_hz = float(freq_mhz) * 1e6
-    orig_sink = osmosdr.sink
-    # Force the pinned TX serial for the single sink their __init__ builds, then
-    # restore the original factory immediately — the smallest possible window,
-    # and the ONLY change we impose on their flowgraph.
-    osmosdr.sink = _make_pinned_sink(orig_sink, serial)
-    try:
-        tb = _construct_operator_block(cema_base.CEMA_Jammer, freq_hz,
-                                       float(OPERATOR_SAMPLE_RATE_HZ))
-    finally:
-        osmosdr.sink = orig_sink
-    return tb
+    # Force the pinned TX serial for the single sink their __init__ builds, prove
+    # the pin actually took (fail-closed if it did not), then restore the
+    # original factory immediately — the smallest possible window, and the ONLY
+    # change we impose on their flowgraph.
+    return _construct_with_device_pin(osmosdr, cema_base.CEMA_Jammer, freq_hz,
+                                      float(OPERATOR_SAMPLE_RATE_HZ), serial)
 
 
 # ---------------------------------------------------------------------------
