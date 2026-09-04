@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
+import { handleEngageBlock } from "@/lib/engageFix";
 import { Bomb, AlertTriangle, Target as TargetIcon, ShieldCheck, ShieldOff, Signal, ShieldAlert } from "lucide-react";
 import SafetyGate, { SAFETY_GATED } from "@/components/SafetyGate";
 import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
@@ -330,11 +331,14 @@ export default function Payloads() {
       if (data.tx_bridge_subscribed === false) {
         // Honest false-green guard: the backend accepted the request (HTTP 200,
         // AWAITING_ACK) but NO cema-rf-bridge is subscribed, so nothing was
-        // written to any radio — it will TX_TIMEOUT. Surface that as an explicit
-        // error, never a hopeful "sent"/green toast.
-        toast.error(`${pl.name}: NO TX BRIDGE SUBSCRIBED`, {
-          description: `Nothing was transmitted — start cema-rf-bridge on the transmit host. Request ${data.request_id?.slice(0, 8)} will TX_TIMEOUT.`,
-        });
+        // written to any radio — it will TX_TIMEOUT. Translate this into the
+        // plain-language "TX subsystem OFFLINE — Bring TX Online" fix (a button
+        // for commanders) instead of a raw "start cema-rf-bridge" shell hint.
+        if (!handleEngageBlock({ response: data }, { isCommander, onFixed: load })) {
+          toast.error(`${pl.name}: NOT TRANSMITTED`, {
+            description: `Nothing reached a radio. Request ${data.request_id?.slice(0, 8)} will TX_TIMEOUT.`,
+          });
+        }
       } else if (data.status === "AWAITING_ACK") {
         toast.info(`${pl.name} SENT — awaiting bridge ACK`, {
           description: `pkt ${data.length}B · ${broadcast ? "BROADCAST" : `tgt sys=${data.target_system}`} · req ${data.request_id?.slice(0, 8)}`,
@@ -357,6 +361,11 @@ export default function Payloads() {
         setGate({ open: true, pl, broadcast: false, fratricide: true });
         return;
       }
+      // Operator-friendly pre-condition translation: if the fire was blocked
+      // because TX is HALTED or range-auth is OFF, show WHY in plain language
+      // with the fix as a button (RESUME TX / Bring TX Online) instead of the
+      // raw backend "POST /api/emergency/resume" text.
+      if (handleEngageBlock({ error: e }, { isCommander, onFixed: load })) return;
       toast.error("Deploy failed", { description: formatApiError(e) });
     }
   };

@@ -9,6 +9,10 @@ _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 need
 - Every shipped unit: independent verifier sign-off; no fake data / no fake-green.
 - TX device pinning: TX=`…930c` (PA), RX/detection=`…a063`.
 
+## GUI-only mandate (GOVERNING — operator NEVER runs a terminal)
+- ⏸ **"TX Online / Enable Engagement" console control** — commander-gated backend endpoint that does the sniffer→rf-bridge SiK handoff + starts cema-rf-bridge/cema-jam-bridge (and "Stand Down" reverse), driven by a GUI button. Removes the last CLI step from the operator flow. (Container→host systemctl needs a privileged host helper.) HIGH — fielding requirement. _(build; deploy AFTER any live session — a backend restart drops the bridges + re-halts TX.)_
+- Audit every operator action for CLI leaks; each must be a console control.
+
 ## Next queue (backend-touching software; sequence deploys on server.py)
 - ⏸ **Control-link RF classification** — ELRS/CRSF/DSMX/DJI signature typing (identifies any drone incl. MSP/CAN).
 - ⏸ **RemoteID ingest** (Kismet Wi-Fi/BLE, software) + **DJI DroneID** (cued capture on the RX radio).

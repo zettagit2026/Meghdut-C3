@@ -127,6 +127,10 @@ from detection_state import (
 from swarm_classifier import build_swarm_clusters, SWARM_TAXONOMY
 from track_manager import TrackManager, STATE_DROPPED as TRACK_STATE_DROPPED
 from engagement_planner import build_engagement_plan
+# Container->host privilege bridge for the GUI TX-bridge SiK handoff. Talks to
+# the hard-whitelisted cema-tx-helper root daemon over a bind-mounted Unix
+# socket (see backend/tx_bridge_control.py + scripts/host-helper/README.md).
+import tx_bridge_control
 
 # ---------- Config ----------
 # SECURITY: no hardcoded/default secrets. Operators MUST supply real values via
@@ -5142,6 +5146,50 @@ async def list_tracks(
     return result
 
 
+# ---- TX subsystem status (drives the GUI Engagement Control surface) --------
+# One coherent block the console reads to render plain-language engage-flow
+# preconditions (TX OFFLINE/ONLINE, TX HALTED/LIVE, SiK link, range-auth) and
+# to decide which commander controls to offer. Deliberately derived from
+# OBSERVABLE state, not from a written-down intent that could drift:
+#   * bridges_online  <- whether a TX-bridge WS consumer (mavlink/jam) is
+#                        actually connected right now (ws_manager.tx_consumers).
+#                        Self-correcting across a backend restart: if the host
+#                        bridges are still running they reconnect and re-advertise.
+#   * sik_owner       <- "rf-bridge" if a TX bridge is connected (it owns the
+#                        serial radio to transmit); else "sniffer" if we have
+#                        PROVEN recent RX from the SiK; else null (unknown/idle).
+#   * tx_halted       <- the authoritative in-memory fail-closed flag.
+#   * range_auth      <- the existing per-effect lease state (lazy-expired first).
+# This never calls the host helper (kept cheap + dependency-free for a 3s poll);
+# the /tx/online|standdown endpoints return the helper's authoritative
+# systemctl snapshot at the moment of the handoff.
+async def _tx_subsystem_status() -> Dict[str, Any]:
+    await _expire_range_authorization()
+    since = datetime.now(timezone.utc) - timedelta(seconds=60)
+    sik_recent = await db.detections.count_documents({
+        "source": "SIK_RADIO",
+        "protocol_confirmed": True,
+        "last_seen": {"$gt": since.isoformat()},
+    })
+    tx_consumers = ws_manager.tx_consumers()
+    bridges_online = any(c in ("mavlink", "jam") for c in tx_consumers)
+    sik_link_up = sik_recent > 0
+    if bridges_online:
+        sik_owner = "rf-bridge"
+    elif sik_link_up:
+        sik_owner = "sniffer"
+    else:
+        sik_owner = None
+    return {
+        "bridges_online": bridges_online,
+        "sik_owner": sik_owner,
+        "tx_halted": _tx_halted,
+        "sik_link_up": sik_link_up,
+        "tx_bridge_consumers": tx_consumers,
+        "range_auth": {eff: _range_auth_status(eff) for eff in RANGE_AUTH_EFFECTS},
+    }
+
+
 @api.get("/health")
 async def system_health(user: Dict = Depends(get_current_user)):
     # Mongo ping
@@ -5289,6 +5337,10 @@ async def system_health(user: Dict = Depends(get_current_user)):
         "tx_recent_failed": tx_recent_failed,
         "tx_path_degraded": tx_path_degraded,
         "ingest_sources": ingest_sources,
+        # Coherent TX-subsystem block the console reads to render the Engagement
+        # Control surface (TX OFFLINE/ONLINE, TX HALTED/LIVE, SiK link, range-
+        # auth) and to translate blocked-fire errors into plain-language fixes.
+        "tx_subsystem": await _tx_subsystem_status(),
         "server_time": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -5351,6 +5403,102 @@ async def emergency_resume(user: Dict = Depends(require_commander)):
     await log_event("ABORT", "TX resumed by commander after emergency abort",
                     actor=user["email"])
     return {"ok": True, "tx_halted": _tx_halted, "ts": datetime.now(timezone.utc).isoformat()}
+
+
+# =====================================================================
+# Routes: TX-bridge SiK handoff (bring the transmit bridges online / stand
+# them down) — commander-gated, audited, GUI-driven.
+# =====================================================================
+# WHY: bringing the TX bridges up used to require a human running `systemctl`
+# on the transmit host's shell — an out-of-GUI step a fielded operator cannot
+# and should not perform. These endpoints let a COMMANDER perform the SiK
+# handoff from the console. They trigger the hard-whitelisted cema-tx-helper
+# root daemon on the host (see tx_bridge_control.py + scripts/host-helper/),
+# which is the ONLY thing that can run the underlying systemctl calls — the
+# backend container itself has no host systemctl access.
+#
+# SAFETY: this ONLY governs which subsystem owns the SiK radio. It does NOT
+# clear the TX-halt (that stays commander-gated via /emergency/resume) and does
+# NOT touch arm-token / range-auth / IFF gates. Bringing bridges online with TX
+# still halted is fine and expected — the fire path remains blocked until the
+# commander also clears the halt. Both endpoints are idempotent.
+async def _tx_handoff(action: str, user: Dict) -> Dict[str, Any]:
+    verb = "online" if action == "online" else "standdown"
+    try:
+        if action == "online":
+            result = await tx_bridge_control.bring_online()
+        else:
+            result = await tx_bridge_control.stand_down()
+    except tx_bridge_control.TxHelperUnavailable as e:
+        # Host helper not installed/running/reachable. Audit the attempt and
+        # return a clear 503 the GUI turns into plain language — never a raw
+        # systemctl/shell instruction.
+        await log_event(
+            "TX_BRIDGE_CONTROL",
+            f"TX {verb} FAILED — host control helper unavailable: {e}",
+            meta={"action": action, "outcome": "helper_unavailable"},
+            actor=user["email"],
+        )
+        raise HTTPException(
+            503,
+            "TX bridge control helper is not available on the transmit host. "
+            "The cema-tx-helper service must be installed and running (deploy step).",
+        )
+    except tx_bridge_control.TxHelperError as e:
+        await log_event(
+            "TX_BRIDGE_CONTROL",
+            f"TX {verb} FAILED — host helper reported an error: {e}",
+            meta={"action": action, "outcome": "helper_error", "detail": getattr(e, "payload", {})},
+            actor=user["email"],
+        )
+        raise HTTPException(502, f"TX bridge {verb} failed on the host: {e}")
+
+    await log_event(
+        "TX_BRIDGE_CONTROL",
+        f"TX bridges {'brought ONLINE' if action == 'online' else 'STOOD DOWN'} "
+        f"by commander (SiK owner now: {result.get('sik_owner')})",
+        meta={"action": action, "outcome": "ok",
+              "sik_owner": result.get("sik_owner"),
+              "units": result.get("units")},
+        actor=user["email"],
+    )
+    # Broadcast so every open console updates its Engagement Control surface
+    # promptly (the 3s /health poll would catch up anyway; this is faster).
+    await ws_manager.broadcast_json({
+        "type": "tx_bridge_control",
+        "action": action,
+        "sik_owner": result.get("sik_owner"),
+        "bridges_online": result.get("bridges_online"),
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "operator": user["email"],
+    })
+    # Return BOTH the helper's authoritative systemctl snapshot AND the console's
+    # derived tx_subsystem block, so the GUI can update immediately and honestly.
+    return {
+        "ok": True,
+        "action": action,
+        "host_units": result.get("units"),
+        "host_sik_owner": result.get("sik_owner"),
+        "tx_subsystem": await _tx_subsystem_status(),
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@api.post("/tx/online")
+async def tx_bring_online(user: Dict = Depends(require_commander)):
+    """Commander-only: hand the SiK radio to TRANSMIT — stop the passive
+    sniffer, start cema-rf-bridge + cema-jam-bridge. Idempotent. Does NOT clear
+    the TX-halt (still requires /emergency/resume). Returns the resulting
+    subsystem status."""
+    return await _tx_handoff("online", user)
+
+
+@api.post("/tx/standdown")
+async def tx_stand_down(user: Dict = Depends(require_commander)):
+    """Commander-only: reverse of /tx/online — stop the two TX bridges and
+    return the SiK to the passive RX sniffer. Idempotent. Returns the resulting
+    subsystem status."""
+    return await _tx_handoff("standdown", user)
 
 
 # =====================================================================

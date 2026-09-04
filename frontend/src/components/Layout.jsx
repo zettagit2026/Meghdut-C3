@@ -8,6 +8,7 @@ import ErrorBoundary from "@/components/ErrorBoundary";
 // the low-glare light theme from the top status bar; the choice persists
 // (localStorage, see ThemeContext).
 import ThemeToggle from "@/components/ThemeToggle";
+import TxStatusChips from "@/components/TxStatusChips";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import {
@@ -52,7 +53,6 @@ export default function Layout() {
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
-  const sikUp = !!health?.sik_radio;
   const hackrfUp = !!health?.hackrf;
   const year = new Date().getFullYear();
 
@@ -119,17 +119,18 @@ export default function Layout() {
             className="tactical-border-b px-8 py-3 flex items-center justify-between gap-4"
             style={{ background: "var(--bg-surface)" }}
           >
-            <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 min-w-0 truncate flex items-center">
-              <Terminal size={12} className="inline mr-2" strokeWidth={1.5} />
-              <span style={{ color: sikUp ? "var(--accent-success)" : "var(--accent-critical)" }}>
-                ● SiK LINK {sikUp ? "UP" : "DOWN"}
-              </span>
-              <span className="mx-3">|</span>
-              <span style={{ color: hackrfUp ? "var(--accent-success)" : "var(--accent-critical)" }}>
+            <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 min-w-0 flex items-center gap-2 overflow-x-auto">
+              <Terminal size={12} className="inline shrink-0" strokeWidth={1.5} />
+              {/* Persistent engagement-subsystem indicator (TX ONLINE/OFFLINE,
+                  TX HALTED/LIVE, SiK LINK, TX RADIO 930c, RANGE-AUTH) — the
+                  compact twin of the Command Center Engagement Control panel. */}
+              <TxStatusChips health={health} compact />
+              <span className="mx-1 text-slate-600 shrink-0">|</span>
+              <span className="shrink-0 whitespace-nowrap" style={{ color: hackrfUp ? "var(--accent-success)" : "var(--accent-critical)" }}>
                 ● HackRF RX {hackrfUp ? "UP" : "DOWN"}
               </span>
-              <span className="mx-3">|</span>
-              <span style={{ color: "var(--accent-info)" }}>WS CLIENTS: {health?.ws_clients ?? "—"}</span>
+              <span className="mx-1 text-slate-600 shrink-0">|</span>
+              <span className="shrink-0 whitespace-nowrap" style={{ color: "var(--accent-info)" }}>WS CLIENTS: {health?.ws_clients ?? "—"}</span>
             </div>
             <div className="flex items-center gap-4 shrink-0">
               <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">

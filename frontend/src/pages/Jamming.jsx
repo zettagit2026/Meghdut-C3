@@ -4,6 +4,8 @@ import { toast } from "sonner";
 import { Radio, AlertTriangle, ShieldAlert } from "lucide-react";
 import SafetyGate, { JAM_CHECKS } from "@/components/SafetyGate";
 import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
+import { useAuth } from "@/context/AuthContext";
+import { handleEngageBlock } from "@/lib/engageFix";
 
 // task #146: /jam/status polling previously swallowed failures in an empty
 // catch block, so if polling died (backend restart, network partition, auth
@@ -57,6 +59,8 @@ const STATUS_STYLE = {
 };
 
 export default function Jamming() {
+  const { user } = useAuth();
+  const isCommander = user?.role === "commander";
   const [band, setBand] = useState("915");
   const [durationS, setDurationS] = useState(5);
   const [bandwidthKhz, setBandwidthKhz] = useState(500);
@@ -135,10 +139,14 @@ export default function Jamming() {
       if (data.tx_bridge_subscribed === false) {
         // Honest false-green guard: request accepted (HTTP 200, AWAITING_ACK)
         // but NO cema-jam-bridge is subscribed, so nothing will radiate — it
-        // will TX_TIMEOUT. Surface as an explicit error, not a hopeful toast.
-        toast.error(`NO JAM TX BRIDGE SUBSCRIBED`, {
-          description: `Nothing will radiate — start cema-jam-bridge on the transmit host. Request ${data.request_id?.slice(0, 8)} will TX_TIMEOUT.`,
-        });
+        // will TX_TIMEOUT. Translate into the plain-language "TX subsystem
+        // OFFLINE — Bring TX Online" fix (a button for commanders) instead of a
+        // raw "start cema-jam-bridge" shell hint.
+        if (!handleEngageBlock({ response: data }, { isCommander, onFixed: loadStatus })) {
+          toast.error(`JAM NOT TRANSMITTED`, {
+            description: `Nothing radiated. Request ${data.request_id?.slice(0, 8)} will TX_TIMEOUT.`,
+          });
+        }
       } else {
         toast.info(`JAM REQUESTED — awaiting bridge ACK`, {
           description: `${data.freq_mhz} MHz · ${data.duration_s}s · req ${data.request_id?.slice(0, 8)}`,
@@ -146,6 +154,9 @@ export default function Jamming() {
       }
       loadStatus();
     } catch (e) {
+      // Operator-friendly pre-condition translation (TX HALTED -> RESUME TX,
+      // range-auth OFF -> arm it) before the generic error toast.
+      if (handleEngageBlock({ error: e }, { isCommander, onFixed: loadStatus })) return;
       toast.error("Jam request failed", { description: formatApiError(e) });
     } finally {
       setSubmitting(false);

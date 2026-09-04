@@ -5,6 +5,7 @@ import { toast } from "sonner";
 import ReactECharts from "echarts-for-react";
 import { Radar, Skull, Activity, Signal, TrendingUp, AlertTriangle, Volume2, VolumeX } from "lucide-react";
 import SystemHealth from "@/components/SystemHealth";
+import EngagementControl from "@/components/EngagementControl";
 import MlClassifierBadge from "@/components/MlClassifierBadge";
 import ConfidenceTypeBadge from "@/components/ConfidenceTypeBadge";
 import UnconfirmedTag from "@/components/UnconfirmedTag";
@@ -372,6 +373,11 @@ export default function Dashboard() {
         <StatTile testid="stat-neutralized" label="Neutralized" value={neutralized}
                   color="var(--accent-success)" sub="Kill-chain complete" />
       </div>
+
+      {/* GUI-only engage-flow control: live TX/halt/SiK/range-auth status +
+          commander-gated Bring TX Online / Resume TX buttons, so the operator
+          never needs a terminal to satisfy a transmit pre-condition. */}
+      <EngagementControl />
 
       <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
         <div className="xl:col-span-2 space-y-6">

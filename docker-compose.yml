@@ -83,6 +83,19 @@ services:
       # does NOT auto-inject top-level .env values into the container (see the
       # SENSOR_LAT deploy-incident note above).
       DETECTION_WIFI_FUSION_ENABLED: "${DETECTION_WIFI_FUSION_ENABLED:-true}"
+    volumes:
+      # Container->host privilege bridge for the GUI TX-bridge SiK handoff
+      # (POST /api/tx/online|standdown). The cema-tx-helper root daemon on the
+      # HOST creates a Unix-domain control socket here; the backend connects to
+      # it to trigger the ONLY three whitelisted `systemctl start/stop` calls
+      # (cema-rf-bridge / cema-jam-bridge / cema-mavlink-sniffer). This is NOT a
+      # Docker/systemctl handoff — see scripts/host-helper/README.md for the
+      # exact security boundary. The helper must be installed + running on the
+      # host (root) or these endpoints report "helper unavailable" honestly.
+      # If /run/cema-tx-helper does not exist yet on the host, the helper's
+      # systemd unit (RuntimeDirectory=) creates it; recreate the backend
+      # container AFTER the helper is up so the mount is populated.
+      - /run/cema-tx-helper:/run/cema-tx-helper
     ports:
       # Hotfix (task #95 regression): TLS cutover changed this from a
       # published port to `expose: 8001`, which closed backend:8001 to the

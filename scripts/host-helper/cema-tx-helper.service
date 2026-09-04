@@ -1,0 +1,38 @@
+[Unit]
+Description=CEMA cUAS - host privilege helper for the GUI TX-bridge SiK handoff (hard-whitelisted systemctl proxy)
+Documentation=file:/CEMA/joydipdemo/scripts/host-helper/README.md
+After=network.target
+
+[Service]
+Type=simple
+# MUST run as root: its whole job is to run `systemctl start/stop` on the three
+# TX-bridge units. Its attack surface is deliberately tiny — a 3-keyword input
+# grammar mapping to a frozen (verb, unit) whitelist (see cema_tx_helper.py).
+User=root
+# The socket lives under /run so it is tmpfs-backed and cleared on reboot.
+# RuntimeDirectory creates/owns /run/cema-tx-helper with mode 0755 for us.
+RuntimeDirectory=cema-tx-helper
+RuntimeDirectoryMode=0755
+Environment=CEMA_TX_HELPER_SOCK=/run/cema-tx-helper/control.sock
+# 0660 root:root — reachable by the root-user backend container (see
+# backend/Dockerfile). If the backend runs as a non-root uid, either set
+# CEMA_TX_HELPER_SOCK_MODE=0o666 here or grant that uid via a group (README.md).
+Environment=CEMA_TX_HELPER_SOCK_MODE=0o660
+ExecStart=/usr/bin/env python3 /CEMA/joydipdemo/scripts/host-helper/cema_tx_helper.py
+Restart=always
+RestartSec=3
+
+# --- Hardening: this root daemon needs almost nothing beyond running systemctl ---
+NoNewPrivileges=true
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_UNIX
+# It talks to systemd over the private system bus / the AF_UNIX control socket
+# only; no other network families are needed.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
