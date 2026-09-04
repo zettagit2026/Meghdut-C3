@@ -10,13 +10,14 @@ _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 need
 - TX device pinning: TX=`…930c` (PA), RX/detection=`…a063`.
 
 ## GUI-only mandate (GOVERNING — operator NEVER runs a terminal)
-- ⏸ **"TX Online / Enable Engagement" console control** — commander-gated backend endpoint that does the sniffer→rf-bridge SiK handoff + starts cema-rf-bridge/cema-jam-bridge (and "Stand Down" reverse), driven by a GUI button. Removes the last CLI step from the operator flow. (Container→host systemctl needs a privileged host helper.) HIGH — fielding requirement. _(build; deploy AFTER any live session — a backend restart drops the bridges + re-halts TX.)_
+- 🔄 **"TX Online / Enable Engagement" console control** — commander-gated GUI buttons (Resume-TX/Halt + TX-Online/Stand-Down via a tightly-scoped root host helper) + plain-language status + error translation. Built (`84dff1c`), both Phase-4 gates GREEN. **DEPLOY IN FLIGHT to .186** (SRE a7d844d7: stand-down leftover bridges → install host-helper → recreate → verify; backend restart re-halts TX + drops bridges = expected). → operable.
 - Audit every operator action for CLI leaks; each must be a console control.
 
+## Operator-Jam (their code as a governed second mode)
+- 🔄 **Operator Jam mode** — runs the operator's own CEMA_Jammer (GNU Radio, `/CEMA/operator-jam/`, UNMODIFIED) as a selectable jam mode beside MEGHDUT barrage, so they can A/B which defeats a target. Two governed overrides in wrapper code: device-pin→930c (fail-closed, never keys RX) + bounded/abortable (no interactive main()); full spine; distinct OPERATOR/MEGHDUT audit. Committed `0a842fd`, 31 tests green. **Pending independent verify (in flight) → deploy AFTER engage-flow + protocol-library** (needs GNU Radio + gr-osmosdr installed on .186; enable cema-operator-jam-bridge.service; set OPERATOR_JAM_DIR + HACKRF_TX_SERIAL).
+
 ## Next queue (backend-touching software; sequence deploys on server.py)
-- ⏸ **Control-link RF classification** — ELRS/CRSF/DSMX/DJI signature typing (identifies any drone incl. MSP/CAN).
-- ⏸ **RemoteID ingest** (Kismet Wi-Fi/BLE, software) + **DJI DroneID** (cued capture on the RX radio).
-- ⏸ **FPV OSD → backend wiring** — POST decoded telemetry to a new `/api/fpv/osd-telemetry`; surface in console.
+- 🔄 **Protocol library (over-the-air) BUILT + verified GO** (`a768951`) — Control-link RF classification (ELRS/CRSF/DSMX/DJI), RemoteID (Kismet Wi-Fi/BLE), DJI DroneID (cued, lock-guarded), FPV-OSD ingest; honest OFFLINE/READY/LIVE status board (never hardcoded). **DEPLOY AFTER engage-flow** (install cema-remoteid/control-link/fpv-osd/droneid-cued units; set KISMET_URL/APIKEY + DRONEID_SRC_DIR; DroneID stays cued not blind-sweep).
 - ⏸ **GNSS fidelity phase** — solved ephemeris + GPS-time + Doppler dynamics; then real-receiver validation (bench).
 
 ## Queued (software, no user needed)
