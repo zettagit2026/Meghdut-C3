@@ -1007,9 +1007,15 @@ async def _expire_pending_jam() -> None:
     for rid, p in _pending_jam.items():
         if p["status"] == "AWAITING_ACK" and (now - p["ts"]).total_seconds() > JAM_ACK_TIMEOUT_S:
             to_expire.append(rid)
-        elif p["status"] == "JAM_ACTIVE" and \
-                (now - p["ts"]).total_seconds() > p.get("duration_s", 10) + JAM_COMPLETE_MARGIN_S:
-            to_expire.append(rid)
+        elif p["status"] == "JAM_ACTIVE":
+            # A CONTINUOUS jam (duration_s None) has no fixed end — it stays
+            # JAM_ACTIVE until the operator stops it (a terminal jam_ack) or the
+            # bridge drops; do NOT force it to TX_TIMEOUT on a duration deadline
+            # it never had. A bounded jam still times out at duration + margin if
+            # no terminal ack arrives.
+            dur = p.get("duration_s")
+            if dur is not None and (now - p["ts"]).total_seconds() > dur + JAM_COMPLETE_MARGIN_S:
+                to_expire.append(rid)
     for rid in to_expire:
         p = _pending_jam.get(rid)
         if not p:
@@ -1169,8 +1175,11 @@ async def _expire_pending_mavlink_inject() -> None:
     for rid, p in _pending_mavlink_inject.items():
         if p["status"] == "AWAITING_ACK" and (now - p["ts"]).total_seconds() > MAVLINK_INJECT_ACK_TIMEOUT_S:
             to_expire.append(rid)
-        elif p["status"] == "MAVLINK_INJECT_ACTIVE" and \
+        elif p["status"] == "MAVLINK_INJECT_ACTIVE" and not p.get("continuous") and \
                 (now - p["ts"]).total_seconds() > p.get("duration_s", MAVLINK_INJECT_MAX_DURATION_S) + MAVLINK_INJECT_COMPLETE_MARGIN_S:
+            # A CONTINUOUS inject re-emits until the operator stops it — it has no
+            # fixed on-air window to time out against (same posture as a
+            # continuous jam); a bounded inject still times out normally.
             to_expire.append(rid)
     for rid in to_expire:
         p = _pending_mavlink_inject.get(rid)
@@ -1462,8 +1471,25 @@ class JamRequestBody(BaseModel):
     band: Optional[str] = Field(None, pattern="^(433|915|2g4|bt_2g4|5g8|gps_l1|galileo_e1|beidou_b1|glonass_l1)$")
     freq_mhz: Optional[float] = None
     bandwidth_khz: float = 500.0
-    duration_s: float = 5.0  # server-side clamps to JAM_MAX_DURATION_S regardless
+    # Commander directive (post spectrum-analyser field test): NO artificial
+    # auto-stop cap — a capped ~5s burst lets a FHSS+FEC control link recover.
+    # duration_s is the operator-set BOUNDED window (honored verbatim); set
+    # continuous=True to transmit until the operator stops it (Stand Down /
+    # EMERGENCY ABORT / tx_halt). Either way the effect is always instantly
+    # stoppable — that invariant is preserved.
+    duration_s: float = 5.0
+    continuous: bool = False
     tx_gain: int = 20
+    # Swept-barrage (MEGHDUT full-band coverage): a single ~20MHz-instantaneous
+    # HackRF center only covers a slice of an ~80MHz hop band. sweep=True steps
+    # the TX center across [freq_start_mhz, freq_stop_mhz] so a frequency-hopping
+    # control link is hit on every hop over the sweep's revisit interval. Only
+    # valid for jam_mode="meghdut" (the operator's flowgraph is band-fixed).
+    sweep: bool = False
+    freq_start_mhz: Optional[float] = None
+    freq_stop_mhz: Optional[float] = None
+    step_mhz: float = 20.0
+    dwell_ms: float = 5.0
     # jam_mode selects WHICH jammer radiates this (already fully-gated) request:
     #   "meghdut"  (default) — the built-in HackRF barrage jam
     #                          (field-bridge/hackrf_jam.py via jam_bridge.py).
@@ -1558,8 +1584,13 @@ class MavlinkSdrInjectBody(BaseModel):
     bit_order: str = Field("msb", pattern="^(msb|lsb)$")
     tx_gain: int = Field(20, ge=0, le=47)
     # An unauthenticated command is typically sent several times to survive
-    # collisions on the target link. Bounded server-side.
-    repeat: int = Field(3, ge=1, le=MAVLINK_SDR_INJECT_MAX_REPEAT)
+    # collisions on the target link. Commander directive: NO artificial cap —
+    # operator-controlled (floored at 1), or set continuous=True to re-emit the
+    # command on a loop until the operator stops it (still tx_halt/abort-
+    # stoppable at the bridge). MAVLINK_SDR_INJECT_MAX_REPEAT is retained only as
+    # a non-binding default-library reference value.
+    repeat: int = Field(3, ge=1)
+    continuous: bool = False
     # Honesty acknowledgement (same posture as DeployPayloadBody): the operator
     # asserting the target is a legacy/unencrypted-MAVLink craft. NOT a
     # substitute for the backend's own protocol check — an encrypted/FHSS
@@ -5272,6 +5303,10 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
     # rejects an arbitrary freq_mhz / the GNSS bands its flowgraph doesn't cover.
     jam_mode = body.jam_mode
     if jam_mode == "operator":
+        if body.sweep:
+            raise HTTPException(400, "Operator Jam mode is band-fixed and cannot sweep — the "
+                                     "operator's flowgraph transmits at one center. Use "
+                                     "jam_mode=meghdut for a swept barrage.")
         if body.freq_mhz is not None:
             raise HTTPException(400, "Operator Jam mode is band-fixed — omit `freq_mhz` and "
                                      "select one of its supported bands (433|915|2g4|5g8).")
@@ -5279,15 +5314,33 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
             raise HTTPException(400, "Operator Jam mode supports only bands 433|915|2g4|5g8 "
                                      "(its per-band callers cover 435/915/2450/5800 MHz).")
 
-    freq_mhz = body.freq_mhz if body.freq_mhz is not None else JAM_BAND_PRESETS_MHZ.get(body.band)
-    if not freq_mhz:
-        raise HTTPException(400, "Provide either `band` (433|915|2g4|bt_2g4|5g8|gps_l1|galileo_e1|beidou_b1|"
-                                  "glonass_l1) or an explicit `freq_mhz`.")
-    duration_s = min(body.duration_s, JAM_MAX_DURATION_S)
+    # Swept-barrage requires an explicit band span; a single-center jam requires
+    # a resolvable center frequency.
+    if body.sweep:
+        if body.freq_start_mhz is None or body.freq_stop_mhz is None:
+            raise HTTPException(400, "Swept barrage requires `freq_start_mhz` and `freq_stop_mhz` "
+                                     "(e.g. 2400 and 2483.5 for the 2.4GHz ISM hop band).")
+        if body.freq_stop_mhz <= body.freq_start_mhz:
+            raise HTTPException(400, "`freq_stop_mhz` must be greater than `freq_start_mhz`.")
+        freq_mhz = None
+    else:
+        freq_mhz = body.freq_mhz if body.freq_mhz is not None else JAM_BAND_PRESETS_MHZ.get(body.band)
+        if not freq_mhz:
+            raise HTTPException(400, "Provide either `band` (433|915|2g4|bt_2g4|5g8|gps_l1|galileo_e1|beidou_b1|"
+                                      "glonass_l1), an explicit `freq_mhz`, or a `sweep` band span.")
+
+    # NO artificial cap (commander directive): a continuous jam carries
+    # duration_s=None (runs until the operator stops it — always stoppable via
+    # Stand Down / EMERGENCY ABORT / tx_halt); otherwise the operator-set
+    # bounded window is honored verbatim.
+    continuous = bool(body.continuous) or float(body.duration_s) <= 0.0
+    duration_s = None if continuous else float(body.duration_s)
+    # Human-readable duration for logs/records (JSON-safe: None -> "continuous").
+    duration_desc = "continuous" if duration_s is None else f"{duration_s}s"
 
     request_id = str(uuid.uuid4())
 
-    if body.band in JAM_GNSS_BANDS:
+    if body.band in JAM_GNSS_BANDS and freq_mhz is not None:
         # Logging only — NOT an additional gate. The extra GNSS-denial-radius
         # warning is surfaced to the operator in the SAME SafetyGate confirm
         # flow (frontend/src/pages/Jamming.jsx), before arm_token/
@@ -5297,30 +5350,37 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
             "proportionally larger effective radius than comms jamming at the same "
             "TX power (GPS-band receive levels are ~-130dBm).", request_id, body.band, freq_mhz,
         )
-    _pending_jam[request_id] = {
-        "ts": datetime.now(timezone.utc),
-        "status": "AWAITING_ACK",
+    # Common jam parameters, shared by the pending record + the WS broadcast so
+    # the bridge sees exactly what is logged/tracked. continuous / sweep drive
+    # the field bridge (hackrf_jam.transmit_burst continuous / transmit_sweep).
+    jam_fields = {
         "band": body.band,
         "freq_mhz": freq_mhz,
         "bandwidth_khz": body.bandwidth_khz,
-        "duration_s": duration_s,
+        "duration_s": duration_s,          # None => continuous (JSON null)
+        "continuous": continuous,
+        "sweep": body.sweep,
+        "freq_start_mhz": body.freq_start_mhz,
+        "freq_stop_mhz": body.freq_stop_mhz,
+        "step_mhz": body.step_mhz,
+        "dwell_ms": body.dwell_ms,
         "tx_gain": body.tx_gain,
         "jam_mode": jam_mode,  # surfaced in GET /jam/status so the UI shows which jammer fired
+    }
+    _pending_jam[request_id] = {
+        "ts": datetime.now(timezone.utc),
+        "status": "AWAITING_ACK",
+        **jam_fields,
         "actor": user["email"],
     }
 
     await ws_manager.broadcast_json({
         "type": "jam_request",
         "request_id": request_id,
-        "band": body.band,
-        "freq_mhz": freq_mhz,
-        "bandwidth_khz": body.bandwidth_khz,
-        "duration_s": duration_s,
-        "tx_gain": body.tx_gain,
+        **jam_fields,
         # Routes the request to the correct bridge: jam_bridge.py (meghdut)
         # vs operator_jam_bridge.py (operator). Each ignores the other's mode
         # so the two bridges never double-fire on this shared WS channel.
-        "jam_mode": jam_mode,
         # Forwarded AFTER being consumed above — its presence here is the
         # bridge's evidence a real UI confirmation happened, not a live
         # credential the bridge itself validates against the backend.
@@ -5328,14 +5388,16 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
         "actor": user["email"],
     })
 
+    span_desc = (f"SWEEP {body.freq_start_mhz}-{body.freq_stop_mhz} MHz"
+                 if body.sweep else f"{freq_mhz} MHz")
     await log_event(
         "JAM",
-        f"Requested RF jam burst [{jam_mode.upper()}]: {freq_mhz} MHz, {body.bandwidth_khz}kHz BW, "
-        f"{duration_s}s, gain={body.tx_gain} — awaiting bridge TX confirmation (request {request_id})",
+        f"Requested RF jam [{jam_mode.upper()}]: {span_desc}, {body.bandwidth_khz}kHz BW, "
+        f"{duration_desc}, gain={body.tx_gain} — awaiting bridge TX confirmation (request {request_id})",
         # jam_mode is audited distinctly (OPERATOR vs MEGHDUT) so the mission
         # log unambiguously records WHICH jammer radiated each burst.
         meta={"request_id": request_id, "freq_mhz": freq_mhz, "duration_s": duration_s,
-              "jam_mode": jam_mode.upper()},
+              "continuous": continuous, "sweep": body.sweep, "jam_mode": jam_mode.upper()},
         actor=user["email"],
     )
     await ws_manager.broadcast_json({"type": "jam_status", "request_id": request_id, "status": "AWAITING_ACK"})
@@ -5365,7 +5427,11 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
         "status": "AWAITING_ACK",
         "freq_mhz": freq_mhz,
         "bandwidth_khz": body.bandwidth_khz,
-        "duration_s": duration_s,
+        "duration_s": duration_s,       # null => continuous (runs until stopped)
+        "continuous": continuous,
+        "sweep": body.sweep,
+        "freq_start_mhz": body.freq_start_mhz,
+        "freq_stop_mhz": body.freq_stop_mhz,
         "tx_gain": body.tx_gain,
         "jam_mode": jam_mode,  # which jammer fired: "meghdut" | "operator"
         # Additive, informational (never changes status/HTTP code): False means
@@ -5704,6 +5770,7 @@ async def deploy_mavlink_sdr_inject(body: MavlinkSdrInjectBody,
         "center_freq_mhz": body.center_freq_mhz,
         "air_rate_bps": body.air_rate_bps,
         "repeat": body.repeat,
+        "continuous": body.continuous,
         "tx_gain": body.tx_gain,
         "actor": user["email"],
     }
@@ -5738,6 +5805,7 @@ async def deploy_mavlink_sdr_inject(body: MavlinkSdrInjectBody,
         "bt": body.bt,
         "bit_order": body.bit_order,
         "repeat": body.repeat,
+        "continuous": body.continuous,
         "tx_gain": body.tx_gain,
         # Forwarded AFTER being consumed above — same convention as the
         # jam_request/gnss_spoof_request confirm-token forwarding. Its presence

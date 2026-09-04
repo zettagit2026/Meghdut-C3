@@ -130,8 +130,57 @@ def test_base_bridge_do_transmit_uses_transmit_burst(monkeypatch):
     monkeypatch.setattr(jam_bridge, "transmit_burst", fake_burst)
     stop_event = threading.Event()
     params = {"band": "915", "freq_mhz": 915.0, "bandwidth_khz": 500.0,
-              "duration_s": 5.0, "tx_gain": 20, "request_id": "r4", "actor": "a"}
+              "duration_s": 5.0, "tx_gain": 20, "sweep": False, "request_id": "r4", "actor": "a"}
     result = meghdut._do_transmit(params, stop_event, lambda _p: None)
     assert result["ok"] is True
     assert called["args"] == (915.0, 500.0, 5.0, 20)
     assert called["stop_event"] is stop_event
+
+
+def test_base_bridge_do_transmit_continuous_passes_none_duration(monkeypatch):
+    # Commander directive: a continuous jam is routed to transmit_burst with
+    # duration_s=None (run until stopped), NOT a capped value.
+    import jam_bridge
+    meghdut, _ = _make_bridges()
+    called = {}
+
+    def fake_burst(freq, bw, dur, gain, **kwargs):
+        called["dur"] = dur
+        return {"ok": True, "stopped_early": False, "error": None}
+
+    monkeypatch.setattr(jam_bridge, "transmit_burst", fake_burst)
+    params = {"band": "915", "freq_mhz": 915.0, "bandwidth_khz": 500.0,
+              "duration_s": None, "tx_gain": 20, "sweep": False, "request_id": "r5", "actor": "a"}
+    meghdut._do_transmit(params, threading.Event(), lambda _p: None)
+    assert called["dur"] is None
+
+
+def test_base_bridge_do_transmit_routes_sweep_to_transmit_sweep(monkeypatch):
+    # sweep=True routes to transmit_sweep with the band edges + tx_halt wiring,
+    # so a MEGHDUT swept barrage covers the full hop band.
+    import jam_bridge
+    meghdut, _ = _make_bridges()
+    seen = {}
+
+    def fake_sweep(start, stop, bw, gain, **kwargs):
+        seen["start"] = start
+        seen["stop"] = stop
+        seen["duration_s"] = kwargs.get("duration_s")
+        seen["tx_halt_check"] = kwargs.get("tx_halt_check")
+        seen["stop_event"] = kwargs.get("stop_event")
+        return {"ok": True, "stopped_early": False, "error": None}
+
+    monkeypatch.setattr(jam_bridge, "transmit_sweep", fake_sweep)
+    stop_event = threading.Event()
+    params = {"band": None, "freq_mhz": None, "bandwidth_khz": 500.0,
+              "duration_s": None, "tx_gain": 47, "sweep": True,
+              "freq_start_mhz": 2400.0, "freq_stop_mhz": 2483.5,
+              "step_mhz": 20.0, "dwell_ms": 5.0, "request_id": "r6", "actor": "a"}
+    result = meghdut._do_transmit(params, stop_event, lambda _p: None)
+    assert result["ok"] is True
+    assert seen["start"] == 2400.0 and seen["stop"] == 2483.5
+    assert seen["duration_s"] is None  # continuous sweep until stopped
+    assert seen["stop_event"] is stop_event
+    # tx_halt is polled so EMERGENCY ABORT stops an in-progress sweep.
+    meghdut.tx_halted = True
+    assert seen["tx_halt_check"]() is True

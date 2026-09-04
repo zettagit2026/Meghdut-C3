@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Radio, AlertTriangle, ShieldAlert } from "lucide-react";
+import { Radio, AlertTriangle, ShieldAlert, Infinity as InfinityIcon, Waves } from "lucide-react";
 import SafetyGate, { JAM_CHECKS } from "@/components/SafetyGate";
 import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
+import EmergencyAbort from "@/components/EmergencyAbort";
 import { useAuth } from "@/context/AuthContext";
 import { handleEngageBlock } from "@/lib/engageFix";
 
@@ -45,7 +46,22 @@ const BANDS = [
 // its own; it is additional copy inside the SAME confirm flow, not a new gate.
 const GNSS_BANDS = new Set(["gps_l1", "galileo_e1", "beidou_b1", "glonass_l1"]);
 
-const MAX_DURATION_S = 10; // mirrors backend JAM_MAX_DURATION_S / hackrf_jam.py MAX_DURATION_S
+// Commander directive (post spectrum-analyser field test): there is NO
+// artificial auto-stop cap. A capped ~5s burst lets a drone's FHSS+FEC control
+// link re-sync and recover. The operator sets a bounded window OR runs the jam
+// CONTINUOUSLY until Stand Down / EMERGENCY ABORT. Either way the effect is
+// ALWAYS instantly stoppable (see the prominent STOP control below).
+const DEFAULT_DURATION_S = 5;
+
+// Preset sweep spans for the MEGHDUT swept barrage. A single ~20MHz-
+// instantaneous HackRF center only covers a slice of an ~80MHz hop band;
+// sweeping the center across the band hits a frequency-hopping control link on
+// every hop over the sweep's revisit interval.
+const SWEEP_PRESETS = [
+  { label: "2.4 GHz ISM (2400–2483.5) — DJI / Wi-Fi / BT / ELRS", start: 2400, stop: 2483.5 },
+  { label: "5.8 GHz video (5725–5875)", start: 5725, stop: 5875 },
+  { label: "915 MHz ISM (902–928) — SiK / LoRa", start: 902, stop: 928 },
+];
 
 // The four bands the OPERATOR'S own jammer covers (its per-band callers
 // cema_433/915/24/58.py). Operator mode is band-fixed to these — mirrors the
@@ -82,7 +98,11 @@ export default function Jamming() {
   const isCommander = user?.role === "commander";
   const [jamMode, setJamMode] = useState("meghdut");
   const [band, setBand] = useState("915");
-  const [durationS, setDurationS] = useState(5);
+  const [durationS, setDurationS] = useState(DEFAULT_DURATION_S);
+  const [continuous, setContinuous] = useState(false);
+  const [sweep, setSweep] = useState(false);
+  const [freqStartMhz, setFreqStartMhz] = useState(SWEEP_PRESETS[0].start);
+  const [freqStopMhz, setFreqStopMhz] = useState(SWEEP_PRESETS[0].stop);
   const [bandwidthKhz, setBandwidthKhz] = useState(500);
   const [txGain, setTxGain] = useState(20);
   const [gateOpen, setGateOpen] = useState(false);
@@ -128,7 +148,13 @@ export default function Jamming() {
     if (isOperatorMode && !OPERATOR_BAND_VALUES.has(band)) setBand("915");
   }, [isOperatorMode, band]);
 
-  const isGnssTarget = GNSS_BANDS.has(band);
+  // Operator mode is band-fixed (single-center flowgraph) — it cannot sweep.
+  // Force sweep off when operator mode is selected.
+  useEffect(() => {
+    if (isOperatorMode && sweep) setSweep(false);
+  }, [isOperatorMode, sweep]);
+
+  const isGnssTarget = !sweep && GNSS_BANDS.has(band);
 
   // Same JAM_CHECKS the SafetyGate has always used, PLUS one extra line when
   // the operator has selected a GNSS target — still the ONE SafetyGate
@@ -158,10 +184,14 @@ export default function Jamming() {
       // what makes the token mean "a human just deliberately confirmed
       // this", the digital equivalent of typing 'TRANSMIT' at a terminal.
       const { data: confirm } = await api.post("/jam/confirm");
-      // Step 3: the actual jam request, carrying both tokens.
+      // Step 3: the actual jam request, carrying both tokens. continuous / sweep
+      // drive the field bridge; there is no artificial duration cap.
       const { data } = await api.post("/payloads/jam", {
-        band,
+        band: sweep ? undefined : band,
         duration_s: durationS,
+        continuous,
+        sweep,
+        ...(sweep ? { freq_start_mhz: Number(freqStartMhz), freq_stop_mhz: Number(freqStopMhz) } : {}),
         bandwidth_khz: bandwidthKhz,
         tx_gain: txGain,
         jam_mode: jamMode,
@@ -181,8 +211,12 @@ export default function Jamming() {
           });
         }
       } else {
+        const where = data.sweep
+          ? `SWEEP ${data.freq_start_mhz}–${data.freq_stop_mhz} MHz`
+          : `${data.freq_mhz} MHz`;
+        const dur = data.continuous || data.duration_s == null ? "CONTINUOUS (until Stand Down)" : `${data.duration_s}s`;
         toast.info(`${modeLabel} REQUESTED — awaiting bridge ACK`, {
-          description: `${data.freq_mhz} MHz · ${data.duration_s}s · req ${data.request_id?.slice(0, 8)}`,
+          description: `${where} · ${dur} · req ${data.request_id?.slice(0, 8)}`,
         });
       }
       loadStatus();
@@ -211,12 +245,30 @@ export default function Jamming() {
         <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
         <div className="font-mono text-xs text-slate-300">
           <span className="font-bold" style={{ color: "var(--accent-critical)" }}>WARNING:</span>{" "}
-          This transmits REAL RF via a HackRF, band-limited noise for a hard-capped, bounded burst
-          (max {MAX_DURATION_S}s per request — never continuous/unattended). Requires commander role, a
-          fresh arm token, a jam confirmation token minted at the instant you complete the checklist
-          below, AND a live Range Authorization lease for this effect (armed via the control below,
-          re-checked by the bridge at the moment of transmission) — all four independently, every time.
+          This transmits REAL RF via a HackRF (band-limited noise). It can run CONTINUOUSLY and it
+          runs until YOU stop it — use STAND DOWN / EMERGENCY ABORT to cease TX instantly at any
+          moment. Requires commander role, a fresh arm token, a jam confirmation token minted at the
+          instant you complete the checklist below, AND a live Range Authorization lease for this
+          effect (armed via the control below, re-checked by the bridge at the moment of
+          transmission) — all four independently, every time.{" "}
+          <span className="font-bold" style={{ color: "var(--accent-warning)" }}>
+            Effectiveness at range depends on PA power, antenna and proximity (physical) and on
+            jamming the CONTROL band (add GNSS denial to prevent return-to-home) — jamming does not
+            guarantee a stop.
+          </span>
         </div>
+      </div>
+
+      {/* Prominent, always-available STOP: halts ALL TX (continuous jams
+          included) instantly. This is the operator's guaranteed off-switch. */}
+      <div className="tactical-border p-4 flex items-center justify-between gap-3"
+           style={{ background: "var(--surface-critical)" }}>
+        <div className="font-mono text-[11px] text-slate-300 leading-relaxed">
+          <span className="font-bold" style={{ color: "var(--accent-critical)" }}>STOP / STAND DOWN —</span>{" "}
+          halts every RF transmission immediately, including a continuous or swept jam in progress.
+          The jammer can ALWAYS be switched off.
+        </div>
+        <EmergencyAbort />
       </div>
 
       <RangeAuthorizationControl effect="jam" label="RF JAMMING" />
@@ -257,30 +309,114 @@ export default function Jamming() {
             </span>
           </label>
 
-          <label className="block">
-            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Band</span>
-            <select
-              data-testid="jam-band-select"
-              value={band}
-              onChange={(e) => setBand(e.target.value)}
-              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
-            >
-              {bandOptions.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
-            </select>
+          {/* SWEPT BARRAGE (MEGHDUT only): step the center across a hop band so
+              a frequency-hopping control link is hit on every hop. */}
+          {!isOperatorMode && (
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                data-testid="jam-sweep-toggle"
+                type="checkbox"
+                checked={sweep}
+                onChange={(e) => setSweep(e.target.checked)}
+                className="mt-1"
+              />
+              <span className="font-mono text-[10px] text-slate-400 leading-relaxed">
+                <Waves size={11} className="inline mr-1" strokeWidth={1.5} />
+                <span className="uppercase tracking-widest text-slate-300">Swept barrage (full-band)</span>
+                {" — "}sweep the TX center across a band so a frequency-hopping (FHSS) control link is
+                hit on every hop. A single ~20 MHz HackRF window covers only a slice of an ~80 MHz hop
+                band; the sweep covers it over time (revisit ≈ steps × dwell), not instantaneously.
+              </span>
+            </label>
+          )}
+
+          {sweep ? (
+            <div className="space-y-3">
+              <label className="block">
+                <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Sweep preset</span>
+                <select
+                  data-testid="jam-sweep-preset"
+                  value={`${freqStartMhz}-${freqStopMhz}`}
+                  onChange={(e) => {
+                    const p = SWEEP_PRESETS.find((x) => `${x.start}-${x.stop}` === e.target.value);
+                    if (p) { setFreqStartMhz(p.start); setFreqStopMhz(p.stop); }
+                  }}
+                  className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+                >
+                  {SWEEP_PRESETS.map((p) => (
+                    <option key={p.label} value={`${p.start}-${p.stop}`}>{p.label}</option>
+                  ))}
+                </select>
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <label className="block">
+                  <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Start (MHz)</span>
+                  <input
+                    data-testid="jam-sweep-start"
+                    type="number" min={1} step={0.5}
+                    value={freqStartMhz}
+                    onChange={(e) => setFreqStartMhz(Number(e.target.value))}
+                    className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+                  />
+                </label>
+                <label className="block">
+                  <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Stop (MHz)</span>
+                  <input
+                    data-testid="jam-sweep-stop"
+                    type="number" min={1} step={0.5}
+                    value={freqStopMhz}
+                    onChange={(e) => setFreqStopMhz(Number(e.target.value))}
+                    className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+                  />
+                </label>
+              </div>
+            </div>
+          ) : (
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Band</span>
+              <select
+                data-testid="jam-band-select"
+                value={band}
+                onChange={(e) => setBand(e.target.value)}
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+              >
+                {bandOptions.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
+              </select>
+            </label>
+          )}
+
+          {/* CONTINUOUS: no artificial auto-stop timer — runs until Stand Down /
+              Abort. When off, an operator-set bounded window (NOT capped). */}
+          <label className="flex items-start gap-2 cursor-pointer">
+            <input
+              data-testid="jam-continuous-toggle"
+              type="checkbox"
+              checked={continuous}
+              onChange={(e) => setContinuous(e.target.checked)}
+              className="mt-1"
+            />
+            <span className="font-mono text-[10px] text-slate-400 leading-relaxed">
+              <InfinityIcon size={11} className="inline mr-1" strokeWidth={1.5} />
+              <span className="uppercase tracking-widest text-slate-300">Continuous</span>
+              {" — "}transmit until you STAND DOWN / EMERGENCY ABORT (no auto-stop timer). A capped
+              short burst lets a FHSS+FEC link re-sync and recover; continuous denial does not.
+            </span>
           </label>
 
-          <label className="block">
-            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-              Duration (s, max {MAX_DURATION_S})
-            </span>
-            <input
-              data-testid="jam-duration-input"
-              type="number" min={1} max={MAX_DURATION_S} step={0.5}
-              value={durationS}
-              onChange={(e) => setDurationS(Math.min(MAX_DURATION_S, Math.max(1, Number(e.target.value))))}
-              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
-            />
-          </label>
+          {!continuous && (
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
+                Duration (s) — bounded window, no cap
+              </span>
+              <input
+                data-testid="jam-duration-input"
+                type="number" min={0.5} step={0.5}
+                value={durationS}
+                onChange={(e) => setDurationS(Math.max(0.5, Number(e.target.value)))}
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+              />
+            </label>
+          )}
 
           <label className="block">
             <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
@@ -317,9 +453,10 @@ export default function Jamming() {
               style={{ background: "var(--surface-critical)" }}
             >
               OPERATOR JAM: runs the operator's OWN unmodified GNU Radio jammer, pinned to the TX
-              radio (serial) and hard-capped at {MAX_DURATION_S}s. Waveform, bandwidth and gains
-              (GAUSSIAN ×12, 47/47/20, 20 Msps) are fixed by the operator's code — only band and
-              duration apply. Same arm / confirm / range-authorization / TX-halt gates as MEGHDUT.
+              radio (serial), continuous-until-stopped (no auto-stop timer). Waveform, bandwidth and
+              gains (GAUSSIAN ×12, 47/47/20, 20 Msps) are fixed by the operator's code — only band and
+              duration/continuous apply, and it is band-fixed (no sweep). Same arm / confirm /
+              range-authorization / TX-halt gates as MEGHDUT — Stand Down stops it instantly.
             </div>
           )}
 
@@ -366,7 +503,11 @@ export default function Jamming() {
                 <div key={s.request_id} data-testid={`jam-session-${s.request_id}`}
                      className="flex items-center justify-between p-3 tactical-border">
                   <div className="font-mono text-[11px] text-slate-300">
-                    {s.freq_mhz} MHz · {s.duration_s}s · gain={s.tx_gain}
+                    {s.sweep
+                      ? `SWEEP ${s.freq_start_mhz}–${s.freq_stop_mhz} MHz`
+                      : `${s.freq_mhz} MHz`}{" · "}
+                    {s.continuous || s.duration_s == null ? "CONTINUOUS" : `${s.duration_s}s`}
+                    {" · "}gain={s.tx_gain}
                     <div className="text-slate-500 text-[10px] flex items-center gap-2">
                       <span>{s.request_id?.slice(0, 8)}</span>
                       <span
@@ -394,7 +535,9 @@ export default function Jamming() {
 
       <SafetyGate
         open={gateOpen}
-        payloadName={`${isOperatorMode ? "OPERATOR JAM" : "MEGHDUT RF BARRAGE JAM"} (${BANDS.find((b) => b.value === band)?.label || band})`}
+        payloadName={`${isOperatorMode ? "OPERATOR JAM" : sweep ? "MEGHDUT SWEPT BARRAGE" : "MEGHDUT RF BARRAGE JAM"} `
+          + `(${sweep ? `${freqStartMhz}–${freqStopMhz} MHz sweep` : (BANDS.find((b) => b.value === band)?.label || band)}`
+          + `${continuous ? ", CONTINUOUS until Stand Down" : ""})`}
         severity="CRITICAL"
         checks={gateChecks}
         actionLabel="TRANSMIT"

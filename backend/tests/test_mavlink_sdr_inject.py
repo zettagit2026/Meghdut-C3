@@ -128,10 +128,25 @@ def test_target_detection_id_is_required():
                                  mavlink_sdr_inject_confirm_token="b" * 36)
 
 
-def test_repeat_bounded_by_model():
+def test_repeat_is_operator_controlled_not_capped():
+    # Commander directive: NO artificial repeat ceiling — a large operator-set
+    # repeat is accepted verbatim (only a floor of 1 remains).
+    body = srv.MavlinkSdrInjectBody(target_detection_id="det-1", repeat=9999,
+                                    arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+    assert body.repeat == 9999
+    # Floor of 1 still enforced (repeat < 1 is meaningless for a one-shot frame).
     with pytest.raises(Exception):
-        srv.MavlinkSdrInjectBody(target_detection_id="det-1", repeat=9999,
+        srv.MavlinkSdrInjectBody(target_detection_id="det-1", repeat=0,
                                  arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+
+
+def test_continuous_flag_defaults_false_and_accepts_true():
+    body = srv.MavlinkSdrInjectBody(target_detection_id="det-1",
+                                    arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+    assert body.continuous is False
+    body2 = srv.MavlinkSdrInjectBody(target_detection_id="det-1", continuous=True,
+                                     arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+    assert body2.continuous is True
 
 
 # ---------------------------------------------------------------------

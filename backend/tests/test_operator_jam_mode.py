@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 os.environ.setdefault("MONGO_URL", "mongodb://localhost:27017")
@@ -145,3 +146,94 @@ def test_operator_mode_rejects_explicit_freq(monkeypatch):
     with pytest.raises(srv.HTTPException) as ei:
         asyncio.run(srv.deploy_jam(body, user=USER))
     assert ei.value.status_code == 400
+
+
+# --------------------------------------------------------------------------
+# Commander directive: continuous (no auto-stop cap) + swept barrage
+# --------------------------------------------------------------------------
+def test_continuous_jam_forwards_null_duration(monkeypatch):
+    _, broadcasts = _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(band="915", continuous=True, **TOKENS)
+    resp = asyncio.run(srv.deploy_jam(body, user=USER))
+    # A continuous jam carries duration_s = None (runs until the operator stops
+    # it) — NOT a capped number.
+    assert resp["duration_s"] is None
+    assert resp["continuous"] is True
+    jam_req = [b for b in broadcasts if b.get("type") == "jam_request"][0]
+    assert jam_req["duration_s"] is None
+    assert jam_req["continuous"] is True
+
+
+def test_long_bounded_duration_is_not_capped(monkeypatch):
+    # NO artificial ceiling: a 3600s bounded request is forwarded verbatim,
+    # not clamped to the old 10s JAM_MAX_DURATION_S.
+    _, broadcasts = _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(band="915", duration_s=3600.0, **TOKENS)
+    resp = asyncio.run(srv.deploy_jam(body, user=USER))
+    assert resp["duration_s"] == 3600.0
+    assert resp["duration_s"] > srv.JAM_MAX_DURATION_S  # the old cap is gone
+
+
+def test_sweep_jam_forwards_band_edges(monkeypatch):
+    _, broadcasts = _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(sweep=True, freq_start_mhz=2400.0, freq_stop_mhz=2483.5,
+                              continuous=True, **TOKENS)
+    resp = asyncio.run(srv.deploy_jam(body, user=USER))
+    assert resp["sweep"] is True
+    assert resp["freq_start_mhz"] == 2400.0 and resp["freq_stop_mhz"] == 2483.5
+    jam_req = [b for b in broadcasts if b.get("type") == "jam_request"][0]
+    assert jam_req["sweep"] is True
+    assert jam_req["freq_start_mhz"] == 2400.0 and jam_req["freq_stop_mhz"] == 2483.5
+
+
+def test_sweep_requires_band_edges(monkeypatch):
+    _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(sweep=True, **TOKENS)  # no start/stop
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.deploy_jam(body, user=USER))
+    assert ei.value.status_code == 400
+
+
+def test_operator_mode_rejects_sweep(monkeypatch):
+    _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(band="915", jam_mode="operator", sweep=True,
+                              freq_start_mhz=2400.0, freq_stop_mhz=2483.5, **TOKENS)
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.deploy_jam(body, user=USER))
+    assert ei.value.status_code == 400
+
+
+def test_continuous_jam_still_409_when_tx_halted(monkeypatch):
+    # KILL-SWITCH PROOF at the backend layer: even a continuous jam is refused
+    # with 409 while EMERGENCY ABORT (tx_halt) is in effect — the operator's
+    # stop always wins, no matter the duration mode.
+    monkeypatch.setattr(srv, "_tx_halted", True)
+    body = srv.JamRequestBody(band="915", continuous=True, **TOKENS)
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.deploy_jam(body, user=USER))
+    assert ei.value.status_code == 409
+
+
+def test_continuous_active_jam_not_force_expired(monkeypatch):
+    # A CONTINUOUS jam sits in JAM_ACTIVE indefinitely (no fixed duration) — the
+    # lazy expiry must NOT crash on duration_s=None nor time it out.
+    import asyncio as _aio
+    srv._pending_jam.clear()
+    old = datetime.now(timezone.utc) - timedelta(seconds=10_000)
+    srv._pending_jam["rid-cont"] = {
+        "ts": old, "status": "JAM_ACTIVE", "duration_s": None, "continuous": True,
+        "freq_mhz": 915.0, "actor": "x",
+    }
+
+    async def _noop_broadcast(msg):
+        return None
+    monkeypatch.setattr(srv.ws_manager, "broadcast_json", _noop_broadcast)
+
+    async def _noop_log(*a, **k):
+        return {}
+    monkeypatch.setattr(srv, "log_event", _noop_log)
+
+    _aio.run(srv._expire_pending_jam())
+    # Still active — never force-expired to TX_TIMEOUT on a duration it never had.
+    assert srv._pending_jam["rid-cont"]["status"] == "JAM_ACTIVE"
+    srv._pending_jam.clear()

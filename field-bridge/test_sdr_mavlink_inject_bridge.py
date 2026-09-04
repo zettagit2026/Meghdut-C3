@@ -247,7 +247,8 @@ def test_happy_path_modulates_and_transmits_via_pinned_iq_path(monkeypatch):
 
     tx_calls = []
 
-    def fake_transmit(iq_path, freq_mhz, duration_s, tx_gain, stop_event=None, on_started=None):
+    def fake_transmit(iq_path, freq_mhz, duration_s, tx_gain, stop_event=None,
+                      on_started=None, tx_halt_check=None):
         tx_calls.append({"iq_path": iq_path, "freq_mhz": freq_mhz,
                          "duration_s": duration_s, "tx_gain": tx_gain})
         if on_started:
@@ -273,9 +274,9 @@ def test_happy_path_modulates_and_transmits_via_pinned_iq_path(monkeypatch):
     assert tx_calls[0]["freq_mhz"] == 915.0
 
 
-def test_repeat_is_clamped_to_bridge_bound(monkeypatch):
-    """repeat from the WS payload is never trusted as authoritative — clamped
-    independently by the bridge, mirroring the other bridges' posture."""
+def test_repeat_is_operator_controlled_not_clamped(monkeypatch):
+    """Commander directive: repeat is operator-controlled — NO artificial cap.
+    A large repeat passes through verbatim (only floored at 1)."""
     b = _bridge()
     monkeypatch.setattr(b, "is_range_authorized", lambda effect="mavlink_sdr_inject": True)
     captured = {}
@@ -287,7 +288,53 @@ def test_repeat_is_clamped_to_bridge_bound(monkeypatch):
     deadline = time.time() + 2
     while time.time() < deadline and "write_kw" not in captured:
         time.sleep(0.02)
-    assert captured["write_kw"]["repeat"] == sib.MAX_REPEAT
+    # NOT clamped to MAX_REPEAT — the operator-set value is honored verbatim.
+    assert captured["write_kw"]["repeat"] == 9999
+
+
+def test_repeat_floored_at_one(monkeypatch):
+    """The only remaining bound is a floor of 1 (repeat=0 is meaningless for a
+    one-shot frame; use continuous=True for an unbounded loop instead)."""
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect="mavlink_sdr_inject": True)
+    captured = {}
+    _stub_modulation(monkeypatch, captured)
+    monkeypatch.setattr(sib, "transmit_iq_file",
+                        lambda *a, **k: {"ok": True, "error": None, "stopped_early": False})
+    ws = FakeWS()
+    b._handle_inject_request(ws, _valid_request(repeat=0))
+    deadline = time.time() + 2
+    while time.time() < deadline and "write_kw" not in captured:
+        time.sleep(0.02)
+    assert captured["write_kw"]["repeat"] == 1
+
+
+def test_continuous_inject_loops_until_stopped(monkeypatch):
+    """continuous=True => transmit_iq_file is handed a None window (loop via -R)
+    so the command re-emits until the operator stops it — still abortable."""
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect="mavlink_sdr_inject": True)
+    captured = {}
+    _stub_modulation(monkeypatch, captured)
+    tx_calls = []
+
+    def fake_transmit(iq_path, freq_mhz, duration_s, tx_gain, stop_event=None,
+                      on_started=None, tx_halt_check=None):
+        tx_calls.append({"duration_s": duration_s, "tx_halt_check": tx_halt_check})
+        if on_started:
+            on_started(object())
+        return {"ok": True, "error": None, "stopped_early": False}
+
+    monkeypatch.setattr(sib, "transmit_iq_file", fake_transmit)
+    ws = FakeWS()
+    b._handle_inject_request(ws, _valid_request(continuous=True))
+    deadline = time.time() + 2
+    while time.time() < deadline and not tx_calls:
+        time.sleep(0.02)
+    assert tx_calls, "transmit_iq_file was never called"
+    # None window = continuous loop until stopped; tx_halt is still polled.
+    assert tx_calls[0]["duration_s"] is None
+    assert callable(tx_calls[0]["tx_halt_check"])
 
 
 def test_transmit_failure_reported_as_failed_not_crash(monkeypatch):

@@ -1,17 +1,37 @@
 #!/usr/bin/env python3
-"""Bounded-duration RF link-disruption demo via HackRF TX.
+"""Operator-controlled RF link-disruption via HackRF TX.
 
-TRANSMITS real RF. Demonstrates CEMA "communication disruption" (RFI item
+TRANSMITS real RF. Implements CEMA "communication disruption" (RFI item
 1.4) against the SiK 915MHz ISM band or DJI's 2.4/5.8GHz video/control
-bands, by transmitting a band-limited noise waveform for a fixed duration.
+bands, by transmitting a band-limited noise waveform.
 
-SAFETY GATING — refuses to run unless BOTH are true:
+EFFECTIVENESS (commander directive, post spectrum-analyser field test):
+There is NO artificial auto-stop duration/repeat cap here. A capped ~5s
+burst lets a drone's FHSS+FEC control link re-sync and recover, and a
+single fixed-center ~20MHz barrage only covers a fraction of an ~80MHz
+hopping band. This module therefore supports:
+  * CONTINUOUS transmission — runs until the OPERATOR stops it (never an
+    unattended auto-stop timer). See transmit_burst()/transmit_iq_file()
+    (loop-and-retransmit via hackrf_transfer -R) and the CLI --continuous.
+  * SWEPT-BARRAGE (transmit_sweep) — steps the TX center frequency across a
+    configurable band so a frequency-hopping control link is hit on every
+    hop over the sweep's revisit interval (HackRF's instantaneous bandwidth
+    is only ~20MHz; the sweep is what covers the full ~80MHz hop band).
+
+SAFETY — the effect ALWAYS remains instantly stoppable by the operator.
+Every transmit loop below polls BOTH a stop_event (set by EMERGENCY ABORT /
+Stand Down via the governed bridges) AND an optional tx_halt_check on every
+iteration, and terminates the live hackrf_transfer process promptly when
+either fires. "No timing limit" means "runs until the operator stops it",
+NOT "cannot be switched off".
+
+SAFETY GATING (CLI) — refuses to run unless BOTH are true:
   1. env var CEMA_AUTHORIZED_RANGE=1
   2. --i-confirm-authorized-range passed on the command line
-
-Only run this at STEAG under Army Signals spectrum authorization.
-Duration is hard-capped at 10 seconds per invocation — re-run explicitly
-for a longer demo window rather than allowing an unattended long TX.
+Only run this at STEAG under Army Signals spectrum authorization. The
+governed bridges (jam_bridge.py / operator_jam_bridge.py) additionally
+enforce the arm token, jam-confirm token, live range-authorization lease,
+commander role, tx_halt, and the …930c TX device-pin (fail-closed).
 """
 from __future__ import annotations
 
@@ -50,9 +70,97 @@ def _tx_device_args() -> list:
     return ["-d", HACKRF_TX_SERIAL] if HACKRF_TX_SERIAL else []
 
 
+# RETAINED as a NON-binding default only (e.g. the CLI --duration-s default and
+# backward-compatible imports in operator_jam_wrapper.py / jam_bridge.py). It is
+# NO LONGER a hard auto-stop cap — per the commander directive there is no
+# artificial timing limit; a continuous effect runs until the operator stops it
+# (stop_event / tx_halt / Stand Down). Left defined so existing `from hackrf_jam
+# import MAX_DURATION_S` callers keep working.
 MAX_DURATION_S = 10.0
 SAMPLE_RATE_HZ = 20_000_000  # 20 Msps, matches /CEMA/drone-kit/dronev5/cema/cema_base.py's
                               # proven RATE for these same bands.
+
+# Length of ONE noise-IQ chunk built for a continuous / long transmission. The
+# chunk is transmitted on a loop (hackrf_transfer -R) so we never materialize a
+# multi-minute IQ buffer in memory; the loop is what makes the effect run
+# indefinitely, and stop_event/tx_halt terminate it between/within chunks.
+CONTINUOUS_CHUNK_S = 0.5
+
+# Swept-barrage defaults. HackRF's instantaneous TX bandwidth is ~20MHz, so a
+# single center only covers a slice of a wide hop band; the sweep retunes across
+# the band every SWEEP_DEFAULT_STEP_MHZ with SWEEP_DEFAULT_DWELL_MS dwell so a
+# hopping control link is hit on every hop over the sweep's revisit interval.
+# HONEST NOTE: revisit_interval ≈ n_steps * dwell — a fast hopper is only denied
+# on the fraction of hops that land in the currently-illuminated ~20MHz window
+# during each dwell; a shorter dwell / narrower band improves revisit at the
+# cost of per-step energy. These are tuning knobs, not guarantees.
+SWEEP_DEFAULT_STEP_MHZ = 20.0
+SWEEP_DEFAULT_DWELL_MS = 5.0
+# The two common hop bands, as (start_mhz, stop_mhz) — 2.4GHz ISM (DJI/Wi-Fi/BT)
+# and the 5.8GHz video band. Exposed for the CLI/bridge; any explicit range is
+# accepted.
+SWEEP_BAND_2G4 = (2400.0, 2483.5)
+SWEEP_BAND_5G8 = (5725.0, 5875.0)
+
+# Maximum HackRF TX gains for maximum radiated power (within the device's own
+# limits): TX VGA (IF) gain caps at 47 dB. build the command with `-x 47` when
+# the operator asks for max power. NOT auto-applied — the operator still sets
+# tx_gain; this is the ceiling the UI/CLI expose.
+MAX_TX_VGA_GAIN = 47
+
+
+def _is_continuous(duration_s) -> bool:
+    """True when the caller asked for a continuous (operator-stopped) run rather
+    than a fixed-duration burst. Accepts None, <=0, or the string "continuous"
+    as the continuous sentinel; any positive number is a bounded duration."""
+    if duration_s is None:
+        return True
+    if isinstance(duration_s, str):
+        return duration_s.strip().lower() in ("continuous", "cont", "", "0")
+    try:
+        return float(duration_s) <= 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _stop_requested(stop_event, tx_halt_check) -> bool:
+    """Single place both continuous/sweep supervision loops poll to decide
+    whether the operator has demanded a stop. Checks the EMERGENCY-ABORT
+    stop_event AND an optional tx_halt_check callback — either one ends TX."""
+    if stop_event is not None and stop_event.is_set():
+        return True
+    if tx_halt_check is not None:
+        try:
+            if tx_halt_check():
+                return True
+        except Exception:
+            # A failing tx_halt probe must fail SAFE (treat as "stop"): never
+            # let a broken predicate keep a jammer transmitting.
+            return True
+    return False
+
+
+def _supervise_transfer(proc, deadline, stop_event, tx_halt_check, poll_s: float = 0.1) -> str:
+    """Poll a live hackrf_transfer subprocess until it exits, its bounded
+    deadline passes, or the operator demands a stop (stop_event / tx_halt).
+    Returns one of: "exited" (process ended on its own), "deadline" (bounded
+    window elapsed — normal completion), or "stopped" (operator abort/tx_halt —
+    process was terminated). `deadline` is an absolute time.time() value, or
+    None for a continuous run with no time bound (only a stop ends it)."""
+    while True:
+        if proc.poll() is not None:
+            return "exited"
+        if _stop_requested(stop_event, tx_halt_check):
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            return "stopped"
+        if deadline is not None and time.time() > deadline:
+            proc.kill()
+            return "deadline"
+        time.sleep(poll_s)
 
 # GNSS-spoof ("soft-kill", Task #103) duration cap — deliberately much
 # shorter than jamming's MAX_DURATION_S. See
@@ -159,6 +267,7 @@ def transmit_iq_file(
     tx_gain: int,
     stop_event: Optional["threading.Event"] = None,
     on_started: Optional[Callable[["subprocess.Popen"], None]] = None,
+    tx_halt_check: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """Shared subprocess-management / abort-mid-transmission mechanics,
     factored out of transmit_burst() (Task #103, see
@@ -176,12 +285,21 @@ def transmit_iq_file(
     `hackrf_transfer -t <iq_path> ...` — otherwise byte-for-byte the same
     command construction transmit_burst() has always used.
 
-    stop_event / on_started: identical contract to transmit_burst()'s own
-    parameters — see that function's docstring.
+    stop_event / on_started / tx_halt_check: identical contract to
+    transmit_burst()'s own parameters — see that function's docstring.
+
+    CONTINUOUS: when duration_s is a continuous sentinel (None / <=0 /
+    "continuous", per _is_continuous), the IQ file is transmitted ON A LOOP
+    (hackrf_transfer -R) with NO time deadline — it runs until stop_event or
+    tx_halt_check fires (the operator stopping it), then the live process is
+    terminated. This lets a takeover command be re-emitted continuously until
+    the operator stops it, exactly as the commander directed, while staying
+    instantly abortable.
 
     Returns {"ok": bool, "error": Optional[str], "stopped_early": bool}.
     Never raises for TX-side failures — same convention as transmit_burst().
     """
+    continuous = _is_continuous(duration_s)
     cmd = [
         "hackrf_transfer",
         "-t", iq_path,
@@ -189,6 +307,7 @@ def transmit_iq_file(
         "-s", str(SAMPLE_RATE_HZ),
         "-x", str(tx_gain),
         "-a", "1",
+        *(["-R"] if continuous else []),  # loop the file until the operator stops it
         *_tx_device_args(),  # `-d <TX serial>` when a TX unit is pinned (see HACKRF_TX_SERIAL)
     ]
     # TX device pinning (task #TX-pin): serialize this TX burst behind the TX
@@ -208,27 +327,11 @@ def transmit_iq_file(
             if on_started:
                 on_started(proc)
 
-            deadline = time.time() + duration_s + 5  # matches transmit_burst()'s timeout=duration+5 margin
-            stopped_early = False
-            while True:
-                ret = proc.poll()
-                if ret is not None:
-                    break
-                if stop_event is not None and stop_event.is_set():
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                    stopped_early = True
-                    break
-                if time.time() > deadline:
-                    # Same as transmit_burst()'s expected TimeoutExpired boundary:
-                    # the bounded burst ran its full duration; this is success, not
-                    # failure.
-                    proc.kill()
-                    break
-                time.sleep(0.1)
+            # continuous -> no deadline (only a stop ends it); bounded -> the
+            # requested window + a 5s margin, matching the legacy behavior.
+            deadline = None if continuous else time.time() + float(duration_s) + 5
+            outcome = _supervise_transfer(proc, deadline, stop_event, tx_halt_check)
+            stopped_early = (outcome == "stopped")
     except HackrfDeviceBusy as e:
         # Another TX/RX consumer holds this device — treat like any other
         # TX-side failure (never crash the caller), same convention as
@@ -288,14 +391,19 @@ def transmit_burst(
         'TRANSMIT' — it cannot exist unless a human deliberately went through
         the real confirmation flow.
 
-    Duration is hard-capped at MAX_DURATION_S regardless of what is
-    requested, same as the CLI path.
+    Duration is NOT capped (commander directive: no artificial auto-stop
+    timer). A positive duration_s is a bounded burst; a continuous sentinel
+    (None / <=0 / "continuous", per _is_continuous) transmits a looped noise
+    chunk (hackrf_transfer -R) with NO deadline — it runs until the operator
+    stops it via stop_event / tx_halt_check. Either way the effect is always
+    instantly stoppable (that is the one invariant that never changes).
 
     stop_event: if provided and set() while the burst is running, the
     underlying hackrf_transfer process is terminated early (used by
     jam_bridge.py to honor a live EMERGENCY ABORT mid-burst — the app's
     existing Tier-0 "stop all TX now" control must also be able to kill a
-    real RF jam in progress, not just queued MAVLink frames).
+    real RF jam in progress, not just queued MAVLink frames). For a continuous
+    jam this is the operator's stop control, polled on every loop iteration.
 
     on_started: optional callback invoked with the live subprocess.Popen the
     instant the process is spawned, so the caller can store a handle to it
@@ -336,8 +444,18 @@ def transmit_burst(
     HackrfDeviceBusy, so jam_bridge.py sends a normal "failed" jam_ack for
     this request rather than the whole service dying.
     """
-    duration = min(duration_s, MAX_DURATION_S)
-    iq_bytes = build_noise_iq(duration, bandwidth_khz)
+    continuous = _is_continuous(duration_s)
+    # For a continuous or long run, build ONE short chunk and loop it on the
+    # radio (-R) rather than materializing a giant IQ buffer. For a short
+    # bounded burst, build exactly that many seconds and play it once (legacy
+    # behavior — keeps small-burst callers byte-identical).
+    if continuous or float(duration_s) > CONTINUOUS_CHUNK_S:
+        chunk_s = CONTINUOUS_CHUNK_S
+        loop = True
+    else:
+        chunk_s = float(duration_s)
+        loop = False
+    iq_bytes = build_noise_iq(chunk_s, bandwidth_khz)
 
     with tempfile.NamedTemporaryFile(suffix=".iq") as f:
         f.write(iq_bytes)
@@ -349,6 +467,7 @@ def transmit_burst(
             "-s", str(SAMPLE_RATE_HZ),
             "-x", str(tx_gain),
             "-a", "1",
+            *(["-R"] if loop else []),  # loop the chunk (continuous / long burst)
             *_tx_device_args(),  # `-d <TX serial>` when a TX unit is pinned (see HACKRF_TX_SERIAL)
         ]
         try:
@@ -367,27 +486,11 @@ def transmit_burst(
                 if on_started:
                     on_started(proc)
 
-                deadline = time.time() + duration + 5  # matches CLI's timeout=duration+5 margin
-                stopped_early = False
-                while True:
-                    ret = proc.poll()
-                    if ret is not None:
-                        break
-                    if stop_event is not None and stop_event.is_set():
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=3)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                        stopped_early = True
-                        break
-                    if time.time() > deadline:
-                        # Same as the CLI's expected TimeoutExpired boundary: the
-                        # bounded burst ran its full duration; this is success, not
-                        # failure.
-                        proc.kill()
-                        break
-                    time.sleep(0.1)
+                # continuous -> no deadline (only stop_event/tx_halt ends it);
+                # bounded -> the requested window + 5s margin, as before.
+                deadline = None if continuous else time.time() + float(duration_s) + 5
+                outcome = _supervise_transfer(proc, deadline, stop_event, None)
+                stopped_early = (outcome == "stopped")
         except HackrfDeviceBusy as e:
             # Another process (hackrf_rx.py's sweep loop or
             # ml_classify_bridge.py's gate-check sweep/IQ capture) is
@@ -418,6 +521,124 @@ def transmit_burst(
                  "stopped_early": False}
 
 
+def sweep_centers_mhz(start_mhz: float, stop_mhz: float, step_mhz: float) -> list:
+    """The ordered list of TX center frequencies (MHz) for ONE pass across
+    [start_mhz, stop_mhz], spaced step_mhz apart, with the final center pinned
+    to stop_mhz so the top of the band is always illuminated even when the span
+    is not an exact multiple of the step. Pure/deterministic — unit-testable
+    without any radio. A HackRF at each center covers roughly ±(step/2) of
+    instantaneous bandwidth, so consecutive centers tile the band."""
+    lo, hi = float(min(start_mhz, stop_mhz)), float(max(start_mhz, stop_mhz))
+    step = abs(float(step_mhz)) or SWEEP_DEFAULT_STEP_MHZ
+    centers: list = []
+    f = lo
+    while f < hi:
+        centers.append(round(f, 6))
+        f += step
+    if not centers or centers[-1] < hi:
+        centers.append(round(hi, 6))
+    return centers
+
+
+def transmit_sweep(
+    freq_start_mhz: float,
+    freq_stop_mhz: float,
+    bandwidth_khz: float,
+    tx_gain: int,
+    step_mhz: float = SWEEP_DEFAULT_STEP_MHZ,
+    dwell_ms: float = SWEEP_DEFAULT_DWELL_MS,
+    duration_s=None,
+    stop_event: Optional["threading.Event"] = None,
+    on_started: Optional[Callable[["subprocess.Popen"], None]] = None,
+    tx_halt_check: Optional[Callable[[], bool]] = None,
+    dwell_runner: Optional[Callable[..., str]] = None,
+) -> Dict[str, Any]:
+    """MEGHDUT swept-barrage jam: step the TX center frequency across
+    [freq_start_mhz, freq_stop_mhz] (see sweep_centers_mhz), dwelling dwell_ms
+    at each center, wrapping around and repeating. This is how a ~20MHz-
+    instantaneous HackRF denies a wide (~80MHz) frequency-hopping control link:
+    every hop is hit within one sweep revisit interval (≈ n_centers * dwell).
+
+    CONTINUOUS by default (duration_s continuous sentinel) — sweeps until the
+    operator stops it (stop_event / tx_halt_check). A positive duration_s runs
+    the sweep for a bounded window instead. STOP IS ALWAYS HONORED: the loop
+    polls stop_event AND tx_halt_check before every dwell and terminates the
+    live hackrf_transfer immediately (this is the non-negotiable safety
+    invariant — a swept jammer that cannot be switched off must never be built).
+
+    HONEST EFFECTIVENESS: the sweep denies a fast hopper only on the fraction of
+    hops that land in the currently-illuminated window during each dwell;
+    revisit interval, per-step energy, PA power, antenna and proximity all bound
+    real-world effect. See module-level SWEEP_* notes.
+
+    dwell_runner: injectable "run one dwell at center f, return an outcome
+    string" hook for unit tests; default = a real hackrf_transfer subprocess.
+    Returns {"ok", "error", "stopped_early"} like transmit_burst.
+    """
+    continuous = _is_continuous(duration_s)
+    dwell_s = max(0.001, float(dwell_ms) / 1000.0)
+    centers = sweep_centers_mhz(freq_start_mhz, freq_stop_mhz, step_mhz)
+    if not centers:
+        return {"ok": False, "error": "empty sweep band", "stopped_early": False}
+
+    # Build ONE dwell-length noise chunk, reused (retuned) at every center.
+    iq_bytes = build_noise_iq(dwell_s, bandwidth_khz)
+    deadline = None if continuous else time.time() + float(duration_s)
+    started_fired = {"done": False}
+
+    def _default_runner(iq_path: str, center_mhz: float) -> str:
+        cmd = [
+            "hackrf_transfer",
+            "-t", iq_path,
+            "-f", str(int(center_mhz * 1_000_000)),
+            "-s", str(SAMPLE_RATE_HZ),
+            "-x", str(tx_gain),
+            "-a", "1",
+            *_tx_device_args(),
+        ]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        if on_started and not started_fired["done"]:
+            started_fired["done"] = True
+            on_started(proc)
+        # Each dwell is a bounded mini-burst; the sweep's own stop check happens
+        # between dwells and within _supervise_transfer during the dwell.
+        return _supervise_transfer(proc, time.time() + dwell_s, stop_event, tx_halt_check)
+
+    runner = dwell_runner or _default_runner
+
+    stopped_early = False
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".iq") as f:
+            f.write(iq_bytes)
+            f.flush()
+            # Hold the TX unit's own per-serial lock for the WHOLE sweep session
+            # (mirrors the continuous-CLI branch) so the swept barrage can never
+            # collide with the RX consumers on the separate RX unit.
+            with hackrf_device_lock(serial=HACKRF_TX_SERIAL):
+                idx = 0
+                while True:
+                    if _stop_requested(stop_event, tx_halt_check):
+                        stopped_early = True
+                        break
+                    if deadline is not None and time.time() > deadline:
+                        break
+                    center = centers[idx % len(centers)]
+                    idx += 1
+                    try:
+                        outcome = runner(f.name, center)
+                    except FileNotFoundError:
+                        return {"ok": False,
+                                "error": "hackrf_transfer not found (install the `hackrf` package)",
+                                "stopped_early": False}
+                    if outcome == "stopped":
+                        stopped_early = True
+                        break
+    except HackrfDeviceBusy as e:
+        return {"ok": False, "error": f"HackRF device busy: {e}", "stopped_early": False}
+
+    return {"ok": True, "error": None, "stopped_early": stopped_early}
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--band", choices=list(BAND_PRESETS_MHZ.keys()),
@@ -425,16 +646,76 @@ def main() -> None:
     ap.add_argument("--freq-mhz", type=float,
                      help="Explicit center frequency in MHz (overrides --band if both given)")
     ap.add_argument("--bandwidth-khz", type=float, default=500)
-    ap.add_argument("--duration-s", type=float, default=5)
+    ap.add_argument("--duration-s", type=float, default=5,
+                     help="Bounded burst length in seconds. NOT capped — use --continuous "
+                          "for an operator-stopped run. 0 / negative also means continuous.")
     ap.add_argument("--tx-gain", type=int, default=20, help="HackRF TX VGA gain, 0-47")
+    ap.add_argument("--max-gain", action="store_true",
+                     help=f"Shortcut: set TX VGA gain to the HackRF maximum ({MAX_TX_VGA_GAIN}) "
+                          f"for maximum radiated power.")
     ap.add_argument("--continuous", action="store_true",
-                     help="Keep transmitting repeated bursts until you press Ctrl+C. "
+                     help="Transmit continuously until YOU press Ctrl+C (no auto-stop timer). "
                           "Still requires the one-time TRANSMIT confirmation before starting; "
                           "you retain full manual control to stop it at any moment.")
+    # Swept-barrage (MEGHDUT effectiveness mode): step the TX center across a
+    # band so a frequency-hopping control link is hit on every hop over time.
+    ap.add_argument("--sweep", action="store_true",
+                     help="Swept-barrage: step the TX center across [--freq-start-mhz, "
+                          "--freq-stop-mhz]. Continuous unless --duration-s > 0.")
+    ap.add_argument("--freq-start-mhz", type=float, help="Sweep band start (MHz).")
+    ap.add_argument("--freq-stop-mhz", type=float, help="Sweep band stop (MHz).")
+    ap.add_argument("--step-mhz", type=float, default=SWEEP_DEFAULT_STEP_MHZ,
+                     help=f"Sweep step (MHz), ~HackRF instantaneous BW. Default {SWEEP_DEFAULT_STEP_MHZ}.")
+    ap.add_argument("--dwell-ms", type=float, default=SWEEP_DEFAULT_DWELL_MS,
+                     help=f"Dwell at each center (ms). Default {SWEEP_DEFAULT_DWELL_MS}.")
     ap.add_argument("--i-confirm-authorized-range", action="store_true")
     args = ap.parse_args()
 
     check_authorized(args.i_confirm_authorized_range)
+
+    if args.max_gain:
+        args.tx_gain = MAX_TX_VGA_GAIN
+
+    # continuous when explicitly asked OR duration_s is a continuous sentinel.
+    continuous = args.continuous or _is_continuous(args.duration_s)
+
+    # ---- Swept-barrage branch (MEGHDUT full-band coverage) --------------------
+    if args.sweep:
+        start = args.freq_start_mhz
+        stop = args.freq_stop_mhz
+        if start is None or stop is None:
+            print("ERROR: --sweep needs --freq-start-mhz and --freq-stop-mhz "
+                  "(e.g. 2400 2483.5 for the 2.4GHz ISM band).", file=sys.stderr)
+            sys.exit(1)
+        span_desc = (f"SWEEP {start}->{stop} MHz, step {args.step_mhz}MHz, dwell {args.dwell_ms}ms, "
+                     f"~{args.bandwidth_khz}kHz BW, gain {args.tx_gain}")
+        mode_desc = "CONTINUOUS (until Ctrl+C)" if continuous else f"{args.duration_s}s"
+        print(f"Preparing swept barrage [{mode_desc}]: {span_desc}.")
+        confirm = input(f"About to TRANSMIT a swept barrage across {start}-{stop} MHz "
+                        f"({'until you press Ctrl+C' if continuous else str(args.duration_s) + 's'}). "
+                        f"Type 'TRANSMIT' to proceed: ")
+        if confirm.strip() != "TRANSMIT":
+            print("Aborted — no transmission sent.")
+            return
+        print("TRANSMITTING SWEPT BARRAGE — press Ctrl+C at any time to stop.")
+        stop_event = threading.Event()
+        try:
+            result = transmit_sweep(
+                start, stop, args.bandwidth_khz, args.tx_gain,
+                step_mhz=args.step_mhz, dwell_ms=args.dwell_ms,
+                duration_s=(None if continuous else args.duration_s),
+                stop_event=stop_event,
+            )
+        except KeyboardInterrupt:
+            stop_event.set()
+            print("\nStopped by operator (Ctrl+C).")
+            return
+        if not result["ok"]:
+            print(f"ERROR: swept barrage failed: {result['error']}", file=sys.stderr)
+            sys.exit(1)
+        print("Swept barrage complete." if not result["stopped_early"]
+              else "Swept barrage stopped by operator.")
+        return
 
     freq_mhz = args.freq_mhz if args.freq_mhz is not None else BAND_PRESETS_MHZ.get(args.band)
     if freq_mhz is None:
@@ -442,20 +723,22 @@ def main() -> None:
         sys.exit(1)
     args.freq_mhz = freq_mhz
 
-    duration = min(args.duration_s, MAX_DURATION_S)
-    if duration != args.duration_s:
-        print(f"Duration capped at {MAX_DURATION_S}s per invocation (requested {args.duration_s}s).")
+    # NO cap — the operator-set duration is honored verbatim (commander directive).
+    duration = args.duration_s
 
-    mode = "CONTINUOUS (until you press Ctrl+C)" if args.continuous else f"{duration}s burst"
+    # For a continuous run, build a short chunk and loop it per burst; for a
+    # bounded run, build the requested duration and play it once.
+    chunk = CONTINUOUS_CHUNK_S if continuous else duration
+    mode = "CONTINUOUS (until you press Ctrl+C)" if continuous else f"{duration}s burst"
     print(f"Preparing {mode} @ {args.freq_mhz} MHz, "
           f"~{args.bandwidth_khz}kHz bandwidth, TX gain {args.tx_gain}.")
-    iq_bytes = build_noise_iq(duration, args.bandwidth_khz)
+    iq_bytes = build_noise_iq(chunk, args.bandwidth_khz)
 
     with tempfile.NamedTemporaryFile(suffix=".iq") as f:
         f.write(iq_bytes)
         f.flush()
         prompt = (f"About to TRANSMIT CONTINUOUSLY at {args.freq_mhz} MHz until you press Ctrl+C. "
-                  f"Type 'TRANSMIT' to proceed: " if args.continuous else
+                  f"Type 'TRANSMIT' to proceed: " if continuous else
                   f"About to TRANSMIT at {args.freq_mhz} MHz for {duration}s. Type 'TRANSMIT' to proceed: ")
         confirm = input(prompt)
         if confirm.strip() != "TRANSMIT":
@@ -471,7 +754,7 @@ def main() -> None:
             *_tx_device_args(),  # `-d <TX serial>` when a TX unit is pinned (see HACKRF_TX_SERIAL)
         ]
         print("Running:", " ".join(cmd))
-        if args.continuous:
+        if continuous:
             print("TRANSMITTING CONTINUOUSLY — press Ctrl+C at any time to stop.")
             total_bursts = 0
             try:
@@ -485,12 +768,12 @@ def main() -> None:
                 with hackrf_device_lock(serial=HACKRF_TX_SERIAL):
                     while True:
                         try:
-                            subprocess.run(cmd, timeout=duration + 5, check=True)
+                            subprocess.run(cmd, timeout=chunk + 5, check=True)
                         except subprocess.TimeoutExpired:
                             pass  # expected per-burst boundary, loop continues
                         total_bursts += 1
-                        print(f"  ...burst #{total_bursts} complete, continuing "
-                              f"({total_bursts * duration:.0f}s transmitted so far)")
+                        print(f"  ...chunk #{total_bursts} complete, continuing "
+                              f"(~{total_bursts * chunk:.1f}s transmitted so far)")
             except KeyboardInterrupt:
                 print(f"\nStopped by operator after {total_bursts} bursts "
                       f"(~{total_bursts * duration:.0f}s total transmission).")

@@ -86,10 +86,14 @@ messaged; the bridge-side gates below are enforced here again):
 
 None of these gates replace any other. Removing any one is a regression.
 
-BEHAVIOR: BOUNDED BURST ONLY — the injected command is re-emitted `repeat`
-times back-to-back (bounded server-side and again here), a sub-second on-air
-burst, then hackrf_transfer exits. No continuous mode is exposed (same posture
-as jam_bridge.py / gnss_spoof_bridge.py).
+BEHAVIOR: OPERATOR-CONTROLLED — the injected command is re-emitted `repeat`
+times back-to-back (operator-set, no artificial cap), OR, when the request
+sets continuous=True, re-emitted on a loop (hackrf_transfer -R) until the
+operator stops it. Per the commander directive there is no artificial repeat
+or on-air-window ceiling. The kill-switch is unchanged: EMERGENCY ABORT /
+tx_halt terminates the live hackrf_transfer immediately (stop_event +
+tx_halt_check are both honored), so a continuous inject is always
+switchable-off.
 
 Requires: websocket-client, requests, numpy (see field-bridge/requirements.txt).
 
@@ -142,13 +146,13 @@ except Exception as e:  # pragma: no cover - only hit on a broken field host
 # backend/server.py's _issue_mavlink_sdr_inject_confirm_token() are UUID4 (36 chars).
 MIN_CONFIRM_TOKEN_LEN = 20
 
-# Independent, bridge-side bound on the repeat count — never trust the WS
-# payload as authoritative (same posture jam_bridge.py / gnss_spoof_bridge.py
-# take toward all request fields). Mirrors backend MAVLINK_SDR_INJECT_MAX_REPEAT.
+# Commander directive: NO artificial repeat/window cap on the takeover path.
+# repeat is now operator-controlled (only floored at 1); a request may also ask
+# for continuous=True to re-emit the command on a loop until the operator stops
+# it. MAX_REPEAT is retained ONLY as a non-binding default-library reference
+# value (it is no longer enforced as a ceiling). The kill-switch is unchanged:
+# every transmit still stops instantly on EMERGENCY ABORT (stop_event) / tx_halt.
 MAX_REPEAT = 20
-# Independent hard cap on the on-air transmit window handed to transmit_iq_file
-# (a GFSK command burst is sub-second; this is a failsafe deadline, not a target).
-MAX_TX_WINDOW_S = 5.0
 
 # Commands this bridge will build (mirrors sdr_mavlink_inject.COMMAND_BUILDERS
 # and the backend MavlinkSdrInjectBody pattern). A request for anything else is
@@ -351,8 +355,11 @@ class SdrMavlinkInjectBridge:
             bt = float(data.get("bt", _inj.DEFAULT_BT))
             bit_order = str(data.get("bit_order", _inj.DEFAULT_BIT_ORDER))
             tx_gain = int(data.get("tx_gain", 20))
-            # Independent bound — never trust the WS payload's repeat as authoritative.
-            repeat = max(1, min(int(data.get("repeat", 3)), MAX_REPEAT))
+            # NO artificial cap (commander directive): operator-controlled repeat
+            # (floored at 1 only). continuous=True re-emits the command on a loop
+            # until the operator stops it (still tx_halt/abort-stoppable).
+            repeat = max(1, int(data.get("repeat", 3)))
+            continuous = bool(data.get("continuous"))
         except (TypeError, ValueError) as e:
             self._send_ack(ws, request_id, "failed", ok=False,
                            error=f"invalid mavlink_sdr_inject parameters: {e}")
@@ -390,6 +397,7 @@ class SdrMavlinkInjectBridge:
             "bit_order": bit_order,
             "tx_gain": tx_gain,
             "repeat": repeat,
+            "continuous": continuous,
             "request_id": request_id,
             "actor": actor,
         }
@@ -434,8 +442,9 @@ class SdrMavlinkInjectBridge:
                 bit_order=params["bit_order"],
                 repeat=params["repeat"],
             )
-            # On-air playback time of the file (tiny — a sub-second burst). Cap it
-            # as an independent failsafe deadline for transmit_iq_file.
+            # On-air playback time of the file (its real length). Used as the
+            # bounded failsafe deadline for a one-shot inject. NO artificial cap
+            # (commander directive) — the window follows the real content length.
             info = _inj.describe_modulation(
                 frame,
                 sample_rate_hz=hackrf_jam.SAMPLE_RATE_HZ,
@@ -445,7 +454,11 @@ class SdrMavlinkInjectBridge:
                 bit_order=params["bit_order"],
                 repeat=params["repeat"],
             )
-            tx_window_s = min(MAX_TX_WINDOW_S, max(0.05, float(info.get("on_air_duration_s", 0.05))))
+            # continuous -> None: transmit_iq_file loops the frame (hackrf_transfer
+            # -R) until the operator stops it (stop_event / tx_halt). Otherwise a
+            # bounded window equal to the frame's own on-air length.
+            tx_window_s = None if params.get("continuous") else \
+                max(0.05, float(info.get("on_air_duration_s", 0.05)))
         except Exception as e:
             return {"ok": False, "stopped_early": False,
                     "error": f"SDR MAVLink inject modulation failed: {e}"}
@@ -453,7 +466,10 @@ class SdrMavlinkInjectBridge:
         try:
             result = transmit_iq_file(
                 iq_path, params["center_freq_mhz"], tx_window_s, params["tx_gain"],
-                stop_event=stop_event, on_started=on_started)
+                stop_event=stop_event, on_started=on_started,
+                # Poll tx_halt too so a continuous inject stops instantly on
+                # EMERGENCY ABORT even if the stop_event path is ever missed.
+                tx_halt_check=lambda: self.tx_halted)
         finally:
             try:
                 os.unlink(iq_path)

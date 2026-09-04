@@ -265,7 +265,9 @@ def _install_fake_clock(monkeypatch):
     return clock
 
 
-def test_run_operator_jam_caps_duration(monkeypatch):
+def test_run_operator_jam_honors_uncapped_bounded_duration(monkeypatch):
+    # Commander directive: NO artificial auto-stop cap. A 100s bounded request
+    # runs the full 100s (far beyond the legacy 10s MAX_DURATION_S), not clamped.
     clock = _install_fake_clock(monkeypatch)
     tb = FakeTopBlock()
     start = clock.now
@@ -275,11 +277,34 @@ def test_run_operator_jam_caps_duration(monkeypatch):
     )
     elapsed = clock.now - start
     assert result == {"ok": True, "stopped_early": False, "error": None}
-    # HARD cap: never ran longer than MAX_DURATION_S regardless of the request.
-    assert elapsed <= w.MAX_DURATION_S + 0.5
-    assert elapsed >= w.MAX_DURATION_S - 0.5
+    # NOT capped: it ran the full requested window, well past MAX_DURATION_S.
+    assert elapsed >= 100.0 - 0.5
+    assert elapsed > w.MAX_DURATION_S  # proves the old 10s cap is gone
     assert tb.events[0] == "start"
     assert "stop" in tb.events and "wait" in tb.events
+
+
+def test_run_operator_jam_continuous_runs_until_stopped(monkeypatch):
+    # duration_s=None => CONTINUOUS: it must NOT self-terminate at any fixed
+    # time (proves no auto-stop timer), yet stop PROMPTLY when tx_halt fires.
+    _install_fake_clock(monkeypatch)
+    tb = FakeTopBlock()
+    polls = {"n": 0}
+
+    def tx_halt():
+        polls["n"] += 1
+        # Stays running well past the legacy cap (many poll cycles), then the
+        # operator stops it — the loop must keep transmitting until this fires.
+        return polls["n"] >= 500
+
+    result = w.run_operator_jam(
+        "915", TX_SERIAL, duration_s=None, tx_halt_check=tx_halt,
+        flowgraph_factory=lambda f, s: tb,
+    )
+    assert result["ok"] is True
+    assert result["stopped_early"] is True  # stopped by the operator, not a timer
+    assert polls["n"] >= 500  # it really kept polling/transmitting until the stop
+    assert "stop" in tb.events  # the live flowgraph was torn down on stop
 
 
 def test_run_operator_jam_uses_correct_band_freq(monkeypatch):

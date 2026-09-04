@@ -80,19 +80,25 @@ jam_confirm_token, or this bridge's own live range-authorization check) is a
 regression and must not be done to make testing "more convenient".
 
 =============================================================================
-BEHAVIOR: BOUNDED BURST ONLY — NOT CONTINUOUS
+BEHAVIOR: CONTINUOUS / SWEPT, OPERATOR-STOPPED (commander directive)
 =============================================================================
-hackrf_jam.py supports an interactive --continuous mode (repeated bursts
-until the *local* operator presses Ctrl+C at the terminal). That mode is
-DELIBERATELY NOT exposed through this bridge / the app UI: an unattended,
-WS-triggered, continuous RF transmission with no local human able to press
-Ctrl+C is a materially different (and much riskier) capability than a
-single hard-capped burst, and building it was explicitly out of scope for
-this integration. Every jam this bridge performs is a single bounded burst,
-capped at hackrf_jam.MAX_DURATION_S seconds (currently 10s), matching
-transmit_burst()'s own enforcement. If a longer engagement window is ever
-needed, that should be a fresh, separately-reviewed safety decision — not a
-side effect of this integration.
+Per the commander's post-field-test directive, there is NO artificial auto-
+stop duration cap. A jam_request may ask for:
+  * a bounded burst (duration_s > 0),
+  * CONTINUOUS transmission (duration_s continuous sentinel / continuous=True)
+    — runs until the operator stops it, or
+  * a SWEPT barrage (sweep=True, freq_start_mhz..freq_stop_mhz) that steps the
+    TX center across a hop band so a FHSS control link is hit on every hop.
+This is safe because the operator can ALWAYS stop it instantly and the app is
+attended: EMERGENCY ABORT / Stand Down sets tx_halted AND the active
+stop_event, and BOTH are polled continuously by transmit_burst /
+transmit_sweep, terminating the live hackrf_transfer immediately (see the
+abort handling in on_message + _do_transmit below). A continuous jam that
+could not be switched off is exactly what must NOT be built — that invariant
+is preserved. What changed is only the removal of the artificial timer that
+let a hopping link recover; the arm token, jam-confirm token, live range-
+authorization lease, commander role, tx_halt and TX device-pin are all
+unchanged and still independently required.
 
 Requires: websocket-client, requests, numpy (see field-bridge/requirements.txt).
 """
@@ -110,7 +116,15 @@ from urllib.parse import quote
 import requests
 import websocket  # websocket-client
 
-from hackrf_jam import BAND_PRESETS_MHZ, MAX_DURATION_S, transmit_burst
+from hackrf_jam import (
+    BAND_PRESETS_MHZ,
+    MAX_DURATION_S,
+    SWEEP_DEFAULT_DWELL_MS,
+    SWEEP_DEFAULT_STEP_MHZ,
+    _is_continuous,
+    transmit_burst,
+    transmit_sweep,
+)
 
 log = logging.getLogger("jam-bridge")
 logging.basicConfig(level=logging.INFO,
@@ -261,11 +275,24 @@ class JamBridge:
     # ---- transmit (overridable so OperatorJamBridge can swap the radiator) --
     def _do_transmit(self, params: dict, stop_event: threading.Event,
                      on_started) -> dict:
-        """Perform the actual bounded, abortable RF transmission and return a
-        result dict {"ok", "stopped_early", "error"}. Default = MEGHDUT's
-        built-in barrage jam (hackrf_jam.transmit_burst). OperatorJamBridge
-        overrides ONLY this method to route through the operator's own jammer;
-        every gate in _handle_jam_request above it is shared, unchanged."""
+        """Perform the actual abortable RF transmission and return a result dict
+        {"ok", "stopped_early", "error"}. Default = MEGHDUT's built-in barrage
+        jam: a swept barrage across [freq_start_mhz, freq_stop_mhz] when the
+        request asks for sweep=True, otherwise a single-center burst that is
+        continuous (duration_s None) or bounded. Both stop instantly on
+        EMERGENCY ABORT: stop_event is set by the abort handler AND tx_halted is
+        polled here via tx_halt_check, so a continuous/swept jam is always
+        switchable-off. OperatorJamBridge overrides ONLY this method to route
+        through the operator's own jammer; every gate in _handle_jam_request
+        above it is shared, unchanged."""
+        if params.get("sweep"):
+            return transmit_sweep(
+                params["freq_start_mhz"], params["freq_stop_mhz"],
+                params["bandwidth_khz"], params["tx_gain"],
+                step_mhz=params["step_mhz"], dwell_ms=params["dwell_ms"],
+                duration_s=params["duration_s"],
+                stop_event=stop_event, on_started=on_started,
+                tx_halt_check=lambda: self.tx_halted)
         return transmit_burst(
             params["freq_mhz"], params["bandwidth_khz"], params["duration_s"],
             params["tx_gain"], stop_event=stop_event, on_started=on_started)
@@ -326,14 +353,34 @@ class JamBridge:
 
         try:
             band = data.get("band")
-            freq_mhz = data.get("freq_mhz") or BAND_PRESETS_MHZ.get(band)
             bandwidth_khz = float(data.get("bandwidth_khz", 500))
-            duration_s = min(float(data.get("duration_s", 5)), MAX_DURATION_S)
             tx_gain = int(data.get("tx_gain", 20))
+            # NO artificial cap (commander directive). A continuous request
+            # (continuous=True or a continuous duration sentinel) => duration_s
+            # None, which transmit_burst/transmit_sweep run until the operator
+            # stops it; a positive value is an uncapped bounded window.
+            raw_duration = data.get("duration_s", 5)
+            continuous = bool(data.get("continuous")) or _is_continuous(raw_duration)
+            duration_s = None if continuous else float(raw_duration)
+            # Swept-barrage (MEGHDUT full-band coverage) parameters.
+            sweep = bool(data.get("sweep"))
+            freq_start_mhz = data.get("freq_start_mhz")
+            freq_stop_mhz = data.get("freq_stop_mhz")
+            step_mhz = float(data.get("step_mhz", SWEEP_DEFAULT_STEP_MHZ))
+            dwell_ms = float(data.get("dwell_ms", SWEEP_DEFAULT_DWELL_MS))
+            freq_mhz = data.get("freq_mhz") or BAND_PRESETS_MHZ.get(band)
         except (TypeError, ValueError) as e:
             self._send_jam_ack(ws, request_id, "failed", ok=False, error=f"invalid jam parameters: {e}")
             return
-        if not freq_mhz:
+        if sweep:
+            try:
+                freq_start_mhz = float(freq_start_mhz)
+                freq_stop_mhz = float(freq_stop_mhz)
+            except (TypeError, ValueError):
+                self._send_jam_ack(ws, request_id, "failed", ok=False,
+                                  error="sweep requires numeric freq_start_mhz and freq_stop_mhz")
+                return
+        elif not freq_mhz:
             self._send_jam_ack(ws, request_id, "failed", ok=False,
                               error="no band/freq_mhz resolved for this request")
             return
@@ -342,11 +389,17 @@ class JamBridge:
         with self._active_lock:
             self._active_stop_event = stop_event
 
+        # Human-readable description of what is about to radiate, robust to
+        # continuous (no fixed duration) and sweep (no single center).
+        dur_desc = "CONTINUOUS (until stopped)" if duration_s is None else f"{duration_s:.1f}s"
+        span_desc = (f"SWEEP {freq_start_mhz}-{freq_stop_mhz} MHz step {step_mhz}MHz dwell {dwell_ms}ms"
+                     if sweep else f"{freq_mhz} MHz")
+
         def on_started(_proc) -> None:
             log.warning(
-                "TRANSMITTING real RF jam burst: %.1f MHz, %.0fkHz BW, %.1fs, gain=%d "
+                "TRANSMITTING real RF jam: %s, %.0fkHz BW, %s, gain=%d "
                 "(request %s, requested by %s)",
-                freq_mhz, bandwidth_khz, duration_s, tx_gain, request_id, actor,
+                span_desc, bandwidth_khz, dur_desc, tx_gain, request_id, actor,
             )
             self._send_jam_ack(ws, request_id, "started", ok=True)
 
@@ -356,6 +409,11 @@ class JamBridge:
             "bandwidth_khz": bandwidth_khz,
             "duration_s": duration_s,
             "tx_gain": tx_gain,
+            "sweep": sweep,
+            "freq_start_mhz": freq_start_mhz,
+            "freq_stop_mhz": freq_stop_mhz,
+            "step_mhz": step_mhz,
+            "dwell_ms": dwell_ms,
             "request_id": request_id,
             "actor": actor,
         }

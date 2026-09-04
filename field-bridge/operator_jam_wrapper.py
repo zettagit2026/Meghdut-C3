@@ -40,14 +40,18 @@ BOTH here in the wrapper (never by editing their code):
      this wrapper FAILS CLOSED — it refuses to build the flowgraph rather than
      fall back to "hackrf=0" (which could key the RX radio).
 
-  2. BOUNDED, NON-INTERACTIVE RUN.
-     Their main() ends on a blocking input("Press Enter...") — an unattended,
-     WS-triggered transmit could otherwise run forever with no terminal to
-     press Enter at. This wrapper NEVER calls their main(); it start()s their
-     top_block, runs it for a HARD-CAPPED bounded duration (the SAME
-     MAX_DURATION_S cap the governed MEGHDUT jam uses), polling an abort /
-     tx_halt signal the whole time, then stop()s and wait()s it. An
-     EMERGENCY ABORT mid-burst terminates the transmission immediately.
+  2. NON-INTERACTIVE, ALWAYS-STOPPABLE RUN.
+     Their main() ends on a blocking input("Press Enter...") — which cannot
+     work over a WS-driven bridge with no terminal. This wrapper NEVER calls
+     their main(); it start()s their top_block and runs it CONTINUOUSLY (the
+     commander directive: no artificial auto-stop timer — their own main() was
+     also continuous-until-Enter, and this restores that spirit), OR for a
+     bounded duration when one is explicitly given. Throughout, it polls an
+     abort / tx_halt signal on every iteration and stop()s + wait()s the
+     flowgraph the instant either fires. An EMERGENCY ABORT / Stand Down
+     terminates the transmission immediately. This is the one invariant that is
+     NOT relaxed: the operator can always stop it instantly — "no timing limit"
+     means "runs until the operator stops it", never "cannot be switched off".
 
 If GNU Radio / gr-osmosdr (or their module) is not importable, every entry
 point here fails cleanly with a clear "Operator mode unavailable: ..."
@@ -70,12 +74,23 @@ from typing import Any, Callable, Dict, Optional
 
 log = logging.getLogger("operator-jam-wrapper")
 
-# Reuse the EXACT same hard duration cap the governed MEGHDUT jam enforces, so
-# "Operator Jam" can never transmit for longer than the built-in barrage jam.
+# MAX_DURATION_S is retained ONLY as a non-binding default import (no longer a
+# hard cap — per the commander directive there is no artificial auto-stop
+# timer). _is_continuous decides whether a request is continuous (operator-
+# stopped) or a bounded window. Both come from hackrf_jam so the two jam modes
+# share one definition of "continuous".
 try:
-    from hackrf_jam import MAX_DURATION_S  # same 10s cap as the governed jam
+    from hackrf_jam import MAX_DURATION_S, _is_continuous
 except Exception:  # pragma: no cover - hackrf_jam always importable on the bridge host
     MAX_DURATION_S = 10.0
+
+    def _is_continuous(duration_s) -> bool:
+        if duration_s is None:
+            return True
+        try:
+            return float(duration_s) <= 0.0
+        except (TypeError, ValueError):
+            return False
 
 # Their proven flowgraph parameters (from /CEMA/operator-jam/cema_base.py),
 # reproduced here ONLY as documentation / for the informational log line — the
@@ -404,8 +419,17 @@ def run_operator_jam(
     flowgraph_factory: Optional[Callable[[float, str], Any]] = None,
     poll_interval_s: float = 0.1,
 ) -> Dict[str, Any]:
-    """Run the operator's jammer for a HARD-CAPPED bounded duration, pinned to
-    the TX serial, abortable at any moment.
+    """Run the operator's jammer pinned to the TX serial, abortable at any
+    moment. CONTINUOUS by default (duration_s a continuous sentinel: None /
+    <=0) — the flowgraph runs until the operator stops it (abort_event /
+    tx_halt_check), exactly as their own main() blocked until Enter. A positive
+    duration_s runs a bounded window instead. There is NO artificial cap on the
+    duration (commander directive).
+
+    SAFETY INVARIANT (never relaxed): abort_event AND tx_halt_check are polled
+    on EVERY loop iteration, so EMERGENCY ABORT / Stand Down / tx_halt stop an
+    in-progress operator jam immediately — a jammer that cannot be switched off
+    must never be built.
 
     Returns a result dict matching field-bridge/hackrf_jam.transmit_burst()'s
     shape so the bridge can ack it identically:
@@ -419,7 +443,7 @@ def run_operator_jam(
         return {"ok": False, "stopped_early": False,
                 "error": f"operator jam: unsupported band {band!r} "
                          f"(supports {sorted(OPERATOR_BANDS)})"}
-    duration = min(float(duration_s), MAX_DURATION_S)
+    continuous = _is_continuous(duration_s)
     freq_mhz = OPERATOR_BANDS[band]
     factory = flowgraph_factory or _build_operator_flowgraph
 
@@ -432,6 +456,10 @@ def run_operator_jam(
         return {"ok": False, "stopped_early": False,
                 "error": f"operator flowgraph construction failed: {e}"}
 
+    def _stop_now() -> bool:
+        return (abort_event is not None and abort_event.is_set()) or \
+               (tx_halt_check is not None and tx_halt_check())
+
     stopped_early = False
     try:
         tb.start()
@@ -440,14 +468,21 @@ def run_operator_jam(
                 on_started(tb)
             except Exception as e:
                 log.warning("operator jam on_started callback error: %s", e)
-        deadline = time.monotonic() + duration
-        while time.monotonic() < deadline:
-            if (abort_event is not None and abort_event.is_set()) or \
-               (tx_halt_check is not None and tx_halt_check()):
+        # continuous -> no deadline (only an abort/tx_halt ends it); bounded ->
+        # exactly the requested window (uncapped). Either way, poll the stop
+        # signals every poll_interval_s so a stop is honored promptly.
+        deadline = None if continuous else time.monotonic() + float(duration_s)
+        while True:
+            if _stop_now():
                 stopped_early = True
                 break
-            remaining = deadline - time.monotonic()
-            time.sleep(max(0.0, min(poll_interval_s, remaining)))
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            if deadline is None:
+                time.sleep(poll_interval_s)
+            else:
+                remaining = deadline - time.monotonic()
+                time.sleep(max(0.0, min(poll_interval_s, remaining)))
     except Exception as e:
         # Best-effort teardown, then report the failure.
         _safe_stop(tb)
