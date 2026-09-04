@@ -18,7 +18,10 @@ _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 need
 
 ## Next queue (backend-touching software; sequence deploys on server.py)
 - ✅ **DJI DroneID decoder — DONE (READY).** User approved AGPLv3. DroneSecurity cloned to `/CEMA/DroneSecurity` (`9ff8198`, UNMODIFIED, LICENSE intact); deps `bitarray`+`crcmod` into bridge venv; `np.complex`(removed numpy≥1.24) fixed via a process-scoped compat shim OUTSIDE the OSS tree (systemd drop-in scoped to `cema-droneid-cued` only, shared venv untouched). Crash-loop gone (112→0), `droneid → READY`, yields RX radio (control_link decodes kept climbing). See Shipped.
-- ⏸ **SDR MAVLink injection → governed backend endpoint** — module built+committed (`84dff1c`); wire to a governed fire path + independent review + verify. #3 priority (niche unencrypted-MAVLink). Queued behind the JAM chain to avoid server.py churn.
+- 🔄 **SDR MAVLink injection → governed capability BUILT (`e874a58`)** — first-class `mavlink_sdr_inject` effect, full spine + IFF fratricide interlock + honesty gate (encrypted/FHSS/unknown→422) + 930c pin fail-closed + bounded/abort; GUI page + coupled unit (no whitelist change); pure-numpy (plain venv, no GNU Radio). 24+19+146 tests green. **Under independent verify + security-review → then dormant deploy.**
+
+## 18-PROTOCOL AUTOPILOT (deploy+expose+test all 18 parser modules; spec `.omc/autopilot/spec-18-protocols.md`)
+- 🔄 **Phase 1 planning IN FLIGHT.** Reconciliation done: NO documented 35/36 (that was the RFUAV airframe dataset) — there ARE 18 real parser modules, all with code. State: 4 OTA deployed (control_link LIVE + remoteid/droneid/fpv_osd READY); 5 OTA-capable not-wired (flysky_afhds/frsky_accst/spektrum_dsm/adsb/parrot_arsdk); 9 forensic wire (crsf/dronecan/ltm/msp/canopen/sik_wire/dshot/frsky_smartport/graupner_hott — need UART/CAN tap, bench-only). Plan → wire 5 OTA live + expose all 18 on the board honestly + deploy+test. NO overclaim (jam = universal defeat; these = detect/ID only).
 - ⏸ **GNSS fidelity phase** — solved ephemeris + GPS-time + Doppler dynamics; then real-receiver validation (bench).
 
 ## Queued (software, no user needed)
