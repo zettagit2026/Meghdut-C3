@@ -182,7 +182,7 @@ FORENSIC_PROTOCOLS: List[Dict[str, str]] = [
         "id": "dshot",
         "name": "DShot ESC telemetry (bidirectional)",
         "requires": "Logic-level tap on the ESC signal wire (bench capture)",
-        "source": "field-bridge/dshot_parser.py",
+        "source": "field-bridge/dshot_telemetry_parser.py",
     },
     {
         "id": "frsky_smartport",
