@@ -81,7 +81,7 @@ DEFAULT_LIVE_WINDOW_S = 45.0
 # forever after a single stale decode.
 DEFAULT_DECODE_WINDOW_S = 120.0
 
-# The four over-the-air operational protocols. `id` is the key each field
+# The six over-the-air operational protocols. `id` is the key each field
 # bridge reports under (POST /api/protocols/heartbeat and the per-protocol
 # ingest endpoints). Order here is the display order on the board.
 OPERATIONAL_PROTOCOLS: List[Dict[str, str]] = [
