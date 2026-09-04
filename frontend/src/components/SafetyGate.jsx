@@ -58,6 +58,24 @@ export const GNSS_SPOOF_CHECKS = [
     "transmission, not a preview.",
 ];
 
+// SDR MAVLink inject ("no-pairing, adversary-grade takeover") — a REAL,
+// over-the-air GFSK-modulated MAVLink COMMAND_LONG radiated by the pinned TX
+// HackRF at the target link's frequency, no SiK pairing. The checklist wording
+// carries the HONEST fidelity limits verbatim: this works ONLY against a
+// fixed-frequency, UNENCRYPTED MAVLink link; FHSS/hopping and signed/encrypted
+// links are out of scope (jamming remains the universal defeat). See
+// backend/server.py's MavlinkSdrInjectBody honest-fidelity notes and
+// field-bridge/sdr_mavlink_inject.py.
+export const MAVLINK_SDR_INJECT_CHECKS = [
+  "Range Authorization is armed for effect=mavlink_sdr_inject via the GUI toggle (see control below) for " +
+    "this session — arming effect=jam or effect=mavlink does NOT arm this.",
+  "Target is a FIXED-FREQUENCY, UNENCRYPTED MAVLink link (hop DISABLED). This injection does NOT follow an " +
+    "FHSS hop pattern and is N/A against signed/encrypted links — for those the defeat is JAMMING, not injection.",
+  "Center frequency and air-data-rate reviewed and matched to the TARGET link (measured, not assumed).",
+  "Physical safety perimeter established; personnel clear of the TX antenna.",
+  "This is a REAL RF transmission of a takeover command (not a preview) and cannot be recalled once sent.",
+];
+
 export default function SafetyGate({
   open, onClose, onConfirm, payloadName, severity,
   checks = CHECKS,

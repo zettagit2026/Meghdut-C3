@@ -116,6 +116,17 @@ from mavlink_codec import (
     # shared with field-bridge/mavlink_takeover.py.
     classify_override_link,
     link_is_overridable as _codec_link_is_overridable,
+    # Byte-accurate MAVLink command builders — the SINGLE source of truth for
+    # frame bytes. Used by the governed SDR-MAVLink-inject path (deploy_mavlink_
+    # sdr_inject) to build the exact frame it authorizes for audit; the field
+    # bridge (field-bridge/sdr_mavlink_inject_bridge.py) rebuilds the identical
+    # bytes from these same builders (via field-bridge/sdr_mavlink_inject.py)
+    # before GFSK-modulating them, so backend audit and on-air frame match.
+    payload_force_land,
+    payload_rth,
+    payload_disarm,
+    payload_flight_termination,
+    payload_maneuver_takeover,
 )
 from payload_library import PAYLOAD_CATALOG, PAYLOAD_BUILDERS, get_payload_by_id
 from detection_state import (
@@ -355,7 +366,7 @@ ARM_TOKEN_TTL_S = 60
 # broadcast / jam / gnss_spoof instead. Each entry now carries the intended
 # effect + optional target so _consume_arm_token can reject cross-effect /
 # cross-target reuse. Valid effects mirror the transmit consumers below.
-ARM_TOKEN_EFFECTS = ("deploy", "mavlink", "jam", "gnss_spoof")
+ARM_TOKEN_EFFECTS = ("deploy", "mavlink", "jam", "gnss_spoof", "mavlink_sdr_inject")
 # token -> {"expiry": datetime, "effect": str, "target_detection_id": Optional[str]}
 _arm_tokens: Dict[str, Dict[str, Any]] = {}
 
@@ -586,6 +597,55 @@ def _consume_gnss_spoof_confirm_token(token: Optional[str], attestation: str) ->
         )
 
 
+# ---- MAVLink-SDR-inject-confirm token — DELIBERATELY a SEPARATE token type
+# from jam_confirm_token / gnss_spoof_confirm_token, for the SAME reason
+# gnss_spoof got its own (see GNSS-spoof block above): the field bridge's
+# confirm-token shape check (field-bridge/sdr_mavlink_inject_bridge.py's
+# _looks_like_real_confirm_token) is deliberately dumb/shape-only, so if these
+# capabilities shared one token type a caller bug that forwarded a valid
+# jam/gnss confirm token where an inject confirm was expected would be silently
+# accepted by that shape check. Distinct token types make that class of bug a
+# hard 403 at the backend instead of a silent cross-effect authorization leak.
+#
+# This is the "no-pairing, adversary-grade SDR MAVLink takeover" path: instead
+# of the paired-SiK takeover (field-bridge/mavlink_takeover.py + /payloads/
+# deploy PL-011), the frame is GFSK-modulated onto baseband IQ and radiated
+# over the air by the pinned TX HackRF at the target link's frequency
+# (field-bridge/sdr_mavlink_inject.py). It carries the SAME full arming spine
+# as every other TX in this system — proof of a real human SafetyGate confirm
+# is exactly what this token is.
+MAVLINK_SDR_INJECT_CONFIRM_TTL_S = 30  # mirrors JAM_CONFIRM_TTL_S / GNSS_SPOOF_CONFIRM_TTL_S
+_mavlink_sdr_inject_confirm_tokens: Dict[str, datetime] = {}
+
+
+def _issue_mavlink_sdr_inject_confirm_token() -> Dict[str, Any]:
+    token = str(uuid.uuid4())
+    _mavlink_sdr_inject_confirm_tokens[token] = (
+        datetime.now(timezone.utc) + timedelta(seconds=MAVLINK_SDR_INJECT_CONFIRM_TTL_S)
+    )
+    return {"mavlink_sdr_inject_confirm_token": token,
+            "expires_in_s": MAVLINK_SDR_INJECT_CONFIRM_TTL_S}
+
+
+def _consume_mavlink_sdr_inject_confirm_token(token: Optional[str]) -> None:
+    """Validate and burn a single-use SDR-MAVLink-inject confirm token. Mirrors
+    _consume_jam_confirm_token (atomic pop, short TTL) — NOT interchangeable with
+    jam_confirm_token or gnss_spoof_confirm_token (separate dict)."""
+    if not token:
+        raise HTTPException(
+            403,
+            "SDR-MAVLink-inject confirmation token required: complete the SafetyGate "
+            "checklist and ARM & FIRE -> CONFIRM FIRE sequence in the SDR MAVLink Inject "
+            "UI, which requests a fresh POST /api/mavlink-sdr-inject/confirm at the moment "
+            "of confirmation. This token is NOT interchangeable with jam_confirm_token or "
+            "gnss_spoof_confirm_token.",
+        )
+    expiry = _mavlink_sdr_inject_confirm_tokens.pop(token, None)
+    if not expiry or datetime.now(timezone.utc) > expiry:
+        raise HTTPException(403, "SDR-MAVLink-inject confirmation token invalid or expired — "
+                                  "re-run the confirmation sequence in the SDR MAVLink Inject UI.")
+
+
 _EARTH_RADIUS_M = 6371000.0  # mean earth radius, meters — standard spherical-earth approximation
 
 
@@ -643,7 +703,7 @@ def _bearing_compass(bearing_deg: float) -> str:
 # `CEMA_AUTHORIZED_RANGE != "1"` behavior.
 RANGE_AUTH_TTL_S = 15 * 60
 RANGE_AUTH_CONFIRM_PHRASE = "AUTHORIZE LIVE RANGE"
-RANGE_AUTH_EFFECTS = ("jam", "mavlink", "gnss_spoof")
+RANGE_AUTH_EFFECTS = ("jam", "mavlink", "gnss_spoof", "mavlink_sdr_inject")
 
 # effect -> {"enabled": bool, "expires_at": datetime|None, "enabled_by": str|None,
 #            "enabled_at": datetime|None}
@@ -1085,6 +1145,88 @@ async def _handle_gnss_spoof_ack(msg: Dict[str, Any]) -> None:
                                      "error": error})
 
 
+# =====================================================================
+# SDR MAVLink-inject session tracking — parallel to _pending_jam /
+# _pending_gnss_spoof above, own dict (never shares state with jamming or
+# gnss_spoof). This is the no-pairing, adversary-grade MAVLink takeover path
+# radiated by the pinned TX HackRF via field-bridge/sdr_mavlink_inject_bridge.py.
+# =====================================================================
+_pending_mavlink_inject: Dict[str, Dict[str, Any]] = {}
+MAVLINK_INJECT_ACK_TIMEOUT_S = 8
+MAVLINK_INJECT_COMPLETE_MARGIN_S = 15
+# The GFSK burst is short (a few framed repeats); its on-air lifetime is a
+# small fraction of a second, so the completion margin dominates the timeout.
+MAVLINK_INJECT_MAX_DURATION_S = 5.0
+
+
+async def _expire_pending_mavlink_inject() -> None:
+    """Lazy/on-read expiry, same pattern as _expire_pending_gnss_spoof."""
+    now = datetime.now(timezone.utc)
+    to_expire = []
+    for rid, p in _pending_mavlink_inject.items():
+        if p["status"] == "AWAITING_ACK" and (now - p["ts"]).total_seconds() > MAVLINK_INJECT_ACK_TIMEOUT_S:
+            to_expire.append(rid)
+        elif p["status"] == "MAVLINK_INJECT_ACTIVE" and \
+                (now - p["ts"]).total_seconds() > p.get("duration_s", MAVLINK_INJECT_MAX_DURATION_S) + MAVLINK_INJECT_COMPLETE_MARGIN_S:
+            to_expire.append(rid)
+    for rid in to_expire:
+        p = _pending_mavlink_inject.get(rid)
+        if not p:
+            continue
+        p["status"] = "TX_TIMEOUT"
+        await log_event(
+            "MAVLINK_SDR_INJECT",
+            f"No terminal bridge ack for mavlink-sdr-inject request {rid} within expected "
+            f"window — marking TX_TIMEOUT (bridge not connected, crashed, or lost mid-burst)",
+            meta={"request_id": rid}, actor="SYSTEM",
+        )
+        await ws_manager.broadcast_json({"type": "mavlink_inject_status", "request_id": rid, "status": "TX_TIMEOUT"})
+
+
+async def _handle_mavlink_inject_ack(msg: Dict[str, Any]) -> None:
+    """Process a real {"type": "mavlink_inject_ack", "phase": ..., ...} message
+    from field-bridge/sdr_mavlink_inject_bridge.py. Mirrors _handle_gnss_spoof_ack
+    exactly — own dict, own log kind. Never speculative: the bridge sends these
+    only after a real modulate+transmit attempt/outcome."""
+    request_id = msg.get("request_id")
+    phase = msg.get("phase")
+    pending = _pending_mavlink_inject.get(request_id) if request_id else None
+    if not pending:
+        logger.warning("mavlink_inject_ack received for unknown/expired request_id=%s (phase=%s)", request_id, phase)
+        return
+
+    phase_to_status = {
+        "started": "MAVLINK_INJECT_ACTIVE",
+        "complete": "MAVLINK_INJECT_COMPLETE",
+        "failed": "TX_FAILED",
+        "stopped": "MAVLINK_INJECT_STOPPED",
+    }
+    status = phase_to_status.get(phase)
+    if not status:
+        logger.warning("mavlink_inject_ack with unrecognized phase=%s for request_id=%s", phase, request_id)
+        return
+
+    pending["status"] = status
+    pending["ts"] = datetime.now(timezone.utc)
+    error = msg.get("error")
+    if error:
+        pending["error"] = error
+    if status in ("MAVLINK_INJECT_COMPLETE", "TX_FAILED", "MAVLINK_INJECT_STOPPED"):
+        pending["terminal"] = True
+
+    await log_event(
+        "MAVLINK_SDR_INJECT_ACK",
+        (f"Bridge CONFIRMED SDR MAVLink-inject TX started for request {request_id}") if status == "MAVLINK_INJECT_ACTIVE" else
+        (f"SDR MAVLink-inject burst complete for request {request_id}") if status == "MAVLINK_INJECT_COMPLETE" else
+        (f"SDR MAVLink-inject burst STOPPED early (EMERGENCY ABORT) for request {request_id}") if status == "MAVLINK_INJECT_STOPPED" else
+        (f"SDR MAVLink-inject burst FAILED for request {request_id}: {error or 'no reason given'}"),
+        meta={"request_id": request_id, "status": status, "error": error},
+        actor="BRIDGE",
+    )
+    await ws_manager.broadcast_json({"type": "mavlink_inject_status", "request_id": request_id, "status": status,
+                                     "error": error})
+
+
 async def _handle_tx_ack(msg: Dict[str, Any]) -> None:
     """Process a real {"type": "tx_ack", ...} message received FROM a
     connected bridge client over the mavlink WS — see
@@ -1302,7 +1444,7 @@ class ArmTokenBody(BaseModel):
     # F3 (2026-08): an arm token is bound at mint time to the effect it is for
     # (and, for a single-target deploy, the target detection). See
     # _issue_arm_token/_consume_arm_token.
-    effect: str = Field(pattern="^(deploy|mavlink|jam|gnss_spoof)$")
+    effect: str = Field(pattern="^(deploy|mavlink|jam|gnss_spoof|mavlink_sdr_inject)$")
     target_detection_id: Optional[str] = None
 
 
@@ -1344,11 +1486,90 @@ class JamConfirmBody(BaseModel):
 
 
 class RangeAuthorizationBody(BaseModel):
-    effect: str = Field(pattern="^(jam|mavlink|gnss_spoof)$")
+    effect: str = Field(pattern="^(jam|mavlink|gnss_spoof|mavlink_sdr_inject)$")
     enabled: bool
     # Required (and checked) only when enabled=True — see POST handler.
     password: Optional[str] = None
     confirm_phrase: Optional[str] = None
+
+
+# ---- SDR MAVLink inject (no-pairing adversary-grade takeover) — the frame
+# BYTES come from the SAME byte-accurate mavlink_codec builders the paired-SiK
+# takeover uses, but instead of a SiK-radio serial write the frame is
+# GFSK-modulated onto baseband IQ and radiated over the air at the target link's
+# frequency by the pinned TX HackRF (field-bridge/sdr_mavlink_inject.py +
+# sdr_mavlink_inject_bridge.py). See MAVLINK_SDR_INJECT_CONFIRM_TTL_S above.
+#
+# HONEST FIDELITY (project rule: do NOT overclaim). This is a NICHE adversary
+# path, NOT a universal defeat:
+#   * WORKS against a FIXED-FREQUENCY, UNENCRYPTED MAVLink telemetry link (a
+#     3DR/SiK/RFD900 radio parked on one channel, hop DISABLED, carrying raw
+#     MAVLink) — the injected COMMAND_LONG is indistinguishable from the real GCS.
+#   * DOES NOT WORK against FHSS / frequency-hopping links (SiK/RFD900 DEFAULT
+#     configs hop across the ISM band on a NetID-derived sequence) — hop-pattern
+#     following is NOT implemented (v1). A fixed-freq burst lands on a hopping
+#     target only ~1/N of the time and will not reliably drive a takeover.
+#   * N/A for MAVLink-signed / encrypted / proprietary control links — there is
+#     no unauthenticated MAVLink to inject into. Against those the defeat is
+#     JAMMING (/payloads/jam), which remains the universal defeat.
+# The same encrypted/FHSS honesty gate the paired takeover enforces
+# (mavlink_codec.link_is_overridable / classify_override_link) is applied here.
+MAVLINK_SDR_INJECT_COMMAND_BUILDERS = {
+    "force_land": payload_force_land,
+    "rth": payload_rth,
+    "disarm": payload_disarm,
+    "flight_termination": payload_flight_termination,
+    "maneuver_takeover": payload_maneuver_takeover,
+}
+# GFSK air-PHY parameter bounds — validated so a caller can't request a
+# nonsensical modulation. Defaults mirror field-bridge/sdr_mavlink_inject.py's
+# module DEFAULT_* (915 MHz US/AU SiK band, 250 kbps air rate, h=0.5 GFSK).
+MAVLINK_SDR_INJECT_DEFAULT_FREQ_MHZ = 915.0
+MAVLINK_SDR_INJECT_DEFAULT_AIR_RATE_BPS = 250_000.0
+MAVLINK_SDR_INJECT_DEFAULT_DEVIATION_HZ = 62_500.0
+MAVLINK_SDR_INJECT_DEFAULT_BT = 0.5
+MAVLINK_SDR_INJECT_MAX_REPEAT = 20
+
+
+class MavlinkSdrInjectConfirmBody(BaseModel):
+    # Empty like JamConfirmBody — the endpoint's only job is to mint a token at
+    # the instant the frontend SafetyGate confirm completes.
+    pass
+
+
+class MavlinkSdrInjectBody(BaseModel):
+    # Targeted takeover: a concrete target detection is REQUIRED (this is not a
+    # broadcast capability) so the fire-time IFF fratricide interlock and the
+    # target-bound arm token both apply exactly as they do for /payloads/deploy.
+    target_detection_id: str
+    # Which byte-accurate MAVLink command to inject (bytes from mavlink_codec).
+    command: str = Field("force_land",
+                         pattern="^(force_land|rth|disarm|flight_termination|maneuver_takeover)$")
+    # Target link air-PHY parameters — set these to the TARGET link's real
+    # frequency / air rate / deviation (measured from a capture). center_freq_mhz
+    # is where hackrf_transfer retunes; the rest shape the GFSK.
+    center_freq_mhz: float = Field(MAVLINK_SDR_INJECT_DEFAULT_FREQ_MHZ, gt=0, lt=7250)
+    air_rate_bps: float = Field(MAVLINK_SDR_INJECT_DEFAULT_AIR_RATE_BPS, gt=0)
+    deviation_hz: float = Field(MAVLINK_SDR_INJECT_DEFAULT_DEVIATION_HZ, gt=0)
+    bt: float = Field(MAVLINK_SDR_INJECT_DEFAULT_BT, gt=0, le=1.0)
+    bit_order: str = Field("msb", pattern="^(msb|lsb)$")
+    tx_gain: int = Field(20, ge=0, le=47)
+    # An unauthenticated command is typically sent several times to survive
+    # collisions on the target link. Bounded server-side.
+    repeat: int = Field(3, ge=1, le=MAVLINK_SDR_INJECT_MAX_REPEAT)
+    # Honesty acknowledgement (same posture as DeployPayloadBody): the operator
+    # asserting the target is a legacy/unencrypted-MAVLink craft. NOT a
+    # substitute for the backend's own protocol check — an encrypted/FHSS
+    # protocol is refused regardless of this flag.
+    target_link_legacy_mavlink: bool = False
+    # Full arming spine tokens (all REQUIRED, every time):
+    arm_token: str            # bound to effect=mavlink_sdr_inject + this target (F3)
+    mavlink_sdr_inject_confirm_token: str  # proof of the SafetyGate two-step confirm
+    # DELIBERATE fratricide override — single-use, commander-minted, target-bound
+    # (see POST /api/detections/{id}/friendly-fire-ack). Consumed exactly once,
+    # ONLY when the target is currently IFF-verified FRIENDLY. Never a bypass of
+    # the spine; an EXTRA gate. See _enforce_fire_time_iff.
+    iff_friendly_fire_ack: Optional[str] = None
 
 
 # ---- GNSS L1 civil-signal spoofing ("soft-kill") — Task #103. See
@@ -4540,6 +4761,9 @@ async def ws_mavlink(ws: WebSocket):
             elif isinstance(incoming, dict) and incoming.get("type") == "gnss_spoof_ack":
                 # From field-bridge/gnss_spoof_bridge.py — see _handle_gnss_spoof_ack.
                 await _handle_gnss_spoof_ack(incoming)
+            elif isinstance(incoming, dict) and incoming.get("type") == "mavlink_inject_ack":
+                # From field-bridge/sdr_mavlink_inject_bridge.py — see _handle_mavlink_inject_ack.
+                await _handle_mavlink_inject_ack(incoming)
             elif isinstance(incoming, dict) and incoming.get("type") == "bridge_hello":
                 # A TX bridge announcing which effect(s) it will actually
                 # transmit (rf-bridge -> "mavlink", jam_bridge -> "jam"). Lets
@@ -5231,6 +5455,242 @@ async def gnss_spoof_status(user: Dict = Depends(get_current_user)):
     sessions = sorted(
         ({"request_id": rid, **{k: v for k, v in p.items() if k != "ts"},
           "ts": p["ts"].isoformat()} for rid, p in _pending_gnss_spoof.items()),
+        key=lambda s: s["ts"], reverse=True,
+    )
+    return {"sessions": sessions[:20]}
+
+
+# =====================================================================
+# Routes: SDR MAVLink inject — no-pairing, adversary-grade MAVLink takeover.
+# The byte-accurate frame (from mavlink_codec, the SAME builders the paired-SiK
+# takeover uses) is GFSK-modulated onto baseband IQ and radiated over the air at
+# the target link's frequency by the pinned TX HackRF, via
+# field-bridge/sdr_mavlink_inject_bridge.py -> sdr_mavlink_inject.py. See the
+# MavlinkSdrInjectBody / MAVLINK_SDR_INJECT_CONFIRM_TTL_S honest-fidelity notes.
+# =====================================================================
+@api.post("/mavlink-sdr-inject/confirm")
+async def mavlink_sdr_inject_confirm(body: MavlinkSdrInjectConfirmBody,
+                                     user: Dict = Depends(require_commander)):
+    """Mint a single-use mavlink_sdr_inject_confirm_token (NOT interchangeable
+    with jam_confirm_token or gnss_spoof_confirm_token). The frontend must call
+    this EXACTLY at the moment its SafetyGate two-step confirm completes — never
+    earlier, never cached. It stands in for the interactive 'type TRANSMIT'
+    prompt once the request reaches the WS-driven field bridge."""
+    tok = _issue_mavlink_sdr_inject_confirm_token()
+    await log_event("MAVLINK_SDR_INJECT_CONFIRM",
+                    f"SDR-MAVLink-inject confirmation token issued (valid "
+                    f"{MAVLINK_SDR_INJECT_CONFIRM_TTL_S}s) — operator completed SafetyGate "
+                    f"checklist + two-click confirm",
+                    actor=user["email"])
+    return tok
+
+
+@api.post("/payloads/mavlink-sdr-inject")
+async def deploy_mavlink_sdr_inject(body: MavlinkSdrInjectBody,
+                                    user: Dict = Depends(require_commander)):
+    """Request a real, bounded, GFSK-modulated MAVLink command injection over
+    the air at the target link's frequency (no pairing, no shared NetID).
+
+    Layered gates, ALL independently required (mirrors deploy_jam / deploy_gnss_
+    spoof / deploy_payload — see field-bridge/sdr_mavlink_inject_bridge.py's
+    module docstring for the bridge-side gates this endpoint cannot itself
+    enforce):
+      1. require_commander (above).
+      2. _check_tx_not_halted — EMERGENCY ABORT blocks this like any other TX.
+      3. arm_token — bound to effect=mavlink_sdr_inject AND this exact target (F3).
+      4. mavlink_sdr_inject_confirm_token — proof the SafetyGate two-step confirm
+         happened for THIS request.
+      5. IFF fratricide interlock — a takeover aimed at a CONFIRMED-FRIENDLY
+         (IFF-verified) contact is HARD-BLOCKED (403) unless the single-use,
+         target-bound commander friendly-fire ack is presented (exactly like
+         /payloads/deploy). Re-evaluated at fire time (_enforce_fire_time_iff).
+      6. range-authorization lease for effect=mavlink_sdr_inject (arming
+         effect=mavlink or effect=jam does NOT arm this — a separate,
+         GUI-armed, auto-expiring lease, same principle as gnss_spoof).
+      7. HONESTY gate — an encrypted/FHSS target link is refused as NOT
+         APPLICABLE (never transmitted); an unknown link fails closed unless
+         the operator attests target_link_legacy_mavlink=True. SDR MAVLink
+         injection only works against fixed-frequency UNENCRYPTED MAVLink.
+    None of these replaces any other — removing any one is a regression.
+    """
+    _check_tx_not_halted()
+    _consume_arm_token(body.arm_token, effect="mavlink_sdr_inject",
+                       target_detection_id=body.target_detection_id)  # F3: effect+target bound
+    _consume_mavlink_sdr_inject_confirm_token(body.mavlink_sdr_inject_confirm_token)
+
+    detection = await db.detections.find_one({"id": body.target_detection_id})
+    if not detection:
+        raise HTTPException(404, "Target detection not found")
+
+    is_friendly = (
+        detection.get("iff_verified")
+        or detection.get("threat_level") == "FRIENDLY (IFF verified)"
+    )
+    # Friendly-fire interlock: a non-friendly must be an authorized target; a
+    # CONFIRMED-FRIENDLY is exempt from this routine check because its ONLY
+    # licence is the single-use commander friendly-fire ack enforced (consumed +
+    # loudly audited) in _enforce_fire_time_iff just below — so a friendly with
+    # no ack still cannot fire. Identical posture to /payloads/deploy.
+    if not is_friendly and not detection.get("authorized_target"):
+        raise HTTPException(
+            403,
+            "Target not authorized — friendly-fire interlock: "
+            "POST /api/detections/{id}/authorize-target first.",
+        )
+    # Fire-time IFF re-check (fratricide interlock). For a CONFIRMED-FRIENDLY
+    # this is the SOLE authorization gate and requires the single-use,
+    # target-bound commander friendly-fire ack from this request (consumed here).
+    await _enforce_fire_time_iff(detection, user, context="SDR MAVLink inject",
+                                 friendly_fire_ack=body.iff_friendly_fire_ack)
+
+    target_sys = detection.get("system_id", 1)
+    target_comp = detection.get("component_id", 1)
+    # A target_system of 0 in a MAVLink command is a BROADCAST to every craft in
+    # range — it defeats the target-bound arm-token + IFF interlocks above.
+    # Refuse before building/sending any frame (mirrors /payloads/deploy F-4).
+    if target_sys in (0, None):
+        raise HTTPException(
+            422,
+            "Refusing targeted SDR inject: target detection has system_id 0/None, which in "
+            "MAVLink broadcasts the command to ALL craft in range and defeats the "
+            "target-bound gates. Re-detect the craft with a concrete system id.",
+        )
+
+    # HONESTY GATE: SDR MAVLink injection is inapplicable to an encrypted/FHSS
+    # link (there is no unauthenticated MAVLink to inject into), and an
+    # unknown/empty link fails closed unless the operator attests it is legacy
+    # MAVLink. Same single-source-of-truth classifier the paired takeover uses.
+    proto = detection.get("protocol")
+    if not _codec_link_is_overridable(proto, legacy_attested=body.target_link_legacy_mavlink):
+        cls = classify_override_link(proto)
+        if cls == "encrypted":
+            reason = (
+                f"target link '{proto}' is encrypted/frequency-hopping. SDR MAVLink "
+                "injection cannot inject into it (no unauthenticated MAVLink; a "
+                "fixed-frequency burst does not follow an FHSS hop pattern) — the defeat "
+                "for such a link is JAMMING, not injection. Refusing to transmit uselessly."
+            )
+        else:  # unknown / empty, and no legacy attestation
+            reason = (
+                f"target link protocol '{proto}' is unknown/unrecognized and the operator "
+                "did not attest it is legacy MAVLink (target_link_legacy_mavlink=true). For "
+                "an SDR MAVLink injection an unknown link type fails closed — refusing to "
+                "transmit."
+            )
+        await log_event(
+            "MAVLINK_SDR_INJECT",
+            f"SDR MAVLink inject NOT APPLICABLE against {detection.get('callsign','?')} "
+            f"— {reason} No RF transmitted.",
+            meta={"target_detection_id": body.target_detection_id, "protocol": proto,
+                  "classification": cls, "legacy_attested": body.target_link_legacy_mavlink,
+                  "command": body.command, "not_applicable": True},
+            actor=user["email"],
+        )
+        raise HTTPException(422, f"SDR MAVLink inject not applicable: {reason}")
+
+    # Backend-side range-authorization gate (effect=mavlink_sdr_inject). This is
+    # a SEPARATE lease from effect=mavlink / effect=jam — arming those does NOT
+    # arm this (same principle as gnss_spoof). Two-sided gate: this 409 plus the
+    # field bridge's own live poll as defense in depth.
+    await _require_range_authorized("mavlink_sdr_inject", user["email"])
+
+    # Build the byte-accurate frame for the audit record (the field bridge
+    # rebuilds identical bytes via sdr_mavlink_inject.py before modulating).
+    builder = MAVLINK_SDR_INJECT_COMMAND_BUILDERS[body.command]
+    frame = builder(target_sys, target_comp, 0)
+
+    request_id = str(uuid.uuid4())
+    _pending_mavlink_inject[request_id] = {
+        "ts": datetime.now(timezone.utc),
+        "status": "AWAITING_ACK",
+        "command": body.command,
+        "target_detection_id": body.target_detection_id,
+        "target_system": target_sys,
+        "center_freq_mhz": body.center_freq_mhz,
+        "air_rate_bps": body.air_rate_bps,
+        "repeat": body.repeat,
+        "tx_gain": body.tx_gain,
+        "actor": user["email"],
+    }
+
+    await log_event(
+        "MAVLINK_SDR_INJECT",
+        f"Requested SDR MAVLink inject [{body.command.upper()}] over the air at "
+        f"{body.center_freq_mhz} MHz (air rate {body.air_rate_bps:.0f} bps, "
+        f"repeat={body.repeat}, gain={body.tx_gain}) against "
+        f"{detection.get('callsign','?')} (sys {target_sys}) — GFSK modulation of a "
+        f"byte-accurate {body.command} COMMAND_LONG onto baseband IQ, no pairing. "
+        f"Awaiting bridge TX confirmation (request {request_id})",
+        # Audited DISTINCTLY (kind MAVLINK_SDR_INJECT) with the command type in meta.
+        meta={"request_id": request_id, "command": body.command,
+              "target_detection_id": body.target_detection_id, "target_system": target_sys,
+              "center_freq_mhz": body.center_freq_mhz, "air_rate_bps": body.air_rate_bps,
+              "deviation_hz": body.deviation_hz, "bt": body.bt, "bit_order": body.bit_order,
+              "repeat": body.repeat, "tx_gain": body.tx_gain,
+              "frame_hex": frame.hex().upper(), "decoded": describe_packet(frame)},
+        actor=user["email"],
+    )
+
+    await ws_manager.broadcast_json({
+        "type": "mavlink_inject_request",
+        "request_id": request_id,
+        "command": body.command,
+        "target_system": target_sys,
+        "target_component": target_comp,
+        "center_freq_mhz": body.center_freq_mhz,
+        "air_rate_bps": body.air_rate_bps,
+        "deviation_hz": body.deviation_hz,
+        "bt": body.bt,
+        "bit_order": body.bit_order,
+        "repeat": body.repeat,
+        "tx_gain": body.tx_gain,
+        # Forwarded AFTER being consumed above — same convention as the
+        # jam_request/gnss_spoof_request confirm-token forwarding. Its presence
+        # is the bridge's evidence a real UI confirmation happened, not a live
+        # credential the bridge validates against the backend.
+        "mavlink_sdr_inject_confirm_token": body.mavlink_sdr_inject_confirm_token,
+        "actor": user["email"],
+    })
+    await ws_manager.broadcast_json({"type": "mavlink_inject_status", "request_id": request_id,
+                                     "status": "AWAITING_ACK"})
+
+    # Honest "no TX bridge subscribed" signal (false-green hardening) — the
+    # AWAITING_ACK -> mavlink_inject_ack -> ACTIVE/COMPLETE (or lazy TX_TIMEOUT)
+    # machinery already prevents a silent false success; this neither gates nor
+    # changes the status/HTTP code. It only lets the console warn AT FIRE TIME
+    # that no sdr-mavlink bridge is subscribed to actually radiate.
+    tx_bridge_subscribed = ws_manager.has_tx_consumer("mavlink_sdr_inject")
+    if not tx_bridge_subscribed:
+        await log_event(
+            "MAVLINK_SDR_INJECT",
+            f"WARNING: NO SDR-MAVLink-inject TX bridge subscribed — request {request_id} "
+            f"will not radiate and will TX_TIMEOUT. Start cema-sdr-mavlink-bridge on the "
+            f"transmit host (bring TX online) before engaging.",
+            meta={"request_id": request_id, "tx_bridge_subscribed": False},
+            actor="SYSTEM",
+        )
+
+    return {
+        "request_id": request_id,
+        "status": "AWAITING_ACK",
+        "command": body.command,
+        "target_system": target_sys,
+        "center_freq_mhz": body.center_freq_mhz,
+        "air_rate_bps": body.air_rate_bps,
+        "repeat": body.repeat,
+        "tx_gain": body.tx_gain,
+        "tx_bridge_subscribed": tx_bridge_subscribed,
+    }
+
+
+@api.get("/mavlink-sdr-inject/status")
+async def mavlink_sdr_inject_status(user: Dict = Depends(get_current_user)):
+    """Current/most-recent SDR MAVLink inject session state(s), poll-and-render
+    pattern, mirrors GET /gnss-spoof/status."""
+    await _expire_pending_mavlink_inject()
+    sessions = sorted(
+        ({"request_id": rid, **{k: v for k, v in p.items() if k != "ts"},
+          "ts": p["ts"].isoformat()} for rid, p in _pending_mavlink_inject.items()),
         key=lambda s: s["ts"], reverse=True,
     )
     return {"sessions": sessions[:20]}

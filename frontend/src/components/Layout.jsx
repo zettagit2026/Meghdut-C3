@@ -13,7 +13,7 @@ import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import {
   Radar, Waves, Radio, Bomb, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History, MapPin, BookOpen,
-  Satellite,
+  Satellite, RadioTower,
 } from "lucide-react";
 
 const NAV = [
@@ -24,6 +24,7 @@ const NAV = [
   { to: "/protocols",   label: "PROTOCOL LIBRARY", icon: BookOpen,  testid: "nav-protocols" },
   { to: "/jamming",     label: "RF BARRAGE JAM",   icon: Zap,       testid: "nav-jamming" },
   { to: "/gnss-spoof",  label: "GNSS SPOOF",       icon: Satellite, testid: "nav-gnss-spoof" },
+  { to: "/sdr-mavlink-inject", label: "SDR MAVLINK INJECT", icon: RadioTower, testid: "nav-sdr-mavlink-inject" },
   { to: "/killchain",   label: "KILL CHAIN",       icon: Crosshair, testid: "nav-killchain" },
   { to: "/history",     label: "DETECTION HISTORY",icon: History,   testid: "nav-history" },
   { to: "/map",         label: "TACTICAL MAP",     icon: MapPin,    testid: "nav-map" },

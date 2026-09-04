@@ -1,0 +1,88 @@
+[Unit]
+Description=CEMA cUAS - SDR MAVLink inject bridge (no-pairing over-the-air MAVLink takeover, WS-driven, bounded burst only)
+After=network-online.target docker.service
+Wants=network-online.target
+
+# This bridge is a COMPANION of cema-jam-bridge.service, not an independently
+# started unit — IDENTICAL coupling to cema-operator-jam-bridge.service. The GUI
+# "Bring TX Online" starts cema-jam-bridge via the root host-helper
+# (scripts/host-helper/cema_tx_helper.py), whose FROZEN whitelist we deliberately
+# DO NOT touch. That unit's Wants=+Before= pulls this one up alongside it, so the
+# SDR-MAVLink-inject TX consumer is running whenever TX is online — without the
+# operator ever starting it from a terminal. The PartOf= below binds this unit's
+# lifecycle to cema-jam-bridge so a stop/restart of cema-jam-bridge propagates
+# here — i.e. "Stand Down" (`systemctl stop cema-jam-bridge`) stops this bridge
+# too. After= keeps ordering deterministic (jam-bridge settles first). NOTE:
+# PartOf only propagates stop/restart, not start; the start side comes from the
+# jam-bridge unit's Wants=. The operator must never start this unit from a
+# terminal, and its [Install] below is scoped to cema-jam-bridge (NOT
+# multi-user.target) so it never auto-starts at boot independently of TX-online.
+PartOf=cema-jam-bridge.service
+After=cema-jam-bridge.service
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as field-bridge/cema-jam-bridge.service /
+# cema-operator-jam-bridge.service. There is deliberately only ONE copy of this
+# unit in the repo; do not fork per-host copies with hardcoded paths/users baked
+# in. Keep host-specific values out of this file — they belong in the
+# EnvironmentFile below.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# This bridge GFSK-modulates a byte-accurate MAVLink command frame and radiates
+# it over the air via the pinned TX HackRF, through the SAME governed spine as
+# cema-jam-bridge.service. See field-bridge/sdr_mavlink_inject_bridge.py +
+# sdr_mavlink_inject.py.
+#
+# The EnvironmentFile must define at minimum (same as the other bridges):
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+# and SHOULD define (to enable the honest "TX bridge subscribed" signal):
+#   CEMA_BRIDGE_TOKEN=<same shared secret as the backend + other bridge .env>
+#
+# ONE value is REQUIRED for this bridge to actually radiate:
+#   HACKRF_TX_SERIAL=<TX unit serial>   # e.g. the ...930c TX unit. The bridge
+#                                       # FAILS CLOSED without it — it will NOT
+#                                       # fall back to index-based "hackrf=0"
+#                                       # (which could key the RX detection
+#                                       # radio). This is the device-pin safety
+#                                       # override, identical to the other TX bridges.
+#
+# =====================================================================
+# CEMA_AUTHORIZED_RANGE — DELIBERATELY NOT SET IN THIS UNIT FILE.
+# =====================================================================
+# Identical to cema-jam-bridge.service / cema-operator-jam-bridge.service: the
+# live range-authorization lease is an explicit, GUI-driven, auto-expiring
+# per-deployment decision (checked LIVE by this bridge at the moment of
+# transmission via GET /api/range-authorization/status?effect=mavlink_sdr_inject —
+# a SEPARATE lease from effect=jam / effect=mavlink). Do NOT bake any static
+# authorization into this committed unit, a shared default .env, or any image —
+# doing so would silently turn every deployment into a live transmitter.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+# INTERPRETER REQUIREMENT — NOTE THE DIFFERENCE FROM cema-operator-jam-bridge.service:
+# Unlike the OPERATOR jam bridge (which needs a GNU-Radio-enabled system python),
+# sdr_mavlink_inject_bridge.py does NOT require GNU Radio / gr-osmosdr.
+# field-bridge/sdr_mavlink_inject.py is PURE numpy (it writes an IQ file), and the
+# transmit is the same hackrf_transfer subprocess jam_bridge.py already uses. So
+# this ExecStart points at the SAME plain field-bridge venv as cema-jam-bridge.service
+# (numpy + requests + websocket-client) — NOT the /CEMA/operator-jam-venv GNU-Radio
+# venv. If the interpreter cannot import numpy / sdr_mavlink_inject, or
+# hackrf_transfer is not installed, the bridge fails closed with a clean error
+# (never an ungoverned transmit).
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u sdr_mavlink_inject_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/sdr_mavlink_inject_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/sdr_mavlink_inject_bridge.log
+
+[Install]
+# Scoped to the jam-bridge coupling, NOT multi-user.target: `systemctl enable`
+# installs this only into cema-jam-bridge.service.wants/, so it never comes up on
+# its own at boot — it is brought up only as a companion of cema-jam-bridge when
+# the GUI brings TX online (see the [Unit] PartOf= coupling above and the
+# Wants=/Before= added to cema-jam-bridge.service).
+WantedBy=cema-jam-bridge.service
