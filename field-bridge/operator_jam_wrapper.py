@@ -215,13 +215,19 @@ def _make_pinned_sink(orig_sink: Callable[..., Any], serial: str,
 
 
 def _readback_serial(sink: Any) -> Optional[str]:
-    """Best-effort: recover the serial/device string the gr-osmosdr sink actually
-    bound to, via common introspection accessors. Returns a non-empty string when
-    an accessor yields one, else None (introspection unavailable/ambiguous — the
+    """Best-effort: recover the SERIAL the gr-osmosdr sink actually bound to, via
+    serial-specific introspection accessors ONLY. Returns a non-empty string when
+    a serial accessor yields one, else None (introspection unavailable — the
     sentinel remains the real guarantee, so a None here is NOT a failure). Fully
-    guarded: no accessor error can escape."""
-    for name in ("get_device_serial", "get_serial", "get_device_name",
-                 "get_device_args", "device_serial", "serial", "device"):
+    guarded: no accessor error can escape.
+
+    Deliberately restricted to accessors whose value is genuinely a SERIAL
+    (``get_device_serial`` / ``get_serial``). Ambiguous non-serial identifiers
+    (device name / device args / index selector) are NOT consulted, so a value
+    returned here truly is a serial and the caller's 'definite mismatch -> fail
+    closed' is literally true (a human-readable device NAME can never be
+    mislabelled as a serial mismatch)."""
+    for name in ("get_device_serial", "get_serial"):
         try:
             attr = getattr(sink, name, None)
             if attr is None:
@@ -256,11 +262,18 @@ def _enforce_device_pin(sentinel: "_PinSentinel", serial: str) -> None:
             "(the pinned osmosdr sink was never invoked; the operator's code may "
             "have bound `sink` before the patch via `from osmosdr import sink`, "
             "bypassing the device pin — an unpinned build could key the RX radio)")
-    if serial not in (sentinel.forced_device or ""):
+    # Exact-token match, mirroring how _pin_device_string emits the selector
+    # ("hackrf=<serial>", comma-joined with any other tokens). Checking the exact
+    # token as a standalone device selector — not a bare substring — means a
+    # serial appearing incidentally inside some unrelated arg can never satisfy
+    # the pin, while still being robust to extra tokens after a comma.
+    forced_tokens = [t.strip() for t in (sentinel.forced_device or "").split(",")]
+    if f"hackrf={serial}" not in forced_tokens:
         raise OperatorJamUnavailable(
             "device-pin not applied — refusing to transmit "
             f"(pinned sink was invoked but its forced device "
-            f"{sentinel.forced_device!r} does not carry the TX serial)")
+            f"{sentinel.forced_device!r} does not carry the pinned hackrf=<serial> "
+            f"selector)")
     for sink in sentinel.sinks:
         rb = _readback_serial(sink)
         if rb is not None and serial not in rb:

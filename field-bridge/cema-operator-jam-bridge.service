@@ -72,12 +72,13 @@ EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 #   2) the field-bridge deps used by jam_bridge.py / JamBridge
 #      (requests, websocket-client, etc.).
 # If the ExecStart python can see only one of these, the unit fails at import
-# (the wrapper fails closed when GNU Radio / gr-osmosdr is missing). The path
-# below mirrors cema-jam-bridge.service as a placeholder; the deploy step must
-# point ExecStart at the interpreter/venv that satisfies BOTH sets above
-# (e.g. a venv created with --system-site-packages over a GNU-Radio-enabled
-# system python, or that system python directly).
-ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u operator_jam_bridge.py
+# (the wrapper fails closed when GNU Radio / gr-osmosdr is missing). The
+# resolved interpreter this deployment uses is /CEMA/operator-jam-venv — a
+# dedicated venv created with --system-site-packages over a GNU-Radio-enabled
+# system python (so `import gnuradio` / `import osmosdr` resolve), plus the
+# field-bridge deps installed into it (requests, websocket-client, numpy). Do
+# NOT point ExecStart back at a plain pip venv that cannot see GNU Radio.
+ExecStart=/CEMA/operator-jam-venv/bin/python -u operator_jam_bridge.py
 Restart=always
 RestartSec=3
 StandardOutput=append:/CEMA/joydipdemo/field-bridge/operator_jam_bridge.log

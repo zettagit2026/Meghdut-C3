@@ -206,6 +206,28 @@ def test_pin_readback_ambiguous_is_skipped_not_failed():
     assert tb.sink.dev == f"hackrf={TX_SERIAL}"
 
 
+def test_enforce_device_pin_exact_token_not_incidental_substring():
+    # The forced-device check must be an EXACT `hackrf=<serial>` token match, not
+    # a bare substring: a serial appearing incidentally inside an unrelated arg
+    # (and NO real `hackrf=<serial>` selector) must NOT satisfy the pin.
+    sentinel = w._PinSentinel()
+    # Sink was "invoked" but the serial only appears inside an unrelated token —
+    # there is no standalone `hackrf=<serial>` selector.
+    sentinel.record(f"hackrf=0,label={TX_SERIAL}", object())
+    with pytest.raises(w.OperatorJamUnavailable) as ei:
+        w._enforce_device_pin(sentinel, TX_SERIAL)
+    assert "does not carry" in str(ei.value)
+
+
+def test_enforce_device_pin_accepts_token_with_extra_args():
+    # Robust to extra tokens after a comma: as long as the exact
+    # `hackrf=<serial>` selector is present as a standalone token, the pin holds.
+    sentinel = w._PinSentinel()
+    sentinel.record(f"hackrf={TX_SERIAL},buffers=32", object())
+    # Must NOT raise (no serial-introspection accessor on a plain object -> skip).
+    w._enforce_device_pin(sentinel, TX_SERIAL)
+
+
 # --------------------------------------------------------------------------
 # Safety override #2: bounded, abortable run (fake flowgraph + fake clock)
 # --------------------------------------------------------------------------
