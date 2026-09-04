@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Radio, AlertTriangle, ShieldAlert, Infinity as InfinityIcon, Waves } from "lucide-react";
+import { Radio, AlertTriangle, ShieldAlert, Infinity as InfinityIcon, Waves, Siren } from "lucide-react";
 import SafetyGate, { JAM_CHECKS } from "@/components/SafetyGate";
 import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
 import EmergencyAbort from "@/components/EmergencyAbort";
@@ -78,8 +78,9 @@ const JAM_MODES = [
     hint: "MEGHDUT's built-in HackRF band-limited noise barrage." },
   { value: "operator", label: "Operator Jam (your code)",
     hint: "Runs the operator's OWN unmodified GNU Radio jammer (fixed waveform: " +
-          "GAUSSIAN noise ×12, gains 47/47/20, 20 Msps), pinned to the TX radio and " +
-          "hard-time-bounded. Band-fixed to 433 / 915 / 2.4 / 5.8 GHz." },
+          "GAUSSIAN noise ×12, 20 Msps; TX gain operator-adjustable up to the 47 dB " +
+          "HackRF ceiling), pinned to the TX radio and continuous-until-stopped. " +
+          "Band-fixed to 433 / 915 / 2.4 / 5.8 GHz." },
 ];
 
 // Poll-and-render, same pattern as KillChain.jsx / Payloads.jsx — no
@@ -259,14 +260,24 @@ export default function Jamming() {
         </div>
       </div>
 
-      {/* Prominent, always-available STOP: halts ALL TX (continuous jams
-          included) instantly. This is the operator's guaranteed off-switch. */}
-      <div className="tactical-border p-4 flex items-center justify-between gap-3"
-           style={{ background: "var(--surface-critical)" }}>
-        <div className="font-mono text-[11px] text-slate-300 leading-relaxed">
-          <span className="font-bold" style={{ color: "var(--accent-critical)" }}>STOP / STAND DOWN —</span>{" "}
-          halts every RF transmission immediately, including a continuous or swept jam in progress.
-          The jammer can ALWAYS be switched off.
+      {/* Directive #3: PROMINENT, always-visible EMERGENCY ABORT — the very
+          first control on the barrage screen, never buried. Halts ALL TX
+          (continuous / swept jams included) instantly via POST /emergency/abort
+          (sets tx_halt + kills the active jam). Works whether or not a jam is
+          currently armed/firing — it is the operator's guaranteed off-switch. */}
+      <div
+        data-testid="jam-emergency-abort-panel"
+        className="p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 pulse-crit"
+        style={{ background: "var(--surface-critical)", border: "2px solid var(--accent-critical)" }}
+      >
+        <div className="font-mono leading-relaxed">
+          <div className="text-sm font-black uppercase tracking-widest" style={{ color: "var(--accent-critical)" }}>
+            <Siren size={16} className="inline mr-2" strokeWidth={2} /> EMERGENCY ABORT / STAND DOWN
+          </div>
+          <div className="text-[11px] text-slate-300 mt-1">
+            Halts every RF transmission immediately — continuous or swept jam in progress included.
+            Always available; the jammer can ALWAYS be switched off.
+          </div>
         </div>
         <EmergencyAbort />
       </div>
@@ -434,16 +445,22 @@ export default function Jamming() {
 
           <label className="block">
             <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-              TX Gain (0-47){isOperatorMode ? " — fixed 47/47/20 by operator code" : ""}
+              TX Gain (0-47 dB — HackRF TX VGA hardware ceiling)
             </span>
             <input
               data-testid="jam-gain-input"
               type="number" min={0} max={47}
               value={txGain}
-              disabled={isOperatorMode}
-              onChange={(e) => setTxGain(Number(e.target.value))}
-              className={`mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info ${isOperatorMode ? "opacity-30 cursor-not-allowed" : ""}`}
+              onChange={(e) => setTxGain(Math.max(0, Math.min(47, Number(e.target.value))))}
+              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
             />
+            <span className="mt-1 block font-mono text-[10px] text-slate-500 leading-relaxed">
+              {isOperatorMode
+                ? "Operator-adjustable — driven onto the operator jammer's osmosdr sink " +
+                  "(overrides its baked-in gain). 47 dB is the HackRF TX VGA hardware maximum, " +
+                  "not an artificial limit."
+                : "47 dB is the HackRF TX VGA hardware maximum (no artificial cap)."}
+            </span>
           </label>
 
           {isOperatorMode && (
@@ -453,10 +470,12 @@ export default function Jamming() {
               style={{ background: "var(--surface-critical)" }}
             >
               OPERATOR JAM: runs the operator's OWN unmodified GNU Radio jammer, pinned to the TX
-              radio (serial), continuous-until-stopped (no auto-stop timer). Waveform, bandwidth and
-              gains (GAUSSIAN ×12, 47/47/20, 20 Msps) are fixed by the operator's code — only band and
-              duration/continuous apply, and it is band-fixed (no sweep). Same arm / confirm /
-              range-authorization / TX-halt gates as MEGHDUT — Stand Down stops it instantly.
+              radio (serial), continuous-until-stopped (no auto-stop timer). Waveform and bandwidth
+              (GAUSSIAN ×12, 20 Msps) are fixed by the operator's code; TX GAIN is now
+              operator-adjustable (0-47 dB, HackRF TX VGA hardware ceiling — no artificial cap) and
+              driven onto its osmosdr sink, overriding the baked-in gain. Band, duration/continuous
+              and TX gain apply; it is band-fixed (no sweep). Same arm / confirm / range-authorization
+              / TX-halt gates as MEGHDUT — Stand Down stops it instantly.
             </div>
           )}
 

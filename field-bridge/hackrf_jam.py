@@ -799,35 +799,51 @@ def main() -> None:
             "-s", str(SAMPLE_RATE_HZ),
             "-x", str(args.tx_gain),
             "-a", "1",
+            # CONTINUOUS = GAPLESS: loop the noise chunk seamlessly on the radio
+            # itself (hackrf_transfer -R) as ONE long-lived process. The previous
+            # loop-and-relaunch (a fresh subprocess.run per chunk, no -R) left an
+            # inter-launch USB re-init gap between chunks that showed up on a
+            # spectrum analyser as PULSING/HOPPING — a battlefield jammer set to
+            # continuous must emit unbroken noise at the single center, not pulse.
+            # This mirrors transmit_burst()/transmit_iq_file(), which have always
+            # used -R for exactly this reason. There is NO center hop here (single
+            # -f); center-stepping happens ONLY on the explicit --sweep branch.
+            *(["-R"] if continuous else []),  # loop the chunk gaplessly (continuous)
             *_tx_device_args(),  # `-d <TX serial>` when a TX unit is pinned (see HACKRF_TX_SERIAL)
         ]
         print("Running:", " ".join(cmd))
         if continuous:
-            print("TRANSMITTING CONTINUOUSLY — press Ctrl+C at any time to stop.")
-            total_bursts = 0
+            print("TRANSMITTING CONTINUOUSLY (gapless -R, single center) — "
+                  "press Ctrl+C at any time to stop.")
             try:
                 # TX device pinning (task #TX-pin): hold the TX unit's OWN
-                # per-serial lock for the whole continuous session so these
-                # ungoverned-CLI bursts address the pinned TX unit (`-d` above)
-                # and can never key the RX antenna or collide with the RX
+                # per-serial lock for the whole continuous session so this
+                # ungoverned-CLI transmission addresses the pinned TX unit (`-d`
+                # above) and can never key the RX antenna or collide with the RX
                 # consumers (hackrf_rx.py sweep / ml_classify_bridge.py) on the
                 # separate RX unit. serial=None (HACKRF_TX_SERIAL unset) keeps
                 # the original shared-default behavior single-radio hosts rely on.
                 with hackrf_device_lock(serial=HACKRF_TX_SERIAL):
-                    while True:
+                    try:
+                        # ONE process, running -R — NOT a relaunch loop. The radio
+                        # repeats the chunk with no restart gap; the operator's
+                        # Ctrl+C terminates the single live process below.
+                        proc = subprocess.Popen(cmd)
+                    except FileNotFoundError:
+                        print("ERROR: hackrf_transfer not found. Install the `hackrf` package.",
+                              file=sys.stderr)
+                        sys.exit(1)
+                    try:
+                        proc.wait()  # blocks until the process exits or Ctrl+C
+                        print("hackrf_transfer exited on its own — transmission ended.")
+                    except KeyboardInterrupt:
+                        print("\nStopping — terminating the live hackrf_transfer.")
+                        proc.terminate()
                         try:
-                            subprocess.run(cmd, timeout=chunk + 5, check=True)
+                            proc.wait(timeout=3)
                         except subprocess.TimeoutExpired:
-                            pass  # expected per-burst boundary, loop continues
-                        total_bursts += 1
-                        print(f"  ...chunk #{total_bursts} complete, continuing "
-                              f"(~{total_bursts * chunk:.1f}s transmitted so far)")
-            except KeyboardInterrupt:
-                print(f"\nStopped by operator after {total_bursts} bursts "
-                      f"(~{total_bursts * duration:.0f}s total transmission).")
-            except FileNotFoundError:
-                print("ERROR: hackrf_transfer not found. Install the `hackrf` package.", file=sys.stderr)
-                sys.exit(1)
+                            proc.kill()
+                        print("Stopped by operator (Ctrl+C).")
             except HackrfDeviceBusy as e:
                 print(f"ERROR: HackRF TX device busy (another TX/RX consumer holds it): {e}",
                       file=sys.stderr)

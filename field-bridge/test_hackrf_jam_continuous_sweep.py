@@ -200,6 +200,44 @@ def test_transmit_burst_continuous_uses_repeat_flag_and_stops_on_event(monkeypat
     assert proc.terminated is True
 
 
+def test_transmit_burst_continuous_is_one_process_not_relaunch_loop(monkeypatch):
+    # DIRECTIVE #2 (barrage-hopping fix): a plain (sweep OFF) continuous barrage
+    # must be ONE gapless `hackrf_transfer -R` process at a SINGLE center — never
+    # a loop that respawns hackrf_transfer per chunk (the inter-launch gaps read
+    # as pulsing/hopping on a spectrum analyser). Assert exactly one Popen, the
+    # command carries -R, and it targets a single -f (no center hop).
+    popen_calls = []
+    proc = FakeProc()
+
+    def fake_popen(cmd, **kwargs):
+        popen_calls.append(list(cmd))
+        return proc
+
+    monkeypatch.setattr(hj.subprocess, "Popen", fake_popen)
+
+    stop = threading.Event()
+    sleeps = {"n": 0}
+
+    def fake_sleep(s):
+        sleeps["n"] += 1
+        if sleeps["n"] >= 5:
+            stop.set()  # operator stops it after several poll cycles
+
+    monkeypatch.setattr(hj.time, "sleep", fake_sleep)
+
+    result = hj.transmit_burst(2450.0, 500.0, None, 20, stop_event=stop)  # None => continuous
+    assert result["ok"] is True
+    assert result["stopped_early"] is True
+    # ONE process for the whole continuous run — the radio looped the chunk (-R),
+    # the supervisor never relaunched a fresh hackrf_transfer per chunk.
+    assert len(popen_calls) == 1, f"expected 1 hackrf_transfer process, got {len(popen_calls)}"
+    cmd = popen_calls[0]
+    assert "-R" in cmd  # gapless repeat on the radio
+    # Exactly one center frequency (no hop while sweep is off).
+    assert cmd.count("-f") == 1
+    assert proc.terminated is True
+
+
 def test_transmit_burst_bounded_short_burst_has_no_repeat_flag(monkeypatch):
     captured = {}
 

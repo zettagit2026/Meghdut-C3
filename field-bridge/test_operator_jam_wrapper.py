@@ -358,6 +358,95 @@ def test_run_operator_jam_calls_on_started(monkeypatch):
     assert started.get("tb") is tb
 
 
+# --------------------------------------------------------------------------
+# Directive #1: operator-adjustable TX gain, NO artificial cap (only the HackRF
+# TX VGA 0-47 dB hardware ceiling). Driven onto the flowgraph's osmosdr sink.
+# --------------------------------------------------------------------------
+class GainRecordingBlock(FakeTopBlock):
+    """FakeTopBlock that also records the gain setters the wrapper drives onto
+    it — stands in for a top_block whose set_gain/set_if_gain proxy to the sink
+    (or the sink itself)."""
+    def __init__(self):
+        super().__init__()
+        self.gains = []
+        self.if_gains = []
+
+    def set_gain(self, g):
+        self.gains.append(g)
+
+    def set_if_gain(self, g):
+        self.if_gains.append(g)
+
+
+def test_operator_tx_gain_applied_to_sink(monkeypatch):
+    # The operator's requested TX gain is driven onto the flowgraph via set_gain
+    # with the operator value (not the baked-in 47) — proves the gain is now
+    # operator-adjustable rather than stuck.
+    _install_fake_clock(monkeypatch)
+    tb = GainRecordingBlock()
+    result = w.run_operator_jam(
+        "915", TX_SERIAL, 1.0, tx_gain=40,
+        flowgraph_factory=lambda f, s: tb,
+    )
+    assert result["ok"] is True
+    assert tb.gains == [40]           # set_gain called with the operator value
+    assert tb.if_gains == [40]        # IF/TXVGA gain driven too (real power up to 47)
+
+
+def test_operator_tx_gain_uncapped_to_hardware_ceiling(monkeypatch):
+    # NO artificial cap below the 47 dB HackRF TX VGA ceiling: 47 passes through
+    # verbatim (not clamped down to the old baked 20/legacy value).
+    _install_fake_clock(monkeypatch)
+    tb = GainRecordingBlock()
+    w.run_operator_jam("915", TX_SERIAL, 1.0, tx_gain=47,
+                       flowgraph_factory=lambda f, s: tb)
+    assert tb.gains == [47]
+    assert w.MAX_TX_VGA_GAIN == 47
+
+
+def test_operator_tx_gain_clamped_to_hardware_ceiling(monkeypatch):
+    # Above the hardware maximum is clamped to 47 (the device ceiling) — the ONLY
+    # clamp, and it is hardware, not an artificial policy cap.
+    _install_fake_clock(monkeypatch)
+    tb = GainRecordingBlock()
+    w.run_operator_jam("915", TX_SERIAL, 1.0, tx_gain=60,
+                       flowgraph_factory=lambda f, s: tb)
+    assert tb.gains == [47]
+
+
+def test_operator_tx_gain_none_leaves_waveform_untouched(monkeypatch):
+    # No tx_gain requested -> the operator's own baked-in gain stands; the
+    # wrapper touches no gain setter.
+    _install_fake_clock(monkeypatch)
+    tb = GainRecordingBlock()
+    w.run_operator_jam("915", TX_SERIAL, 1.0, tx_gain=None,
+                       flowgraph_factory=lambda f, s: tb)
+    assert tb.gains == []
+    assert tb.if_gains == []
+
+
+def test_operator_tx_gain_prefers_the_pinned_sink(monkeypatch):
+    # When the device-pin construction captured the real osmosdr sink (exposed as
+    # tb._cema_tx_sinks), the gain is driven onto THAT sink — where the operator's
+    # code actually set its gains — not merely a proxy.
+    _install_fake_clock(monkeypatch)
+    sink = GainRecordingBlock()   # reuse the recorder as a stand-in sink
+    tb = GainRecordingBlock()
+    tb._cema_tx_sinks = [sink]
+    w.run_operator_jam("915", TX_SERIAL, 1.0, tx_gain=33,
+                       flowgraph_factory=lambda f, s: tb)
+    assert sink.gains == [33]      # the real sink received the operator gain
+    assert tb.gains == []          # not double-applied to the top_block
+
+
+def test_apply_operator_tx_gain_never_raises_without_setter():
+    # A flowgraph/sink with NO gain accessor must not crash TX — the operator's
+    # baked-in gain simply stands (fail-open on a non-safety nicety).
+    class NoSetter:
+        pass
+    assert w._apply_operator_tx_gain(NoSetter(), 40) is None
+
+
 def test_run_operator_jam_rejects_unknown_band(monkeypatch):
     _install_fake_clock(monkeypatch)
     result = w.run_operator_jam(

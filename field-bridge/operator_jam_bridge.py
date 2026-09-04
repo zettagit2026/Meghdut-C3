@@ -109,6 +109,11 @@ class OperatorJamBridge(JamBridge):
             band,
             self.tx_serial,
             params["duration_s"],
+            # Directive #1: operator-adjustable TX gain (clamped to the HackRF TX
+            # VGA hardware ceiling 0-47 dB in the wrapper, no artificial cap).
+            # Driven onto the operator flowgraph's osmosdr sink; None leaves their
+            # baked-in gain untouched.
+            tx_gain=params.get("tx_gain"),
             abort_event=stop_event,
             # Honor a mid-burst EMERGENCY ABORT exactly like the MEGHDUT jam:
             # the base bridge sets self.tx_halted on abort AND sets stop_event;

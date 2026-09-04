@@ -80,9 +80,12 @@ log = logging.getLogger("operator-jam-wrapper")
 # stopped) or a bounded window. Both come from hackrf_jam so the two jam modes
 # share one definition of "continuous".
 try:
-    from hackrf_jam import MAX_DURATION_S, _is_continuous
+    from hackrf_jam import MAX_DURATION_S, MAX_TX_VGA_GAIN, _is_continuous
 except Exception:  # pragma: no cover - hackrf_jam always importable on the bridge host
     MAX_DURATION_S = 10.0
+    # HackRF TX VGA hardware ceiling (dB). NOT an artificial cap — it is the
+    # device's own maximum; the operator gain is clamped only to [0, this].
+    MAX_TX_VGA_GAIN = 47
 
     def _is_continuous(duration_s) -> bool:
         if duration_s is None:
@@ -314,6 +317,16 @@ def _construct_with_device_pin(osmosdr_module: Any, block_cls: Any,
         _enforce_device_pin(sentinel, serial)
     finally:
         osmosdr_module.sink = orig_sink
+    # Expose the exact osmosdr sink object(s) the pinned construction captured so
+    # the operator-adjustable TX gain (Directive #1) can be driven onto the REAL
+    # sink — their CEMA_Jammer sets set_gain/set_if_gain/set_bb_gain on the sink
+    # inside __init__, so the gain accessors live on the sink, not necessarily on
+    # the top_block. Best-effort attribute; never fatal (a gr.top_block accepts
+    # arbitrary attributes; guarded regardless).
+    try:
+        tb._cema_tx_sinks = list(sentinel.sinks)
+    except Exception:  # pragma: no cover - top_block should always accept an attr
+        pass
     return tb
 
 
@@ -408,11 +421,69 @@ def _build_operator_flowgraph(freq_mhz: float, serial: str):
 # ---------------------------------------------------------------------------
 # Safety override #2: bounded, abortable run (unit-testable via a fake factory)
 # ---------------------------------------------------------------------------
+def _apply_operator_tx_gain(tb: Any, tx_gain: Optional[int]) -> Optional[int]:
+    """Directive #1 (operator-adjustable TX gain, NO artificial cap): drive the
+    operator-requested TX gain onto the flowgraph's osmosdr sink.
+
+    The operator's CEMA_Jammer hardcodes its gains (set_gain(47)/set_if_gain(47)/
+    set_bb_gain(20)); this lets the operator raise/lower the TX gain from the app
+    instead of being stuck at the flowgraph's baked-in value. The value is
+    clamped ONLY to the HackRF TX VGA hardware ceiling [0, MAX_TX_VGA_GAIN=47] —
+    that is the device's own maximum, NOT an artificial software cap.
+
+    The osmosdr sink exposes the gain accessors (set_gain = RF/TX gain,
+    set_if_gain = TXVGA/IF gain); both are set to the operator value so the
+    hardware actually responds up to the ceiling. The waveform (noise source ×12,
+    sample rate, band center) is left byte-for-byte untouched — only the gain
+    knob moves. Targets the real sink object(s) captured during the device-pin
+    construction (tb._cema_tx_sinks), falling back to the top_block itself (GRC
+    flowgraphs expose set_gain proxies).
+
+    Returns the clamped value actually applied, or None when no gain was
+    requested (tx_gain is None) or no setter could be found. NEVER raises — a
+    missing/failing setter must not crash a TX (the operator's own baked-in gain
+    then stands), same fail-open-on-nicety / fail-closed-on-safety discipline as
+    the rest of this wrapper (gain is not a safety gate; the device pin and the
+    abort/tx_halt stop are)."""
+    if tx_gain is None:
+        return None
+    try:
+        g = max(0, min(int(tx_gain), MAX_TX_VGA_GAIN))
+    except (TypeError, ValueError):
+        log.warning("operator jam: non-numeric tx_gain %r ignored — the operator "
+                    "flowgraph's own baked-in gain stands.", tx_gain)
+        return None
+    # Prefer the real osmosdr sink(s) captured by the device-pin construction;
+    # fall back to the top_block (a GRC flowgraph proxies set_gain to its sink).
+    targets = list(getattr(tb, "_cema_tx_sinks", None) or [])
+    targets.append(tb)
+    for tgt in targets:
+        hit = False
+        for setter in ("set_gain", "set_if_gain"):
+            fn = getattr(tgt, setter, None)
+            if callable(fn):
+                try:
+                    fn(g)
+                    hit = True
+                except Exception as e:
+                    log.warning("operator jam: gain setter %s(%d) failed: %s", setter, g, e)
+        if hit:
+            log.warning("Operator Jam TX gain set to %d dB (operator-adjustable, "
+                        "clamped to the HackRF TX VGA ceiling %d dB — no artificial cap).",
+                        g, MAX_TX_VGA_GAIN)
+            return g
+    log.warning("operator jam: no set_gain/set_if_gain accessor found on the "
+                "flowgraph or its sink — requested TX gain %d dB NOT applied; the "
+                "operator waveform's own baked-in gain stands.", g)
+    return None
+
+
 def run_operator_jam(
     band: str,
     serial: str,
     duration_s: float,
     *,
+    tx_gain: Optional[int] = None,
     abort_event: Optional[threading.Event] = None,
     tx_halt_check: Optional[Callable[[], bool]] = None,
     on_started: Optional[Callable[[Any], None]] = None,
@@ -455,6 +526,12 @@ def run_operator_jam(
     except Exception as e:  # defensive: never let construction crash the bridge
         return {"ok": False, "stopped_early": False,
                 "error": f"operator flowgraph construction failed: {e}"}
+
+    # Directive #1: drive the operator-adjustable TX gain onto the sink BEFORE
+    # starting the flowgraph. Clamped only to the HackRF TX VGA hardware ceiling
+    # (0-47 dB), never an artificial cap; leaves the operator's waveform
+    # otherwise untouched. No-op (baked-in gain stands) when tx_gain is None.
+    _apply_operator_tx_gain(tb, tx_gain)
 
     def _stop_now() -> bool:
         return (abort_event is not None and abort_event.is_set()) or \
