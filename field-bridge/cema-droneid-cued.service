@@ -1,0 +1,30 @@
+[Unit]
+Description=CEMA cUAS - DJI DroneID cued capture (device-lock guarded, non-contending): cued IQ window -> CRC decode -> /api/detections/ingest
+After=network-online.target docker.service cema-hackrf-rx.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# Host-specific values (CEMA_API_URL/EMAIL/PASSWORD, DRONEID_SRC_DIR,
+# CEMA_DRONEID_* capture/cooldown/lock knobs) live in the EnvironmentFile.
+#
+# CRITICAL (SRE): this shares the RX HackRF with cema-hackrf-rx.service. It is
+# CUED (captures only on a live DJI/OcuSync detection) and DEVICE-LOCK GUARDED
+# (hackrf_device_lock, short timeout -> skips the cue if the RX sweep holds the
+# lock), so it CANNOT starve the detection sweep. Do NOT replace it with the
+# stock droneid_decode_bridge.py, whose blind 16-freq sweep is contending. The
+# HackRF device lock (/tmp/cema_hackrf_device*.lock) is what enforces mutual
+# exclusion -- both units must run as the SAME user for the flock to apply.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+# Cold-boot readiness gate: wait up to 60s for the backend (127.0.0.1:8001).
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8001/ && exit 0; sleep 1; done; exit 0'
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u droneid_cued_capture.py
+Restart=always
+RestartSec=5
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/droneid_cued_capture.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/droneid_cued_capture.log
+
+[Install]
+WantedBy=multi-user.target

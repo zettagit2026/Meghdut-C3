@@ -1,0 +1,23 @@
+[Unit]
+Description=CEMA cUAS - Control-link RF classification: live detections -> ELRS/CRSF/DSMX/DJI/MAVLink family -> /api/control-link/ingest
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# Host-specific values (CEMA_API_URL/EMAIL/PASSWORD, CONTROL_LINK_POLL_INTERVAL_S)
+# live in the EnvironmentFile. RX-ONLY: this reads the backend's own detection
+# list and never touches the radio, so it cannot contend with the RX sweep.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+# Cold-boot readiness gate: wait up to 60s for the backend (127.0.0.1:8001).
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8001/ && exit 0; sleep 1; done; exit 0'
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u control_link_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/control_link_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/control_link_bridge.log
+
+[Install]
+WantedBy=multi-user.target

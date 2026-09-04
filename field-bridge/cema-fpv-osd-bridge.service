@@ -1,0 +1,26 @@
+[Unit]
+Description=CEMA cUAS - FPV OSD telemetry: reconstructed analog FPV frame -> OSD OCR -> /api/fpv/osd/ingest
+After=network-online.target docker.service cema-fpv-bridge.service
+Wants=network-online.target cema-fpv-bridge.service
+
+[Service]
+Type=simple
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# Host-specific values (CEMA_API_URL/EMAIL/PASSWORD, FPV_OSD_POLL_INTERVAL_S,
+# FPV_OSD_VIDEO_STANDARD) live in the EnvironmentFile. RX-ONLY, analog only:
+# reads the reconstructed frame the FPV video bridge already produced and OCRs
+# the OSD overlay -- it does not touch the radio. Wants= (not Requires=) the
+# FPV video bridge so this still starts and heartbeats (READY) if that unit is
+# not up yet.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+# Cold-boot readiness gate: wait up to 60s for the backend (127.0.0.1:8001).
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8001/ && exit 0; sleep 1; done; exit 0'
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u fpv_osd_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/fpv_osd_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/fpv_osd_bridge.log
+
+[Install]
+WantedBy=multi-user.target

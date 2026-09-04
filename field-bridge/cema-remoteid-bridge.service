@@ -1,0 +1,28 @@
+[Unit]
+Description=CEMA cUAS - Remote ID (Wi-Fi/BLE) live decoder: Kismet -> ODID decode -> /api/remoteid/ingest
+After=network-online.target docker.service cema-kismet.service
+Wants=network-online.target
+Requires=cema-kismet.service
+
+[Service]
+Type=simple
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# Host-specific values (CEMA_API_URL/EMAIL/PASSWORD, KISMET_URL, KISMET_APIKEY,
+# REMOTEID_POLL_INTERVAL_S) live in the EnvironmentFile, never hardcoded here.
+# NOTE for the SRE deploy: this decodes ONLY if Kismet is configured to surface
+# OpenDroneID payloads (monitor-mode Wi-Fi NIC and/or BLE5 dongle). Otherwise
+# the service runs and heartbeats (board shows READY) but decodes nothing --
+# that is the honest, expected state, not a failure.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+# Cold-boot readiness gate: wait up to 60s for BOTH the backend (127.0.0.1:8001)
+# and Kismet REST (127.0.0.1:2501) to accept a connection before starting.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8001/ && curl -s -o /dev/null http://127.0.0.1:2501/ && exit 0; sleep 1; done; exit 0'
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u remoteid_kismet_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/remoteid_kismet_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/remoteid_kismet_bridge.log
+
+[Install]
+WantedBy=multi-user.target
