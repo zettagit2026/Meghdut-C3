@@ -127,6 +127,10 @@ from detection_state import (
 from swarm_classifier import build_swarm_clusters, SWARM_TAXONOMY
 from track_manager import TrackManager, STATE_DROPPED as TRACK_STATE_DROPPED
 from engagement_planner import build_engagement_plan
+# Protocol-Library status board (over-the-air decoders vs forensic). Pure,
+# dependency-free derivation lives in protocol_status.py so it is unit-testable
+# without booting FastAPI/Mongo -- server.py only owns the runtime report store.
+import protocol_status
 # Container->host privilege bridge for the GUI TX-bridge SiK handoff. Talks to
 # the hard-whitelisted cema-tx-helper root daemon over a bind-mounted Unix
 # socket (see backend/tx_bridge_control.py + scripts/host-helper/README.md).
@@ -251,7 +255,12 @@ logger = logging.getLogger("cema")
 # These paths are the full set of bridge->backend ingest endpoints (TX-side
 # jam_bridge.py is deliberately out of scope — see AGENT.md task #74 notes).
 INGEST_PATHS = {"/api/detections/ingest", "/api/spectrum/ingest", "/api/fpv/ingest",
-                "/api/ml-classify/heartbeat"}
+                "/api/ml-classify/heartbeat",
+                # Over-the-air Protocol-Library decoder ingest + liveness (task:
+                # make-protocol-library-live). Tracked by X-Bridge-Name in
+                # db.ingest_health exactly like the sensors above.
+                "/api/remoteid/ingest", "/api/fpv/osd/ingest",
+                "/api/control-link/ingest", "/api/protocols/heartbeat"}
 AUTH_FAIL_CONSECUTIVE_THRESHOLD = 3
 
 # ---- Audit-chain anchor (lightweight external anchoring) -------------------
@@ -3153,6 +3162,228 @@ async def ml_classify_heartbeat(body: MlClassifyHeartbeatBody,
     return {"ok": True}
 
 
+# =====================================================================
+# Protocol-Library live status board (over-the-air decoders vs forensic)
+# =====================================================================
+# Runtime report store, one record per over-the-air protocol id
+# (protocol_status.OPERATIONAL_PROTOCOLS). Each running field-bridge decoder
+# POSTs a heartbeat every poll/sweep cycle (so its liveness is OBSERVABLE even
+# when the RF is quiet -> READY, not a fake LIVE), and POSTs a decode whenever
+# it actually decodes a real message (-> LIVE, within the decode-recency
+# window). The status board is derived PURELY from this observable state by
+# protocol_status.build_board() -- never a hardcoded optimistic status. Kept in
+# memory (same pattern as _last_fpv_frame / _last_ml_classify_heartbeat above):
+# this is a live-operator liveness view, not a durable archive.
+_protocol_reports: Dict[str, Dict] = {}
+
+# Latest-only decoded payloads per over-the-air protocol (live-operator view;
+# same "store the most recent, no synthetic fallback" pattern as _last_fpv_frame).
+_last_remoteid_decode: Optional[Dict] = None
+_last_fpv_osd_telemetry: Optional[Dict] = None
+_last_control_link: Optional[Dict] = None
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _protocol_touch_heartbeat(protocol_id: str, note: Optional[str] = None) -> Dict:
+    """Record a liveness heartbeat for one over-the-air protocol. Creates the
+    report record on first sighting. Returns the updated record."""
+    rec = _protocol_reports.setdefault(protocol_id, {
+        "last_heartbeat_ts": None, "last_decode_ts": None,
+        "last_decode_summary": None, "decode_count": 0,
+        "heartbeat_count": 0, "note": None,
+    })
+    rec["last_heartbeat_ts"] = _now_iso()
+    rec["heartbeat_count"] = rec.get("heartbeat_count", 0) + 1
+    if note is not None:
+        rec["note"] = note
+    return rec
+
+
+def _protocol_touch_decode(protocol_id: str, summary: str,
+                            note: Optional[str] = None) -> Dict:
+    """Record a REAL decode for one over-the-air protocol (also refreshes the
+    heartbeat -- a decode implies the service is alive). `summary` is a short,
+    human-readable one-liner the board surfaces (e.g. the decoded serial)."""
+    rec = _protocol_touch_heartbeat(protocol_id, note=note)
+    rec["last_decode_ts"] = _now_iso()
+    rec["last_decode_summary"] = summary
+    rec["decode_count"] = rec.get("decode_count", 0) + 1
+    return rec
+
+
+class ProtocolHeartbeatBody(BaseModel):
+    """Liveness heartbeat from a running over-the-air decoder service. POSTed
+    once per poll/sweep cycle REGARDLESS of whether anything was decoded, so a
+    running-but-quiet decoder shows honestly as READY (running, awaiting a
+    matching signal) rather than OFFLINE or a fabricated LIVE."""
+    protocol: str
+    note: Optional[str] = None
+
+
+class RemoteIdIngestBody(BaseModel):
+    """One decoded ASTM F3411 / ASD-STAN Remote ID broadcast, aggregated from
+    a device's ODID message set by field-bridge/remoteid_kismet_bridge.py.
+    Every field is optional because Remote ID senders transmit different
+    message types at different cadences -- a field is null when that message
+    type has not been seen for this sender (no fabrication)."""
+    uas_id: Optional[str] = None          # serial or CAA registration id
+    id_type: Optional[str] = None
+    ua_type: Optional[str] = None
+    latitude_deg: Optional[float] = None
+    longitude_deg: Optional[float] = None
+    altitude_geo_m: Optional[float] = None
+    height_m: Optional[float] = None
+    speed_horizontal_mps: Optional[float] = None
+    operator_id: Optional[str] = None
+    operator_latitude_deg: Optional[float] = None
+    operator_longitude_deg: Optional[float] = None
+    description: Optional[str] = None
+    source_mac: Optional[str] = None      # Kismet device MAC this was read from
+    transport: Optional[str] = None       # "wifi" | "bluetooth"
+    rssi_dbm: Optional[float] = None
+    message_types: List[str] = []         # which ODID message types contributed
+    caveats: List[str] = []
+
+
+class FpvOsdIngestBody(BaseModel):
+    """FPV analog-video OSD telemetry, exactly the shape
+    field-bridge/fpv_osd_ocr.py FpvOsdTelemetry.to_ingest_dict() produces.
+    Stored latest-only (live-operator view). Fields inside `telemetry` are
+    already null when they could not be read with sufficient confidence."""
+    source: str = "FPV_OSD_OCR"
+    method: Optional[str] = None
+    signal_class: Optional[str] = None
+    telemetry: Dict = {}
+    mean_confidence: float = 0.0
+    field_confidence: Dict = {}
+    video_standard: Optional[str] = None
+    raw_osd_text: List[str] = []
+    caveats: List[str] = []
+
+
+class ControlLinkIngestBody(BaseModel):
+    """A heuristic control-link classification attached to a live contact by
+    field-bridge/control_link_bridge.py. HONEST: this is a band+signature
+    heuristic (ELRS/CRSF/DSMX/DJI/MAVLink-SiK family), NOT a protocol decode --
+    confidence_type reflects that (`advisory_only` / `heuristic_binary`)."""
+    detection_id: Optional[str] = None
+    center_freq_ghz: Optional[float] = None
+    link_type: str                        # e.g. "ELRS/CRSF-class", "DJI OcuSync", "unknown"
+    link_family: Optional[str] = None
+    confidence_type: str = "advisory_only"
+    rationale: Optional[str] = None
+    evidence: Dict = {}
+
+
+@api.post("/protocols/heartbeat")
+async def protocol_heartbeat(body: ProtocolHeartbeatBody,
+                              user: Dict = Depends(get_current_user)):
+    """Liveness heartbeat from a running over-the-air decoder service. Rejects
+    unknown protocol ids so a typo can never invent a phantom LIVE row."""
+    if body.protocol not in {p["id"] for p in protocol_status.OPERATIONAL_PROTOCOLS}:
+        raise HTTPException(status_code=400,
+                            detail=f"unknown over-the-air protocol id '{body.protocol}'")
+    _protocol_touch_heartbeat(body.protocol, note=body.note)
+    return {"ok": True}
+
+
+@api.post("/remoteid/ingest")
+async def remoteid_ingest(body: RemoteIdIngestBody,
+                           user: Dict = Depends(get_current_user)):
+    """Ingest one decoded Remote ID broadcast (id/serial/position/operator).
+    Real decode -> the remoteid protocol goes LIVE on the status board. Stores
+    latest-only + refreshes decode recency."""
+    global _last_remoteid_decode
+    _last_remoteid_decode = {**body.dict(), "received_at": _now_iso()}
+    ident = body.uas_id or body.operator_id or body.source_mac or "unknown"
+    _protocol_touch_decode("remoteid", summary=f"Remote ID {ident}")
+    await log_event(
+        "REMOTEID_DECODE",
+        f"Remote ID decoded: id={body.uas_id or 'n/a'} "
+        f"operator={body.operator_id or 'n/a'} transport={body.transport or 'n/a'} "
+        f"pos=({body.latitude_deg},{body.longitude_deg})",
+        actor=user["email"],
+    )
+    return {"ok": True, "stored": True}
+
+
+@api.get("/remoteid/latest")
+async def remoteid_latest(user: Dict = Depends(get_current_user)):
+    """Most recent decoded Remote ID broadcast, or an honest 'none yet'."""
+    if _last_remoteid_decode is None:
+        return {"available": False}
+    return {"available": True, **_last_remoteid_decode}
+
+
+@api.post("/fpv/osd/ingest")
+async def fpv_osd_ingest(body: FpvOsdIngestBody,
+                          user: Dict = Depends(get_current_user)):
+    """Ingest FPV analog-video OSD telemetry (fpv_osd_ocr.to_ingest_dict()).
+    A decode with at least one non-null telemetry field takes fpv_osd LIVE;
+    an empty read (frame present but nothing legible) is recorded as a
+    heartbeat only (stays READY) -- never faked as telemetry."""
+    global _last_fpv_osd_telemetry
+    _last_fpv_osd_telemetry = {**body.dict(), "received_at": _now_iso()}
+    tele = body.telemetry or {}
+    has_any = any(v is not None for v in tele.values())
+    if has_any:
+        parts = [f"{k}={v}" for k, v in tele.items() if v is not None][:4]
+        _protocol_touch_decode("fpv_osd", summary="OSD " + ", ".join(parts))
+    else:
+        _protocol_touch_heartbeat("fpv_osd", note="frame processed, no legible OSD fields")
+    await log_event(
+        "FPV_OSD_TELEMETRY",
+        f"FPV OSD telemetry ingest: fields_read={sum(1 for v in tele.values() if v is not None)} "
+        f"mean_conf={body.mean_confidence} std={body.video_standard}",
+        actor=user["email"],
+    )
+    return {"ok": True, "stored": True, "telemetry_present": has_any}
+
+
+@api.get("/fpv/osd/latest")
+async def fpv_osd_latest(user: Dict = Depends(get_current_user)):
+    if _last_fpv_osd_telemetry is None:
+        return {"available": False}
+    return {"available": True, **_last_fpv_osd_telemetry}
+
+
+@api.post("/control-link/ingest")
+async def control_link_ingest(body: ControlLinkIngestBody,
+                               user: Dict = Depends(get_current_user)):
+    """Ingest a heuristic control-link classification for a live contact. A
+    non-'unknown' classification takes control_link LIVE (it classified a real
+    contact); an 'unknown' result is a heartbeat only (running, nothing it
+    could confidently classify)."""
+    global _last_control_link
+    _last_control_link = {**body.dict(), "received_at": _now_iso()}
+    if body.link_type and body.link_type.lower() != "unknown":
+        _protocol_touch_decode("control_link",
+                                summary=f"{body.link_type} @ {body.center_freq_ghz} GHz")
+    else:
+        _protocol_touch_heartbeat("control_link")
+    return {"ok": True, "stored": True}
+
+
+@api.get("/control-link/latest")
+async def control_link_latest(user: Dict = Depends(get_current_user)):
+    if _last_control_link is None:
+        return {"available": False}
+    return {"available": True, **_last_control_link}
+
+
+@api.get("/protocols/status")
+async def protocols_status(user: Dict = Depends(get_current_user)):
+    """Truthful per-protocol status board for the Protocol Library page.
+    OPERATIONAL (over-the-air) statuses are derived PURELY from the observable
+    report store (heartbeat + decode recency); FORENSIC (wire/bench) decoders
+    are statically flagged as requiring physical access. See
+    protocol_status.py for the full derivation + doctrine."""
+    return protocol_status.build_board(_protocol_reports)
+
+
 DETECTION_MERGE_WINDOW_S = 20  # re-ingests of the same real contact within this
                                # window update the existing record instead of
                                # spawning a new one — a continuously-running RX
@@ -3674,6 +3905,14 @@ async def iff_list_revoked(user: Dict = Depends(get_current_user)):
 @api.post("/detections/ingest")
 async def detection_ingest(body: DetectionIngestBody,
                            user: Dict = Depends(get_current_user)):
+    # Protocol-Library board hook: a CRC-verified DJI DroneID decode (posted by
+    # droneid_cued_capture.py / droneid_decode_bridge.py) takes the over-the-air
+    # `droneid` protocol LIVE. Identified by its distinctive decoded model +
+    # protocol_verified confidence -- an RSSI/ML "candidate" never sets both, so
+    # this can never be tripped by an energy/heuristic guess.
+    if body.confidence_type == "protocol_verified" and "droneid" in (body.model or "").lower():
+        _protocol_touch_decode("droneid",
+                                summary=f"{body.model} @ {body.center_freq_ghz} GHz")
     since = (datetime.now(timezone.utc) - timedelta(seconds=DETECTION_MERGE_WINDOW_S)).isoformat()
     # MERGE-MATCH ROOT-CAUSE FIX (2026-07-24): match on the immutable
     # match_model/match_protocol fields, NEVER on the currently-DISPLAYED
