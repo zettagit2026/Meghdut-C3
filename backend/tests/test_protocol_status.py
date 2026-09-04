@@ -55,12 +55,83 @@ def test_unparseable_timestamps_are_offline_not_crash():
 # --------------------------------------------------------------------------
 # build_board
 # --------------------------------------------------------------------------
-def test_board_has_four_operational_and_five_forensic():
+def test_board_has_six_operational_and_twelve_forensic():
     board = ps.build_board({}, NOW)
-    assert len(board["operational"]) == 4
-    assert len(board["forensic"]) == 5
+    assert len(board["operational"]) == 6
+    assert len(board["forensic"]) == 12
     ids = {o["id"] for o in board["operational"]}
-    assert ids == {"remoteid", "droneid", "control_link", "fpv_osd"}
+    assert ids == {"remoteid", "droneid", "control_link", "fpv_osd", "adsb", "parrot"}
+
+
+def test_all_ids_unique_across_the_18():
+    board = ps.build_board({}, NOW)
+    all_ids = [p["id"] for p in board["operational"]] + [p["id"] for p in board["forensic"]]
+    assert len(all_ids) == 18
+    assert len(set(all_ids)) == 18  # no duplicate ids anywhere on the board
+
+
+def test_forensic_ids_are_the_expected_twelve():
+    board = ps.build_board({}, NOW)
+    forensic_ids = {f["id"] for f in board["forensic"]}
+    assert forensic_ids == {
+        "crsf", "msp", "canopen", "dronecan", "sik_mavlink_wire",
+        "ltm", "dshot", "frsky_smartport", "graupner_hott",
+        "flysky_afhds", "frsky_accst", "spektrum_dsm",
+    }
+
+
+def test_every_forensic_entry_is_static_forensic():
+    board = ps.build_board({}, NOW)
+    assert all(f["status"] == "FORENSIC" for f in board["forensic"])
+
+
+def test_rc_parsers_carry_ota_family_and_requires():
+    # The 3 chip-level RC control-link parsers must HONESTLY state that their
+    # OTA presence is only surfaced at family level (hobby_rc_2g4) and name the
+    # dedicated receiver chip they'd need -- never a phantom airborne radio.
+    board = ps.build_board({}, NOW)
+    by_id = {f["id"]: f for f in board["forensic"]}
+    expected_chip = {
+        "flysky_afhds": "A7105",
+        "frsky_accst": "CC2500",
+        "spektrum_dsm": "CYRF6936",
+    }
+    for pid, chip in expected_chip.items():
+        entry = by_id[pid]
+        assert entry["status"] == "FORENSIC"
+        assert entry.get("ota_family"), f"{pid} missing ota_family"
+        assert "hobby_rc_2g4" in entry["ota_family"]
+        assert chip in entry["requires"]
+        assert "HackRF" in entry["requires"]
+
+
+def test_wire_tap_forensic_entries_have_no_ota_family():
+    # Non-RC-parser forensic entries are pure wire taps -- no OTA-family claim.
+    board = ps.build_board({}, NOW)
+    by_id = {f["id"]: f for f in board["forensic"]}
+    for pid in ("crsf", "msp", "canopen", "dronecan", "sik_mavlink_wire",
+                "ltm", "dshot", "frsky_smartport", "graupner_hott"):
+        assert by_id[pid].get("ota_family") is None
+
+
+def test_adsb_and_parrot_derive_offline_ready_live():
+    # New operational protocols derive status the SAME honest way as the others:
+    # no report -> OFFLINE, fresh heartbeat only -> READY, fresh decode -> LIVE.
+    board_offline = ps.build_board({}, NOW)
+    by_id = {o["id"]: o for o in board_offline["operational"]}
+    assert by_id["adsb"]["status"] == "OFFLINE"
+    assert by_id["parrot"]["status"] == "OFFLINE"
+
+    reports = {
+        "adsb": {"last_heartbeat_ts": _iso(3), "last_decode_ts": None},
+        "parrot": {"last_heartbeat_ts": _iso(3), "last_decode_ts": _iso(8),
+                   "decode_count": 2, "last_decode_summary": "Parrot ARSDK Piloting"},
+    }
+    board = ps.build_board(reports, NOW)
+    by_id = {o["id"]: o for o in board["operational"]}
+    assert by_id["adsb"]["status"] == "READY"
+    assert by_id["parrot"]["status"] == "LIVE"
+    assert by_id["parrot"]["decode_count"] == 2
 
 
 def test_board_all_operational_offline_when_no_reports():

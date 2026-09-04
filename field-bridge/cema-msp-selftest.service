@@ -1,0 +1,23 @@
+[Unit]
+Description=CEMA cUAS - BENCH GATE: msp_parser.py forensic decoder self-test (synthetic vectors, offline)
+# This is a DEPLOY-TIME BENCH GATE, not a live decoder. It runs the parser's
+# own --selftest against its hand-verified synthetic vectors and PASSES/FAILS on
+# the exit code. It has NO credentials and NO EnvironmentFile: it must NEVER POST
+# to the board or send a heartbeat, so it can never make a forensic entry look
+# LIVE. Run it at deploy time to prove the parser logic is intact before wiring
+# real hardware (see field-bridge/msp_parser.py and cema-crsf-parser.service's
+# note recommending exactly this check).
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# NOTE: msp_parser.py's self-test flag is --selftest (one word), verified
+# against its argparse definition. No EnvironmentFile on purpose (bench gate).
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u msp_parser.py --selftest
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/msp_selftest.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/msp_selftest.log
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,32 @@
+[Unit]
+Description=CEMA cUAS - Parrot ARSDK3 (Wi-Fi) live decoder: Kismet -> ARNetworkAL/ARCommand decode -> /api/parrot/ingest
+After=network-online.target docker.service cema-kismet.service
+Wants=network-online.target
+Requires=cema-kismet.service
+
+[Service]
+Type=simple
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# Host-specific values (CEMA_API_URL/EMAIL/PASSWORD, KISMET_URL, KISMET_APIKEY,
+# PARROT_POLL_INTERVAL_S) live in the EnvironmentFile, never hardcoded here.
+# DETECTION-side / RX / software-only: this RIDES THE EXISTING Kismet monitor
+# NIC (the same one remoteid uses) and opens NO radio/adapter of its own, so it
+# cannot contend with the RX sweep. It is NOT a TX bridge and is NOT coupled to
+# TX-online.
+# NOTE for the SRE deploy: this decodes ONLY if Kismet surfaces a Parrot drone's
+# ARSDK Wi-Fi data-frame bytes (monitor-mode NIC + a Bebop/Bebop2/Disco/ANAFI in
+# range). Kismet reachable but quiet -> heartbeats (board shows READY). Kismet
+# NOT reachable -> honest OFFLINE, no heartbeat -- the expected state, not a bug.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+# Cold-boot readiness gate: wait up to 60s for BOTH the backend (127.0.0.1:8001)
+# and Kismet REST (127.0.0.1:2501) to accept a connection before starting.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8001/ && curl -s -o /dev/null http://127.0.0.1:2501/ && exit 0; sleep 1; done; exit 0'
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u parrot_arsdk_ingest_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/parrot_arsdk_ingest_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/parrot_arsdk_ingest_bridge.log
+
+[Install]
+WantedBy=multi-user.target

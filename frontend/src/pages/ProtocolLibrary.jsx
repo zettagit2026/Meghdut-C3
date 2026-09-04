@@ -133,6 +133,11 @@ function ForensicCard({ p }) {
         <span className="text-[9px] uppercase tracking-widest text-slate-500">Requires: </span>
         {p.requires}
       </div>
+      {p.ota_family && (
+        <div className="mt-1 font-mono text-[10px] text-slate-500">
+          OTA family coverage: {p.ota_family}
+        </div>
+      )}
       {p.source && (
         <div className="mt-2 font-mono text-[9px] uppercase tracking-widest text-slate-600">{p.source}</div>
       )}

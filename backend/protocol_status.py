@@ -31,10 +31,22 @@ is split into two clearly-separated groups:
                    * control_link  (ELRS/CRSF/DSMX/DJI/MAVLink emission class)
                    * fpv_osd       (analog FPV video OSD telemetry -- the
                                     over-the-air "MSP-class" data on an enemy)
+                   * adsb          (1090 MHz Mode-S DF17, via an EXISTING
+                                    dump1090/readsb feed -- not the primary SDR)
+                   * parrot        (Parrot ARSDK3 over Wi-Fi, via the EXISTING
+                                    Kismet monitor NIC)
 
   FORENSIC    -- recovered / own airframe, bench, requires physical access
                  (USB-UART / CAN electrical tap). NOT for airborne engagement:
-                   * crsf, msp, canopen, dronecan, sik_mavlink_wire
+                   * crsf, msp, canopen, dronecan, sik_mavlink_wire,
+                     ltm, dshot, frsky_smartport, graupner_hott (wire taps)
+                   * flysky_afhds, frsky_accst, spektrum_dsm -- chip-level RC
+                     control-link parsers. HONEST: their over-the-air presence
+                     is surfaced at FAMILY level by the operational Control-Link
+                     RF Classification (hobby_rc_2g4); the per-chip frame decode
+                     needs a dedicated receiver IC (A7105 / CC2500 / CYRF6936)
+                     and is NOT decodable from the wideband HackRF sweep. They
+                     are bench parsers, never phantom airborne radios.
 
 STATUS VALUES
 =============
@@ -105,6 +117,25 @@ OPERATIONAL_PROTOCOLS: List[Dict[str, str]] = [
         "service": "fpv_osd_bridge.py",
         "identifies": "Craft name, battery, altitude, GPS, sats, RSSI read off the video (analog only)",
     },
+    {
+        "id": "adsb",
+        "name": "ADS-B (1090 MHz Mode-S DF17)",
+        "aka": "Mode-S Extended Squitter (DF17/18) 1090 MHz cooperative surveillance",
+        "over_the_air": "Passive 1090 MHz feed from an EXISTING dump1090/readsb receiver "
+                        "(Beast/SBS output) -- NOT the primary detection HackRF",
+        "service": "adsb_ingest_bridge.py",
+        "identifies": "ICAO24 address, callsign, live position, altitude + velocity of a "
+                      "transponder-equipped aircraft (cooperative broadcast, decoded)",
+    },
+    {
+        "id": "parrot",
+        "name": "Parrot ARSDK3 (Wi-Fi)",
+        "aka": "Parrot ARSDK3 command/telemetry over the drone's own Wi-Fi",
+        "over_the_air": "Passive 802.11 capture on the EXISTING Kismet monitor-mode NIC "
+                        "(no new radio) -- reads a Parrot drone's own Wi-Fi link",
+        "service": "parrot_arsdk_ingest_bridge.py",
+        "identifies": "ARSDK project / class / command id observed off a Parrot drone's Wi-Fi",
+    },
 ]
 
 # Wire / bench decoders. These require PHYSICAL contact with a recovered or
@@ -140,6 +171,62 @@ FORENSIC_PROTOCOLS: List[Dict[str, str]] = [
         "name": "MAVLink over SiK (paired telemetry-radio tap)",
         "requires": "Paired SiK 915 MHz radio + UART tap (bench / range-authorized)",
         "source": "field-bridge/sik_mavlink_bridge.py",
+    },
+    {
+        "id": "ltm",
+        "name": "LTM (Light Telemetry Protocol)",
+        "requires": "USB-UART tap on the flight controller telemetry port",
+        "source": "field-bridge/ltm_parser.py",
+    },
+    {
+        "id": "dshot",
+        "name": "DShot ESC telemetry (bidirectional)",
+        "requires": "Logic-level tap on the ESC signal wire (bench capture)",
+        "source": "field-bridge/dshot_parser.py",
+    },
+    {
+        "id": "frsky_smartport",
+        "name": "FrSky S.Port (SmartPort telemetry)",
+        "requires": "Inverted-UART tap on the FrSky S.Port telemetry wire",
+        "source": "field-bridge/frsky_smartport_parser.py",
+    },
+    {
+        "id": "graupner_hott",
+        "name": "Graupner HoTT telemetry",
+        "requires": "USB-UART tap on the HoTT telemetry bus",
+        "source": "field-bridge/graupner_hott_parser.py",
+    },
+    # Chip-level RC control-link parsers. These decode the on-air FRAME FORMAT of
+    # a specific 2.4 GHz hobby-RC receiver chip -- but ONLY from a dedicated
+    # receiver IC's baseband, NOT from the wideband HackRF sweep. Their over-the-
+    # air PRESENCE is surfaced at family level by the operational Control-Link RF
+    # Classification (hobby_rc_2g4); the per-chip frame decode is a BENCH parser
+    # against a matching receiver. `ota_family` states that honest linkage and
+    # `requires` names the dedicated receiver chip -- never a phantom airborne
+    # radio on the primary SDR.
+    {
+        "id": "flysky_afhds",
+        "name": "Flysky AFHDS/AFHDS2A (RC control link)",
+        "requires": "A7105 2.4 GHz receiver IC -- NOT decodable from the wideband HackRF sweep",
+        "ota_family": "OTA presence surfaced at family level by Control-Link RF "
+                      "Classification (hobby_rc_2g4); per-chip frame decode is bench-only",
+        "source": "field-bridge/flysky_afhds_parser.py",
+    },
+    {
+        "id": "frsky_accst",
+        "name": "FrSky ACCST/ACCESS (RC control link)",
+        "requires": "CC2500 2.4 GHz receiver IC -- NOT decodable from the wideband HackRF sweep",
+        "ota_family": "OTA presence surfaced at family level by Control-Link RF "
+                      "Classification (hobby_rc_2g4); per-chip frame decode is bench-only",
+        "source": "field-bridge/frsky_accst_parser.py",
+    },
+    {
+        "id": "spektrum_dsm",
+        "name": "Spektrum DSM2/DSMX (RC control link)",
+        "requires": "CYRF6936 2.4 GHz receiver IC -- NOT decodable from the wideband HackRF sweep",
+        "ota_family": "OTA presence surfaced at family level by Control-Link RF "
+                      "Classification (hobby_rc_2g4); per-chip frame decode is bench-only",
+        "source": "field-bridge/spektrum_dsm_parser.py",
     },
 ]
 

@@ -1,0 +1,29 @@
+[Unit]
+Description=CEMA cUAS - BENCH GATE: dronecan_parser.py forensic decoder self-test (synthetic vectors, offline)
+# DEPLOY-TIME BENCH GATE, not a live decoder. Runs the parser's own --self-test
+# against synthetic vectors and PASSES/FAILS on the exit code. NO credentials,
+# NO EnvironmentFile: it must NEVER POST to the board or heartbeat, so it can
+# never make a forensic entry look LIVE.
+#
+# SANDBOX CAVEAT (honest): dronecan_parser.py's self-test drives the real
+# `dronecan` pip package over a virtual CAN bus. On a macOS dev box that virtual
+# backend raises NotImplementedError in python-can's flush_tx_buffer() (a
+# platform limitation of the dev sandbox, NOT a parser-logic failure). On the
+# Linux deploy target with a working python-can virtual/socketcan backend the
+# self-test is expected to pass. Confirm this gate is GREEN on the target host
+# before relying on it; if it is red, verify the python-can backend, not the
+# parser logic.
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# NOTE: dronecan_parser.py's self-test flag is --self-test (hyphenated),
+# verified against its argparse definition. No EnvironmentFile (bench gate).
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u dronecan_parser.py --self-test
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/dronecan_selftest.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/dronecan_selftest.log
+
+[Install]
+WantedBy=multi-user.target

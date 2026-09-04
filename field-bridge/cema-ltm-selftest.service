@@ -1,0 +1,20 @@
+[Unit]
+Description=CEMA cUAS - BENCH GATE: ltm_parser.py forensic decoder self-test (synthetic vectors, offline)
+# DEPLOY-TIME BENCH GATE, not a live decoder. Runs the parser's own --self-test
+# against hand-verified synthetic vectors and PASSES/FAILS on the exit code. NO
+# credentials, NO EnvironmentFile: it must NEVER POST to the board or heartbeat,
+# so it can never make a forensic entry look LIVE.
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# NOTE: ltm_parser.py's self-test flag is --self-test (hyphenated), verified
+# against its argparse definition. No EnvironmentFile on purpose (bench gate).
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u ltm_parser.py --self-test
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/ltm_selftest.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/ltm_selftest.log
+
+[Install]
+WantedBy=multi-user.target

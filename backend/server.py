@@ -271,7 +271,10 @@ INGEST_PATHS = {"/api/detections/ingest", "/api/spectrum/ingest", "/api/fpv/inge
                 # make-protocol-library-live). Tracked by X-Bridge-Name in
                 # db.ingest_health exactly like the sensors above.
                 "/api/remoteid/ingest", "/api/fpv/osd/ingest",
-                "/api/control-link/ingest", "/api/protocols/heartbeat"}
+                "/api/control-link/ingest", "/api/protocols/heartbeat",
+                # ADS-B (1090 MHz Mode-S) + Parrot ARSDK3 (Wi-Fi) over-the-air
+                # decoder ingest -- same X-Bridge-Name ingest-health tracking.
+                "/api/adsb/ingest", "/api/parrot/ingest"}
 AUTH_FAIL_CONSECUTIVE_THRESHOLD = 3
 
 # ---- Audit-chain anchor (lightweight external anchoring) -------------------
@@ -3414,6 +3417,8 @@ _protocol_reports: Dict[str, Dict] = {}
 _last_remoteid_decode: Optional[Dict] = None
 _last_fpv_osd_telemetry: Optional[Dict] = None
 _last_control_link: Optional[Dict] = None
+_last_adsb_decode: Optional[Dict] = None
+_last_parrot_decode: Optional[Dict] = None
 
 
 def _now_iso() -> str:
@@ -3511,6 +3516,41 @@ class ControlLinkIngestBody(BaseModel):
     evidence: Dict = {}
 
 
+class AdsbIngestBody(BaseModel):
+    """One decoded ADS-B (1090 MHz Mode-S DF17/18) message, as
+    field-bridge/adsb_ingest_bridge.py produces from an EXISTING dump1090/readsb
+    Beast/SBS feed (NOT the primary detection HackRF). Every field is optional
+    because a real ADS-B contact is assembled from several message types at
+    different rates -- a field is null when that message has not been seen for
+    this ICAO (no fabrication). Stored latest-only."""
+    icao24: Optional[str] = None          # 24-bit ICAO address (hex)
+    callsign: Optional[str] = None
+    latitude_deg: Optional[float] = None
+    longitude_deg: Optional[float] = None
+    altitude_ft: Optional[float] = None
+    ground_speed_kt: Optional[float] = None
+    track_deg: Optional[float] = None
+    vertical_rate_fpm: Optional[float] = None
+    squawk: Optional[str] = None
+    source: str = "ADSB_DUMP1090"
+    caveats: List[str] = []
+
+
+class ParrotArsdkIngestBody(BaseModel):
+    """One observed Parrot ARSDK3 command/telemetry frame, as
+    field-bridge/parrot_arsdk_ingest_bridge.py reads off a Parrot drone's own
+    Wi-Fi link via the EXISTING Kismet monitor-mode NIC (no new radio). Fields
+    are optional -- a frame carries only the ids it carries. Stored latest-only."""
+    project: Optional[str] = None         # ARSDK project (e.g. "ardrone3")
+    drone_class: Optional[str] = None     # ARSDK class name/id
+    command: Optional[str] = None         # ARSDK command name/id
+    source_mac: Optional[str] = None      # Kismet device MAC this was read from
+    ssid: Optional[str] = None            # Parrot AP SSID (e.g. "ANAFI-xxxxxx")
+    rssi_dbm: Optional[float] = None
+    source: str = "PARROT_ARSDK_KISMET"
+    caveats: List[str] = []
+
+
 @api.post("/protocols/heartbeat")
 async def protocol_heartbeat(body: ProtocolHeartbeatBody,
                               user: Dict = Depends(get_current_user)):
@@ -3605,6 +3645,61 @@ async def control_link_latest(user: Dict = Depends(get_current_user)):
     if _last_control_link is None:
         return {"available": False}
     return {"available": True, **_last_control_link}
+
+
+@api.post("/adsb/ingest")
+async def adsb_ingest(body: AdsbIngestBody,
+                      user: Dict = Depends(get_current_user)):
+    """Ingest one decoded ADS-B (1090 MHz Mode-S DF17) message from the EXISTING
+    dump1090/readsb feed. A real decode takes the adsb protocol LIVE on the
+    status board. Stores latest-only + refreshes decode recency."""
+    global _last_adsb_decode
+    _last_adsb_decode = {**body.dict(), "received_at": _now_iso()}
+    ident = body.icao24 or body.callsign or "unknown"
+    _protocol_touch_decode("adsb", summary=f"ADS-B {ident}")
+    await log_event(
+        "ADSB_DECODE",
+        f"ADS-B decoded: icao24={body.icao24 or 'n/a'} callsign={body.callsign or 'n/a'} "
+        f"pos=({body.latitude_deg},{body.longitude_deg}) alt_ft={body.altitude_ft}",
+        actor=user["email"],
+    )
+    return {"ok": True, "stored": True}
+
+
+@api.get("/adsb/latest")
+async def adsb_latest(user: Dict = Depends(get_current_user)):
+    """Most recent decoded ADS-B message, or an honest 'none yet'."""
+    if _last_adsb_decode is None:
+        return {"available": False}
+    return {"available": True, **_last_adsb_decode}
+
+
+@api.post("/parrot/ingest")
+async def parrot_ingest(body: ParrotArsdkIngestBody,
+                        user: Dict = Depends(get_current_user)):
+    """Ingest one observed Parrot ARSDK3 (Wi-Fi) command/telemetry frame read
+    via the EXISTING Kismet monitor NIC. A real observation takes the parrot
+    protocol LIVE on the status board. Stores latest-only + refreshes recency."""
+    global _last_parrot_decode
+    _last_parrot_decode = {**body.dict(), "received_at": _now_iso()}
+    ident = body.command or body.drone_class or body.project or body.ssid or "unknown"
+    _protocol_touch_decode("parrot", summary=f"Parrot ARSDK {ident}")
+    await log_event(
+        "PARROT_ARSDK_DECODE",
+        f"Parrot ARSDK observed: project={body.project or 'n/a'} "
+        f"class={body.drone_class or 'n/a'} command={body.command or 'n/a'} "
+        f"ssid={body.ssid or 'n/a'}",
+        actor=user["email"],
+    )
+    return {"ok": True, "stored": True}
+
+
+@api.get("/parrot/latest")
+async def parrot_latest(user: Dict = Depends(get_current_user)):
+    """Most recent observed Parrot ARSDK3 frame, or an honest 'none yet'."""
+    if _last_parrot_decode is None:
+        return {"available": False}
+    return {"available": True, **_last_parrot_decode}
 
 
 @api.get("/protocols/status")

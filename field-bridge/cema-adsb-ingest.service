@@ -1,0 +1,32 @@
+[Unit]
+Description=CEMA cUAS - ADS-B (1090 MHz Mode-S DF17) live decoder: EXISTING dump1090/readsb Beast feed -> DF17/CPR decode -> /api/adsb/ingest
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# Host-specific values (CEMA_API_URL/EMAIL/PASSWORD, ADSB_FEED_HOST/PORT,
+# ADSB_POLL_INTERVAL_S) live in the EnvironmentFile, never hardcoded here.
+# DETECTION-side / RX / software-only: this consumes an EXISTING dump1090/readsb
+# Beast TCP feed and NEVER opens the primary detection HackRF/SDR, so it cannot
+# contend with the RX sweep. It is NOT a TX bridge and is NOT coupled to TX-online.
+# NOTE for the SRE deploy: this decodes ONLY while the Beast feed (default
+# 127.0.0.1:30005) is reachable. Feed reachable but quiet -> heartbeats (board
+# shows READY). Feed NOT reachable -> honest OFFLINE, no heartbeat, keeps
+# retrying -- that is the expected state, not a failure.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+# Cold-boot readiness gate: wait up to 60s for the backend (127.0.0.1:8001) to
+# accept a connection before starting. (The Beast feed's own reachability is
+# handled honestly at runtime -- OFFLINE, not a start failure -- so it is not
+# gated here.)
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8001/ && exit 0; sleep 1; done; exit 0'
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u adsb_ingest_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/adsb_ingest_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/adsb_ingest_bridge.log
+
+[Install]
+WantedBy=multi-user.target
