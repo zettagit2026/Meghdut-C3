@@ -3,6 +3,18 @@ Description=CEMA cUAS - real HackRF barrage-jam bridge (WS-driven, bounded burst
 After=network-online.target docker.service
 Wants=network-online.target
 
+# TX-online coupling for the OPERATOR jam bridge. The fielded GUI "Bring TX
+# Online" runs the root host-helper (scripts/host-helper/cema_tx_helper.py),
+# whose FROZEN whitelist does `systemctl start cema-jam-bridge` (and, on Stand
+# Down, `systemctl stop cema-jam-bridge`). We deliberately DO NOT touch that
+# reviewed whitelist. Instead this Wants+Before makes `start cema-jam-bridge`
+# transitively pull in cema-operator-jam-bridge.service, so the operator-mode
+# TX consumer is running whenever TX is online — without the operator ever
+# starting it from a terminal. Stop propagation is handled from the operator
+# unit's PartOf=, so Stand Down (`stop cema-jam-bridge`) also stops it.
+Wants=cema-operator-jam-bridge.service
+Before=cema-operator-jam-bridge.service
+
 [Service]
 Type=simple
 # Change these three (User/WorkingDirectory/EnvironmentFile path) to match your

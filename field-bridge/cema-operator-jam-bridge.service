@@ -3,6 +3,20 @@ Description=CEMA cUAS - OPERATOR jam bridge (operator's own jammer, WS-driven, b
 After=network-online.target docker.service
 Wants=network-online.target
 
+# This bridge is a COMPANION of cema-jam-bridge.service, not an independently
+# started unit. The GUI "Bring TX Online" starts cema-jam-bridge via the root
+# host-helper; that unit's Wants=+Before= pulls this one up alongside it. The
+# PartOf= below binds this unit's lifecycle to cema-jam-bridge so that a stop
+# or restart of cema-jam-bridge propagates here — i.e. "Stand Down"
+# (`systemctl stop cema-jam-bridge`) stops this operator bridge too. The After=
+# keeps ordering deterministic (jam-bridge settles first). NOTE: PartOf only
+# propagates stop/restart, not start; the start side comes from the jam-bridge
+# unit's Wants=. The operator must never start this unit from a terminal, and
+# its [Install] below is scoped to cema-jam-bridge (NOT multi-user.target) so it
+# does not auto-start at boot independently of TX-online.
+PartOf=cema-jam-bridge.service
+After=cema-jam-bridge.service
+
 [Service]
 Type=simple
 # Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
@@ -48,6 +62,21 @@ WorkingDirectory=/CEMA/joydipdemo/field-bridge
 # doing so would silently turn every deployment into a live transmitter.
 EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
 
+# INTERPRETER REQUIREMENT (resolved at deploy, do NOT hardcode a wrong path):
+# operator_jam_bridge.py runs the operator's own GNU Radio flowgraph via
+# operator_jam_wrapper.py, so the interpreter named in ExecStart MUST be able to
+# import BOTH:
+#   1) GNU Radio + gr-osmosdr   (`import gnuradio`, `import osmosdr`) — usually
+#      provided by the SYSTEM python where GNU Radio is installed, NOT a plain
+#      pip venv; and
+#   2) the field-bridge deps used by jam_bridge.py / JamBridge
+#      (requests, websocket-client, etc.).
+# If the ExecStart python can see only one of these, the unit fails at import
+# (the wrapper fails closed when GNU Radio / gr-osmosdr is missing). The path
+# below mirrors cema-jam-bridge.service as a placeholder; the deploy step must
+# point ExecStart at the interpreter/venv that satisfies BOTH sets above
+# (e.g. a venv created with --system-site-packages over a GNU-Radio-enabled
+# system python, or that system python directly).
 ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u operator_jam_bridge.py
 Restart=always
 RestartSec=3
@@ -55,4 +84,8 @@ StandardOutput=append:/CEMA/joydipdemo/field-bridge/operator_jam_bridge.log
 StandardError=append:/CEMA/joydipdemo/field-bridge/operator_jam_bridge.log
 
 [Install]
-WantedBy=multi-user.target
+# Scoped to the jam-bridge coupling, NOT multi-user.target: `systemctl enable`
+# installs this only into cema-jam-bridge.service.wants/, so it never comes up
+# on its own at boot — it is brought up only as a companion of cema-jam-bridge
+# when the GUI brings TX online (see the [Unit] Wants=/PartOf= coupling above).
+WantedBy=cema-jam-bridge.service
