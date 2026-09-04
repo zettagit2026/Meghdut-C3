@@ -355,10 +355,14 @@ class SdrMavlinkInjectBridge:
             bt = float(data.get("bt", _inj.DEFAULT_BT))
             bit_order = str(data.get("bit_order", _inj.DEFAULT_BIT_ORDER))
             tx_gain = int(data.get("tx_gain", 20))
-            # NO artificial cap (commander directive): operator-controlled repeat
-            # (floored at 1 only). continuous=True re-emits the command on a loop
-            # until the operator stops it (still tx_halt/abort-stoppable).
-            repeat = max(1, int(data.get("repeat", 3)))
+            # Operator-controlled repeat (floored at 1). NOT a timing/effectiveness
+            # cap: continuous=True remains the uncapped path (re-emits on a loop
+            # with no in-memory expansion, still tx_halt/abort-stoppable). The
+            # 10_000 ceiling bounds ONLY the FINITE one-shot case, where each
+            # repeat is expanded into an in-memory IQ buffer — an unbounded value
+            # there is a memory-DoS vector, not extra takeover effect. Mirrors the
+            # backend's MavlinkSdrInjectBody.repeat le=10_000 bound.
+            repeat = max(1, min(int(data.get("repeat", 3)), 10_000))
             continuous = bool(data.get("continuous"))
         except (TypeError, ValueError) as e:
             self._send_ack(ws, request_id, "failed", ok=False,

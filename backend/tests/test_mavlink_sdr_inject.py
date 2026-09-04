@@ -129,14 +129,27 @@ def test_target_detection_id_is_required():
 
 
 def test_repeat_is_operator_controlled_not_capped():
-    # Commander directive: NO artificial repeat ceiling — a large operator-set
-    # repeat is accepted verbatim (only a floor of 1 remains).
+    # A large operator-set repeat is still accepted verbatim (well within the
+    # 10_000 memory-DoS ceiling) — the bound is NOT a timing/effectiveness cap;
+    # continuous=True remains the uncapped path.
     body = srv.MavlinkSdrInjectBody(target_detection_id="det-1", repeat=9999,
                                     arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
     assert body.repeat == 9999
     # Floor of 1 still enforced (repeat < 1 is meaningless for a one-shot frame).
     with pytest.raises(Exception):
         srv.MavlinkSdrInjectBody(target_detection_id="det-1", repeat=0,
+                                 arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+
+
+def test_repeat_upper_bound_blocks_memory_dos():
+    # le=10_000 bounds ONLY the finite in-memory expansion (each repeat becomes
+    # an IQ buffer). An absurd one-shot repeat is a memory-DoS vector, not extra
+    # takeover effect, so it is rejected. The upper edge (10_000) is accepted.
+    body = srv.MavlinkSdrInjectBody(target_detection_id="det-1", repeat=10_000,
+                                    arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+    assert body.repeat == 10_000
+    with pytest.raises(Exception):
+        srv.MavlinkSdrInjectBody(target_detection_id="det-1", repeat=100_000_000,
                                  arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
 
 

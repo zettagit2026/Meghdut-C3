@@ -96,6 +96,21 @@ CONTINUOUS_CHUNK_S = 0.5
 # cost of per-step energy. These are tuning knobs, not guarantees.
 SWEEP_DEFAULT_STEP_MHZ = 20.0
 SWEEP_DEFAULT_DWELL_MS = 5.0
+# FREQUENCY-SCOPE safety bounds — a SECOND, bridge-side layer mirroring the
+# backend's deploy_jam sweep validation (backend/server.py: HACKRF_MIN/MAX_FREQ_MHZ,
+# MAX_SWEEP_SPAN_MHZ). These are NOT timing/effectiveness caps (the commander
+# removed all duration caps): they only bound WHERE the sweep may radiate so a
+# malformed/hostile request can't fan the TX across the whole 1-6000MHz span and
+# blanket aviation/GNSS/cellular. The span cap is GENEROUS (covers any single
+# drone band); real drone-band jamming is unaffected. Defence-in-depth: the
+# backend gate is primary; this is the belt-and-braces backstop if the bridge is
+# ever driven directly.
+# TODO(range-auth): the right long-term fix is a FREQUENCY-SCOPED range-auth
+# lease the sweep must be a subset of; until then this static bound closes the
+# blast-radius hole.
+HACKRF_MIN_FREQ_MHZ = 1.0
+HACKRF_MAX_FREQ_MHZ = 6000.0
+MAX_SWEEP_SPAN_MHZ = 500.0
 # The two common hop bands, as (start_mhz, stop_mhz) — 2.4GHz ISM (DJI/Wi-Fi/BT)
 # and the 5.8GHz video band. Exposed for the CLI/bridge; any explicit range is
 # accepted.
@@ -365,6 +380,7 @@ def transmit_burst(
     tx_gain: int,
     stop_event: Optional["threading.Event"] = None,
     on_started: Optional[Callable[["subprocess.Popen"], None]] = None,
+    tx_halt_check: Optional[Callable[[], bool]] = None,
 ) -> Dict[str, Any]:
     """Non-interactive, mechanical HackRF TX primitive — the exact same
     hackrf_transfer invocation as main()'s interactive CLI path below, minus
@@ -404,6 +420,15 @@ def transmit_burst(
     existing Tier-0 "stop all TX now" control must also be able to kill a
     real RF jam in progress, not just queued MAVLink frames). For a continuous
     jam this is the operator's stop control, polled on every loop iteration.
+
+    tx_halt_check: optional zero-arg callable polled on EVERY supervise poll
+    (via _supervise_transfer/_stop_requested); returning True terminates the
+    burst immediately, independently of stop_event. This gives the single-center
+    continuous path the SAME direct tx_halt backstop that transmit_sweep /
+    transmit_iq_file / the operator paths already have (jam_bridge.py passes
+    `lambda: self.tx_halted`), so a global EMERGENCY ABORT is honored even if the
+    per-request stop_event was never wired. A failing probe fails SAFE (treated
+    as "stop"). Omit it (None) to rely on stop_event alone.
 
     on_started: optional callback invoked with the live subprocess.Popen the
     instant the process is spawned, so the caller can store a handle to it
@@ -489,7 +514,11 @@ def transmit_burst(
                 # continuous -> no deadline (only stop_event/tx_halt ends it);
                 # bounded -> the requested window + 5s margin, as before.
                 deadline = None if continuous else time.time() + float(duration_s) + 5
-                outcome = _supervise_transfer(proc, deadline, stop_event, None)
+                # Forward tx_halt_check so this path polls tx_halt DIRECTLY as an
+                # independent stop trigger (matching transmit_sweep /
+                # transmit_iq_file / the operator paths) — not solely via the
+                # caller's stop_event. Both are honored on every poll.
+                outcome = _supervise_transfer(proc, deadline, stop_event, tx_halt_check)
                 stopped_early = (outcome == "stopped")
         except HackrfDeviceBusy as e:
             # Another process (hackrf_rx.py's sweep loop or
@@ -529,6 +558,11 @@ def sweep_centers_mhz(start_mhz: float, stop_mhz: float, step_mhz: float) -> lis
     without any radio. A HackRF at each center covers roughly ±(step/2) of
     instantaneous bandwidth, so consecutive centers tile the band."""
     lo, hi = float(min(start_mhz, stop_mhz)), float(max(start_mhz, stop_mhz))
+    # Frequency-scope clamp (defence-in-depth, mirrors the backend bound): never
+    # emit a center outside the HackRF tunable range even if called directly with
+    # an out-of-range band. Not a timing/effectiveness limit.
+    lo = max(HACKRF_MIN_FREQ_MHZ, min(lo, HACKRF_MAX_FREQ_MHZ))
+    hi = max(HACKRF_MIN_FREQ_MHZ, min(hi, HACKRF_MAX_FREQ_MHZ))
     step = abs(float(step_mhz)) or SWEEP_DEFAULT_STEP_MHZ
     centers: list = []
     f = lo
@@ -577,6 +611,20 @@ def transmit_sweep(
     """
     continuous = _is_continuous(duration_s)
     dwell_s = max(0.001, float(dwell_ms) / 1000.0)
+    # Frequency-scope safety bound (SECOND layer; backend deploy_jam is primary).
+    # Refuse an out-of-range or over-wide span outright rather than radiating it.
+    # NOT a timing/effectiveness cap — see MAX_SWEEP_SPAN_MHZ note above.
+    lo_req, hi_req = float(min(freq_start_mhz, freq_stop_mhz)), float(max(freq_start_mhz, freq_stop_mhz))
+    if lo_req < HACKRF_MIN_FREQ_MHZ or hi_req > HACKRF_MAX_FREQ_MHZ:
+        return {"ok": False,
+                "error": f"sweep band outside HackRF range "
+                         f"[{HACKRF_MIN_FREQ_MHZ:g},{HACKRF_MAX_FREQ_MHZ:g}] MHz",
+                "stopped_early": False}
+    if (hi_req - lo_req) > MAX_SWEEP_SPAN_MHZ:
+        return {"ok": False,
+                "error": f"sweep span {hi_req - lo_req:g} MHz exceeds frequency-scope safety "
+                         f"bound {MAX_SWEEP_SPAN_MHZ:g} MHz",
+                "stopped_early": False}
     centers = sweep_centers_mhz(freq_start_mhz, freq_stop_mhz, step_mhz)
     if not centers:
         return {"ok": False, "error": "empty sweep band", "stopped_early": False}

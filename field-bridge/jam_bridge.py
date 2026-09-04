@@ -295,7 +295,12 @@ class JamBridge:
                 tx_halt_check=lambda: self.tx_halted)
         return transmit_burst(
             params["freq_mhz"], params["bandwidth_khz"], params["duration_s"],
-            params["tx_gain"], stop_event=stop_event, on_started=on_started)
+            params["tx_gain"], stop_event=stop_event, on_started=on_started,
+            # Pass tx_halt_check so the single-center continuous burst polls
+            # tx_halted DIRECTLY too (matching the sweep branch above and
+            # transmit_iq_file / operator paths) — both stop_event AND tx_halt
+            # are now independent stop triggers on ALL continuous paths.
+            tx_halt_check=lambda: self.tx_halted)
 
     # ---- WS handling ---------------------------------------------------
     def _handle_jam_request(self, ws, data: dict) -> None:

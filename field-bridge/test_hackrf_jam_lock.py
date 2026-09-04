@@ -88,13 +88,19 @@ def test_transmit_burst_releases_lock_after_missing_binary_failure(isolated_lock
         os.close(fd)
 
 
-def test_transmit_burst_signature_unchanged():
-    """Task #152 must not change transmit_burst()'s public signature --
-    only wire in the shared lock around its existing subprocess logic."""
+def test_transmit_burst_signature_stable_plus_tx_halt_check():
+    """The original positional params are unchanged (task #152 only wired in the
+    shared lock). The kill-switch hardening (FIX 2) appends ONE optional keyword,
+    tx_halt_check, so the single-center continuous burst polls tx_halt directly
+    like transmit_sweep / transmit_iq_file / the operator paths — an additive,
+    backward-compatible change (default None => prior behavior)."""
     sig = inspect.signature(hackrf_jam.transmit_burst)
     assert list(sig.parameters.keys()) == [
         "freq_mhz", "bandwidth_khz", "duration_s", "tx_gain", "stop_event", "on_started",
+        "tx_halt_check",
     ]
+    # The new param is optional (keyword, default None) — no caller is broken.
+    assert sig.parameters["tx_halt_check"].default is None
 
 
 def test_transmit_burst_imports_shared_device_lock():

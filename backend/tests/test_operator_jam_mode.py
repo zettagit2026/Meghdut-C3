@@ -194,6 +194,94 @@ def test_sweep_requires_band_edges(monkeypatch):
     assert ei.value.status_code == 400
 
 
+# --------------------------------------------------------------------------
+# FREQUENCY-SCOPE sweep bounds (security hardening — NOT a timing/effectiveness
+# cap). See backend/server.py: HACKRF_MIN/MAX_FREQ_MHZ + MAX_SWEEP_SPAN_MHZ.
+# --------------------------------------------------------------------------
+def test_sweep_bound_constants_are_generous_frequency_scope():
+    # The span cap is deliberately GENEROUS (covers any single drone band incl.
+    # the full 5.8GHz video band) — it blocks all-spectrum, not real jamming.
+    assert srv.HACKRF_MIN_FREQ_MHZ == 1.0
+    assert srv.HACKRF_MAX_FREQ_MHZ == 6000.0
+    assert srv.MAX_SWEEP_SPAN_MHZ == 500.0
+
+
+def test_sweep_rejects_below_hackrf_range(monkeypatch):
+    _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(sweep=True, freq_start_mhz=0.5, freq_stop_mhz=100.0,
+                              continuous=True, **TOKENS)
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.deploy_jam(body, user=USER))
+    assert ei.value.status_code == 400
+
+
+def test_sweep_rejects_above_hackrf_range(monkeypatch):
+    _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(sweep=True, freq_start_mhz=5900.0, freq_stop_mhz=6100.0,
+                              continuous=True, **TOKENS)
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.deploy_jam(body, user=USER))
+    assert ei.value.status_code == 400
+
+
+def test_sweep_rejects_all_spectrum_span(monkeypatch):
+    # The blast-radius case the bound exists to stop: 2400 -> 6000 MHz (blankets
+    # aviation/GNSS/cellular). Span 3600 MHz >> 500 MHz -> 400.
+    _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(sweep=True, freq_start_mhz=2400.0, freq_stop_mhz=6000.0,
+                              continuous=True, **TOKENS)
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.deploy_jam(body, user=USER))
+    assert ei.value.status_code == 400
+
+
+def test_sweep_rejects_span_just_over_cap(monkeypatch):
+    _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(sweep=True, freq_start_mhz=2400.0, freq_stop_mhz=2901.0,
+                              continuous=True, **TOKENS)  # span 501 MHz
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.deploy_jam(body, user=USER))
+    assert ei.value.status_code == 400
+
+
+def test_sweep_rejects_nonpositive_step(monkeypatch):
+    _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(sweep=True, freq_start_mhz=2400.0, freq_stop_mhz=2483.5,
+                              step_mhz=0.0, continuous=True, **TOKENS)
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.deploy_jam(body, user=USER))
+    assert ei.value.status_code == 400
+
+
+def test_sweep_rejects_nonpositive_dwell(monkeypatch):
+    _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(sweep=True, freq_start_mhz=2400.0, freq_stop_mhz=2483.5,
+                              dwell_ms=-1.0, continuous=True, **TOKENS)
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.deploy_jam(body, user=USER))
+    assert ei.value.status_code == 400
+
+
+def test_normal_drone_band_sweep_accepted(monkeypatch):
+    # A real 2.4GHz ISM drone-band sweep (span 83.5 MHz, positive step/dwell) is
+    # unaffected by the frequency-scope bounds — the whole point.
+    _, broadcasts = _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(sweep=True, freq_start_mhz=2400.0, freq_stop_mhz=2483.5,
+                              step_mhz=20.0, dwell_ms=5.0, continuous=True, **TOKENS)
+    resp = asyncio.run(srv.deploy_jam(body, user=USER))
+    assert resp["sweep"] is True
+    assert resp["freq_start_mhz"] == 2400.0 and resp["freq_stop_mhz"] == 2483.5
+
+
+def test_full_5g8_video_band_sweep_accepted(monkeypatch):
+    # The full 5.725-5.875GHz video band (span 150 MHz) is well within the cap.
+    _stub_spine(monkeypatch)
+    body = srv.JamRequestBody(sweep=True, freq_start_mhz=5725.0, freq_stop_mhz=5875.0,
+                              continuous=True, **TOKENS)
+    resp = asyncio.run(srv.deploy_jam(body, user=USER))
+    assert resp["sweep"] is True
+
+
 def test_operator_mode_rejects_sweep(monkeypatch):
     _stub_spine(monkeypatch)
     body = srv.JamRequestBody(band="915", jam_mode="operator", sweep=True,
@@ -235,5 +323,81 @@ def test_continuous_active_jam_not_force_expired(monkeypatch):
 
     _aio.run(srv._expire_pending_jam())
     # Still active — never force-expired to TX_TIMEOUT on a duration it never had.
+    assert srv._pending_jam["rid-cont"]["status"] == "JAM_ACTIVE"
+    srv._pending_jam.clear()
+
+
+# --------------------------------------------------------------------------
+# FIX 4: a dropped TX bridge must not leave a phantom-active CONTINUOUS session
+# reported "active" forever (status-honesty only; the TX already stopped).
+# --------------------------------------------------------------------------
+def test_lost_jam_bridge_marks_continuous_session_bridge_lost(monkeypatch):
+    import asyncio as _aio
+    srv._pending_jam.clear()
+    srv._pending_jam["rid-cont"] = {
+        "ts": datetime.now(timezone.utc), "status": "JAM_ACTIVE",
+        "duration_s": None, "continuous": True, "freq_mhz": 915.0, "actor": "x",
+    }
+
+    async def _noop_broadcast(msg):
+        return None
+    monkeypatch.setattr(srv.ws_manager, "broadcast_json", _noop_broadcast)
+
+    async def _noop_log(*a, **k):
+        return {}
+    monkeypatch.setattr(srv, "log_event", _noop_log)
+    # No jam bridge remains subscribed after the drop.
+    monkeypatch.setattr(srv.ws_manager, "has_tx_consumer", lambda effect: False)
+
+    _aio.run(srv._mark_lost_tx_bridge_sessions({"jam"}))
+    # The phantom continuous session is now honestly closed — not "active" forever.
+    assert srv._pending_jam["rid-cont"]["status"] == "BRIDGE_LOST"
+    assert srv._pending_jam["rid-cont"]["terminal"] is True
+    srv._pending_jam.clear()
+
+
+def test_lost_bridge_does_not_touch_bounded_or_other_effect(monkeypatch):
+    import asyncio as _aio
+    srv._pending_jam.clear()
+    # A BOUNDED jam self-expires via the normal timeout — do NOT relabel it here.
+    srv._pending_jam["rid-bounded"] = {
+        "ts": datetime.now(timezone.utc), "status": "JAM_ACTIVE",
+        "duration_s": 30.0, "continuous": False, "freq_mhz": 915.0, "actor": "x",
+    }
+
+    async def _noop_broadcast(msg):
+        return None
+    monkeypatch.setattr(srv.ws_manager, "broadcast_json", _noop_broadcast)
+
+    async def _noop_log(*a, **k):
+        return {}
+    monkeypatch.setattr(srv, "log_event", _noop_log)
+    monkeypatch.setattr(srv.ws_manager, "has_tx_consumer", lambda effect: False)
+
+    # A dropped mavlink_sdr_inject bridge must not touch a jam session at all.
+    _aio.run(srv._mark_lost_tx_bridge_sessions({"mavlink_sdr_inject"}))
+    assert srv._pending_jam["rid-bounded"]["status"] == "JAM_ACTIVE"
+    srv._pending_jam.clear()
+
+
+def test_lost_bridge_noop_when_another_bridge_still_subscribed(monkeypatch):
+    import asyncio as _aio
+    srv._pending_jam.clear()
+    srv._pending_jam["rid-cont"] = {
+        "ts": datetime.now(timezone.utc), "status": "JAM_ACTIVE",
+        "duration_s": None, "continuous": True, "freq_mhz": 915.0, "actor": "x",
+    }
+
+    async def _noop_broadcast(msg):
+        return None
+    monkeypatch.setattr(srv.ws_manager, "broadcast_json", _noop_broadcast)
+
+    async def _noop_log(*a, **k):
+        return {}
+    monkeypatch.setattr(srv, "log_event", _noop_log)
+    # Another jam bridge is STILL connected — the session is still being carried.
+    monkeypatch.setattr(srv.ws_manager, "has_tx_consumer", lambda effect: True)
+
+    _aio.run(srv._mark_lost_tx_bridge_sessions({"jam"}))
     assert srv._pending_jam["rid-cont"]["status"] == "JAM_ACTIVE"
     srv._pending_jam.clear()

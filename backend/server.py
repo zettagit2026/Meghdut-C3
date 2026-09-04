@@ -1239,6 +1239,55 @@ async def _handle_mavlink_inject_ack(msg: Dict[str, Any]) -> None:
                                      "error": error})
 
 
+async def _mark_lost_tx_bridge_sessions(dropped_roles: set) -> None:
+    """Monitoring-integrity cleanup when a TX bridge WS disconnects.
+
+    A CONTINUOUS jam/inject session has no fixed on-air window, so the normal
+    lazy-expiry (_expire_pending_jam / _expire_pending_mavlink_inject) leaves it
+    JAM_ACTIVE / MAVLINK_INJECT_ACTIVE indefinitely. If the bridge that was
+    carrying it drops (crash / kill / network partition), the TX itself has
+    ALREADY stopped (the bridge is the only thing radiating) — but GET
+    /jam/status would keep reporting a phantom-active continuous session forever.
+
+    This closes ONLY that status-honesty gap. It does NOT touch bounded sessions
+    (they self-expire to TX_TIMEOUT) and only fires when NO other bridge for that
+    effect remains subscribed — so it never mislabels a session another live
+    bridge is still carrying. It is purely a monitoring/status correction; it
+    changes no authorization and reintroduces no timing/duration cap."""
+    if not dropped_roles:
+        return
+    now = datetime.now(timezone.utc)
+
+    async def _expire_continuous(dict_ref: Dict[str, Dict[str, Any]], active_status: str,
+                                 status_msg_type: str, log_kind: str) -> None:
+        for rid, p in dict_ref.items():
+            if p.get("status") != active_status:
+                continue
+            # Only phantom-prone (continuous) sessions; bounded ones self-expire.
+            if not (p.get("continuous") or p.get("duration_s") is None):
+                continue
+            p["status"] = "BRIDGE_LOST"
+            p["terminal"] = True
+            p["ts"] = now
+            p["error"] = "bridge lost — TX presumed stopped"
+            await log_event(
+                log_kind,
+                f"TX bridge disconnected while continuous request {rid} was active — "
+                f"marking BRIDGE_LOST (bridge is the sole radiator; TX presumed stopped). "
+                f"Status-honesty correction only; no cap or gate changed.",
+                meta={"request_id": rid}, actor="SYSTEM",
+            )
+            await ws_manager.broadcast_json(
+                {"type": status_msg_type, "request_id": rid, "status": "BRIDGE_LOST",
+                 "error": "bridge lost — TX presumed stopped"})
+
+    if "jam" in dropped_roles and not ws_manager.has_tx_consumer("jam"):
+        await _expire_continuous(_pending_jam, "JAM_ACTIVE", "jam_status", "JAM")
+    if "mavlink_sdr_inject" in dropped_roles and not ws_manager.has_tx_consumer("mavlink_sdr_inject"):
+        await _expire_continuous(_pending_mavlink_inject, "MAVLINK_INJECT_ACTIVE",
+                                 "mavlink_inject_status", "MAVLINK_SDR_INJECT")
+
+
 async def _handle_tx_ack(msg: Dict[str, Any]) -> None:
     """Process a real {"type": "tx_ack", ...} message received FROM a
     connected bridge client over the mavlink WS — see
@@ -1589,7 +1638,12 @@ class MavlinkSdrInjectBody(BaseModel):
     # command on a loop until the operator stops it (still tx_halt/abort-
     # stoppable at the bridge). MAVLINK_SDR_INJECT_MAX_REPEAT is retained only as
     # a non-binding default-library reference value.
-    repeat: int = Field(3, ge=1)
+    # le=10_000 is NOT a timing/effectiveness cap: continuous=True remains the
+    # uncapped path (it re-emits on a loop with no in-memory expansion). This
+    # bound only limits the FINITE one-shot case, where each repeat is expanded
+    # into an in-memory IQ buffer — an unbounded `repeat` there is a memory-DoS
+    # vector, not additional jamming effect.
+    repeat: int = Field(3, ge=1, le=10_000)
     continuous: bool = False
     # Honesty acknowledgement (same posture as DeployPayloadBody): the operator
     # asserting the target is a legacy/unencrypted-MAVLink craft. NOT a
@@ -1684,13 +1738,18 @@ class WSManager:
             if identity:
                 self.identities[ws] = identity
 
-    def disconnect(self, ws: WebSocket) -> None:
+    def disconnect(self, ws: WebSocket) -> set:
         if ws in self.clients:
             self.clients.remove(ws)
         # Drop any advertised roles too, so a disconnected bridge stops counting
         # as a subscribed TX consumer immediately (fails safe toward "none").
-        self.consumers.pop(ws, None)
+        # Return the roles this connection had advertised so the caller can run
+        # continuous-session status cleanup (see _mark_lost_tx_bridge_sessions):
+        # a dropped TX bridge must not leave a phantom continuous JAM_ACTIVE /
+        # MAVLINK_INJECT_ACTIVE session reported "active" forever.
+        dropped = self.consumers.pop(ws, set())
         self.identities.pop(ws, None)
+        return set(dropped)
 
     def check_bridge_hello(self, ws: WebSocket, incoming: Dict) -> tuple:
         """Authorize a bridge_hello BEFORE registering its advertised TX
@@ -4917,7 +4976,10 @@ async def ws_mavlink(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        ws_manager.disconnect(ws)
+        dropped_roles = ws_manager.disconnect(ws)
+        # Monitoring-integrity: if this was a TX bridge carrying a continuous
+        # jam/inject, don't leave a phantom-active session in GET /jam/status.
+        await _mark_lost_tx_bridge_sessions(dropped_roles)
 
 
 # =====================================================================
@@ -5258,6 +5320,25 @@ JAM_MAX_DURATION_S = 10.0  # matches field-bridge/hackrf_jam.py's MAX_DURATION_S
 # field-bridge/operator_jam_wrapper.py's OPERATOR_BANDS keys.
 OPERATOR_JAM_BANDS = {"433", "915", "2g4", "5g8"}
 
+# Swept-barrage FREQUENCY-SCOPE safety bounds (NOT a timing/effectiveness limit —
+# the commander deliberately removed all duration caps; effect stays uncapped and
+# instantly stoppable). These bound only WHERE the sweep may radiate, so an
+# operator (or a malformed/hostile request) cannot fan the TX center across the
+# whole HackRF span (e.g. 2400->6000 MHz) and blanket aviation/GNSS/cellular.
+#   * [1, 6000] MHz is the HackRF One tunable range.
+#   * MAX_SWEEP_SPAN_MHZ = 500 is GENEROUS: it comfortably covers any single
+#     drone control/video band (e.g. the full 5.725-5.875GHz 5.8GHz video band
+#     with margin) while blocking the all-spectrum case. Real drone-band jamming
+#     is unaffected.
+# TODO(range-auth): the RIGHT long-term fix is a FREQUENCY-SCOPED range-auth lease
+# (an explicitly authorized band) that every sweep must be a strict subset of —
+# then this static span/range bound becomes a belt-and-braces backstop rather
+# than the primary control. For now the span+range bound closes the
+# blast-radius hole.
+HACKRF_MIN_FREQ_MHZ = 1.0
+HACKRF_MAX_FREQ_MHZ = 6000.0
+MAX_SWEEP_SPAN_MHZ = 500.0
+
 
 @api.post("/jam/confirm")
 async def jam_confirm(user: Dict = Depends(require_commander)):
@@ -5322,6 +5403,22 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
                                      "(e.g. 2400 and 2483.5 for the 2.4GHz ISM hop band).")
         if body.freq_stop_mhz <= body.freq_start_mhz:
             raise HTTPException(400, "`freq_stop_mhz` must be greater than `freq_start_mhz`.")
+        # FREQUENCY-SCOPE safety bounds (NOT a timing/effectiveness cap). Keep the
+        # sweep inside the HackRF tunable range and cap the span so a single
+        # request cannot blanket aviation/GNSS/cellular. See MAX_SWEEP_SPAN_MHZ.
+        if (body.freq_start_mhz < HACKRF_MIN_FREQ_MHZ
+                or body.freq_stop_mhz > HACKRF_MAX_FREQ_MHZ):
+            raise HTTPException(400, f"Sweep band must lie within the HackRF tunable range "
+                                     f"[{HACKRF_MIN_FREQ_MHZ:g}, {HACKRF_MAX_FREQ_MHZ:g}] MHz.")
+        if (body.freq_stop_mhz - body.freq_start_mhz) > MAX_SWEEP_SPAN_MHZ:
+            raise HTTPException(400, f"Sweep span must not exceed {MAX_SWEEP_SPAN_MHZ:g} MHz "
+                                     f"(frequency-scope safety bound — covers any single drone "
+                                     f"band; not a timing limit). Requested span "
+                                     f"{body.freq_stop_mhz - body.freq_start_mhz:g} MHz.")
+        if body.step_mhz <= 0:
+            raise HTTPException(400, "`step_mhz` must be > 0.")
+        if body.dwell_ms <= 0:
+            raise HTTPException(400, "`dwell_ms` must be > 0.")
         freq_mhz = None
     else:
         freq_mhz = body.freq_mhz if body.freq_mhz is not None else JAM_BAND_PRESETS_MHZ.get(body.band)

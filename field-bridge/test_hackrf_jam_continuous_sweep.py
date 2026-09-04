@@ -217,6 +217,99 @@ def test_transmit_burst_bounded_short_burst_has_no_repeat_flag(monkeypatch):
     assert "-R" not in captured["cmd"]  # a short bounded burst plays once
 
 
+def test_transmit_burst_continuous_stops_on_tx_halt_without_stop_event(monkeypatch):
+    # KILL-SWITCH SYMMETRY (FIX 2): the single-center continuous burst must
+    # terminate on tx_halt DIRECTLY, even when no per-request stop_event was
+    # wired — matching transmit_sweep / transmit_iq_file / the operator paths.
+    captured = {}
+    proc = FakeProc()
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return proc
+
+    monkeypatch.setattr(hj.subprocess, "Popen", fake_popen)
+
+    halted = {"v": False}
+    sleeps = {"n": 0}
+
+    def fake_sleep(s):
+        sleeps["n"] += 1
+        if sleeps["n"] >= 3:
+            halted["v"] = True  # global EMERGENCY ABORT asserted mid-burst
+
+    monkeypatch.setattr(hj.time, "sleep", fake_sleep)
+
+    # NOTE: stop_event is deliberately NOT passed — only tx_halt_check.
+    result = hj.transmit_burst(2450.0, 500.0, 0, 20,  # 0 => continuous
+                               tx_halt_check=lambda: halted["v"])
+    assert result["ok"] is True
+    assert result["stopped_early"] is True
+    assert "-R" in captured["cmd"]
+    # The live process was actually terminated when tx_halt fired.
+    assert proc.terminated is True
+
+
+# --------------------------------------------------------------------------
+# FREQUENCY-SCOPE safety bounds (FIX 1, bridge-side second layer). NOT a
+# timing/effectiveness cap — bounds only WHERE the sweep may radiate.
+# --------------------------------------------------------------------------
+def test_sweep_bound_constants():
+    assert hj.HACKRF_MIN_FREQ_MHZ == 1.0
+    assert hj.HACKRF_MAX_FREQ_MHZ == 6000.0
+    assert hj.MAX_SWEEP_SPAN_MHZ == 500.0
+
+
+def test_transmit_sweep_refuses_over_wide_span():
+    # The all-spectrum blast-radius case (2400 -> 6000, span 3600 MHz) is refused
+    # by the bridge-side layer without radiating anything.
+    calls = {"n": 0}
+
+    def runner(iq_path, center_mhz):
+        calls["n"] += 1
+        return "exited"
+
+    result = hj.transmit_sweep(2400.0, 6000.0, 500.0, 20, duration_s=None,
+                               dwell_runner=runner)
+    assert result["ok"] is False
+    assert "span" in (result["error"] or "").lower()
+    assert calls["n"] == 0  # nothing transmitted
+
+
+def test_transmit_sweep_refuses_out_of_hackrf_range():
+    result = hj.transmit_sweep(5900.0, 6100.0, 20.0, 20, duration_s=None,
+                               dwell_runner=lambda *a: "exited")
+    assert result["ok"] is False
+    assert "range" in (result["error"] or "").lower()
+
+
+def test_transmit_sweep_normal_drone_band_unaffected():
+    # A real 2.4GHz drone-band sweep still runs normally through the bounds.
+    visited = []
+    stop = threading.Event()
+
+    def runner(iq_path, center_mhz):
+        visited.append(center_mhz)
+        if len(visited) >= 6:
+            stop.set()
+        return "exited"
+
+    result = hj.transmit_sweep(2400.0, 2483.5, 500.0, 20, step_mhz=20.0,
+                               dwell_ms=1.0, duration_s=None, stop_event=stop,
+                               dwell_runner=runner)
+    assert result["ok"] is True
+    assert result["stopped_early"] is True
+    assert len(visited) >= 1
+
+
+def test_sweep_centers_clamped_to_hackrf_range():
+    # Even if called directly with an out-of-range band, no center escapes
+    # [1, 6000] MHz (defence-in-depth clamp).
+    centers = hj.sweep_centers_mhz(-100.0, 9000.0, 1000.0)
+    assert centers, "expected a non-empty clamped center list"
+    assert all(hj.HACKRF_MIN_FREQ_MHZ <= c <= hj.HACKRF_MAX_FREQ_MHZ for c in centers)
+
+
 def test_transmit_iq_file_continuous_loops_with_repeat_flag(monkeypatch, tmp_path):
     captured = {}
     proc = FakeProc()
