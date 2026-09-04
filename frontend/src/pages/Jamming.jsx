@@ -47,6 +47,25 @@ const GNSS_BANDS = new Set(["gps_l1", "galileo_e1", "beidou_b1", "glonass_l1"]);
 
 const MAX_DURATION_S = 10; // mirrors backend JAM_MAX_DURATION_S / hackrf_jam.py MAX_DURATION_S
 
+// The four bands the OPERATOR'S own jammer covers (its per-band callers
+// cema_433/915/24/58.py). Operator mode is band-fixed to these — mirrors the
+// backend's OPERATOR_JAM_BANDS and operator_jam_wrapper.py's OPERATOR_BANDS.
+const OPERATOR_BAND_VALUES = new Set(["433", "915", "2g4", "5g8"]);
+
+// Two jammers, one governed spine. "meghdut" = the built-in HackRF barrage
+// jam; "operator" = the operator's OWN GNU Radio jammer, run pinned+bounded
+// through the identical arm/confirm/range-auth/tx-halt gates (see
+// field-bridge/operator_jam_bridge.py). Operator mode exists purely so the
+// operator can A/B which jammer works — it is NOT a new authorization path.
+const JAM_MODES = [
+  { value: "meghdut", label: "MEGHDUT Barrage (built-in)",
+    hint: "MEGHDUT's built-in HackRF band-limited noise barrage." },
+  { value: "operator", label: "Operator Jam (your code)",
+    hint: "Runs the operator's OWN unmodified GNU Radio jammer (fixed waveform: " +
+          "GAUSSIAN noise ×12, gains 47/47/20, 20 Msps), pinned to the TX radio and " +
+          "hard-time-bounded. Band-fixed to 433 / 915 / 2.4 / 5.8 GHz." },
+];
+
 // Poll-and-render, same pattern as KillChain.jsx / Payloads.jsx — no
 // bespoke WS consumer needed on the frontend.
 const STATUS_STYLE = {
@@ -61,6 +80,7 @@ const STATUS_STYLE = {
 export default function Jamming() {
   const { user } = useAuth();
   const isCommander = user?.role === "commander";
+  const [jamMode, setJamMode] = useState("meghdut");
   const [band, setBand] = useState("915");
   const [durationS, setDurationS] = useState(5);
   const [bandwidthKhz, setBandwidthKhz] = useState(500);
@@ -97,6 +117,17 @@ export default function Jamming() {
   const statusUnconfirmed = staleByAge || staleByFailures || neverSucceeded;
 
   const active = sessions.find((s) => s.status === "AWAITING_ACK" || s.status === "JAM_ACTIVE");
+  const isOperatorMode = jamMode === "operator";
+  // Operator mode is band-fixed to the operator jammer's four presets; MEGHDUT
+  // mode keeps the full band list (incl. Bluetooth + GNSS targets).
+  const bandOptions = isOperatorMode ? BANDS.filter((b) => OPERATOR_BAND_VALUES.has(b.value)) : BANDS;
+
+  // Switching into operator mode must snap the selected band into the
+  // operator-supported set (otherwise a GNSS/BT band would be sent and 400).
+  useEffect(() => {
+    if (isOperatorMode && !OPERATOR_BAND_VALUES.has(band)) setBand("915");
+  }, [isOperatorMode, band]);
+
   const isGnssTarget = GNSS_BANDS.has(band);
 
   // Same JAM_CHECKS the SafetyGate has always used, PLUS one extra line when
@@ -133,9 +164,11 @@ export default function Jamming() {
         duration_s: durationS,
         bandwidth_khz: bandwidthKhz,
         tx_gain: txGain,
+        jam_mode: jamMode,
         arm_token: arm.arm_token,
         jam_confirm_token: confirm.jam_confirm_token,
       });
+      const modeLabel = jamMode === "operator" ? "OPERATOR JAM" : "MEGHDUT BARRAGE";
       if (data.tx_bridge_subscribed === false) {
         // Honest false-green guard: request accepted (HTTP 200, AWAITING_ACK)
         // but NO cema-jam-bridge is subscribed, so nothing will radiate — it
@@ -143,12 +176,12 @@ export default function Jamming() {
         // OFFLINE — Bring TX Online" fix (a button for commanders) instead of a
         // raw "start cema-jam-bridge" shell hint.
         if (!handleEngageBlock({ response: data }, { isCommander, onFixed: loadStatus })) {
-          toast.error(`JAM NOT TRANSMITTED`, {
+          toast.error(`${modeLabel} NOT TRANSMITTED`, {
             description: `Nothing radiated. Request ${data.request_id?.slice(0, 8)} will TX_TIMEOUT.`,
           });
         }
       } else {
-        toast.info(`JAM REQUESTED — awaiting bridge ACK`, {
+        toast.info(`${modeLabel} REQUESTED — awaiting bridge ACK`, {
           description: `${data.freq_mhz} MHz · ${data.duration_s}s · req ${data.request_id?.slice(0, 8)}`,
         });
       }
@@ -210,6 +243,21 @@ export default function Jamming() {
           <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Burst Parameters</div>
 
           <label className="block">
+            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Jammer</span>
+            <select
+              data-testid="jam-mode-select"
+              value={jamMode}
+              onChange={(e) => setJamMode(e.target.value)}
+              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+            >
+              {JAM_MODES.map((m) => <option key={m.value} value={m.value}>{m.label}</option>)}
+            </select>
+            <span className="mt-1 block font-mono text-[10px] text-slate-500 leading-relaxed">
+              {JAM_MODES.find((m) => m.value === jamMode)?.hint}
+            </span>
+          </label>
+
+          <label className="block">
             <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Band</span>
             <select
               data-testid="jam-band-select"
@@ -217,7 +265,7 @@ export default function Jamming() {
               onChange={(e) => setBand(e.target.value)}
               className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
             >
-              {BANDS.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
+              {bandOptions.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
             </select>
           </label>
 
@@ -235,26 +283,45 @@ export default function Jamming() {
           </label>
 
           <label className="block">
-            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Bandwidth (kHz)</span>
+            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
+              Bandwidth (kHz){isOperatorMode ? " — fixed by operator code" : ""}
+            </span>
             <input
               data-testid="jam-bandwidth-input"
               type="number" min={50} max={5000} step={50}
               value={bandwidthKhz}
+              disabled={isOperatorMode}
               onChange={(e) => setBandwidthKhz(Number(e.target.value))}
-              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+              className={`mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info ${isOperatorMode ? "opacity-30 cursor-not-allowed" : ""}`}
             />
           </label>
 
           <label className="block">
-            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">TX Gain (0-47)</span>
+            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
+              TX Gain (0-47){isOperatorMode ? " — fixed 47/47/20 by operator code" : ""}
+            </span>
             <input
               data-testid="jam-gain-input"
               type="number" min={0} max={47}
               value={txGain}
+              disabled={isOperatorMode}
               onChange={(e) => setTxGain(Number(e.target.value))}
-              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+              className={`mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info ${isOperatorMode ? "opacity-30 cursor-not-allowed" : ""}`}
             />
           </label>
+
+          {isOperatorMode && (
+            <div
+              data-testid="jam-operator-note"
+              className="tactical-border p-3 font-mono text-[10px] text-slate-400 leading-relaxed"
+              style={{ background: "var(--surface-critical)" }}
+            >
+              OPERATOR JAM: runs the operator's OWN unmodified GNU Radio jammer, pinned to the TX
+              radio (serial) and hard-capped at {MAX_DURATION_S}s. Waveform, bandwidth and gains
+              (GAUSSIAN ×12, 47/47/20, 20 Msps) are fixed by the operator's code — only band and
+              duration apply. Same arm / confirm / range-authorization / TX-halt gates as MEGHDUT.
+            </div>
+          )}
 
           <button
             data-testid="jam-arm-button"
@@ -300,7 +367,16 @@ export default function Jamming() {
                      className="flex items-center justify-between p-3 tactical-border">
                   <div className="font-mono text-[11px] text-slate-300">
                     {s.freq_mhz} MHz · {s.duration_s}s · gain={s.tx_gain}
-                    <div className="text-slate-500 text-[10px]">{s.request_id?.slice(0, 8)}</div>
+                    <div className="text-slate-500 text-[10px] flex items-center gap-2">
+                      <span>{s.request_id?.slice(0, 8)}</span>
+                      <span
+                        data-testid={`jam-mode-${s.request_id}`}
+                        className="px-1.5 py-0.5 tactical-border uppercase tracking-widest"
+                        style={{ color: s.jam_mode === "operator" ? "var(--accent-info)" : "var(--text-muted)" }}
+                      >
+                        {s.jam_mode === "operator" ? "OPERATOR" : "MEGHDUT"}
+                      </span>
+                    </div>
                   </div>
                   <span
                     data-testid={`jam-status-${s.request_id}`}
@@ -318,7 +394,7 @@ export default function Jamming() {
 
       <SafetyGate
         open={gateOpen}
-        payloadName={`RF BARRAGE JAM (${BANDS.find((b) => b.value === band)?.label || band})`}
+        payloadName={`${isOperatorMode ? "OPERATOR JAM" : "MEGHDUT RF BARRAGE JAM"} (${BANDS.find((b) => b.value === band)?.label || band})`}
         severity="CRITICAL"
         checks={gateChecks}
         actionLabel="TRANSMIT"

@@ -137,6 +137,16 @@ def _cfg(key: str, default: Optional[str] = None) -> str:
 
 
 class JamBridge:
+    # Which jam_mode this bridge is responsible for. The backend now stamps
+    # every jam_request with jam_mode ("meghdut" = this built-in barrage jam,
+    # "operator" = the operator's own jammer handled by
+    # field-bridge/operator_jam_bridge.py's OperatorJamBridge subclass). Two
+    # bridges can share this one WS channel without double-firing: each acts
+    # ONLY on requests whose mode matches its own JAM_MODE (see
+    # _handles_mode below). A request with no jam_mode is treated as
+    # "meghdut" for backward compatibility.
+    JAM_MODE = "meghdut"
+
     def __init__(self) -> None:
         self.api_url = _cfg("CEMA_API_URL").rstrip("/")
         self.email = _cfg("CEMA_EMAIL")
@@ -239,10 +249,37 @@ class JamBridge:
         except Exception as e:
             log.warning("failed to send jam_ack (phase=%s) for request_id=%s: %s", phase, request_id, e)
 
+    # ---- mode routing (two bridges, one WS channel) --------------------
+    def _handles_mode(self, data: dict) -> bool:
+        """True iff THIS bridge should act on this jam_request. Each bridge
+        owns exactly one jam_mode; a request with no jam_mode defaults to
+        'meghdut'. This is a routing filter only — it is NOT a safety gate and
+        never relaxes one; the request the matching bridge DOES pick up still
+        passes every gate below unchanged."""
+        return (data.get("jam_mode") or "meghdut") == self.JAM_MODE
+
+    # ---- transmit (overridable so OperatorJamBridge can swap the radiator) --
+    def _do_transmit(self, params: dict, stop_event: threading.Event,
+                     on_started) -> dict:
+        """Perform the actual bounded, abortable RF transmission and return a
+        result dict {"ok", "stopped_early", "error"}. Default = MEGHDUT's
+        built-in barrage jam (hackrf_jam.transmit_burst). OperatorJamBridge
+        overrides ONLY this method to route through the operator's own jammer;
+        every gate in _handle_jam_request above it is shared, unchanged."""
+        return transmit_burst(
+            params["freq_mhz"], params["bandwidth_khz"], params["duration_s"],
+            params["tx_gain"], stop_event=stop_event, on_started=on_started)
+
     # ---- WS handling ---------------------------------------------------
     def _handle_jam_request(self, ws, data: dict) -> None:
         request_id = data.get("request_id")
         actor = data.get("actor", "?")
+
+        # ---- Mode routing (NOT a gate): ignore requests for the other jam
+        # mode so the meghdut and operator bridges never double-fire on the
+        # same shared WS channel. The matching bridge still runs every gate.
+        if not self._handles_mode(data):
+            return
 
         # ---- Gate A: live range-authorization check against the backend. --
         # Independent of anything the app already checked/forwarded in this
@@ -313,9 +350,18 @@ class JamBridge:
             )
             self._send_jam_ack(ws, request_id, "started", ok=True)
 
+        params = {
+            "band": band,
+            "freq_mhz": freq_mhz,
+            "bandwidth_khz": bandwidth_khz,
+            "duration_s": duration_s,
+            "tx_gain": tx_gain,
+            "request_id": request_id,
+            "actor": actor,
+        }
+
         def run() -> None:
-            result = transmit_burst(freq_mhz, bandwidth_khz, duration_s, tx_gain,
-                                    stop_event=stop_event, on_started=on_started)
+            result = self._do_transmit(params, stop_event, on_started)
             with self._active_lock:
                 if self._active_stop_event is stop_event:
                     self._active_stop_event = None

@@ -1319,6 +1319,18 @@ class JamRequestBody(BaseModel):
     bandwidth_khz: float = 500.0
     duration_s: float = 5.0  # server-side clamps to JAM_MAX_DURATION_S regardless
     tx_gain: int = 20
+    # jam_mode selects WHICH jammer radiates this (already fully-gated) request:
+    #   "meghdut"  (default) — the built-in HackRF barrage jam
+    #                          (field-bridge/hackrf_jam.py via jam_bridge.py).
+    #   "operator"           — the operator's OWN GNU Radio jammer
+    #                          (field-bridge/operator_jam_wrapper.py via
+    #                          operator_jam_bridge.py), for A/B comparison.
+    # It is NOT a new authorization path: both modes traverse the IDENTICAL
+    # spine (commander role + arm token + jam-confirm token + range-auth lease
+    # + tx_halt). It only changes the radiator and the audit label. Operator
+    # mode supports only the four bands the operator's per-band callers cover
+    # (see OPERATOR_JAM_BANDS / the deploy_jam validation below).
+    jam_mode: str = Field("meghdut", pattern="^(meghdut|operator)$")
     arm_token: str  # required unconditionally — jamming is always CRITICAL severity
     jam_confirm_token: str  # required unconditionally — see /jam/confirm
 
@@ -4889,6 +4901,13 @@ JAM_BAND_PRESETS_MHZ = {
 JAM_GNSS_BANDS = {"gps_l1", "galileo_e1", "beidou_b1", "glonass_l1"}
 JAM_MAX_DURATION_S = 10.0  # matches field-bridge/hackrf_jam.py's MAX_DURATION_S
 
+# Bands the OPERATOR'S own jammer covers (its per-band callers
+# cema_433/915/24/58.py -> 435/915/2450/5800 MHz). jam_mode="operator" is
+# restricted to these — the operator's flowgraph is band-fixed and does not
+# accept an arbitrary freq_mhz / the GNSS presets. Mirrors
+# field-bridge/operator_jam_wrapper.py's OPERATOR_BANDS keys.
+OPERATOR_JAM_BANDS = {"433", "915", "2g4", "5g8"}
+
 
 @api.post("/jam/confirm")
 async def jam_confirm(user: Dict = Depends(require_commander)):
@@ -4929,6 +4948,18 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
     # relying solely on the field-bridge's own poll at TX time.
     await _require_range_authorized("jam", user["email"])
 
+    # jam_mode routing (NOT a new authz path — every gate above already ran for
+    # both modes). Operator mode is band-fixed to the operator's own presets and
+    # rejects an arbitrary freq_mhz / the GNSS bands its flowgraph doesn't cover.
+    jam_mode = body.jam_mode
+    if jam_mode == "operator":
+        if body.freq_mhz is not None:
+            raise HTTPException(400, "Operator Jam mode is band-fixed — omit `freq_mhz` and "
+                                     "select one of its supported bands (433|915|2g4|5g8).")
+        if body.band not in OPERATOR_JAM_BANDS:
+            raise HTTPException(400, "Operator Jam mode supports only bands 433|915|2g4|5g8 "
+                                     "(its per-band callers cover 435/915/2450/5800 MHz).")
+
     freq_mhz = body.freq_mhz if body.freq_mhz is not None else JAM_BAND_PRESETS_MHZ.get(body.band)
     if not freq_mhz:
         raise HTTPException(400, "Provide either `band` (433|915|2g4|bt_2g4|5g8|gps_l1|galileo_e1|beidou_b1|"
@@ -4955,6 +4986,7 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
         "bandwidth_khz": body.bandwidth_khz,
         "duration_s": duration_s,
         "tx_gain": body.tx_gain,
+        "jam_mode": jam_mode,  # surfaced in GET /jam/status so the UI shows which jammer fired
         "actor": user["email"],
     }
 
@@ -4966,6 +4998,10 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
         "bandwidth_khz": body.bandwidth_khz,
         "duration_s": duration_s,
         "tx_gain": body.tx_gain,
+        # Routes the request to the correct bridge: jam_bridge.py (meghdut)
+        # vs operator_jam_bridge.py (operator). Each ignores the other's mode
+        # so the two bridges never double-fire on this shared WS channel.
+        "jam_mode": jam_mode,
         # Forwarded AFTER being consumed above — its presence here is the
         # bridge's evidence a real UI confirmation happened, not a live
         # credential the bridge itself validates against the backend.
@@ -4975,9 +5011,12 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
 
     await log_event(
         "JAM",
-        f"Requested RF jam burst: {freq_mhz} MHz, {body.bandwidth_khz}kHz BW, "
+        f"Requested RF jam burst [{jam_mode.upper()}]: {freq_mhz} MHz, {body.bandwidth_khz}kHz BW, "
         f"{duration_s}s, gain={body.tx_gain} — awaiting bridge TX confirmation (request {request_id})",
-        meta={"request_id": request_id, "freq_mhz": freq_mhz, "duration_s": duration_s},
+        # jam_mode is audited distinctly (OPERATOR vs MEGHDUT) so the mission
+        # log unambiguously records WHICH jammer radiated each burst.
+        meta={"request_id": request_id, "freq_mhz": freq_mhz, "duration_s": duration_s,
+              "jam_mode": jam_mode.upper()},
         actor=user["email"],
     )
     await ws_manager.broadcast_json({"type": "jam_status", "request_id": request_id, "status": "AWAITING_ACK"})
@@ -5009,6 +5048,7 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
         "bandwidth_khz": body.bandwidth_khz,
         "duration_s": duration_s,
         "tx_gain": body.tx_gain,
+        "jam_mode": jam_mode,  # which jammer fired: "meghdut" | "operator"
         # Additive, informational (never changes status/HTTP code): False means
         # "nothing will radiate — no jam bridge subscribed". Console warns on it.
         "tx_bridge_subscribed": tx_bridge_subscribed,

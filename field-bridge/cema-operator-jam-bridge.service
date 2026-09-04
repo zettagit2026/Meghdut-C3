@@ -1,0 +1,58 @@
+[Unit]
+Description=CEMA cUAS - OPERATOR jam bridge (operator's own jammer, WS-driven, bounded burst only)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as field-bridge/cema-jam-bridge.service. There is
+# deliberately only ONE copy of this unit in the repo; do not fork per-host
+# copies with hardcoded paths/users baked in. Keep host-specific values out of
+# this file — they belong in the EnvironmentFile below.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# This bridge runs the OPERATOR'S OWN jammer (their unmodified files under
+# OPERATOR_JAM_DIR) through the SAME governed spine as cema-jam-bridge.service.
+# See field-bridge/operator_jam_bridge.py + operator_jam_wrapper.py.
+#
+# The EnvironmentFile must define at minimum (same as the MEGHDUT jam bridge):
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+# and SHOULD define (to enable the honest "TX bridge subscribed" signal):
+#   CEMA_BRIDGE_TOKEN=<same shared secret as the backend + other bridge .env>
+#
+# TWO operator-jam-specific values are REQUIRED for this bridge to actually
+# radiate the operator's jammer:
+#   HACKRF_TX_SERIAL=<TX unit serial>   # e.g. the ...930c TX unit. The wrapper
+#                                       # FAILS CLOSED without it — it will NOT
+#                                       # fall back to index-based "hackrf=0"
+#                                       # (which could key the RX detection
+#                                       # radio). This is the one device-pin
+#                                       # safety override the wrapper imposes.
+#   OPERATOR_JAM_DIR=/CEMA/operator-jam # directory holding the operator's
+#                                       # UNMODIFIED files (cema_base.py, etc.).
+#                                       # These are imported as-is and NEVER
+#                                       # modified or copied into the repo.
+#
+# =====================================================================
+# CEMA_AUTHORIZED_RANGE — DELIBERATELY NOT SET IN THIS UNIT FILE.
+# =====================================================================
+# Identical to cema-jam-bridge.service: the live range-authorization lease is
+# an explicit, GUI-driven, auto-expiring per-deployment decision (checked LIVE
+# by the shared JamBridge spine at the moment of transmission via GET
+# /api/range-authorization/status?effect=jam). Do NOT bake any static
+# authorization into this committed unit, a shared default .env, or any image —
+# doing so would silently turn every deployment into a live transmitter.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u operator_jam_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/operator_jam_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/operator_jam_bridge.log
+
+[Install]
+WantedBy=multi-user.target
