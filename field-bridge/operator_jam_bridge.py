@@ -64,6 +64,7 @@ from operator_jam_wrapper import (
     ensure_operator_jam_available,
     run_operator_jam,
 )
+from range_auth_lease import RangeAuthLease, make_tx_halt_check
 
 log = logging.getLogger("operator-jam-bridge")
 
@@ -118,7 +119,14 @@ class OperatorJamBridge(JamBridge):
             # Honor a mid-burst EMERGENCY ABORT exactly like the MEGHDUT jam:
             # the base bridge sets self.tx_halted on abort AND sets stop_event;
             # we poll both so an abort kills an in-progress operator burst too.
-            tx_halt_check=lambda: self.tx_halted,
+            # LEASE-EXPIRY STOP (holistic, same as the MEGHDUT branch): also stop
+            # the operator jammer the instant the effect=jam range-auth lease
+            # expires mid-stream — re-polling the SAME live source (TTL-cached,
+            # fail-closed), so a continuous operator jam is not left running on a
+            # bare lease expiry either.
+            tx_halt_check=make_tx_halt_check(
+                lambda: self.tx_halted,
+                RangeAuthLease(lambda: self.is_range_authorized("jam"))),
             on_started=on_started,
         )
 

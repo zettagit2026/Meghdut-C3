@@ -121,6 +121,7 @@ import websocket  # websocket-client
 
 from hackrf_jam import transmit_iq_file
 import hackrf_jam
+from range_auth_lease import RangeAuthLease, make_tx_halt_check
 
 log = logging.getLogger("sdr-mavlink-inject-bridge")
 logging.basicConfig(level=logging.INFO,
@@ -359,6 +360,18 @@ class SdrMavlinkInjectBridge:
             # transmitting a malformed burst. fec toggles the Golay(24,12) layer.
             preamble = bytes.fromhex(str(data.get("preamble_hex", _inj.DEFAULT_PREAMBLE.hex())))
             sync_word = bytes.fromhex(str(data.get("sync_word_hex", _inj.DEFAULT_SYNC_WORD.hex())))
+            # Defense-in-depth (Claude L1): mirror the backend
+            # MavlinkSdrInjectBody.preamble_hex/sync_word_hex bound
+            # (pattern ^(?:[0-9a-fA-F]{2}){1,64}$ == 1..64 bytes) HERE at the
+            # bridge, inside this same try/except, so a malformed/oversized value
+            # can't drive a giant on-air preamble/sync even if the backend bound
+            # is ever bypassed (bytes.fromhex already rejects odd-length/non-hex).
+            if not (1 <= len(preamble) <= 64):
+                raise ValueError(
+                    f"preamble_hex must decode to 1..64 bytes (got {len(preamble)})")
+            if not (1 <= len(sync_word) <= 64):
+                raise ValueError(
+                    f"sync_word_hex must decode to 1..64 bytes (got {len(sync_word)})")
             fec = str(data.get("fec", _inj.DEFAULT_FEC))
             if fec not in _inj.FEC_CHOICES:
                 raise ValueError(f"unsupported fec {fec!r} (supports {list(_inj.FEC_CHOICES)})")
@@ -488,9 +501,17 @@ class SdrMavlinkInjectBridge:
             result = transmit_iq_file(
                 iq_path, params["center_freq_mhz"], tx_window_s, params["tx_gain"],
                 stop_event=stop_event, on_started=on_started,
-                # Poll tx_halt too so a continuous inject stops instantly on
-                # EMERGENCY ABORT even if the stop_event path is ever missed.
-                tx_halt_check=lambda: self.tx_halted)
+                # Poll tx_halt AND the live range-auth lease so a continuous
+                # inject stops instantly on EMERGENCY ABORT (even if the
+                # stop_event path is ever missed) AND terminates the instant the
+                # effect=mavlink_sdr_inject LEASE expires mid-stream — not only
+                # on an operator abort. Re-polls the SAME live source Gate A used
+                # at request start (is_range_authorized("mavlink_sdr_inject")),
+                # TTL-cached so per-poll checking never hammers the backend,
+                # fail-closed. Mirrors mavlink_takeover.py's _halted().
+                tx_halt_check=make_tx_halt_check(
+                    lambda: self.tx_halted,
+                    RangeAuthLease(lambda: self.is_range_authorized("mavlink_sdr_inject"))))
         finally:
             try:
                 os.unlink(iq_path)

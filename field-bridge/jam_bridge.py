@@ -125,6 +125,7 @@ from hackrf_jam import (
     transmit_burst,
     transmit_sweep,
 )
+from range_auth_lease import RangeAuthLease, make_tx_halt_check
 
 log = logging.getLogger("jam-bridge")
 logging.basicConfig(level=logging.INFO,
@@ -284,7 +285,18 @@ class JamBridge:
         polled here via tx_halt_check, so a continuous/swept jam is always
         switchable-off. OperatorJamBridge overrides ONLY this method to route
         through the operator's own jammer; every gate in _handle_jam_request
-        above it is shared, unchanged."""
+        above it is shared, unchanged.
+
+        LEASE-EXPIRY STOP (holistic): tx_halt_check now returns True on EITHER
+        local EMERGENCY ABORT (self.tx_halted) OR the range-auth LEASE going
+        unauthorized mid-stream — re-polling the SAME live source Gate A used at
+        request start (is_range_authorized("jam")), TTL-cached so per-frame
+        polling never hammers the backend, fail-closed. So a continuous/swept jam
+        stops within one poll interval of a bare lease expiry too, not only on an
+        operator abort — mirroring mavlink_takeover.py's _halted()."""
+        tx_halt_check = make_tx_halt_check(
+            lambda: self.tx_halted,
+            RangeAuthLease(lambda: self.is_range_authorized("jam")))
         if params.get("sweep"):
             return transmit_sweep(
                 params["freq_start_mhz"], params["freq_stop_mhz"],
@@ -292,15 +304,16 @@ class JamBridge:
                 step_mhz=params["step_mhz"], dwell_ms=params["dwell_ms"],
                 duration_s=params["duration_s"],
                 stop_event=stop_event, on_started=on_started,
-                tx_halt_check=lambda: self.tx_halted)
+                tx_halt_check=tx_halt_check)
         return transmit_burst(
             params["freq_mhz"], params["bandwidth_khz"], params["duration_s"],
             params["tx_gain"], stop_event=stop_event, on_started=on_started,
             # Pass tx_halt_check so the single-center continuous burst polls
-            # tx_halted DIRECTLY too (matching the sweep branch above and
-            # transmit_iq_file / operator paths) — both stop_event AND tx_halt
-            # are now independent stop triggers on ALL continuous paths.
-            tx_halt_check=lambda: self.tx_halted)
+            # tx_halted AND the live range-auth lease DIRECTLY too (matching the
+            # sweep branch above and transmit_iq_file / operator paths) —
+            # stop_event, tx_halt AND lease-expiry are all independent stop
+            # triggers on ALL continuous paths.
+            tx_halt_check=tx_halt_check)
 
     # ---- WS handling ---------------------------------------------------
     def _handle_jam_request(self, ws, data: dict) -> None:

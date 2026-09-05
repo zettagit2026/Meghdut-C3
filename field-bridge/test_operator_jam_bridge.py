@@ -184,3 +184,65 @@ def test_base_bridge_do_transmit_routes_sweep_to_transmit_sweep(monkeypatch):
     # tx_halt is polled so EMERGENCY ABORT stops an in-progress sweep.
     meghdut.tx_halted = True
     assert seen["tx_halt_check"]() is True
+
+
+def test_base_bridge_tx_halt_check_fires_on_range_auth_lease_expiry(monkeypatch):
+    # HOLISTIC lease-expiry stop: the tx_halt_check the base jam bridge hands to
+    # transmit_burst must return True when the effect=jam range-auth LEASE goes
+    # unauthorized mid-stream — NOT only on tx_halt. Proves a continuous jam
+    # stops on a bare lease expiry without any operator abort.
+    import jam_bridge
+    import range_auth_lease
+    monkeypatch.setattr(range_auth_lease, "DEFAULT_TTL_S", 0.0)  # re-check every call
+    meghdut, _ = _make_bridges()
+    authorized = {"v": True}
+    monkeypatch.setattr(meghdut, "is_range_authorized",
+                        lambda effect="jam": authorized["v"])
+
+    captured = {}
+
+    def fake_burst(freq, bw, dur, gain, **kwargs):
+        captured["thc"] = kwargs.get("tx_halt_check")
+        return {"ok": True, "stopped_early": False, "error": None}
+
+    monkeypatch.setattr(jam_bridge, "transmit_burst", fake_burst)
+    params = {"band": "915", "freq_mhz": 915.0, "bandwidth_khz": 500.0,
+              "duration_s": None, "tx_gain": 20, "sweep": False,
+              "request_id": "r7", "actor": "a"}
+    meghdut._do_transmit(params, threading.Event(), lambda _p: None)
+
+    thc = captured["thc"]
+    # Authorized + not halted -> keep transmitting.
+    assert meghdut.tx_halted is False
+    assert thc() is False
+    # Lease EXPIRES (no abort, tx_halt stays False) -> halt fires.
+    authorized["v"] = False
+    assert thc() is True
+
+
+def test_operator_bridge_tx_halt_check_fires_on_range_auth_lease_expiry(monkeypatch):
+    # Same holistic stop for the OPERATOR jammer branch (effect=jam lease).
+    import operator_jam_bridge
+    import range_auth_lease
+    monkeypatch.setattr(range_auth_lease, "DEFAULT_TTL_S", 0.0)
+    _, operator = _make_bridges()
+    authorized = {"v": True}
+    monkeypatch.setattr(operator, "is_range_authorized",
+                        lambda effect="jam": authorized["v"])
+
+    captured = {}
+
+    def fake_run(band, serial, duration_s, **kwargs):
+        captured["thc"] = kwargs.get("tx_halt_check")
+        return {"ok": True, "stopped_early": False, "error": None}
+
+    monkeypatch.setattr(operator_jam_bridge, "run_operator_jam", fake_run)
+    params = {"band": "2g4", "freq_mhz": 2450.0, "bandwidth_khz": 500.0,
+              "duration_s": None, "tx_gain": 20, "request_id": "r8", "actor": "a"}
+    operator._do_transmit(params, threading.Event(), lambda _p: None)
+
+    thc = captured["thc"]
+    assert operator.tx_halted is False
+    assert thc() is False
+    authorized["v"] = False
+    assert thc() is True

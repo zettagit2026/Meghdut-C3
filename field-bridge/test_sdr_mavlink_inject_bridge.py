@@ -417,6 +417,137 @@ def test_hackrf_tx_device_args_pins_serial_when_set(monkeypatch):
     assert hackrf_jam._tx_device_args() == ["-d", "TESTTX930c"]
 
 
+# ---------------------------------------------------------------------
+# HOLISTIC lease-expiry stop: the continuous inject must terminate when the
+# effect=mavlink_sdr_inject range-auth LEASE expires mid-stream, not only on
+# EMERGENCY ABORT / tx_halt.
+# ---------------------------------------------------------------------
+def test_continuous_inject_tx_halt_check_fires_on_range_auth_lease_expiry(monkeypatch):
+    import range_auth_lease
+    monkeypatch.setattr(range_auth_lease, "DEFAULT_TTL_S", 0.0)  # re-check every call
+    b = _bridge()
+    authorized = {"v": True}
+    monkeypatch.setattr(b, "is_range_authorized",
+                        lambda effect="mavlink_sdr_inject": authorized["v"])
+    captured = {}
+    _stub_modulation(monkeypatch, captured)
+
+    tx = {}
+
+    def fake_transmit(iq_path, freq_mhz, duration_s, tx_gain, stop_event=None,
+                      on_started=None, tx_halt_check=None):
+        tx["thc"] = tx_halt_check
+        tx["duration_s"] = duration_s
+        if on_started:
+            on_started(object())
+        return {"ok": True, "error": None, "stopped_early": False}
+
+    monkeypatch.setattr(sib, "transmit_iq_file", fake_transmit)
+    ws = FakeWS()
+    b._handle_inject_request(ws, _valid_request(continuous=True))
+    deadline = time.time() + 2
+    while time.time() < deadline and "thc" not in tx:
+        time.sleep(0.02)
+
+    assert tx["duration_s"] is None            # continuous loop
+    thc = tx["thc"]
+    assert callable(thc)
+    # Authorized + not halted -> keep transmitting.
+    assert b.tx_halted is False
+    assert thc() is False
+    # Lease EXPIRES mid-inject (no abort, tx_halt stays False) -> halt fires.
+    authorized["v"] = False
+    assert thc() is True
+
+
+def test_tx_halt_check_still_fires_instantly_on_abort(monkeypatch):
+    # Regression: EMERGENCY ABORT / tx_halt must STILL stop instantly (checked
+    # before the lease), even while the lease is fully authorized.
+    import range_auth_lease
+    monkeypatch.setattr(range_auth_lease, "DEFAULT_TTL_S", 0.0)
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized",
+                        lambda effect="mavlink_sdr_inject": True)
+    captured = {}
+    _stub_modulation(monkeypatch, captured)
+    tx = {}
+
+    def fake_transmit(iq_path, freq_mhz, duration_s, tx_gain, stop_event=None,
+                      on_started=None, tx_halt_check=None):
+        tx["thc"] = tx_halt_check
+        if on_started:
+            on_started(object())
+        return {"ok": True, "error": None, "stopped_early": False}
+
+    monkeypatch.setattr(sib, "transmit_iq_file", fake_transmit)
+    ws = FakeWS()
+    b._handle_inject_request(ws, _valid_request(continuous=True))
+    deadline = time.time() + 2
+    while time.time() < deadline and "thc" not in tx:
+        time.sleep(0.02)
+
+    thc = tx["thc"]
+    assert thc() is False           # authorized, not halted
+    b.tx_halted = True              # EMERGENCY ABORT
+    assert thc() is True            # halts instantly despite the armed lease
+
+
+# ---------------------------------------------------------------------
+# Defense-in-depth (Claude L1): bridge-side preamble/sync hex length bound
+# (mirrors the backend MavlinkSdrInjectBody 1..64-byte pattern).
+# ---------------------------------------------------------------------
+def test_oversized_preamble_hex_refused_at_bridge(monkeypatch):
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized",
+                        lambda effect="mavlink_sdr_inject": True)
+    captured = {}
+    _stub_modulation(monkeypatch, captured)
+    monkeypatch.setattr(sib, "transmit_iq_file",
+                        lambda *a, **k: {"ok": True, "error": None, "stopped_early": False})
+    ws = FakeWS()
+    # 65 bytes of hex -> exceeds the 64-byte bound.
+    b._handle_inject_request(ws, _valid_request(preamble_hex="AA" * 65))
+    assert ws.sent[0]["phase"] == "failed"
+    assert "preamble_hex" in ws.sent[0]["error"]
+    assert "write_kw" not in captured  # never reached modulation/transmit
+
+
+def test_oversized_sync_word_hex_refused_at_bridge(monkeypatch):
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized",
+                        lambda effect="mavlink_sdr_inject": True)
+    captured = {}
+    _stub_modulation(monkeypatch, captured)
+    monkeypatch.setattr(sib, "transmit_iq_file",
+                        lambda *a, **k: {"ok": True, "error": None, "stopped_early": False})
+    ws = FakeWS()
+    b._handle_inject_request(ws, _valid_request(sync_word_hex="BB" * 65))
+    assert ws.sent[0]["phase"] == "failed"
+    assert "sync_word_hex" in ws.sent[0]["error"]
+    assert "write_kw" not in captured
+
+
+def test_max_length_preamble_sync_hex_accepted(monkeypatch):
+    # Exactly 64 bytes each is still accepted (boundary), so a legitimate long
+    # framing is not over-rejected.
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized",
+                        lambda effect="mavlink_sdr_inject": True)
+    captured = {}
+    _stub_modulation(monkeypatch, captured)
+    monkeypatch.setattr(sib, "transmit_iq_file",
+                        lambda *a, **k: {"ok": True, "error": None, "stopped_early": False})
+    ws = FakeWS()
+    b._handle_inject_request(ws, _valid_request(
+        preamble_hex="AA" * 64, sync_word_hex="2D" * 64))
+    deadline = time.time() + 2
+    while time.time() < deadline and "write_kw" not in captured:
+        time.sleep(0.02)
+    assert "write_kw" in captured  # passed the bound and reached modulation
+    assert captured["write_kw"]["preamble"] == bytes.fromhex("AA" * 64)
+    assert captured["write_kw"]["sync_word"] == bytes.fromhex("2D" * 64)
+
+
 if __name__ == "__main__":
     import sys
     sys.exit(pytest.main([__file__, "-v"]))
