@@ -6,13 +6,10 @@ import Layout from "@/components/Layout";
 import Login from "@/pages/Login";
 import Dashboard from "@/pages/Dashboard";
 import Signals from "@/pages/Signals";
-import MavlinkConsole from "@/pages/MavlinkConsole";
-import Payloads from "@/pages/Payloads";
-import ProtocolLibrary from "@/pages/ProtocolLibrary";
-import ThreatLibrary from "@/pages/ThreatLibrary";
+import Library from "@/pages/Library";
+import Takeover from "@/pages/Takeover";
 import Jamming from "@/pages/Jamming";
 import GnssSpoof from "@/pages/GnssSpoof";
-import SdrMavlinkInject from "@/pages/SdrMavlinkInject";
 import KillChain from "@/pages/KillChain";
 import DetectionHistory from "@/pages/DetectionHistory";
 import MissionLog from "@/pages/MissionLog";
@@ -49,14 +46,12 @@ export default function App() {
           <Route path="/" element={<Protected><Layout /></Protected>}>
             <Route index element={<Navigate to="/dashboard" replace />} />
             <Route path="dashboard" element={<Dashboard />} />
+            {/* Signals is off-nav but kept routed for its ?contact= deep-link. */}
             <Route path="signals"   element={<Signals />} />
-            <Route path="mavlink"   element={<MavlinkConsole />} />
-            <Route path="payloads"  element={<Payloads />} />
-            <Route path="protocols" element={<ProtocolLibrary />} />
-            <Route path="threat-library" element={<ThreatLibrary />} />
+            <Route path="library"   element={<Library />} />
             <Route path="jamming"   element={<Jamming />} />
             <Route path="gnss-spoof" element={<GnssSpoof />} />
-            <Route path="sdr-mavlink-inject" element={<SdrMavlinkInject />} />
+            <Route path="takeover"  element={<Takeover />} />
             <Route path="killchain" element={<KillChain />} />
             <Route path="decision"  element={<DecisionSupport />} />
             <Route path="history"   element={<DetectionHistory />} />
@@ -64,6 +59,12 @@ export default function App() {
             <Route path="zones"     element={<Zones />} />
             <Route path="sop-rules" element={<SopRules />} />
             <Route path="logs"      element={<MissionLog />} />
+            {/* Retired-route redirects — keep old deep-links from 404-ing. */}
+            <Route path="threat-library"     element={<Navigate to="/library" replace />} />
+            <Route path="protocols"          element={<Navigate to="/library" replace />} />
+            <Route path="payloads"           element={<Navigate to="/takeover" replace />} />
+            <Route path="sdr-mavlink-inject" element={<Navigate to="/takeover" replace />} />
+            <Route path="mavlink"            element={<Navigate to="/takeover" replace />} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

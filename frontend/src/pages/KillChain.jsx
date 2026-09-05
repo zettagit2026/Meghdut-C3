@@ -3,7 +3,7 @@ import { useSearchParams } from "react-router-dom";
 import CytoscapeComponent from "react-cytoscapejs";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Crosshair, ChevronRight, CheckCircle2, Circle, Loader2, Skull, ShieldAlert } from "lucide-react";
+import { Crosshair, CheckCircle2, Circle, Loader2, Skull, ShieldAlert } from "lucide-react";
 import { getThreatHex } from "@/lib/threatLevels";
 import { useTheme } from "@/context/ThemeContext";
 
@@ -101,11 +101,6 @@ export default function KillChain() {
     }
     setSelectedId(deepLinkedId);
   }, [dets, deepLinkedId]);
-
-  const advance = async (id) => {
-    try { await api.post(`/detections/${id}/killchain-advance`); load(); }
-    catch (e) { toast.error("Advance failed", { description: formatApiError(e) }); }
-  };
 
   // Build cytoscape elements from the live detection list. This is pure
   // derived state -- recomputed on every `dets` poll tick, no separate
@@ -218,7 +213,7 @@ export default function KillChain() {
           is a companion visualization to the detail list below, not a
           replacement -- clicking a node highlights (and scrolls to) that
           contact's full detail row, which retains all WCAG icon+color
-          encoding, status badges, and the ADVANCE control. */}
+          encoding and status badges. */}
       <div
         className="tactical-border"
         style={{ background: "var(--bg-surface)" }}
@@ -277,7 +272,6 @@ export default function KillChain() {
           const awaitingAck = d.status === "AWAITING_ACK";
           const txFailed = d.status === "TX_FAILED";
           const txTimeout = d.status === "TX_TIMEOUT";
-          const terminalOrPending = defeated || awaitingAck || txFailed || txTimeout;
           const isDeepLinked = deepLinkedId === d.id || selectedId === d.id;
           return (
             <div key={d.id} data-testid={`kc-${d.id}`} id={`kc-row-${d.id}`}
@@ -298,16 +292,6 @@ export default function KillChain() {
                     {d.last_payload && <> · last-payload={d.last_payload}</>}
                   </div>
                 </div>
-                {!terminalOrPending && (
-                  <button
-                    data-testid={`kc-advance-${d.id}`}
-                    onClick={() => advance(d.id)}
-                    className="flex items-center gap-2 px-3 py-1.5 tactical-border font-mono text-[10px] uppercase tracking-widest hover-accent-info transition-colors scanline-btn"
-                    style={{ color: "var(--accent-info)", borderColor: "var(--accent-info)" }}
-                  >
-                    ADVANCE <ChevronRight size={12} strokeWidth={1.5} />
-                  </button>
-                )}
                 {awaitingAck && (
                   <span data-testid={`kc-status-${d.id}`}
                         className="px-3 py-1.5 tactical-border font-mono text-[10px] uppercase tracking-widest blink"

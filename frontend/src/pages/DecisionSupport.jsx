@@ -43,7 +43,7 @@ const THREAT_STYLE = {
 const EFFECTOR_ROUTE = {
   jam: { to: "/jamming", label: "RF BARRAGE JAM", icon: Radio },
   gnss_deny: { to: "/gnss-spoof", label: "GNSS SPOOF", icon: Satellite },
-  mavlink_takeover: { to: "/sdr-mavlink-inject", label: "SDR MAVLINK INJECT", icon: RadioTower },
+  mavlink_takeover: { to: "/takeover", label: "MAVLINK TAKEOVER", icon: RadioTower },
 };
 
 function VerdictBadge({ verdict, testid }) {
@@ -487,10 +487,10 @@ function PageHeader({ right }) {
           <Crosshair size={12} className="inline mr-2" strokeWidth={1.5} /> Decision / Effector-Selection Engine · RFI 4.5.3/4.5.4/4.5.6/4.5.7
         </div>
         <h1 className="font-heading font-black text-5xl uppercase tracking-tighter">
-          Decision Support
+          DECIDE
         </h1>
         <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500 mt-1">
-          Ranked, proposed effector recommendations · commander-authorized engagement only
+          Effector C2 · Ranked, proposed effector recommendations · commander-authorized engagement only
         </div>
       </div>
       {right}

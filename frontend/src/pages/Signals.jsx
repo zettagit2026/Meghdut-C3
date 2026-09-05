@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { Waves, ChevronRight, CheckCircle2 } from "lucide-react";
+import { Waves, CheckCircle2 } from "lucide-react";
 import SpectrumWaterfall from "@/components/SpectrumWaterfall";
 import SpectrumScope from "@/components/SpectrumScope";
 
@@ -57,15 +57,6 @@ export default function Signals() {
   useEffect(() => { if (deepLinkedId) load(); }, [deepLinkedId]); // eslint-disable-line
 
   const current = dets.find((d) => d.id === selected);
-
-  const advance = async () => {
-    if (!current) return;
-    try {
-      await api.post(`/detections/${current.id}/cema-advance`);
-      toast.success("CEMA stage advanced");
-      load();
-    } catch (e) { toast.error("Advance failed", { description: formatApiError(e) }); }
-  };
 
   return (
     <div className="space-y-6">
@@ -141,14 +132,6 @@ export default function Signals() {
                     {current.source && <> · SOURCE: <span className="text-slate-300">{current.source}</span></>}
                   </div>
                 </div>
-                <button
-                  data-testid="cema-advance-btn"
-                  onClick={advance}
-                  className="flex items-center gap-2 px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest hover-accent-info transition-colors scanline-btn"
-                  style={{ color: "var(--accent-info)", borderColor: "var(--accent-info)" }}
-                >
-                  ADVANCE STAGE <ChevronRight size={14} strokeWidth={1.5} />
-                </button>
               </div>
 
               <div className="space-y-0 tactical-border">

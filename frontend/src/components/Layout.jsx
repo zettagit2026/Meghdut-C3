@@ -14,27 +14,52 @@ import AutoManualToggle from "@/components/AutoManualToggle";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import {
-  Radar, Waves, Radio, Bomb, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History, MapPin, BookOpen,
-  Satellite, RadioTower, Target, Layers, Gauge,
+  Radar, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History, MapPin, BookOpen,
+  Satellite, RadioTower, Layers, Gauge,
 } from "lucide-react";
 
-const NAV = [
-  { to: "/dashboard",   label: "COMMAND CENTER",   icon: Radar,     testid: "nav-dashboard" },
-  { to: "/signals",     label: "SIGNAL ANALYSIS",  icon: Waves,     testid: "nav-signals" },
-  { to: "/mavlink",     label: "MAVLINK CONSOLE",  icon: Radio,     testid: "nav-mavlink" },
-  { to: "/payloads",    label: "PAYLOAD LIBRARY",  icon: Bomb,      testid: "nav-payloads" },
-  { to: "/protocols",   label: "PROTOCOL LIBRARY", icon: BookOpen,  testid: "nav-protocols" },
-  { to: "/threat-library", label: "THREAT LIBRARY", icon: Target,   testid: "nav-threat-library" },
-  { to: "/jamming",     label: "RF BARRAGE JAM",   icon: Zap,       testid: "nav-jamming" },
-  { to: "/gnss-spoof",  label: "GNSS SPOOF",       icon: Satellite, testid: "nav-gnss-spoof" },
-  { to: "/sdr-mavlink-inject", label: "SDR MAVLINK INJECT", icon: RadioTower, testid: "nav-sdr-mavlink-inject" },
-  { to: "/killchain",   label: "KILL CHAIN",       icon: Crosshair, testid: "nav-killchain" },
-  { to: "/decision",    label: "EFFECTOR C2",      icon: Gauge,     testid: "nav-decision" },
-  { to: "/history",     label: "DETECTION HISTORY",icon: History,   testid: "nav-history" },
-  { to: "/map",         label: "TACTICAL MAP",     icon: MapPin,    testid: "nav-map" },
-  { to: "/zones",       label: "ZONES",            icon: Layers,    testid: "nav-zones" },
-  { to: "/sop-rules",   label: "SOP RULES",        icon: ScrollText,testid: "nav-sop-rules" },
-  { to: "/logs",        label: "MISSION LOG",      icon: ScrollText,testid: "nav-logs" },
+// Grouped IA (FIGHT / PLAN / IDENTIFY / REVIEW). FIGHT stays always-visible —
+// the direct weapons (RF Jam / GNSS Deny / MAVLink Takeover) are never collapsed
+// behind DECIDE. Merged-away surfaces (Signals/MavlinkConsole/Payloads/Protocol
+// & Threat Library/SDR inject) are off-nav; their content lives in DECIDE, the
+// merged Library, and the merged Takeover pages.
+const NAV_GROUPS = [
+  {
+    key: "fight",
+    label: "FIGHT",
+    items: [
+      { to: "/dashboard", label: "COMMAND CENTER",   icon: Radar,     testid: "nav-dashboard" },
+      { to: "/map",       label: "TACTICAL MAP",     icon: MapPin,    testid: "nav-map" },
+      { to: "/killchain", label: "KILL CHAIN",       icon: Crosshair, testid: "nav-killchain" },
+      { to: "/decision",  label: "DECIDE",           icon: Gauge,     testid: "nav-decision" },
+      { to: "/jamming",   label: "RF JAM",           icon: Zap,       testid: "nav-jamming" },
+      { to: "/gnss-spoof",label: "GNSS DENY",        icon: Satellite, testid: "nav-gnss-spoof" },
+      { to: "/takeover",  label: "MAVLINK TAKEOVER", icon: RadioTower,testid: "nav-takeover" },
+    ],
+  },
+  {
+    key: "plan",
+    label: "PLAN",
+    items: [
+      { to: "/zones",     label: "ZONES",            icon: Layers,    testid: "nav-zones" },
+      { to: "/sop-rules", label: "SOP RULES",        icon: ScrollText,testid: "nav-sop-rules" },
+    ],
+  },
+  {
+    key: "identify",
+    label: "IDENTIFY",
+    items: [
+      { to: "/library",   label: "THREAT & PROTOCOL LIBRARY", icon: BookOpen, testid: "nav-library" },
+    ],
+  },
+  {
+    key: "review",
+    label: "REVIEW",
+    items: [
+      { to: "/history",   label: "DETECTION HISTORY",icon: History,   testid: "nav-history" },
+      { to: "/logs",      label: "MISSION LOG",      icon: ScrollText,testid: "nav-logs" },
+    ],
+  },
 ];
 
 export default function Layout() {
@@ -85,21 +110,32 @@ export default function Layout() {
             </div>
           </div>
 
-          <nav className="flex-1 py-4">
-            {NAV.map(({ to, label, icon: Icon, testid }) => (
-              <NavLink
-                key={to}
-                to={to}
-                data-testid={testid}
-                className={({ isActive }) =>
-                  `nav-link flex items-center gap-3 px-6 py-3 font-mono text-xs uppercase tracking-widest transition-colors ${
-                    isActive ? "is-active" : ""
-                  }`
-                }
-              >
-                <Icon size={16} strokeWidth={1.5} />
-                {label}
-              </NavLink>
+          <nav className="flex-1 py-2">
+            {NAV_GROUPS.map(({ key, label: groupLabel, items }, gi) => (
+              <div key={key} className={gi > 0 ? "tactical-border-t mt-2 pt-2" : ""}>
+                <div
+                  data-testid={`nav-group-${key}`}
+                  className="px-6 pt-2 pb-1 font-mono text-[9px] uppercase tracking-widest"
+                  style={{ color: "var(--text-muted)" }}
+                >
+                  {groupLabel}
+                </div>
+                {items.map(({ to, label, icon: Icon, testid }) => (
+                  <NavLink
+                    key={to}
+                    to={to}
+                    data-testid={testid}
+                    className={({ isActive }) =>
+                      `nav-link flex items-center gap-3 px-6 py-3 font-mono text-xs uppercase tracking-widest transition-colors ${
+                        isActive ? "is-active" : ""
+                      }`
+                    }
+                  >
+                    <Icon size={16} strokeWidth={1.5} />
+                    {label}
+                  </NavLink>
+                ))}
+              </div>
             ))}
           </nav>
 
