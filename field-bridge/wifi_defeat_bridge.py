@@ -116,6 +116,13 @@ from wifi_arsdk_encode import (
     encode_ardrone3_piloting,
     encode_tello,
 )
+from wifi_nic_mode import (
+    WifiNicModeBusy,
+    ensure_managed_associated,
+    ensure_monitor,
+    restore_safe,
+    wifi_nic_mode_lock,
+)
 
 log = logging.getLogger("wifi-defeat-bridge")
 logging.basicConfig(level=logging.INFO,
@@ -343,6 +350,10 @@ class WifiDefeatBridge:
             target_bssid = data.get("target_bssid")
             softap = data.get("softap")
             client_mac = data.get("client_mac")
+            # SSID of the drone's OPEN softAP (e.g. TELLO-* / ANAFI-* / DIRECT-*).
+            # Only used by the mode-arbiter for the managed-mode association
+            # (arsdk/tello); ignored for deauth.
+            ssid = data.get("ssid")
             channel = data.get("channel")
             if channel is not None:
                 channel = int(channel)
@@ -383,6 +394,7 @@ class WifiDefeatBridge:
             "target_bssid": target_bssid,
             "softap": softap,
             "client_mac": client_mac,
+            "ssid": ssid,
             "channel": channel,
             "count": count,
             "request_id": request_id,
@@ -390,10 +402,63 @@ class WifiDefeatBridge:
         }
 
         def run() -> None:
-            result = self._do_defeat(mode, params, stop_event, tx_halt_check, on_started)
-            with self._active_lock:
-                if self._active_stop_event is stop_event:
-                    self._active_stop_event = None
+            result: Optional[dict] = None
+            try:
+                # ---- MODE-EXCLUSIVITY: hold the NIC2 mode-arbiter lock across the
+                # WHOLE engagement (mode-switch -> transmit -> restore) so a
+                # concurrent request cannot corrupt NIC2's mode mid-op. A second
+                # contender gets WifiNicModeBusy and a clean failed ack — never a
+                # race. Mirrors jam_bridge's hackrf_device_lock discipline.
+                with wifi_nic_mode_lock():
+                    try:
+                        # ---- PRECONDITION (fail-closed, ADDITIONAL to Gates
+                        # A/B/C): put NIC2 into the REQUIRED mode BEFORE any TX.
+                        # deauth needs monitor; the arsdk/tello injects need
+                        # managed+associated to the open softAP. If the arbiter
+                        # returns not-ok, ABORT the request fail-closed — the
+                        # primitive is NEVER called, and a clean failed ack is
+                        # sent. The arbiter refuses fail-closed for any
+                        # non-WIFI_TX_IFACE, so this can never touch the detection
+                        # NIC.
+                        switch = self._switch_nic_mode(mode, params)
+                        if not switch.get("ok"):
+                            log.error(
+                                "REFUSING wifi_defeat_request %s (mode=%s): NIC2 mode-switch "
+                                "FAILED (fail-closed, NO TX): %s", request_id, mode, switch.get("error"))
+                            self._send_ack(
+                                ws, request_id, "failed", ok=False,
+                                error=f"bridge refused: NIC2 mode-switch failed before TX "
+                                      f"(fail-closed, no primitive called): {switch.get('error')}")
+                            return
+                        result = self._do_defeat(mode, params, stop_event, tx_halt_check, on_started)
+                    finally:
+                        # After the op completes OR on abort/stop (the primitive
+                        # returns stopped_early on abort), AND even after a failed
+                        # mode-switch (NIC2 may be half-configured), return NIC2 to
+                        # the SAFE baseline so it is NEVER left associated to a
+                        # drone AP. A restore failure is logged but — since it only
+                        # touches NIC2 — must NEVER block the halt.
+                        restore = restore_safe(params["iface"])
+                        if not restore.get("ok"):
+                            log.warning(
+                                "NIC2 restore_safe/teardown after wifi defeat FAILED (request %s): "
+                                "%s — NIC2 only, does NOT block the halt.",
+                                request_id, restore.get("error"))
+            except WifiNicModeBusy as e:
+                log.warning("REFUSING wifi_defeat_request %s: NIC2 mode-arbiter busy — another "
+                            "wifi-defeat engagement holds NIC2 (%s).", request_id, e)
+                self._send_ack(
+                    ws, request_id, "failed", ok=False,
+                    error=f"bridge refused: NIC2 mode-arbiter busy (another wifi-defeat op in "
+                          f"progress) — {e}")
+                return
+            finally:
+                with self._active_lock:
+                    if self._active_stop_event is stop_event:
+                        self._active_stop_event = None
+
+            if result is None:
+                return  # mode-switch failed -> failed ack already sent above.
             if result.get("stopped_early"):
                 log.warning("wifi defeat STOPPED EARLY by EMERGENCY ABORT / lease expiry (request %s).",
                            request_id)
@@ -406,6 +471,24 @@ class WifiDefeatBridge:
                 self._send_ack(ws, request_id, "failed", ok=False, error=result.get("error"))
 
         threading.Thread(target=run, name=f"wifi-defeat-{request_id}", daemon=True).start()
+
+    def _switch_nic_mode(self, mode: str, params: dict) -> dict:
+        """Put NIC2 (params['iface'] == WIFI_TX_IFACE) into the mode this request
+        needs BEFORE any TX, via the fail-closed wifi_nic_mode arbiter:
+          - deauth              -> ensure_monitor (monitor mode for injection)
+          - arsdk_*/tello_*     -> ensure_managed_associated (managed + associated
+                                   to the OPEN softAP + DHCP up)
+        Returns the arbiter's {"ok","error",...} dict (never raises). The arbiter
+        refuses fail-closed for any iface that is not the pinned WIFI_TX_IFACE, so
+        this can STRUCTURALLY never reconfigure the detection NIC."""
+        iface = params["iface"]
+        if mode == MODE_DEAUTH:
+            return ensure_monitor(iface, channel=params.get("channel"))
+        # arsdk_land/arsdk_emergency/tello_land/tello_emergency -> managed client
+        # associated to the drone's OPEN softAP (ssid/bssid) with L3 up.
+        return ensure_managed_associated(
+            iface, params.get("ssid"), params.get("target_bssid"),
+            channel=params.get("channel"))
 
     def _do_defeat(self, mode: str, params: dict, stop_event: threading.Event,
                    tx_halt_check, on_started) -> dict:

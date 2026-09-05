@@ -65,6 +65,7 @@ def _valid_request(request_id="req-1", mode="deauth", **overrides):
         "mode": mode,
         "target_bssid": "AA:BB:CC:DD:EE:FF",
         "softap": "192.168.42.1",
+        "ssid": "TELLO-9F1C2A",
         "client_mac": "11:22:33:44:55:66",
         "channel": 6,
         "count": 10,
@@ -81,28 +82,52 @@ def _wait_for_phase(ws, phase, timeout=2.0):
 
 
 def _stub_primitives(monkeypatch):
-    """Replace the P1 TX primitives + encoders with recording stubs so NO real
-    frame / datagram is transmitted. Returns a dict capturing each call."""
+    """Replace the P1 TX primitives + encoders AND the NIC mode-arbiter with
+    recording stubs so NO real frame / datagram is transmitted and NO real
+    iw/ip/dhclient runs. Returns a dict capturing each call, including the ordered
+    'calls' log so a test can assert the mode-switch happened BEFORE the TX
+    primitive."""
     cap = {"deauth": None, "arsdk": None, "tello": None,
-           "encode_arsdk": [], "encode_tello": []}
+           "encode_arsdk": [], "encode_tello": [],
+           "ensure_monitor": None, "ensure_managed": None, "restore_safe": [],
+           "calls": []}
+
+    def fake_ensure_monitor(iface, channel=None, runner=None):
+        cap["ensure_monitor"] = {"iface": iface, "channel": channel}
+        cap["calls"].append("ensure_monitor")
+        return {"ok": True, "error": None, "mode": "monitor", "iface": iface, "ran": []}
+
+    def fake_ensure_managed(iface, ssid, bssid, channel=None, runner=None):
+        cap["ensure_managed"] = {"iface": iface, "ssid": ssid, "bssid": bssid,
+                                 "channel": channel}
+        cap["calls"].append("ensure_managed")
+        return {"ok": True, "error": None, "mode": "managed", "iface": iface, "ran": []}
+
+    def fake_restore_safe(iface, runner=None):
+        cap["restore_safe"].append(iface)
+        cap["calls"].append("restore_safe")
+        return {"ok": True, "error": None, "mode": "safe", "iface": iface, "ran": []}
 
     def fake_send_deauth(iface, target_bssid, client_mac, channel, count,
                          stop_event=None, tx_halt_check=None, frame_sender=None):
         cap["deauth"] = {"iface": iface, "target_bssid": target_bssid,
                          "client_mac": client_mac, "channel": channel,
                          "count": count, "tx_halt_check": tx_halt_check}
+        cap["calls"].append("send_deauth")
         return {"ok": True, "error": None, "stopped_early": False, "frames_sent": 1}
 
     def fake_inject_arsdk(iface, softap, command_bytes,
                           stop_event=None, tx_halt_check=None, udp_sender=None):
         cap["arsdk"] = {"iface": iface, "softap": softap,
                         "command_bytes": command_bytes, "tx_halt_check": tx_halt_check}
+        cap["calls"].append("inject_arsdk")
         return {"ok": True, "error": None, "stopped_early": False, "bytes_sent": len(command_bytes)}
 
     def fake_tello(iface, softap, command,
                    stop_event=None, tx_halt_check=None, udp_sender=None):
         cap["tello"] = {"iface": iface, "softap": softap, "command": command,
                         "tx_halt_check": tx_halt_check}
+        cap["calls"].append("tello_command")
         return {"ok": True, "error": None, "stopped_early": False, "bytes_sent": len(command)}
 
     def fake_encode_arsdk(command, **kw):
@@ -118,7 +143,50 @@ def _stub_primitives(monkeypatch):
     monkeypatch.setattr(wdb, "tello_command", fake_tello)
     monkeypatch.setattr(wdb, "encode_ardrone3_piloting", fake_encode_arsdk)
     monkeypatch.setattr(wdb, "encode_tello", fake_encode_tello)
+    monkeypatch.setattr(wdb, "ensure_monitor", fake_ensure_monitor)
+    monkeypatch.setattr(wdb, "ensure_managed_associated", fake_ensure_managed)
+    monkeypatch.setattr(wdb, "restore_safe", fake_restore_safe)
     return cap
+
+
+# ---------------------------------------------------------------------
+# Test isolation: join stray dispatch threads (root-cause fix for an
+# order-dependent leak — see docstring below).
+# ---------------------------------------------------------------------
+@pytest.fixture(autouse=True)
+def _join_stray_defeat_threads():
+    """`_handle_defeat_request` dispatches every request that clears Gates
+    A-C on a fire-and-forget daemon thread named f"wifi-defeat-{request_id}"
+    (see wifi_defeat_bridge.py's `run()` / `threading.Thread(...).start()`).
+    `_wait_for_phase()` only polls the FakeWS's `sent` list up to a timeout —
+    it does NOT guarantee the underlying thread has actually returned by the
+    time a test's assertions run.
+
+    Because `_stub_primitives()` stubs the P1 primitives + encoders by
+    monkeypatching wifi_defeat_bridge (wdb)'s MODULE-level attributes (shared
+    process-wide, not per-test), a straggling thread from an EARLIER test that
+    is still mid-flight when a LATER test calls `_stub_primitives()` again
+    will call into the LATER test's freshly-installed fakes — appending its
+    own recorded call onto the LATER test's `cap`, corrupting exact
+    call-count/order assertions (e.g. `cap["encode_arsdk"] == ["land"]`
+    becomes `["land", "land"]`). This only shows up under sibling-suite load
+    (more threads => more scheduling delay before a straggler's call lands),
+    which is exactly the order-dependent failure this fixture eliminates.
+
+    Fix: join every "wifi-defeat-*" thread before AND after each test, so no
+    dispatch thread from a previous test can still be alive when this test's
+    (or the next test's) `_stub_primitives()` fakes are in place. Threads are
+    daemon and short-lived (they only await already-fired stop_events / fake
+    primitives that return immediately), so a bounded join is safe and fast.
+    """
+    def _join_stragglers():
+        for t in threading.enumerate():
+            if t is not threading.current_thread() and t.name.startswith("wifi-defeat-"):
+                t.join(timeout=5.0)
+
+    _join_stragglers()
+    yield
+    _join_stragglers()
 
 
 # ---------------------------------------------------------------------
@@ -529,6 +597,176 @@ def test_bad_channel_refused_cleanly(monkeypatch):
     b._handle_defeat_request(ws, _valid_request(mode="deauth", channel="not-a-number"))
     assert ws.sent[0]["phase"] == "failed"
     assert "invalid wifi_defeat parameters" in ws.sent[0]["error"]
+    assert cap["deauth"] is None
+
+
+# ---------------------------------------------------------------------
+# NIC mode-arbiter wiring (P6): the required NIC2 mode is set BEFORE the TX
+# primitive, an arbiter failure aborts fail-closed with NO primitive call, and
+# NIC2 is restored/torn-down after the op.
+# ---------------------------------------------------------------------
+def test_deauth_calls_ensure_monitor_before_send_deauth(monkeypatch):
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect: True)
+    cap = _stub_primitives(monkeypatch)
+    ws = FakeWS()
+    b._handle_defeat_request(ws, _valid_request(mode="deauth"))
+    _wait_for_phase(ws, "complete")
+    # ensure_monitor ran, on the pinned TX NIC, with the request's channel.
+    assert cap["ensure_monitor"] == {"iface": "wlan1", "channel": 6}
+    assert cap["ensure_managed"] is None
+    # Order: monitor mode set, THEN the deauth TX, THEN restore.
+    assert cap["calls"].index("ensure_monitor") < cap["calls"].index("send_deauth")
+    assert "restore_safe" in cap["calls"]
+    assert cap["calls"].index("send_deauth") < cap["calls"].index("restore_safe")
+
+
+def test_arsdk_calls_ensure_managed_associated_before_inject(monkeypatch):
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect: True)
+    cap = _stub_primitives(monkeypatch)
+    ws = FakeWS()
+    b._handle_defeat_request(ws, _valid_request(mode="arsdk_land"))
+    _wait_for_phase(ws, "complete")
+    # managed+associated to the OPEN softAP (ssid/bssid) before the inject.
+    assert cap["ensure_managed"] == {"iface": "wlan1", "ssid": "TELLO-9F1C2A",
+                                     "bssid": "AA:BB:CC:DD:EE:FF", "channel": 6}
+    assert cap["ensure_monitor"] is None
+    assert cap["calls"].index("ensure_managed") < cap["calls"].index("inject_arsdk")
+    assert cap["calls"].index("inject_arsdk") < cap["calls"].index("restore_safe")
+
+
+def test_tello_calls_ensure_managed_associated_before_send(monkeypatch):
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect: True)
+    cap = _stub_primitives(monkeypatch)
+    ws = FakeWS()
+    b._handle_defeat_request(ws, _valid_request(mode="tello_land"))
+    _wait_for_phase(ws, "complete")
+    assert cap["ensure_managed"] is not None
+    assert cap["calls"].index("ensure_managed") < cap["calls"].index("tello_command")
+
+
+def test_arbiter_failure_aborts_with_no_primitive_call(monkeypatch):
+    """If the NIC2 mode-switch fails, the request is refused fail-closed: NO
+    primitive is called and a clean failed ack is sent."""
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect: True)
+    cap = _stub_primitives(monkeypatch)
+    monkeypatch.setattr(
+        wdb, "ensure_monitor",
+        lambda iface, channel=None, runner=None: {
+            "ok": False, "error": "REFUSING NIC mode-switch (fail-closed): iface does not match",
+            "mode": "monitor", "iface": iface, "ran": []})
+    ws = FakeWS()
+    b._handle_defeat_request(ws, _valid_request(mode="deauth"))
+    _wait_for_phase(ws, "failed")
+    phases = [m["phase"] for m in ws.sent]
+    assert "started" not in phases          # NO TX started
+    assert "failed" in phases
+    failed = [m for m in ws.sent if m["phase"] == "failed"][0]
+    assert "NIC2 mode-switch failed" in failed["error"]
+    assert cap["deauth"] is None            # primitive NEVER called
+
+
+def test_arbiter_failure_still_restores_nic(monkeypatch):
+    """Even when the mode-switch fails, NIC2 is returned to the safe baseline
+    (restore is called in the finally)."""
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect: True)
+    cap = _stub_primitives(monkeypatch)
+    monkeypatch.setattr(
+        wdb, "ensure_monitor",
+        lambda iface, channel=None, runner=None: {
+            "ok": False, "error": "switch failed", "mode": "monitor", "iface": iface, "ran": []})
+    ws = FakeWS()
+    b._handle_defeat_request(ws, _valid_request(mode="deauth"))
+    _wait_for_phase(ws, "failed")
+    assert cap["restore_safe"] == ["wlan1"]
+
+
+def test_restore_failure_does_not_block_completion(monkeypatch):
+    """A restore_safe failure only touches NIC2 — it is logged but must NOT turn a
+    successful defeat into a failure or block the halt."""
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect: True)
+    cap = _stub_primitives(monkeypatch)
+    monkeypatch.setattr(
+        wdb, "restore_safe",
+        lambda iface, runner=None: {"ok": False, "error": "restore failed",
+                                    "mode": "safe", "iface": iface, "ran": []})
+    ws = FakeWS()
+    b._handle_defeat_request(ws, _valid_request(mode="deauth"))
+    _wait_for_phase(ws, "complete")
+    assert any(m["phase"] == "complete" for m in ws.sent)
+
+
+def test_abort_triggers_teardown(monkeypatch):
+    """When an in-progress deauth is aborted mid-flight (the primitive returns
+    stopped_early), NIC2 is still torn down to the safe baseline."""
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect: True)
+    cap = _stub_primitives(monkeypatch)
+
+    aborted = threading.Event()
+
+    def blocking_deauth(iface, target_bssid, client_mac, channel, count,
+                        stop_event=None, tx_halt_check=None, frame_sender=None):
+        cap["deauth"] = {"iface": iface, "target_bssid": target_bssid}
+        cap["calls"].append("send_deauth")
+        # Simulate a continuous deauth that runs until EMERGENCY ABORT fires the
+        # stop_event, then returns stopped_early (as the real primitive does).
+        stop_event.wait(2.0)
+        aborted.set()
+        return {"ok": True, "error": None, "stopped_early": True, "frames_sent": 5}
+
+    monkeypatch.setattr(wdb, "send_deauth", blocking_deauth)
+    ws = FakeWS()
+    req = _valid_request(mode="deauth")
+    del req["count"]  # continuous
+    b._handle_defeat_request(ws, req)
+
+    # Wait for the deauth loop to be in-flight, then fire the abort branch.
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        with b._active_lock:
+            active = b._active_stop_event
+        if active is not None:
+            break
+        time.sleep(0.02)
+    b.tx_halted = True
+    with b._active_lock:
+        active = b._active_stop_event
+    assert active is not None
+    active.set()
+
+    assert aborted.wait(2.0)
+    _wait_for_phase(ws, "stopped")
+    assert any(m["phase"] == "stopped" for m in ws.sent)
+    # NIC2 torn down after the aborted op.
+    assert cap["restore_safe"] == ["wlan1"]
+
+
+def test_concurrent_request_gets_busy_when_lock_held(monkeypatch):
+    """The mode-arbiter lock serializes NIC2: when the lock cannot be acquired
+    (another engagement holds it), the request is refused fail-closed with a
+    'busy' failed ack rather than racing the mode — and NO primitive is called."""
+    import contextlib
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect: True)
+    cap = _stub_primitives(monkeypatch)
+
+    @contextlib.contextmanager
+    def busy_lock(*a, **k):
+        raise wdb.WifiNicModeBusy("NIC2 mode-arbiter held by another engagement")
+        yield  # pragma: no cover — unreachable, keeps this a generator
+
+    monkeypatch.setattr(wdb, "wifi_nic_mode_lock", busy_lock)
+    ws = FakeWS()
+    b._handle_defeat_request(ws, _valid_request(mode="deauth"))
+    _wait_for_phase(ws, "failed")
+    failed = [m for m in ws.sent if m["phase"] == "failed"]
+    assert failed and "busy" in failed[0]["error"].lower()
     assert cap["deauth"] is None
 
 
