@@ -162,6 +162,43 @@ def test_continuous_flag_defaults_false_and_accepts_true():
     assert body2.continuous is True
 
 
+def test_phy_preamble_sync_fec_defaults_and_validation():
+    # Defaults mirror the module PHY defaults.
+    body = srv.MavlinkSdrInjectBody(target_detection_id="det-1",
+                                    arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+    assert body.preamble_hex == "AAAAAAAA" and body.sync_word_hex == "2DD4"
+    assert body.fec == "none"
+    # golay accepted; a bogus fec rejected.
+    ok = srv.MavlinkSdrInjectBody(target_detection_id="det-1", fec="golay",
+                                  arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+    assert ok.fec == "golay"
+    with pytest.raises(Exception):
+        srv.MavlinkSdrInjectBody(target_detection_id="det-1", fec="turbo",
+                                 arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+    # non-hex / odd-length / empty preamble+sync rejected (must be whole bytes).
+    for bad in ("ZZ", "AAA", ""):
+        with pytest.raises(Exception):
+            srv.MavlinkSdrInjectBody(target_detection_id="det-1", preamble_hex=bad,
+                                     arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+        with pytest.raises(Exception):
+            srv.MavlinkSdrInjectBody(target_detection_id="det-1", sync_word_hex=bad,
+                                     arm_token="a" * 36, mavlink_sdr_inject_confirm_token="b" * 36)
+
+
+def test_phy_framing_forwarded_to_bridge(monkeypatch):
+    """The operator-set preamble / sync word / FEC reach the field bridge via the
+    mavlink_inject_request WS message (not silently dropped)."""
+    events, broadcasts = _stub_spine(monkeypatch)
+    asyncio.run(srv.deploy_mavlink_sdr_inject(
+        _body(preamble_hex="AAAAAAAAAAAA", sync_word_hex="1337", fec="golay"), user=USER))
+    reqs = [m for m in broadcasts if m.get("type") == "mavlink_inject_request"]
+    assert reqs, "no mavlink_inject_request broadcast emitted"
+    r = reqs[0]
+    assert r["preamble_hex"] == "AAAAAAAAAAAA"
+    assert r["sync_word_hex"] == "1337"
+    assert r["fec"] == "golay"
+
+
 # ---------------------------------------------------------------------
 # Distinct effect wiring
 # ---------------------------------------------------------------------

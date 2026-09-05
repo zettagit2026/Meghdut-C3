@@ -214,6 +214,13 @@ export default function Payloads() {
   const [target, setTarget] = useState("");
   const [gate, setGate] = useState({ open: false, pl: null, broadcast: false, fratricide: false });
   const [authorizing, setAuthorizing] = useState(false);
+  // Per-payload operator parameters surfaced in the card:
+  //   PL-008 RTH HOME-SPOOF: the FALSE home coordinates injected via DO_SET_HOME.
+  //   PL-011 MANEUVER TAKEOVER: the operator-controlled engagement window / continuous.
+  //   PL-005 PROPELLER STOP: how many rotors to stop.
+  const [spoof, setSpoof] = useState({ lat: "", lon: "", alt: "" });
+  const [motorCount, setMotorCount] = useState(4);
+  const [takeover, setTakeover] = useState({ duration_s: 8, continuous: false });
 
   const load = async () => {
     try {
@@ -315,11 +322,25 @@ export default function Payloads() {
         });
         arm_token = arm.arm_token;
       }
+      // Per-payload operator parameters — only sent for the payload they apply
+      // to (the backend ignores them for others, but keep the request tight).
+      const extra = {};
+      if (pl.id === "PL-008") {
+        if (spoof.lat !== "") extra.spoof_lat = Number(spoof.lat);
+        if (spoof.lon !== "") extra.spoof_lon = Number(spoof.lon);
+        if (spoof.alt !== "") extra.spoof_alt = Number(spoof.alt);
+      } else if (pl.id === "PL-005") {
+        extra.motor_count = Number(motorCount);
+      } else if (pl.id === "PL-011") {
+        extra.duration_s = Number(takeover.duration_s);
+        extra.continuous = !!takeover.continuous;
+      }
       const { data } = await api.post("/payloads/deploy", {
         payload_id: pl.id,
         target_detection_id: broadcast ? null : target,
         broadcast,
         arm_token,
+        ...extra,
         // Only ever set for a deliberate, commander-authorized fratricide
         // engagement. Omitted entirely for every routine (non-friendly) deploy.
         ...(iffAck ? { iff_friendly_fire_ack: iffAck } : {}),
@@ -498,10 +519,15 @@ export default function Payloads() {
       <div className="tactical-border p-4 flex items-start gap-3" style={{ background: "color-mix(in srgb, var(--accent-critical) 10%, var(--bg-surface))" }}>
         <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
         <div className="font-mono text-xs text-slate-300">
-          <span className="font-bold" style={{ color: "var(--accent-critical)" }}>WARNING:</span>{" "}
-          Payload deployment generates a valid MAVLink COMMAND_LONG frame with real CRC-16/MCRF4XX and
-          transmits it on the internal WebSocket bus. When routed to a real SDR TX chain this becomes a
-          kinetic/logical attack. Evaluation build only.
+          <span className="font-bold" style={{ color: "var(--accent-critical)" }}>WARNING — REAL WHEN DEPLOYED:</span>{" "}
+          Each payload builds a byte-accurate MAVLink frame (real CRC-16/MCRF4XX) and, when a TX bridge is
+          subscribed and owns the radio, transmits it for real — over the SiK radio, or as real RF via the
+          pinned HackRF — through the full arm / IFF / range-auth / tx_halt / device-pin spine. Against an
+          unencrypted / legacy-MAVLink target this is a real kinetic/logical effect (force-land, disarm,
+          flight-termination, spoof-home→RTH, all-motor stop, controlled-landing takeover). It is NOT a
+          guaranteed kill, and it does NOT apply to encrypted / FHSS links (DJI, ELRS/CRSF, DSMX…) — jamming
+          is the defeat there. GNSS-telemetry denial is protocol-level only; true GNSS spoof stays
+          acquisition-plausible with receiver-lock unproven.
         </div>
       </div>
 
@@ -546,6 +572,51 @@ export default function Payloads() {
                 >
                   Broadcast-only
                 </span>
+              </div>
+            )}
+            {p.id === "PL-008" && (
+              <div data-testid="pl008-spoof-inputs" className="mt-3 space-y-2">
+                <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
+                  Spoofed HOME (false coordinates → RTH)
+                </div>
+                <div className="grid grid-cols-3 gap-2">
+                  <input data-testid="pl008-lat" type="number" step="0.0001" placeholder="lat -90..90"
+                    value={spoof.lat} onChange={(e) => setSpoof((s) => ({ ...s, lat: e.target.value }))}
+                    className="tactical-input tactical-border px-2 py-1 font-mono text-[11px] focus:outline-none focus-accent-info" />
+                  <input data-testid="pl008-lon" type="number" step="0.0001" placeholder="lon -180..180"
+                    value={spoof.lon} onChange={(e) => setSpoof((s) => ({ ...s, lon: e.target.value }))}
+                    className="tactical-input tactical-border px-2 py-1 font-mono text-[11px] focus:outline-none focus-accent-info" />
+                  <input data-testid="pl008-alt" type="number" step="1" placeholder="alt m"
+                    value={spoof.alt} onChange={(e) => setSpoof((s) => ({ ...s, alt: e.target.value }))}
+                    className="tactical-input tactical-border px-2 py-1 font-mono text-[11px] focus:outline-none focus-accent-info" />
+                </div>
+              </div>
+            )}
+            {p.id === "PL-005" && (
+              <div data-testid="pl005-motor-input" className="mt-3">
+                <label className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
+                  Motors to stop (1–8)
+                  <input data-testid="pl005-motor-count" type="number" min={1} max={8} step={1}
+                    value={motorCount}
+                    onChange={(e) => setMotorCount(Math.min(8, Math.max(1, Number(e.target.value) || 1)))}
+                    className="mt-1 w-full tactical-input tactical-border px-2 py-1 font-mono text-[11px] focus:outline-none focus-accent-info" />
+                </label>
+              </div>
+            )}
+            {p.id === "PL-011" && (
+              <div data-testid="pl011-takeover-inputs" className="mt-3 space-y-2">
+                <label className="block font-mono text-[10px] uppercase tracking-widest text-slate-500">
+                  Engagement window (s) — operator-controlled, no cap
+                  <input data-testid="pl011-duration" type="number" min={1} step={1}
+                    value={takeover.duration_s} disabled={takeover.continuous}
+                    onChange={(e) => setTakeover((t) => ({ ...t, duration_s: Number(e.target.value) || 1 }))}
+                    className="mt-1 w-full tactical-input tactical-border px-2 py-1 font-mono text-[11px] focus:outline-none focus-accent-info disabled:opacity-40" />
+                </label>
+                <label className="flex items-center gap-2 font-mono text-[11px] text-slate-300">
+                  <input data-testid="pl011-continuous" type="checkbox" checked={takeover.continuous}
+                    onChange={(e) => setTakeover((t) => ({ ...t, continuous: e.target.checked }))} />
+                  Continuous until stop (EMERGENCY ABORT / tx_halt ends it)
+                </label>
               </div>
             )}
             <div className="mt-4 grid grid-cols-2 gap-0 tactical-border">

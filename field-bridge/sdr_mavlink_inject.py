@@ -54,16 +54,25 @@ v1 targets a FIXED-FREQUENCY, UNENCRYPTED MAVLink telemetry link. Concretely:
   MODEL FIDELITY of the PHY itself (read before trusting against real hardware):
     * The GFSK modulator here (Gaussian-shaped 2-FSK, configurable BT / air-rate
       / deviation) is the correct modulation FAMILY for these radios and is
-      byte-accurate on the MAVLink payload. What it does NOT reproduce is the
-      exact vendor packet handler: SiK/Si10xx wraps the payload in its own
-      preamble, sync word, Golay/FEC coding and interleaving. This module ships
-      a GENERIC, PARAMETERIZED framer (configurable preamble + sync word, NO FEC)
-      that matches a "transparent GFSK serial carrying raw MAVLink, FEC/MAVLink-
-      framing off" target. Matching a specific SiK build's on-air framing
-      (Golay FEC, exact sync/whitening, on-air bit order) is a per-target
-      calibration step that must be verified against a real capture — see
-      "REMAINING". So: this is an HONEST PHY model of the modulation, NOT a
-      drop-in clone of any one radio's full link layer.
+      byte-accurate on the MAVLink payload. What it does NOT reproduce, out of
+      the box, is the exact vendor packet handler: SiK/Si10xx wraps the payload
+      in its own preamble, sync word, Golay/FEC coding, whitening and
+      interleaving. This module ships a GENERIC, PARAMETERIZED framer with
+      OPERATOR-SETTABLE preamble + sync word and an OPTIONAL Golay(24,12) FEC
+      layer (fec="golay") — the same extended-Golay code SiK/RFD900 use on the
+      payload. With FEC off it matches a "transparent GFSK serial carrying raw
+      MAVLink, FEC/MAVLink-framing off" target; with FEC on it matches a
+      Golay-coded SiK-style target.
+      HONEST LIMIT (do NOT overclaim): matching a specific build's on-air framing
+      still depends on getting the TARGET's ACTUAL parameters right — the exact
+      preamble length / sync word, WHETHER Golay is on, whitening (NOT
+      implemented here), interleaving, and on-air bit order — all of which must
+      be VERIFIED against a real capture of that link. Getting preamble/sync/FEC
+      to match RAISES the probability the target's packet handler accepts the
+      burst; it does NOT GUARANTEE decode (whitening/interleaving/bit-order
+      mismatches will still fail it). So: this is an HONEST, now-more-configurable
+      PHY model of the modulation, NOT a drop-in clone of any one radio's full
+      link layer.
 
   => Correct one-line claim: "injects MAVLink command frames over the air into
      a fixed-frequency unencrypted MAVLink link, no pairing required." NOT
@@ -153,6 +162,15 @@ DEFAULT_SYNC_WORD = b"\x2D\xD4"
 # as a parameter for exactly that reason. Default 'msb' (common radio default).
 DEFAULT_BIT_ORDER = "msb"
 
+# Optional forward-error-correction applied to the PAYLOAD (the MAVLink frame
+# bits), NOT the preamble/sync (which are for acquisition). "none" = transparent
+# raw bits; "golay" = extended Golay(24,12), the SAME FEC SiK/RFD900 use. HONEST
+# SCOPE: enabling this matches a Golay-coded target and RAISES decode probability
+# there — it does NOT add whitening/interleaving and does NOT guarantee a real
+# receiver accepts the burst (see the fidelity note at the top of this file).
+FEC_CHOICES = ("none", "golay")
+DEFAULT_FEC = "none"
+
 # Peak IQ amplitude (int8). Matches hackrf_jam.build_noise_iq()'s ~100 posture,
 # leaving headroom under the +/-127 int8 clip. A constant-envelope GFSK signal
 # sits at this magnitude the whole burst.
@@ -223,15 +241,129 @@ def bits_to_bytes(bits, bit_order: str = DEFAULT_BIT_ORDER) -> bytes:
     return packed.tobytes()
 
 
+def _validate_fec(fec: str) -> str:
+    f = str(fec).lower()
+    if f not in FEC_CHOICES:
+        raise ValueError(f"fec must be one of {FEC_CHOICES}, got {fec!r}")
+    return f
+
+
+# =============================================================================
+# Optional extended Golay(24,12) FEC — the SAME code SiK/RFD900 apply to their
+# payload. This is a REAL, self-consistent systematic encoder [I|B] plus an
+# arithmetic syndrome decoder that corrects up to 3 bit errors per 24-bit word,
+# so a burst is decodable through a noisy channel and the modulate->demodulate
+# round-trip (and a single-bit-error test) can prove it. B is the standard
+# symmetric extended-Golay parity matrix (rows below, MSB = leftmost column).
+# Reimplemented cleanly from the public code definition — no third-party code.
+# =============================================================================
+_GOLAY_B = (
+    0b110111000101, 0b101110001011, 0b011100010111, 0b111000101101,
+    0b110001011011, 0b100010110111, 0b000101101111, 0b001011011101,
+    0b010110111001, 0b101101110001, 0b011011100011, 0b111111111110,
+)
+
+
+def _popcount(x: int) -> int:
+    return bin(x).count("1")
+
+
+def _golay_parity(m: int) -> int:
+    """12-bit parity word m·B (== B·m, B symmetric): XOR of the B rows selected
+    by the set bits of the 12-bit dataword m."""
+    p = 0
+    for i in range(12):
+        if (m >> (11 - i)) & 1:
+            p ^= _GOLAY_B[i]
+    return p
+
+
+def golay_encode12(m: int) -> int:
+    """Systematic encode of a 12-bit dataword to a 24-bit codeword [data|parity]."""
+    return ((m & 0xFFF) << 12) | _golay_parity(m & 0xFFF)
+
+
+def golay_decode24(r: int) -> int:
+    """Arithmetic syndrome decode of a 24-bit received word; corrects up to 3 bit
+    errors and returns the recovered 12-bit dataword. On an uncorrectable word
+    (>3 errors) returns the raw systematic data bits (best effort, never raises)."""
+    x = (r >> 12) & 0xFFF
+    y = r & 0xFFF
+    s = y ^ _golay_parity(x)
+    if _popcount(s) <= 3:
+        return x  # errors confined to the parity part; data bits are clean
+    for i in range(12):
+        si = s ^ _GOLAY_B[i]
+        if _popcount(si) <= 2:
+            return x ^ (1 << (11 - i))  # flip data bit i
+    q = _golay_parity(s)
+    if _popcount(q) <= 3:
+        return x ^ q  # error pattern in the data part = q
+    for i in range(12):
+        qi = q ^ _GOLAY_B[i]
+        if _popcount(qi) <= 2:
+            return x ^ qi
+    return x  # >3 errors: uncorrectable, return raw data bits
+
+
+def golay_encode_bits(frame_bits: np.ndarray) -> np.ndarray:
+    """Encode a {0,1} bit stream with Golay(24,12): group into 12-bit words
+    (MSB-first, zero-padded), encode each to 24 bits. Returns a flat int8 bit
+    array (length a multiple of 24)."""
+    bits = np.asarray(frame_bits, dtype=np.int8) & 1
+    pad = (-bits.size) % 12
+    if pad:
+        bits = np.concatenate([bits, np.zeros(pad, dtype=np.int8)])
+    out = np.empty((bits.size // 12) * 24, dtype=np.int8)
+    o = 0
+    for k in range(0, bits.size, 12):
+        word = 0
+        for b in bits[k:k + 12]:
+            word = (word << 1) | int(b)
+        cw = golay_encode12(word)
+        for j in range(23, -1, -1):
+            out[o] = (cw >> j) & 1
+            o += 1
+    return out
+
+
+def golay_decode_bits(coded_bits: np.ndarray, n_frame_bits: int) -> np.ndarray:
+    """Inverse of golay_encode_bits(): decode full 24-bit words back to 12-bit
+    datawords (correcting up to 3 errors each) and return the first n_frame_bits
+    (strips the encode-time zero padding)."""
+    bits = np.asarray(coded_bits, dtype=np.int8) & 1
+    n_words = bits.size // 24
+    out = np.empty(n_words * 12, dtype=np.int8)
+    o = 0
+    for k in range(0, n_words * 24, 24):
+        word = 0
+        for b in bits[k:k + 24]:
+            word = (word << 1) | int(b)
+        d = golay_decode24(word)
+        for j in range(11, -1, -1):
+            out[o] = (d >> j) & 1
+            o += 1
+    return out[:n_frame_bits].astype(np.int8)
+
+
 def build_framed_bits(frame: bytes, preamble: bytes = DEFAULT_PREAMBLE,
                       sync_word: bytes = DEFAULT_SYNC_WORD,
-                      bit_order: str = DEFAULT_BIT_ORDER) -> np.ndarray:
-    """[preamble | sync word | MAVLink frame] as one {0,1} bit array — the PHY
-    payload that gets GFSK-modulated. The MAVLink bytes are inserted verbatim."""
+                      bit_order: str = DEFAULT_BIT_ORDER,
+                      fec: str = DEFAULT_FEC) -> np.ndarray:
+    """[preamble | sync word | (optionally Golay-coded) MAVLink frame] as one
+    {0,1} bit array — the PHY payload that gets GFSK-modulated. preamble and
+    sync_word are OPERATOR-SETTABLE (match the target link). With fec="golay"
+    the MAVLink frame bits are extended-Golay(24,12) coded (the preamble/sync,
+    used for acquisition, are NOT coded); with fec="none" the MAVLink bytes are
+    inserted verbatim."""
+    fec = _validate_fec(fec)
+    frame_bits = bytes_to_bits(frame, bit_order)
+    if fec == "golay":
+        frame_bits = golay_encode_bits(frame_bits)
     return np.concatenate([
         bytes_to_bits(preamble, bit_order),
         bytes_to_bits(sync_word, bit_order),
-        bytes_to_bits(frame, bit_order),
+        frame_bits,
     ]).astype(np.int8)
 
 
@@ -332,6 +464,7 @@ def modulate_frame_to_iq(
     preamble: bytes = DEFAULT_PREAMBLE,
     sync_word: bytes = DEFAULT_SYNC_WORD,
     bit_order: str = DEFAULT_BIT_ORDER,
+    fec: str = DEFAULT_FEC,
     amplitude: int = DEFAULT_AMPLITUDE,
     repeat: int = 1,
     gap_symbols: int = 0,
@@ -339,17 +472,19 @@ def modulate_frame_to_iq(
     """Modulate ONE MAVLink frame into an interleaved-int8 IQ array ready for
     hackrf_jam.transmit_iq_file().
 
-    The frame is wrapped [preamble | sync | frame] and GFSK-modulated. `repeat`
-    re-emits the whole framed burst back-to-back (an unauthenticated command is
-    typically sent several times to survive collisions on the target link);
-    `gap_symbols` inserts that many idle (-1 / 0-bit) symbol periods between
-    repeats. Fully deterministic — same inputs give byte-identical output."""
+    The frame is wrapped [preamble | sync | (optional Golay-coded) frame] and
+    GFSK-modulated. preamble/sync_word/fec are operator-settable to match the
+    target link. `repeat` re-emits the whole framed burst back-to-back (an
+    unauthenticated command is typically sent several times to survive collisions
+    on the target link); `gap_symbols` inserts that many idle (-1 / 0-bit) symbol
+    periods between repeats. Fully deterministic — same inputs give byte-identical
+    output."""
     if repeat < 1:
         raise ValueError("repeat must be >= 1")
     if gap_symbols < 0:
         raise ValueError("gap_symbols must be >= 0")
 
-    framed = build_framed_bits(frame, preamble, sync_word, bit_order)
+    framed = build_framed_bits(frame, preamble, sync_word, bit_order, fec)
     if repeat == 1:
         all_bits = framed
     else:
@@ -399,6 +534,7 @@ def describe_modulation(
     preamble: bytes = DEFAULT_PREAMBLE,
     sync_word: bytes = DEFAULT_SYNC_WORD,
     bit_order: str = DEFAULT_BIT_ORDER,
+    fec: str = DEFAULT_FEC,
     center_freq_mhz: float = DEFAULT_CENTER_FREQ_MHZ,
     repeat: int = 1,
     gap_symbols: int = 0,
@@ -406,7 +542,8 @@ def describe_modulation(
     """Honest, transmit-free summary of what a burst WOULD look like: mod index,
     samples/symbol, sample count, on-air duration, etc. For logging / operator
     display — computes metadata only, generates no IQ and sends nothing."""
-    framed_bits = build_framed_bits(frame, preamble, sync_word, bit_order).size
+    fec = _validate_fec(fec)
+    framed_bits = build_framed_bits(frame, preamble, sync_word, bit_order, fec).size
     total_bits = framed_bits * repeat + gap_symbols * max(0, repeat - 1)
     sps = float(sample_rate_hz) / float(air_data_rate_bps)
     n_samples = int(np.rint(total_bits * sps))
@@ -418,6 +555,9 @@ def describe_modulation(
         "modulation_index": float(2.0 * deviation_hz / air_data_rate_bps),
         "bt": float(bt),
         "bit_order": _validate_bit_order(bit_order),
+        "fec": fec,
+        "preamble_bytes": len(preamble),
+        "sync_word_hex": bytes(sync_word).hex().upper(),
         "samples_per_symbol": sps,
         "frame_bytes": len(frame),
         "framed_bits_per_burst": int(framed_bits),
@@ -469,20 +609,32 @@ def deframe_symbols(
     n_frame_bytes: int,
     sync_word: bytes = DEFAULT_SYNC_WORD,
     bit_order: str = DEFAULT_BIT_ORDER,
+    fec: str = DEFAULT_FEC,
 ) -> Optional[bytes]:
     """Locate the sync word in a demodulated bit stream and return the
     n_frame_bytes that follow it as bytes, or None if sync is not found. The
-    inverse of build_framed_bits()'s framing (used by the round-trip test)."""
+    inverse of build_framed_bits()'s framing (used by the round-trip test).
+    With fec="golay" the post-sync payload is Golay(24,12)-coded — it is decoded
+    (correcting up to 3 errors per 24-bit word) back to the frame bytes."""
+    fec = _validate_fec(fec)
     sync_bits = bytes_to_bits(sync_word, bit_order)
     b = np.asarray(bits, dtype=np.int8) & 1
-    need = sync_bits.size + n_frame_bytes * 8
+    n_frame_bits = n_frame_bytes * 8
+    if fec == "golay":
+        n_words = (n_frame_bits + 11) // 12  # ceil to 12-bit words
+        payload_len = n_words * 24
+    else:
+        payload_len = n_frame_bits
+    need = sync_bits.size + payload_len
     if b.size < need or sync_bits.size == 0:
         return None
     last_start = b.size - need
     for start in range(0, last_start + 1):
         if np.array_equal(b[start:start + sync_bits.size], sync_bits):
             payload_start = start + sync_bits.size
-            payload = b[payload_start:payload_start + n_frame_bytes * 8]
+            payload = b[payload_start:payload_start + payload_len]
+            if fec == "golay":
+                payload = golay_decode_bits(payload, n_frame_bits)
             return bits_to_bytes(payload, bit_order)
     return None
 
@@ -509,11 +661,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     ap.add_argument("--deviation-hz", type=float, default=DEFAULT_DEVIATION_HZ)
     ap.add_argument("--bt", type=float, default=DEFAULT_BT)
     ap.add_argument("--bit-order", choices=("msb", "lsb"), default=DEFAULT_BIT_ORDER)
+    ap.add_argument("--preamble-hex", type=str, default=DEFAULT_PREAMBLE.hex(),
+                    help="Preamble bytes as hex (operator-set to match the target link's "
+                         "acquisition preamble). Default: %(default)s.")
+    ap.add_argument("--sync-hex", type=str, default=DEFAULT_SYNC_WORD.hex(),
+                    help="Sync word bytes as hex (operator-set to match the target link). "
+                         "Default: %(default)s.")
+    ap.add_argument("--fec", choices=FEC_CHOICES, default=DEFAULT_FEC,
+                    help="Payload FEC: 'none' (raw) or 'golay' extended Golay(24,12), the "
+                         "code SiK/RFD900 use. Matching the target RAISES decode probability, "
+                         "does NOT guarantee it. Default: %(default)s.")
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--gap-symbols", type=int, default=0)
     ap.add_argument("--out", type=str, default=None,
                     help="IQ output path (interleaved int8). Default: a temp file.")
     args = ap.parse_args(argv)
+
+    try:
+        preamble = bytes.fromhex(args.preamble_hex)
+        sync_word = bytes.fromhex(args.sync_hex)
+    except ValueError as e:
+        ap.error(f"--preamble-hex/--sync-hex must be valid hex: {e}")
 
     frame = build_command_frame(args.command, args.target_system,
                                 args.target_component, args.seq)
@@ -524,6 +692,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         deviation_hz=args.deviation_hz,
         bt=args.bt,
         bit_order=args.bit_order,
+        fec=args.fec,
+        preamble=preamble,
+        sync_word=sync_word,
         center_freq_mhz=args.freq_mhz,
         repeat=args.repeat,
         gap_symbols=args.gap_symbols,
@@ -535,6 +706,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         deviation_hz=args.deviation_hz,
         bt=args.bt,
         bit_order=args.bit_order,
+        fec=args.fec,
+        preamble=preamble,
+        sync_word=sync_word,
         repeat=args.repeat,
         gap_symbols=args.gap_symbols,
     )
@@ -557,8 +731,11 @@ if __name__ == "__main__":
 # range step — NOT done here; code + tests only):
 #   1. Exact target framing: capture the real link with the RX HackRF, confirm
 #      the vendor packet handler (preamble length, sync word, Golay/FEC,
-#      whitening, on-air bit order) and either disable FEC on a transparent-
-#      serial target or ADD the matching FEC/whitening layer here.
+#      whitening, on-air bit order). preamble, sync word, on-air bit order and
+#      Golay(24,12) FEC are now OPERATOR-SETTABLE here (fec="golay"); what is
+#      still NOT modelled is data WHITENING and interleaving — add those (and
+#      set preamble/sync/fec to the measured values) for a whitened/interleaved
+#      SiK build, or leave FEC off for a transparent-serial target.
 #   2. PHY calibration: match air_data_rate_bps / deviation_hz / bt to the
 #      captured signal (measure from the capture), verify the modulated burst
 #      correlates against the real ground station's frames.

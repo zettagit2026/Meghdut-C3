@@ -29,7 +29,18 @@ const COMMANDS = [
   { value: "maneuver_takeover", label: "MANEUVER TAKEOVER" },
 ];
 
-const MAX_REPEAT = 20;
+// Operator-controlled repeat (commander directive: no artificial cap). The
+// backend bounds the FINITE one-shot case at 10_000 purely as a memory-DoS
+// guard (each repeat expands into an in-memory IQ buffer); continuous=True is
+// the truly uncapped path. This is that memory-DoS bound, NOT a timing cap.
+const MAX_REPEAT = 10000;
+
+// Payload FEC options — mirrors sdr_mavlink_inject.FEC_CHOICES / backend
+// MavlinkSdrInjectBody.fec. Golay(24,12) is the code SiK/RFD900 use.
+const FEC_OPTIONS = [
+  { value: "none", label: "NONE (transparent raw MAVLink)" },
+  { value: "golay", label: "GOLAY(24,12) (SiK/RFD900 payload FEC)" },
+];
 
 // Status feed staleness tracking — same pattern as GnssSpoof.jsx / Jamming.jsx.
 const POLL_INTERVAL_MS = 2000;
@@ -57,8 +68,12 @@ export default function SdrMavlinkInject() {
   const [deviationHz, setDeviationHz] = useState(62500);
   const [bt, setBt] = useState(0.5);
   const [bitOrder, setBitOrder] = useState("msb");
+  const [preambleHex, setPreambleHex] = useState("AAAAAAAA");
+  const [syncHex, setSyncHex] = useState("2DD4");
+  const [fec, setFec] = useState("none");
   const [txGain, setTxGain] = useState(20);
   const [repeat, setRepeat] = useState(3);
+  const [continuous, setContinuous] = useState(false);
 
   const [gateOpen, setGateOpen] = useState(false);
   const [fratricide, setFratricide] = useState(false);
@@ -104,8 +119,19 @@ export default function SdrMavlinkInject() {
 
   // The actual arm->confirm(->ack)->fire sequence, run ONLY after the SafetyGate
   // two-step confirm completes (see onConfirm below).
+  // Preamble/sync must be valid, non-empty, byte-aligned hex (mirrors the
+  // backend MavlinkSdrInjectBody regex ^(?:[0-9a-fA-F]{2}){1,64}$).
+  const isValidPhyHex = (s) => /^(?:[0-9a-fA-F]{2}){1,64}$/.test(String(s || ""));
+  const phyHexValid = isValidPhyHex(preambleHex) && isValidPhyHex(syncHex);
+
   const fireInject = async () => {
     if (!target) { toast.error("No target selected"); return; }
+    if (!phyHexValid) {
+      toast.error("Invalid preamble/sync hex", {
+        description: "Preamble and sync word must be 1–64 bytes of hex (e.g. AAAAAAAA, 2DD4).",
+      });
+      return;
+    }
     setSubmitting(true);
     try {
       // Step 1: arm token bound to effect=mavlink_sdr_inject AND this exact
@@ -136,8 +162,12 @@ export default function SdrMavlinkInject() {
         deviation_hz: Number(deviationHz),
         bt: Number(bt),
         bit_order: bitOrder,
+        preamble_hex: preambleHex,
+        sync_word_hex: syncHex,
+        fec,
         tx_gain: Number(txGain),
         repeat: Number(repeat),
+        continuous,
         arm_token: arm.arm_token,
         mavlink_sdr_inject_confirm_token: confirm.mavlink_sdr_inject_confirm_token,
         ...(iffAck ? { iff_friendly_fire_ack: iffAck } : {}),
@@ -350,18 +380,71 @@ export default function SdrMavlinkInject() {
                 className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
               />
             </label>
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Preamble (hex)</span>
+              <input
+                data-testid="sdr-inject-preamble-input"
+                type="text"
+                value={preambleHex}
+                onChange={(e) => setPreambleHex(e.target.value)}
+                className={`mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info ${isValidPhyHex(preambleHex) ? "" : "border-[var(--accent-critical)]"}`}
+              />
+            </label>
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Sync Word (hex)</span>
+              <input
+                data-testid="sdr-inject-sync-input"
+                type="text"
+                value={syncHex}
+                onChange={(e) => setSyncHex(e.target.value)}
+                className={`mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info ${isValidPhyHex(syncHex) ? "" : "border-[var(--accent-critical)]"}`}
+              />
+            </label>
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Payload FEC</span>
+              <select
+                data-testid="sdr-inject-fec-select"
+                value={fec}
+                onChange={(e) => setFec(e.target.value)}
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+              >
+                {FEC_OPTIONS.map((f) => <option key={f.value} value={f.value}>{f.label}</option>)}
+              </select>
+            </label>
+          </div>
+
+          <label className="flex items-center gap-2 font-mono text-[11px] text-slate-300">
+            <input
+              data-testid="sdr-inject-continuous-toggle"
+              type="checkbox"
+              checked={continuous}
+              onChange={(e) => setContinuous(e.target.checked)}
+            />
+            Continuous re-emit until stopped (no fixed repeat count) — still instantly
+            stoppable via EMERGENCY ABORT / tx_halt at the bridge.
+          </label>
+
+          <div
+            data-testid="sdr-inject-phy-note"
+            className="tactical-border p-2 font-mono text-[10px]"
+            style={{ background: "rgba(255,149,0,0.08)", borderColor: "#FF9500", color: "#FFB454" }}
+          >
+            Preamble / sync / FEC must match the TARGET link's ACTUAL PHY (measured from a
+            capture). Golay(24,12) is the SiK/RFD900 payload FEC. Matching these RAISES the
+            probability the target's packet handler accepts the burst — it does NOT guarantee
+            decode (whitening / interleaving / bit-order mismatches will still fail it).
           </div>
 
           <button
             data-testid="sdr-inject-arm-button"
-            disabled={!canArm}
+            disabled={!canArm || !phyHexValid}
             onClick={openGate}
             className={`w-full flex items-center justify-center gap-2 px-4 py-3 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors ${
-              !canArm
+              !canArm || !phyHexValid
                 ? "opacity-30 border-slate-700 text-slate-600 cursor-not-allowed"
                 : "hover-accent-critical"
             }`}
-            style={!canArm ? undefined : { color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
+            style={!canArm || !phyHexValid ? undefined : { color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
           >
             <TargetIcon size={14} strokeWidth={1.5} />
             {friendlySelected ? "ARM SDR INJECT (FRIENDLY — OVERRIDE)" : "ARM SDR MAVLINK INJECT"}

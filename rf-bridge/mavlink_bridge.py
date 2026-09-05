@@ -209,8 +209,10 @@ class MavlinkBridge:
              Fails closed (treated as halt) on any backend/network error.
 
         Nothing after an abort is transmitted. Duration and rc_rate are taken
-        from the packet (already server-clamped to the PL-011 hard cap); the
-        primitive additionally hard-caps duration itself as defense in depth."""
+        from the packet; per the commander directive the duration is
+        OPERATOR-CONTROLLED (no artificial hard cap) and may be continuous —
+        the kill-switch above (tx_halt / range-auth-off, both per-frame) is the
+        real safety, not a wall-clock ceiling."""
         if run_sustained_takeover is None:
             _send_tx_ack(ws, request_id, False,
                          "sustained-takeover primitive unavailable on this bridge")
@@ -220,6 +222,11 @@ class MavlinkBridge:
         target_component = int(pkt.get("target_component") or 1)
         duration_s = float(pkt.get("duration_s") or 0.0)
         rc_rate_hz = float(pkt.get("rc_rate_hz") or 0.0)
+        # Commander directive: operator-controlled duration (no artificial cap).
+        # continuous=True re-emits the controlled-landing frame until the operator
+        # stops it (EMERGENCY ABORT / range-auth-off, both routed through
+        # _halted). The kill-switch is unchanged.
+        continuous = bool(pkt.get("continuous"))
 
         # INFO #173 hardening: cache the range-auth lease for a short TTL so the
         # per-frame _halted() check does NOT make a blocking HTTP GET on every
@@ -260,6 +267,7 @@ class MavlinkBridge:
                 target_component=target_component,
                 duration_s=duration_s,
                 rc_rate_hz=rc_rate_hz,
+                continuous=continuous,
                 tx_halted=_halted,
                 target_protocol=pkt.get("target_protocol"),
                 target_link_legacy_mavlink=bool(pkt.get("target_link_legacy_mavlink")),

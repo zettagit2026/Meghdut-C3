@@ -36,9 +36,11 @@ class PayloadSpec:
     duration_ms: int  # simulated engagement duration
     requires_takeover: bool  # whether pre-broadcast auth spoof is needed
     # Sustained-injection payloads (e.g. PL-011 RC override controlled-landing)
-    # re-emit their frame at rc_rate_hz for a bounded, hard-capped duration
+    # re-emit their frame at rc_rate_hz for an operator-controlled duration
     # instead of firing one shot. Defaults keep every existing one-shot entry
-    # unchanged (sustained=False).
+    # unchanged (sustained=False). max_duration_s is a NON-BINDING default
+    # reference window (commander directive removed the artificial hard cap); it
+    # is advertised as the suggested default and is NOT enforced as a ceiling.
     sustained: bool = False
     max_duration_s: float = 0.0
     rc_rate_hz: float = 0.0
@@ -193,9 +195,12 @@ PAYLOAD_CATALOG: List[PayloadSpec] = [
             "roll/pitch/yaw neutral and drives throttle below mid to walk the target "
             "down to a controlled landing — a comparatively humane neutralization vs. "
             "flight-termination/force-disarm (which make it fall). Frames are re-emitted "
-            f"at ~{MANEUVER_TAKEOVER_RC_RATE_HZ:.0f}Hz for an operator-set duration, "
-            f"HARD-CAPPED at {MANEUVER_TAKEOVER_MAX_DURATION_S:.0f}s (bounded, not "
-            "transmit-forever) and terminated immediately on EMERGENCY ABORT. "
+            f"at ~{MANEUVER_TAKEOVER_RC_RATE_HZ:.0f}Hz for an OPERATOR-CONTROLLED duration "
+            "(no artificial cap) — bounded to a set window, or continuous-until-stop. The "
+            "safety is not a wall-clock ceiling: EMERGENCY ABORT / tx_halt / range-auth-off "
+            "terminate the stream within one frame period, and at the end of the window (or "
+            "on a graceful Stand Down) a NEUTRAL-RELEASE burst hands RC back to the craft so "
+            "control returns promptly. "
             "HONEST SCOPE: effective ONLY against unencrypted / legacy MAVLink-over-RF "
             "craft (pre-paired or unencrypted SiK-radio ArduPilot/PX4). It does NOT work "
             "against an FHSS / encrypted control link (ELRS/CRSF, DJI OcuSync, DSMX, "
@@ -204,7 +209,9 @@ PAYLOAD_CATALOG: List[PayloadSpec] = [
         ),
         effect=(
             "Legacy/unencrypted-MAVLink target descends to a controlled landing under "
-            "injected RC for the bounded window. No effect on encrypted/FHSS links."
+            "injected RC for the operator-controlled window; a neutral-release burst "
+            "returns control at the end / on graceful stop, and EMERGENCY ABORT stops it "
+            "within one frame. No effect on encrypted/FHSS links."
         ),
         mav_cmd="RC_CHANNELS_OVERRIDE (70)",
         reversible=True,  # override releases the moment the bounded stream stops

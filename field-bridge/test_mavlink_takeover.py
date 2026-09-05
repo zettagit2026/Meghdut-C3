@@ -79,21 +79,76 @@ def test_legacy_link_is_overridable():
     assert not link_is_overridable("ELRS 2.4")
 
 
-# ---- bounded duration: hard cap enforced regardless of caller ------------
-def test_duration_hard_capped():
+# ---- operator-controlled duration: NO artificial hard cap ----------------
+def test_duration_is_operator_controlled_no_cap():
+    # Commander directive: the 30 s hard cap is REMOVED — the operator-set window
+    # is honored verbatim, even well beyond the old MAX_DURATION_S reference.
     clock = FakeClock()
     sent = []
+    long_window = MAX_DURATION_S * 4  # 120 s — far past the old cap
     res = run_sustained_takeover(
         send_frame=sent.append, target_system=5, target_protocol="MAVLink",
-        duration_s=10_000.0,  # absurd request
+        duration_s=long_window,
         rc_rate_hz=10.0, now=clock.now, sleep=clock.sleep,
     )
     assert res.ok and not res.stopped_early
-    assert res.elapsed_s <= MAX_DURATION_S + 1e-6, res.elapsed_s
-    # at 10 Hz for 30 s => ~300 frames, definitely bounded well under an
-    # unbounded stream.
-    assert res.frames_sent <= MAX_DURATION_S * 10 + 1, res.frames_sent
-    assert res.frames_sent > 0
+    # The full operator window ran — the cap did NOT clamp it to 30 s.
+    assert res.elapsed_s >= long_window - 1e-6, res.elapsed_s
+    assert res.frames_sent > MAX_DURATION_S * 10, res.frames_sent  # > old-cap frame count
+    # Neutral-release still fires at the end of the (now uncapped) window.
+    assert res.release_frames_sent == 3, res.release_frames_sent
+
+
+def test_continuous_runs_until_graceful_stop_then_releases():
+    # continuous=True runs with NO fixed end; a graceful operator Stand Down
+    # (stop_event) ends it AND emits the neutral-release burst so control returns.
+    import mavlink_codec as mc
+    clock = FakeClock()
+    ev = threading.Event()
+    sent = []
+
+    def send(frame):
+        sent.append(frame)
+        if len(sent) == 50:  # let it run well past any old 30 s window worth
+            ev.set()
+
+    res = run_sustained_takeover(
+        send_frame=send, target_system=9, target_component=1,
+        target_protocol="MAVLink", continuous=True, duration_s=0.0,
+        rc_rate_hz=20.0, release_frames=3, stop_event=ev,
+        now=clock.now, sleep=clock.sleep,
+    )
+    assert res.ok and res.stopped_early, res
+    assert res.frames_sent == 50, res.frames_sent
+    # Graceful stop emitted the release burst (unlike an EMERGENCY ABORT).
+    assert res.release_frames_sent == 3, res.release_frames_sent
+    for frame in sent[-3:]:
+        dec = mc.decode_rc_channels_override(frame)
+        assert dec["target_system"] == 9
+        assert all(c == mc.RC_OVERRIDE_RELEASE for c in dec["chan_raw"][:4]), dec
+
+
+def test_continuous_aborts_immediately_no_release():
+    # continuous=True is still instantly killable: an EMERGENCY ABORT (tx_halted)
+    # terminates it within one frame and emits NO release (no RF after abort).
+    clock = FakeClock()
+    sent = []
+    halted = {"v": False}
+
+    def send(frame):
+        sent.append(frame)
+        if len(sent) == 7:
+            halted["v"] = True
+
+    res = run_sustained_takeover(
+        send_frame=send, target_system=5, target_protocol="MAVLink",
+        continuous=True, duration_s=0.0, rc_rate_hz=20.0, release_frames=3,
+        tx_halted=lambda: halted["v"], now=clock.now, sleep=clock.sleep,
+    )
+    assert res.ok and res.stopped_early, res
+    assert res.frames_sent == 7, res.frames_sent
+    assert res.release_frames_sent == 0, res.release_frames_sent
+    assert len(sent) == 7, len(sent)
 
 
 def test_normal_bounded_window_frame_count():

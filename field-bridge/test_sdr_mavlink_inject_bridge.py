@@ -221,6 +221,10 @@ def _stub_modulation(monkeypatch, captured):
         DEFAULT_DEVIATION_HZ = 62500.0
         DEFAULT_BT = 0.5
         DEFAULT_BIT_ORDER = "msb"
+        DEFAULT_PREAMBLE = b"\xAA\xAA\xAA\xAA"
+        DEFAULT_SYNC_WORD = b"\x2D\xD4"
+        DEFAULT_FEC = "none"
+        FEC_CHOICES = ("none", "golay")
 
         @staticmethod
         def build_command_frame(command, target_system, target_component):
@@ -272,6 +276,42 @@ def test_happy_path_modulates_and_transmits_via_pinned_iq_path(monkeypatch):
     assert captured["write_kw"]["sample_rate_hz"] == hackrf_jam.SAMPLE_RATE_HZ
     assert len(tx_calls) == 1
     assert tx_calls[0]["freq_mhz"] == 915.0
+
+
+def test_operator_phy_preamble_sync_fec_threaded_to_modulator(monkeypatch):
+    """Operator-settable preamble / sync word / FEC from the WS request are parsed
+    (hex) and passed through to write_iq_file — not silently dropped."""
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect="mavlink_sdr_inject": True)
+    captured = {}
+    _stub_modulation(monkeypatch, captured)
+    monkeypatch.setattr(sib, "transmit_iq_file",
+                        lambda *a, **k: {"ok": True, "error": None, "stopped_early": False})
+    ws = FakeWS()
+    b._handle_inject_request(ws, _valid_request(
+        preamble_hex="AAAAAAAAAAAA", sync_word_hex="ABCD", fec="golay"))
+    deadline = time.time() + 2
+    while time.time() < deadline and "write_kw" not in captured:
+        time.sleep(0.02)
+    kw = captured["write_kw"]
+    assert kw["preamble"] == bytes.fromhex("AAAAAAAAAAAA")
+    assert kw["sync_word"] == bytes.fromhex("ABCD")
+    assert kw["fec"] == "golay"
+
+
+def test_bogus_fec_refused_cleanly(monkeypatch):
+    """An unsupported fec value fails the request cleanly (no ungoverned/broken
+    transmit)."""
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect="mavlink_sdr_inject": True)
+    captured = {}
+    _stub_modulation(monkeypatch, captured)
+    monkeypatch.setattr(sib, "transmit_iq_file",
+                        lambda *a, **k: {"ok": True, "error": None, "stopped_early": False})
+    ws = FakeWS()
+    b._handle_inject_request(ws, _valid_request(fec="turbo9000"))
+    assert ws.sent[0]["phase"] == "failed"
+    assert "fec" in ws.sent[0]["error"].lower()
 
 
 def test_repeat_is_operator_controlled_not_clamped(monkeypatch):

@@ -354,6 +354,14 @@ class SdrMavlinkInjectBridge:
             deviation_hz = float(data.get("deviation_hz", _inj.DEFAULT_DEVIATION_HZ))
             bt = float(data.get("bt", _inj.DEFAULT_BT))
             bit_order = str(data.get("bit_order", _inj.DEFAULT_BIT_ORDER))
+            # Operator-settable on-air framing (match the target link). Parsed
+            # from hex; a bogus value fails this request cleanly rather than
+            # transmitting a malformed burst. fec toggles the Golay(24,12) layer.
+            preamble = bytes.fromhex(str(data.get("preamble_hex", _inj.DEFAULT_PREAMBLE.hex())))
+            sync_word = bytes.fromhex(str(data.get("sync_word_hex", _inj.DEFAULT_SYNC_WORD.hex())))
+            fec = str(data.get("fec", _inj.DEFAULT_FEC))
+            if fec not in _inj.FEC_CHOICES:
+                raise ValueError(f"unsupported fec {fec!r} (supports {list(_inj.FEC_CHOICES)})")
             tx_gain = int(data.get("tx_gain", 20))
             # Operator-controlled repeat (floored at 1). NOT a timing/effectiveness
             # cap: continuous=True remains the uncapped path (re-emits on a loop
@@ -399,6 +407,9 @@ class SdrMavlinkInjectBridge:
             "deviation_hz": deviation_hz,
             "bt": bt,
             "bit_order": bit_order,
+            "preamble": preamble,
+            "sync_word": sync_word,
+            "fec": fec,
             "tx_gain": tx_gain,
             "repeat": repeat,
             "continuous": continuous,
@@ -444,6 +455,9 @@ class SdrMavlinkInjectBridge:
                 deviation_hz=params["deviation_hz"],
                 bt=params["bt"],
                 bit_order=params["bit_order"],
+                preamble=params["preamble"],
+                sync_word=params["sync_word"],
+                fec=params["fec"],
                 repeat=params["repeat"],
             )
             # On-air playback time of the file (its real length). Used as the
@@ -456,6 +470,9 @@ class SdrMavlinkInjectBridge:
                 deviation_hz=params["deviation_hz"],
                 bt=params["bt"],
                 bit_order=params["bit_order"],
+                preamble=params["preamble"],
+                sync_word=params["sync_word"],
+                fec=params["fec"],
                 repeat=params["repeat"],
             )
             # continuous -> None: transmit_iq_file loops the frame (hackrf_transfer

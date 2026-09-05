@@ -267,3 +267,90 @@ def test_import_is_non_transmitting():
     imported at module top; assert the guard constants are sane."""
     assert inj.DEFAULT_SAMPLE_RATE_HZ == 20_000_000
     assert set(inj.COMMAND_BUILDERS) >= {"force_land", "rth", "disarm"}
+
+
+# ---------------------------------------------------------------------
+# Configurable PHY: operator-settable preamble + sync word
+# ---------------------------------------------------------------------
+def test_custom_preamble_and_sync_are_used():
+    """A custom preamble + sync word actually change the framed bits and survive
+    the round-trip (operator matches the target link's acquisition framing)."""
+    frame = _frame()
+    pre = b"\xAA\xAA\xAA\xAA\xAA\xAA"
+    sync = b"\x13\x37"
+    framed = inj.build_framed_bits(frame, preamble=pre, sync_word=sync, bit_order="msb")
+    # First bits are the (uncoded) preamble; the sync word follows it.
+    pre_bits = len(pre) * 8
+    assert framed[:pre_bits].tolist() == inj.bytes_to_bits(pre, "msb").tolist()
+    sync_bits = inj.bytes_to_bits(sync, "msb")
+    assert framed[pre_bits: pre_bits + sync_bits.size].tolist() == sync_bits.tolist()
+    # Round-trip with the SAME custom framing recovers the frame.
+    iq = inj.modulate_frame_to_iq(frame, sample_rate_hz=_SR, air_data_rate_bps=_BAUD,
+                                  deviation_hz=_DEV, preamble=pre, sync_word=sync)
+    bits = inj.demodulate_to_symbols(iq, sample_rate_hz=_SR, air_data_rate_bps=_BAUD)
+    recovered = inj.deframe_symbols(bits, n_frame_bytes=len(frame), sync_word=sync)
+    assert recovered == frame
+
+
+def test_wrong_sync_word_does_not_deframe():
+    """Deframing with a sync word the burst was NOT built with finds no frame —
+    proving sync is genuinely matched, not ignored."""
+    frame = _frame()
+    iq = inj.modulate_frame_to_iq(frame, sample_rate_hz=_SR, air_data_rate_bps=_BAUD,
+                                  deviation_hz=_DEV, sync_word=b"\x2D\xD4")
+    bits = inj.demodulate_to_symbols(iq, sample_rate_hz=_SR, air_data_rate_bps=_BAUD)
+    assert inj.deframe_symbols(bits, n_frame_bytes=len(frame), sync_word=b"\x99\x99") is None
+
+
+# ---------------------------------------------------------------------
+# Optional Golay(24,12) FEC — real encode/decode, real error correction
+# ---------------------------------------------------------------------
+def test_golay_word_roundtrip_all_datawords():
+    """Every 12-bit dataword encodes to 24 bits and decodes back identically."""
+    for m in range(0, 4096, 7):  # sample the 4096 words
+        cw = inj.golay_encode12(m)
+        assert cw >> 12 == m  # systematic: top 12 bits are the data
+        assert inj.golay_decode24(cw) == m
+
+
+def test_golay_corrects_up_to_3_bit_errors():
+    """Extended Golay(24,12) corrects up to 3 bit errors per 24-bit word — the
+    whole point of the FEC (raises decode probability on a noisy link)."""
+    import itertools
+    m = 0b101100111010
+    cw = inj.golay_encode12(m)
+    for nbits in (1, 2, 3):
+        for positions in itertools.combinations(range(24), nbits):
+            r = cw
+            for p in positions:
+                r ^= (1 << p)
+            assert inj.golay_decode24(r) == m, (nbits, positions)
+
+
+def test_fec_golay_frame_round_trips_through_gfsk():
+    """A MAVLink frame Golay-coded, GFSK-modulated, demodulated and deframed with
+    fec='golay' comes back byte-identical."""
+    frame = inj.build_command_frame("disarm", target_system=7, target_component=1, seq=2)
+    iq = inj.modulate_frame_to_iq(frame, sample_rate_hz=_SR, air_data_rate_bps=_BAUD,
+                                  deviation_hz=_DEV, fec="golay")
+    bits = inj.demodulate_to_symbols(iq, sample_rate_hz=_SR, air_data_rate_bps=_BAUD)
+    recovered = inj.deframe_symbols(bits, n_frame_bytes=len(frame),
+                                    sync_word=inj.DEFAULT_SYNC_WORD, fec="golay")
+    assert recovered == frame
+
+
+def test_fec_golay_expands_payload_vs_none():
+    """fec='golay' expands the on-air payload (24/12 = 2x the frame bits) vs raw —
+    a real coding layer, not a no-op flag."""
+    frame = _frame()
+    none_bits = inj.build_framed_bits(frame, fec="none").size
+    golay_bits = inj.build_framed_bits(frame, fec="golay").size
+    # preamble+sync are identical/uncoded; the frame portion roughly doubles.
+    assert golay_bits > none_bits
+    info = inj.describe_modulation(frame, fec="golay")
+    assert info["fec"] == "golay"
+
+
+def test_bad_fec_rejected():
+    with pytest.raises(ValueError):
+        inj.build_framed_bits(_frame(), fec="reed_solomon")
