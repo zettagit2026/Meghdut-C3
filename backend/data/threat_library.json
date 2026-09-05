@@ -320,7 +320,50 @@
         "gnss_deny_applicable": true,
         "cyber_takeover_applicable": false,
         "cyber_takeover_protocol": "Wi-Fi/ARSDK3",
-        "cyber_takeover_note": "Wi-Fi control layer: Wi-Fi deauth / DoS is possible against the AP link, but reliable command TAKEOVER is not assured (newer ANAFI USA hardens the link). Distinctive 'ANAFI-' SSID gives a strong make/model cue."
+        "cyber_takeover_note": "Wi-Fi control layer: Wi-Fi deauth / DoS is possible against the AP link, but reliable command TAKEOVER is not assured (newer ANAFI USA hardens the link). Distinctive 'ANAFI-' SSID gives a strong make/model cue.",
+        "wifi_deauth_applicable": true,
+        "wifi_deauth_note": "802.11 deauth/disassoc against the ANAFI softAP forces the drone's own link-loss failsafe (RTH/hover/land) -- a LINK-DROP, not command takeover. NO-OP against the newer ANAFI USA / ANAFI Ai if 802.11w/PMF is enabled; also defeated by MAC-randomization or a renamed SSID.",
+        "arsdk_inject_applicable": true,
+        "arsdk_inject_note": "Unencrypted Parrot ARSDK3 over the open softAP -- an unauthenticated UDP land/emergency Piloting command is viable against the base ANAFI. Model/firmware-dependent; NOT assured against the hardened ANAFI USA. This is a targeted unauthenticated command against a cooperative unencrypted airframe, NOT takeover of an arbitrary drone."
+      }
+    },
+    {
+      "id": "ryze-tello",
+      "make": "Ryze (DJI-licensed)",
+      "model": "Tello / Tello EDU",
+      "aliases": ["Tello", "Tello EDU", "DJI Ryze Tello"],
+      "class": "multirotor",
+      "threat_level": "LOW",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "Wi-Fi 802.11 (Tello SDK, plaintext UDP)",
+        "control_link_family": "Wi-Fi/Tello",
+        "bands": ["2.4GHz"],
+        "video_band": ["2.4GHz"],
+        "video_type": "digital over Wi-Fi (H.264)",
+        "telemetry": "Tello SDK plaintext UDP over Wi-Fi (SEPARATE plaintext UDP SDK from Parrot ARSDK3 -- NOT ARSDK3)",
+        "remoteid_capable": false
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.437],
+        "occupied_bw_mhz_range": [20, 20],
+        "fhss": false,
+        "hop_markers": "802.11 channel (no classic FHSS); Tello SDK plaintext UDP command/state frames",
+        "remoteid_marker": false,
+        "droneid_marker": null,
+        "wifi_oui": ["60:60:1F"],
+        "wifi_ssid_pattern": "^TELLO-"
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz"],
+        "gnss_deny_applicable": false,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "No GPS; small consumer/education airframe with a Wi-Fi command link only -- no MAVLink/legacy-RC-override surface, so cyber_takeover stays not-applicable (the Tello SDK plaintext UDP command inject is a SEPARATE, honestly-labeled effect -- see arsdk_inject_note).",
+        "wifi_deauth_applicable": true,
+        "wifi_deauth_note": "802.11 deauth/disassoc against the Tello softAP forces the drone's own link-loss failsafe (auto-hover/auto-land) -- a LINK-DROP, not command takeover. No PMF/802.11w hardening documented on this consumer airframe, but defeated by MAC-randomization or a renamed SSID like any other target.",
+        "arsdk_inject_applicable": true,
+        "arsdk_inject_note": "Unencrypted, unauthenticated plaintext UDP command/state SDK over the open softAP -- a targeted land/emergency command is viable against an identified Tello. Tello SDK is a SEPARATE encoder from Parrot ARSDK3 (two distinct command sets); model/firmware-dependent. A targeted unauthenticated command against a cooperative unencrypted airframe, NOT takeover of an arbitrary drone."
       }
     },
     {

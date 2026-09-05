@@ -82,7 +82,7 @@ import os
 import statistics
 import uuid
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import bcrypt
 import jwt
@@ -399,7 +399,8 @@ ARM_TOKEN_TTL_S = 60
 # broadcast / jam / gnss_spoof instead. Each entry now carries the intended
 # effect + optional target so _consume_arm_token can reject cross-effect /
 # cross-target reuse. Valid effects mirror the transmit consumers below.
-ARM_TOKEN_EFFECTS = ("deploy", "mavlink", "jam", "gnss_spoof", "mavlink_sdr_inject")
+ARM_TOKEN_EFFECTS = ("deploy", "mavlink", "jam", "gnss_spoof", "mavlink_sdr_inject",
+                     "wifi_deauth", "arsdk_inject")
 # token -> {"expiry": datetime, "effect": str, "target_detection_id": Optional[str]}
 _arm_tokens: Dict[str, Dict[str, Any]] = {}
 
@@ -679,6 +680,59 @@ def _consume_mavlink_sdr_inject_confirm_token(token: Optional[str]) -> None:
                                   "re-run the confirmation sequence in the SDR MAVLink Inject UI.")
 
 
+# ---- Wifi-defeat-confirm token — DELIBERATELY a SEPARATE token type from
+# jam_confirm_token / gnss_spoof_confirm_token / mavlink_sdr_inject_confirm_token,
+# for the SAME reason each of those got its own (see the blocks above): the
+# wifi-defeat field bridge's confirm-token shape check
+# (field-bridge/wifi_defeat_bridge.py's _looks_like_real_confirm_token) is
+# deliberately dumb/shape-only, so if these capabilities shared one token type a
+# caller bug that forwarded a valid jam / gnss / sdr-inject confirm token where a
+# wifi-defeat confirm was expected would be silently accepted by that shape
+# check. Distinct token types make that class of bug a hard 422 at the backend
+# instead of a silent cross-effect authorization leak — the same defense-in-depth
+# property the jam/gnss/sdr-inject tokens have.
+#
+# This is the ACTIVE Wi-Fi defeat path: an 802.11 deauth/DoS (link-drop, forces
+# the drone's own link-loss failsafe — NOT command takeover) OR an unauthenticated
+# ARSDK3/Tello UDP land/emergency to the drone's OPEN softAP (unencrypted
+# Parrot/Tello only). It is radiated on the pinned WIFI_TX_IFACE by
+# field-bridge/wifi_defeat_bridge.py -> wifi_defeat_primitives.py, and carries the
+# SAME full arming spine as every other TX in this system — proof of a real human
+# SafetyGate confirm is exactly what this token is. Its string length must clear
+# the bridge's MIN_CONFIRM_TOKEN_LEN (currently 20); a uuid4 (36 chars) does.
+WIFI_DEFEAT_CONFIRM_TTL_S = 30  # mirrors JAM / GNSS_SPOOF / MAVLINK_SDR_INJECT confirm TTLs
+_wifi_defeat_confirm_tokens: Dict[str, datetime] = {}
+
+
+def _issue_wifi_defeat_confirm_token() -> Dict[str, Any]:
+    token = str(uuid.uuid4())
+    _wifi_defeat_confirm_tokens[token] = (
+        datetime.now(timezone.utc) + timedelta(seconds=WIFI_DEFEAT_CONFIRM_TTL_S)
+    )
+    return {"wifi_defeat_confirm_token": token, "expires_in_s": WIFI_DEFEAT_CONFIRM_TTL_S}
+
+
+def _consume_wifi_defeat_confirm_token(token: Optional[str]) -> None:
+    """Validate and burn a single-use wifi-defeat confirm token. Mirrors
+    _consume_mavlink_sdr_inject_confirm_token (atomic pop, short TTL) — NOT
+    interchangeable with jam_confirm_token / gnss_spoof_confirm_token /
+    mavlink_sdr_inject_confirm_token (separate dict). Refuses with 422 (bad/
+    missing) so a cross-effect confirm token is a hard, distinct rejection."""
+    if not token:
+        raise HTTPException(
+            422,
+            "Wi-Fi-defeat confirmation token required: complete the SafetyGate "
+            "checklist and ARM & FIRE -> CONFIRM FIRE sequence in the Wi-Fi Defeat "
+            "UI, which requests a fresh POST /api/wifi-defeat/confirm at the moment "
+            "of confirmation. This token is NOT interchangeable with jam_confirm_token, "
+            "gnss_spoof_confirm_token, or mavlink_sdr_inject_confirm_token.",
+        )
+    expiry = _wifi_defeat_confirm_tokens.pop(token, None)
+    if not expiry or datetime.now(timezone.utc) > expiry:
+        raise HTTPException(422, "Wi-Fi-defeat confirmation token invalid or expired — "
+                                  "re-run the confirmation sequence in the Wi-Fi Defeat UI.")
+
+
 _EARTH_RADIUS_M = 6371000.0  # mean earth radius, meters — standard spherical-earth approximation
 
 
@@ -736,7 +790,8 @@ def _bearing_compass(bearing_deg: float) -> str:
 # `CEMA_AUTHORIZED_RANGE != "1"` behavior.
 RANGE_AUTH_TTL_S = 15 * 60
 RANGE_AUTH_CONFIRM_PHRASE = "AUTHORIZE LIVE RANGE"
-RANGE_AUTH_EFFECTS = ("jam", "mavlink", "gnss_spoof", "mavlink_sdr_inject")
+RANGE_AUTH_EFFECTS = ("jam", "mavlink", "gnss_spoof", "mavlink_sdr_inject",
+                      "wifi_deauth", "arsdk_inject")
 
 # effect -> {"enabled": bool, "expires_at": datetime|None, "enabled_by": str|None,
 #            "enabled_at": datetime|None}
@@ -1269,6 +1324,93 @@ async def _handle_mavlink_inject_ack(msg: Dict[str, Any]) -> None:
                                      "error": error})
 
 
+# =====================================================================
+# Wi-Fi-defeat session tracking — parallel to _pending_jam /
+# _pending_mavlink_inject above, own dict (never shares state with jamming,
+# gnss_spoof, or sdr-inject). This is the ACTIVE Wi-Fi defeat path (802.11
+# deauth link-drop OR ARSDK/Tello UDP land/emergency) radiated on the pinned
+# WIFI_TX_IFACE by field-bridge/wifi_defeat_bridge.py.
+# =====================================================================
+_pending_wifi_defeat: Dict[str, Dict[str, Any]] = {}
+WIFI_DEFEAT_ACK_TIMEOUT_S = 8
+WIFI_DEFEAT_COMPLETE_MARGIN_S = 15
+# A bounded deauth burst / a single UDP command is short-lived on air; a
+# continuous deauth re-emits until the operator stops it and has no fixed window.
+WIFI_DEFEAT_MAX_DURATION_S = 5.0
+
+
+async def _expire_pending_wifi_defeat() -> None:
+    """Lazy/on-read expiry, same pattern as _expire_pending_mavlink_inject: a
+    request with no terminal bridge ack within its window is marked TX_TIMEOUT so
+    a stuck AWAITING_ACK / phantom-active bounded session can never be observed as
+    still live. A CONTINUOUS deauth re-emits until stopped and is NOT timed out
+    here (mirrors the continuous jam/inject posture)."""
+    now = datetime.now(timezone.utc)
+    to_expire = []
+    for rid, p in _pending_wifi_defeat.items():
+        if p["status"] == "AWAITING_ACK" and (now - p["ts"]).total_seconds() > WIFI_DEFEAT_ACK_TIMEOUT_S:
+            to_expire.append(rid)
+        elif p["status"] == "WIFI_DEFEAT_ACTIVE" and not p.get("continuous") and \
+                (now - p["ts"]).total_seconds() > p.get("duration_s", WIFI_DEFEAT_MAX_DURATION_S) + WIFI_DEFEAT_COMPLETE_MARGIN_S:
+            to_expire.append(rid)
+    for rid in to_expire:
+        p = _pending_wifi_defeat.get(rid)
+        if not p:
+            continue
+        p["status"] = "TX_TIMEOUT"
+        await log_event(
+            "WIFI_DEFEAT",
+            f"No terminal bridge ack for wifi-defeat request {rid} within expected "
+            f"window — marking TX_TIMEOUT (bridge not connected, crashed, or lost mid-burst)",
+            meta={"request_id": rid}, actor="SYSTEM",
+        )
+        await ws_manager.broadcast_json({"type": "wifi_defeat_status", "request_id": rid, "status": "TX_TIMEOUT"})
+
+
+async def _handle_wifi_defeat_ack(msg: Dict[str, Any]) -> None:
+    """Process a real {"type": "wifi_defeat_ack", "phase": ..., ...} message from
+    field-bridge/wifi_defeat_bridge.py. Mirrors _handle_mavlink_inject_ack exactly
+    — own dict, own log kind. Never speculative: the bridge sends these only after
+    a real transmit attempt/outcome (started/complete/stopped/failed)."""
+    request_id = msg.get("request_id")
+    phase = msg.get("phase")
+    pending = _pending_wifi_defeat.get(request_id) if request_id else None
+    if not pending:
+        logger.warning("wifi_defeat_ack received for unknown/expired request_id=%s (phase=%s)", request_id, phase)
+        return
+
+    phase_to_status = {
+        "started": "WIFI_DEFEAT_ACTIVE",
+        "complete": "WIFI_DEFEAT_COMPLETE",
+        "failed": "TX_FAILED",
+        "stopped": "WIFI_DEFEAT_STOPPED",
+    }
+    status = phase_to_status.get(phase)
+    if not status:
+        logger.warning("wifi_defeat_ack with unrecognized phase=%s for request_id=%s", phase, request_id)
+        return
+
+    pending["status"] = status
+    pending["ts"] = datetime.now(timezone.utc)
+    error = msg.get("error")
+    if error:
+        pending["error"] = error
+    if status in ("WIFI_DEFEAT_COMPLETE", "TX_FAILED", "WIFI_DEFEAT_STOPPED"):
+        pending["terminal"] = True
+
+    await log_event(
+        "WIFI_DEFEAT_ACK",
+        (f"Bridge CONFIRMED wifi-defeat TX started for request {request_id}") if status == "WIFI_DEFEAT_ACTIVE" else
+        (f"Wifi-defeat TX complete for request {request_id}") if status == "WIFI_DEFEAT_COMPLETE" else
+        (f"Wifi-defeat TX STOPPED early (EMERGENCY ABORT / lease expiry) for request {request_id}") if status == "WIFI_DEFEAT_STOPPED" else
+        (f"Wifi-defeat TX FAILED for request {request_id}: {error or 'no reason given'}"),
+        meta={"request_id": request_id, "status": status, "error": error},
+        actor="BRIDGE",
+    )
+    await ws_manager.broadcast_json({"type": "wifi_defeat_status", "request_id": request_id, "status": status,
+                                     "error": error})
+
+
 async def _mark_lost_tx_bridge_sessions(dropped_roles: set) -> None:
     """Monitoring-integrity cleanup when a TX bridge WS disconnects.
 
@@ -1316,6 +1458,13 @@ async def _mark_lost_tx_bridge_sessions(dropped_roles: set) -> None:
     if "mavlink_sdr_inject" in dropped_roles and not ws_manager.has_tx_consumer("mavlink_sdr_inject"):
         await _expire_continuous(_pending_mavlink_inject, "MAVLINK_INJECT_ACTIVE",
                                  "mavlink_inject_status", "MAVLINK_SDR_INJECT")
+    # The wifi-defeat bridge advertises a SINGLE consumer role "wifi_defeat" for
+    # BOTH effects (wifi_deauth + arsdk_inject) — see its bridge_hello. A
+    # continuous deauth left WIFI_DEFEAT_ACTIVE would otherwise phantom-report as
+    # live after the sole radiator dropped.
+    if "wifi_defeat" in dropped_roles and not ws_manager.has_tx_consumer("wifi_defeat"):
+        await _expire_continuous(_pending_wifi_defeat, "WIFI_DEFEAT_ACTIVE",
+                                 "wifi_defeat_status", "WIFI_DEFEAT")
 
 
 async def _handle_tx_ack(msg: Dict[str, Any]) -> None:
@@ -1577,7 +1726,7 @@ class ArmTokenBody(BaseModel):
     # F3 (2026-08): an arm token is bound at mint time to the effect it is for
     # (and, for a single-target deploy, the target detection). See
     # _issue_arm_token/_consume_arm_token.
-    effect: str = Field(pattern="^(deploy|mavlink|jam|gnss_spoof|mavlink_sdr_inject)$")
+    effect: str = Field(pattern="^(deploy|mavlink|jam|gnss_spoof|mavlink_sdr_inject|wifi_deauth|arsdk_inject)$")
     target_detection_id: Optional[str] = None
 
 
@@ -1636,7 +1785,7 @@ class JamConfirmBody(BaseModel):
 
 
 class RangeAuthorizationBody(BaseModel):
-    effect: str = Field(pattern="^(jam|mavlink|gnss_spoof|mavlink_sdr_inject)$")
+    effect: str = Field(pattern="^(jam|mavlink|gnss_spoof|mavlink_sdr_inject|wifi_deauth|arsdk_inject)$")
     enabled: bool
     # Required (and checked) only when enabled=True — see POST handler.
     password: Optional[str] = None
@@ -1739,6 +1888,56 @@ class MavlinkSdrInjectBody(BaseModel):
     # (see POST /api/detections/{id}/friendly-fire-ack). Consumed exactly once,
     # ONLY when the target is currently IFF-verified FRIENDLY. Never a bypass of
     # the spine; an EXTRA gate. See _enforce_fire_time_iff.
+    iff_friendly_fire_ack: Optional[str] = None
+
+
+# ---- Active Wi-Fi defeat (Parrot/Tello) — 802.11 deauth link-drop OR
+# unauthenticated ARSDK3/Tello UDP land/emergency to an OPEN drone softAP. The
+# frame BYTES / UDP payloads are produced on the field bridge
+# (field-bridge/wifi_defeat_primitives.py + wifi_arsdk_encode.py); this endpoint
+# only mints/enforces the governed spine and forwards the target scope. See the
+# WIFI_DEFEAT_CONFIRM_TTL_S honest-fidelity notes above.
+#
+# HONEST FIDELITY (project rule: do NOT overclaim). NEITHER mechanism is a
+# universal takeover:
+#   * deauth = LINK-DROP (forces the drone's OWN link-loss failsafe: RTH / hover /
+#     land — the operator does NOT choose which). It is DEFEATED by 802.11w/PMF
+#     (a no-op there) and by MAC-randomization / renamed SSID (cannot target).
+#   * arsdk_*/tello_* = a targeted UNAUTHENTICATED UDP command against a
+#     cooperative UNENCRYPTED Parrot ARSDK3 / Ryze-DJI Tello airframe ONLY. It is
+#     model/firmware-dependent and is NOT takeover of an arbitrary drone.
+class WifiDefeatConfirmBody(BaseModel):
+    # Empty like MavlinkSdrInjectConfirmBody — the endpoint's only job is to mint
+    # a token at the instant the frontend SafetyGate confirm completes.
+    pass
+
+
+class WifiDefeatBody(BaseModel):
+    # Targeted defeat: a concrete target detection is REQUIRED (this is not a
+    # broadcast/blanket capability) so the fire-time IFF fratricide interlock and
+    # the target-bound arm token both apply — a targeted softAP BSSID, NEVER a
+    # band-wide FF:FF:FF:FF:FF:FF deauth.
+    target_detection_id: str
+    # Which defeat mechanism/command. deauth = 802.11 link-drop; arsdk_*/tello_*
+    # = unauthenticated UDP land/emergency to the OPEN drone softAP.
+    mode: str = Field(pattern="^(deauth|arsdk_land|arsdk_emergency|tello_land|tello_emergency)$")
+    # deauth burst count: None (default) => CONTINUOUS until abort/lease-expiry; a
+    # positive int is a bounded burst. Only meaningful for deauth. Bounded so a
+    # finite request cannot be turned into an unbounded on-air run by param abuse
+    # (continuous=None is the intended uncapped path, stoppable at the bridge).
+    count: Optional[int] = Field(None, ge=1, le=100_000)
+    # OPTIONAL: a specific client MAC to deauth (defaults to the broadcast client
+    # at the bridge — band-safe because the addr2/addr3 BSSID is still the pinned
+    # target AP; only the target_bssid broadcast guard is fratricide-relevant).
+    client_mac: Optional[str] = None
+    # Full arming spine tokens (all REQUIRED, every time):
+    arm_token: Optional[str] = None            # bound to effect=wifi_deauth|arsdk_inject + this target (F3)
+    wifi_defeat_confirm_token: Optional[str] = None  # proof of the SafetyGate two-step confirm
+    # DELIBERATE fratricide override — single-use, commander-minted, target-bound
+    # (see POST /api/detections/{id}/friendly-fire-ack). Consumed exactly once,
+    # ONLY when the target is currently IFF-verified FRIENDLY. Never a bypass of
+    # the spine; an EXTRA gate. See _enforce_fire_time_iff. A registered/friendly
+    # AP is NEVER deauthed without this.
     iff_friendly_fire_ack: Optional[str] = None
 
 
@@ -3619,6 +3818,20 @@ def _effector_availability_snapshot() -> Dict[str, Any]:
         "mavlink_sdr_inject": {
             "bridge_up": ws_manager.has_tx_consumer("mavlink_sdr_inject"),
             "range_auth_enabled": _range_auth_status("mavlink_sdr_inject")["enabled"],
+        },
+        # The wifi-defeat bridge advertises a SINGLE consumer role "wifi_defeat"
+        # for BOTH effects (see its bridge_hello), so bridge_up reads the same
+        # consumer flag for the deauth and inject slots; the range-auth leases are
+        # SEPARATE (wifi_deauth vs arsdk_inject).
+        "wifi_deauth": {
+            "bridge_up": ws_manager.has_tx_consumer("wifi_defeat"),
+            "range_auth_enabled": _range_auth_status("wifi_deauth")["enabled"],
+            "maturity": "link_drop_not_takeover",
+        },
+        "arsdk_inject": {
+            "bridge_up": ws_manager.has_tx_consumer("wifi_defeat"),
+            "range_auth_enabled": _range_auth_status("arsdk_inject")["enabled"],
+            "maturity": "unencrypted_parrot_tello_only",
         },
     }
 
@@ -6289,6 +6502,9 @@ async def ws_mavlink(ws: WebSocket):
             elif isinstance(incoming, dict) and incoming.get("type") == "mavlink_inject_ack":
                 # From field-bridge/sdr_mavlink_inject_bridge.py — see _handle_mavlink_inject_ack.
                 await _handle_mavlink_inject_ack(incoming)
+            elif isinstance(incoming, dict) and incoming.get("type") == "wifi_defeat_ack":
+                # From field-bridge/wifi_defeat_bridge.py — see _handle_wifi_defeat_ack.
+                await _handle_wifi_defeat_ack(incoming)
             elif isinstance(incoming, dict) and incoming.get("type") == "bridge_hello":
                 # A TX bridge announcing which effect(s) it will actually
                 # transmit (rf-bridge -> "mavlink", jam_bridge -> "jam"). Lets
@@ -7321,6 +7537,364 @@ async def mavlink_sdr_inject_status(user: Dict = Depends(get_current_user)):
     sessions = sorted(
         ({"request_id": rid, **{k: v for k, v in p.items() if k != "ts"},
           "ts": p["ts"].isoformat()} for rid, p in _pending_mavlink_inject.items()),
+        key=lambda s: s["ts"], reverse=True,
+    )
+    return {"sessions": sessions[:20]}
+
+
+# =====================================================================
+# Routes: Active Wi-Fi defeat (Parrot/Tello) — 802.11 deauth link-drop OR
+# unauthenticated ARSDK3/Tello UDP land/emergency to an OPEN drone softAP. The
+# governed spine is copied VERBATIM from deploy_mavlink_sdr_inject; the two
+# Wi-Fi-specific additions are (1) the PMF / unencrypted-Parrot-Tello HONESTY
+# gates and (2) the target-softAP-BSSID scope resolution (a broadcast/absent
+# BSSID is a hard, fail-closed refuse — FRATRICIDE-CRITICAL).
+# =====================================================================
+# Mode -> range-authorization effect. Mirrors field-bridge/wifi_defeat_bridge.py's
+# _effect_for_mode EXACTLY: deauth is the wifi_deauth effect; every command-inject
+# mode (ARSDK land/emergency, Tello land/emergency) is the arsdk_inject effect.
+# These are SEPARATE leases and separate arm-token effects — arming one does NOT
+# arm the other (same principle as jam vs gnss_spoof vs mavlink_sdr_inject).
+_WIFI_DEFEAT_INJECT_MODES = ("arsdk_land", "arsdk_emergency", "tello_land", "tello_emergency")
+
+
+def _wifi_defeat_effect_for_mode(mode: str) -> str:
+    if mode == "deauth":
+        return "wifi_deauth"
+    return "arsdk_inject"  # the four ARSDK/Tello UDP command-inject modes
+
+
+# Broadcast (band-wide) BSSID — a deauth aimed here would knock every AP off the
+# channel (FRATRICIDE) and defeats the target-bound arm-token + IFF interlocks.
+# Refused fail-closed here AND independently by the bridge/primitive.
+_WIFI_BROADCAST_BSSID = "FF:FF:FF:FF:FF:FF"
+
+
+def _wifi_bssid_missing_or_broadcast(bssid: Any) -> bool:
+    """True when the resolved softAP BSSID is absent / blank / non-string / the
+    band-wide broadcast address. Any of these must FAIL CLOSED (refuse) before a
+    single frame is forwarded — a targeted defeat requires a concrete AP BSSID."""
+    if not bssid or not isinstance(bssid, str):
+        return True
+    b = bssid.strip().upper()
+    if not b or b == _WIFI_BROADCAST_BSSID:
+        return True
+    return False
+
+
+def _wifi_target_has_pmf(detection: Dict[str, Any]) -> bool:
+    """HONESTY gate signal for mode=deauth. Returns True ONLY when the target
+    detection POSITIVELY indicates 802.11w / PMF (Protected Management Frames) on
+    the softAP link. A deauth against a PMF-protected AP is a NO-OP (management
+    frames are cryptographically protected) — firing one and claiming an effect
+    would be an overclaim, so a positive PMF signal is a hard refuse.
+
+    Keyed ONLY on real, explicit detection fields (never fabricated). ABSENCE of a
+    PMF signal is NOT treated as PMF-present: deauth is honestly labeled a
+    best-effort link-drop and is ALLOWED when PMF is not positively indicated
+    (the honesty invariant is 'never SELL deauth as reliable', not 'refuse deauth
+    whenever PMF is unknown'). Only the inject modes fail closed on unknown
+    identity — see _wifi_inject_target_identity."""
+    for key in ("pmf", "pmf_present", "mfp", "ieee80211w", "protected_management_frames"):
+        if bool(detection.get(key)):
+            return True
+    sec = detection.get("wifi_security")
+    if isinstance(sec, dict):
+        for key in ("pmf", "mfp", "ieee80211w", "required"):
+            if bool(sec.get(key)):
+                return True
+    return False
+
+
+# Real identity markers keyed off the detection's own fields (control_link_family
+# / make / model / ssid / threat-library id / protocol). Parrot ARSDK3 airframes
+# (ANAFI/Bebop, ardrone3 project) vs Ryze/DJI Tello (a SEPARATE plaintext UDP SDK
+# — Tello is NOT ARSDK3). Spoofable cues, but that only ever makes this gate MORE
+# conservative (a spoofed non-Parrot/Tello SSID still fails the identity check).
+_WIFI_ARSDK_MARKERS = ("parrot", "anafi", "bebop", "arsdk", "ardrone")
+_WIFI_TELLO_MARKERS = ("tello", "ryze")
+
+
+def _wifi_inject_target_identity(detection: Dict[str, Any], required_family: str) -> Tuple[bool, str]:
+    """FAIL-CLOSED honesty gate for the ARSDK/Tello UDP command-inject modes.
+    Returns (ok, refuse_reason). Mirrors the encrypted/FHSS refusal the SDR
+    MAVLink inject enforces: inject ONLY where the wire format is actually
+    injectable — an UNAUTHENTICATED UDP land/emergency only works against an
+    IDENTIFIED, UNENCRYPTED Parrot ARSDK3 (required_family='arsdk') or Ryze/DJI
+    Tello (required_family='tello') airframe.
+
+    Decision is based ONLY on the detection's real fields — NEVER fabricated. If
+    the link is marked encrypted, OR the required family cannot be positively
+    confirmed from those fields, it FAILS CLOSED (refuse). An ARSDK frame is never
+    sent to a Tello and vice-versa (each mode requires ITS family's marker)."""
+    if bool(detection.get("encrypted")):
+        return (False, "target link is marked encrypted — there is no unauthenticated UDP "
+                       "command to inject into; refusing (fail-closed)")
+    fields = [
+        detection.get("control_link_family"),
+        detection.get("make"), detection.get("make_candidate"),
+        detection.get("model"), detection.get("callsign"),
+        detection.get("ssid"), detection.get("threat_library_id"),
+        detection.get("protocol"),
+    ]
+    hay = " ".join(str(f) for f in fields if f).lower()
+    if required_family == "arsdk":
+        markers, label = _WIFI_ARSDK_MARKERS, "an unencrypted Parrot/ARSDK3"
+    else:
+        markers, label = _WIFI_TELLO_MARKERS, "an unencrypted Ryze/DJI Tello"
+    if any(m in hay for m in markers):
+        return (True, "")
+    return (False, f"cannot confirm target is {label} candidate — the detection's real "
+                   f"fields (control_link_family / make / model / ssid / threat-library id / "
+                   f"protocol) carry no such identity. The ARSDK/Tello UDP command inject only "
+                   f"works against an identified unencrypted airframe; refusing (fail-closed).")
+
+
+@api.post("/wifi-defeat/confirm")
+async def wifi_defeat_confirm(body: WifiDefeatConfirmBody,
+                              user: Dict = Depends(require_commander)):
+    """Mint a single-use wifi_defeat_confirm_token (NOT interchangeable with
+    jam_confirm_token / gnss_spoof_confirm_token / mavlink_sdr_inject_confirm_token).
+    The frontend must call this EXACTLY at the moment its SafetyGate two-step
+    confirm completes — never earlier, never cached. It stands in for the
+    interactive 'type TRANSMIT' prompt once the request reaches the WS-driven
+    field bridge."""
+    tok = _issue_wifi_defeat_confirm_token()
+    await log_event("WIFI_DEFEAT_CONFIRM",
+                    f"Wi-Fi-defeat confirmation token issued (valid "
+                    f"{WIFI_DEFEAT_CONFIRM_TTL_S}s) — operator completed SafetyGate "
+                    f"checklist + two-click confirm",
+                    actor=user["email"])
+    return tok
+
+
+@api.post("/payloads/wifi-defeat")
+async def deploy_wifi_defeat(body: WifiDefeatBody,
+                             user: Dict = Depends(require_commander)):
+    """Request an ACTIVE Wi-Fi defeat against a specific drone softAP: either an
+    802.11 deauth/DoS (LINK-DROP — forces the drone's own link-loss failsafe, NOT
+    command takeover) or an unauthenticated ARSDK3/Tello UDP land/emergency to the
+    OPEN softAP (unencrypted Parrot/Tello ONLY).
+
+    Layered gates, ALL independently required — copied VERBATIM from
+    deploy_mavlink_sdr_inject (removing ANY one is a regression), in this order:
+      a. require_commander (above).
+      b. _check_tx_not_halted — EMERGENCY ABORT blocks this like any other TX (409).
+      c. arm_token — bound to effect=wifi_deauth (deauth) / arsdk_inject (the four
+         inject modes) AND this exact target (F3). 403 on missing/expired/mismatch.
+      d. wifi_defeat_confirm_token — proof the SafetyGate two-step confirm happened
+         for THIS request (422, a distinct non-interchangeable token type).
+      e. Per-target IFF fratricide interlock — a deauth/inject aimed at a
+         CONFIRMED-FRIENDLY (IFF-verified) softAP is HARD-BLOCKED (403) unless the
+         single-use, target-bound commander friendly-fire ack is presented. NEVER
+         deauth a friendly/registered AP. Re-evaluated at fire time.
+      f. range-authorization lease for effect=wifi_deauth / arsdk_inject (arming a
+         different effect does NOT arm this — separate GUI-armed auto-expiring
+         lease). 409 if OFF.
+      g. HONESTY gates (fratricide + no-overclaim): deauth against an 802.11w/PMF
+         target is refused (422) as a no-op — never fire a useless jam-of-nothing;
+         an inject mode is refused (422) unless the target is an IDENTIFIED
+         UNENCRYPTED Parrot ARSDK3 / Tello. Both key on the detection's REAL
+         fields and FAIL CLOSED when the needed signal is absent.
+      h. softAP BSSID scope — a broadcast/absent BSSID is refused (422,
+         fail-closed) before any frame is forwarded (FRATRICIDE-CRITICAL).
+    """
+    _check_tx_not_halted()
+
+    mode = body.mode
+    effect = _wifi_defeat_effect_for_mode(mode)  # wifi_deauth | arsdk_inject
+
+    _consume_arm_token(body.arm_token, effect=effect,
+                       target_detection_id=body.target_detection_id)  # F3: effect+target bound
+    _consume_wifi_defeat_confirm_token(body.wifi_defeat_confirm_token)
+
+    detection = await db.detections.find_one({"id": body.target_detection_id})
+    if not detection:
+        raise HTTPException(404, "Target detection not found")
+
+    is_friendly = (
+        detection.get("iff_verified")
+        or detection.get("threat_level") == "FRIENDLY (IFF verified)"
+    )
+    # Friendly-fire interlock: a non-friendly must be an authorized target; a
+    # CONFIRMED-FRIENDLY is exempt from this routine check because its ONLY licence
+    # is the single-use commander friendly-fire ack enforced in
+    # _enforce_fire_time_iff just below — a friendly with no ack still cannot fire.
+    # Identical posture to /payloads/deploy and /payloads/mavlink-sdr-inject.
+    if not is_friendly and not detection.get("authorized_target"):
+        raise HTTPException(
+            403,
+            "Target not authorized — friendly-fire interlock: "
+            "POST /api/detections/{id}/authorize-target first.",
+        )
+    # Fire-time IFF re-check (fratricide interlock). For a CONFIRMED-FRIENDLY this
+    # is the SOLE authorization gate and requires the single-use, target-bound
+    # commander friendly-fire ack from this request (consumed here). NEVER deauth a
+    # friendly/registered AP without it.
+    await _enforce_fire_time_iff(detection, user, context=f"Wi-Fi defeat [{mode}]",
+                                 friendly_fire_ack=body.iff_friendly_fire_ack)
+
+    # Backend-side range-authorization gate (effect=wifi_deauth / arsdk_inject).
+    # SEPARATE lease from every other effect. Two-sided gate: this 409 plus the
+    # field bridge's own live poll (Gate A) as defense in depth.
+    await _require_range_authorized(effect, user["email"])
+
+    # HONESTY GATES (fratricide + no-overclaim). Based on the detection's REAL
+    # fields; fail closed where the needed signal is absent for the inject modes.
+    if mode == "deauth":
+        if _wifi_target_has_pmf(detection):
+            reason = (
+                "target softAP advertises 802.11w / PMF (Protected Management Frames). "
+                "An 802.11 deauth against a PMF-protected AP is a NO-OP — the management "
+                "frames are cryptographically protected. Refusing to transmit a useless "
+                "deauth and claim an effect."
+            )
+            await log_event(
+                "WIFI_DEFEAT",
+                f"Wi-Fi deauth NOT APPLICABLE against {detection.get('callsign','?')} "
+                f"— {reason} No RF transmitted.",
+                meta={"target_detection_id": body.target_detection_id, "mode": mode,
+                      "pmf": True, "not_applicable": True},
+                actor=user["email"],
+            )
+            raise HTTPException(422, f"Wi-Fi deauth not applicable: {reason}")
+    else:
+        family = "arsdk" if mode in ("arsdk_land", "arsdk_emergency") else "tello"
+        ok, reason = _wifi_inject_target_identity(detection, family)
+        if not ok:
+            await log_event(
+                "WIFI_DEFEAT",
+                f"Wi-Fi {family} inject NOT APPLICABLE against {detection.get('callsign','?')} "
+                f"— {reason} No RF transmitted.",
+                meta={"target_detection_id": body.target_detection_id, "mode": mode,
+                      "family": family, "encrypted": bool(detection.get("encrypted")),
+                      "control_link_family": detection.get("control_link_family"),
+                      "not_applicable": True},
+                actor=user["email"],
+            )
+            raise HTTPException(422, f"Wi-Fi {family} inject not applicable: {reason}")
+
+    # softAP BSSID scope resolution (FRATRICIDE-CRITICAL). The wifi_drone candidate
+    # carries the softAP BSSID/channel; resolve from the detection's real fields.
+    # A broadcast/absent BSSID is refused fail-closed BEFORE any forward — the
+    # bridge + primitive also refuse it, but this endpoint must never be the thing
+    # that forwards a band-wide deauth.
+    target_bssid = (detection.get("bssid") or detection.get("softap_bssid")
+                    or detection.get("target_bssid"))
+    if _wifi_bssid_missing_or_broadcast(target_bssid):
+        await log_event(
+            "WIFI_DEFEAT",
+            f"Wi-Fi defeat REFUSED against {detection.get('callsign','?')} — target "
+            f"detection has no concrete softAP BSSID (or a broadcast BSSID {target_bssid!r}). "
+            f"A targeted deauth/inject requires a specific AP BSSID; a broadcast/absent BSSID "
+            f"would deauth every AP on the channel (fratricide) and defeats the target-bound "
+            f"gates. No RF transmitted.",
+            meta={"target_detection_id": body.target_detection_id, "mode": mode,
+                  "target_bssid": target_bssid, "refused": True},
+            actor=user["email"],
+        )
+        raise HTTPException(
+            422,
+            "Refusing Wi-Fi defeat: target detection has no concrete softAP BSSID (or a "
+            "broadcast BSSID), which would deauth every AP on the channel (fratricide) and "
+            "defeats the target-bound gates. Re-detect the drone softAP with a concrete BSSID.",
+        )
+    target_bssid = target_bssid.strip().upper()
+    # softAP host (UDP inject target) + channel, from the detection's real fields.
+    softap = detection.get("softap") or detection.get("softap_ip")
+    channel = detection.get("channel")
+    # deauth is CONTINUOUS by default (count None/<=0 -> until abort/lease-expiry);
+    # a positive count is a bounded burst. Only meaningful for deauth.
+    is_continuous = (mode == "deauth" and not body.count)
+
+    request_id = str(uuid.uuid4())
+    _pending_wifi_defeat[request_id] = {
+        "ts": datetime.now(timezone.utc),
+        "status": "AWAITING_ACK",
+        "mode": mode,
+        "effect": effect,
+        "target_detection_id": body.target_detection_id,
+        "target_bssid": target_bssid,
+        "softap": softap,
+        "channel": channel,
+        "count": body.count,
+        "continuous": is_continuous,
+        "actor": user["email"],
+    }
+
+    await log_event(
+        "WIFI_DEFEAT",
+        f"Requested Wi-Fi defeat [{mode.upper()}] (effect={effect}) against "
+        f"{detection.get('callsign','?')} softAP {target_bssid}"
+        f"{f' ch {channel}' if channel is not None else ''} — "
+        + ("802.11 deauth link-drop (forces the drone's OWN link-loss failsafe; NOT command "
+           "takeover, defeated by PMF/MAC-rand)" if mode == "deauth" else
+           "unauthenticated ARSDK/Tello UDP land/emergency to the OPEN softAP (unencrypted "
+           "Parrot/Tello only; NOT takeover of an arbitrary drone)")
+        + f". Awaiting bridge TX confirmation (request {request_id})",
+        # Audited DISTINCTLY (kind WIFI_DEFEAT) with the mode in meta.
+        meta={"request_id": request_id, "mode": mode, "effect": effect,
+              "target_detection_id": body.target_detection_id, "target_bssid": target_bssid,
+              "softap": softap, "channel": channel, "count": body.count,
+              "continuous": is_continuous},
+        actor=user["email"],
+    )
+
+    await ws_manager.broadcast_json({
+        "type": "wifi_defeat_request",
+        "request_id": request_id,
+        "mode": mode,
+        "target_bssid": target_bssid,
+        "softap": softap,
+        "client_mac": body.client_mac,
+        "channel": channel,
+        "count": body.count,
+        # Forwarded AFTER being consumed above — same convention as the
+        # jam_request / mavlink_inject_request confirm-token forwarding. Its
+        # presence is the bridge's evidence a real UI confirmation happened, not a
+        # live credential the bridge validates against the backend.
+        "wifi_defeat_confirm_token": body.wifi_defeat_confirm_token,
+        "actor": user["email"],
+    })
+    await ws_manager.broadcast_json({"type": "wifi_defeat_status", "request_id": request_id,
+                                     "status": "AWAITING_ACK"})
+
+    # Honest "no TX bridge subscribed" signal (false-green hardening). The
+    # wifi-defeat bridge advertises a SINGLE consumer role "wifi_defeat" for BOTH
+    # effects (see its bridge_hello). This neither gates nor changes the HTTP code;
+    # it only lets the console warn AT FIRE TIME that no wifi-defeat bridge is
+    # subscribed to actually radiate.
+    tx_bridge_subscribed = ws_manager.has_tx_consumer("wifi_defeat")
+    if not tx_bridge_subscribed:
+        await log_event(
+            "WIFI_DEFEAT",
+            f"WARNING: NO wifi-defeat TX bridge subscribed — request {request_id} will not "
+            f"radiate and will TX_TIMEOUT. Start cema-wifi-defeat-bridge on the transmit host "
+            f"(bring TX online, WIFI_TX_IFACE pinned) before engaging.",
+            meta={"request_id": request_id, "tx_bridge_subscribed": False},
+            actor="SYSTEM",
+        )
+
+    return {
+        "request_id": request_id,
+        "status": "AWAITING_ACK",
+        "mode": mode,
+        "effect": effect,
+        "target_bssid": target_bssid,
+        "channel": channel,
+        "continuous": is_continuous,
+        "tx_bridge_subscribed": tx_bridge_subscribed,
+    }
+
+
+@api.get("/wifi-defeat/status")
+async def wifi_defeat_status(user: Dict = Depends(get_current_user)):
+    """Current/most-recent wifi-defeat session state(s), poll-and-render pattern,
+    mirrors GET /mavlink-sdr-inject/status."""
+    await _expire_pending_wifi_defeat()
+    sessions = sorted(
+        ({"request_id": rid, **{k: v for k, v in p.items() if k != "ts"},
+          "ts": p["ts"].isoformat()} for rid, p in _pending_wifi_defeat.items()),
         key=lambda s: s["ts"], reverse=True,
     )
     return {"sessions": sessions[:20]}

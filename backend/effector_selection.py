@@ -6,10 +6,10 @@ WHAT THIS IS (read this before touching anything here)
 Given the current contacts + the ranked engagement PLAN + a snapshot of effector
 availability, this module produces, per contact, a PROPOSED effector
 recommendation: an explainable threat score, an honest per-effector feasibility
-matrix (jam / GNSS-deny / MAVLink-takeover), a recommended effector with a
-failover order, and a duplicate-engagement flag. It is a sibling of
-`engagement_planner` and `sop_engine`: same PROPOSED-only, commander-cued
-posture.
+matrix (jam / GNSS-deny / MAVLink-takeover / Wi-Fi-deauth / ARSDK-Tello-inject),
+a recommended effector with a failover order, and a duplicate-engagement flag.
+It is a sibling of `engagement_planner` and `sop_engine`: same PROPOSED-only,
+commander-cued posture.
 
 WHAT THIS IS NOT -- CRITICAL SAFETY BOUNDARY (governing invariant)
 -----------------------------------------------------------------
@@ -46,7 +46,17 @@ unproven), NEVER a plain FEASIBLE. Jam -> universally applicable as an RF deny,
 but its *effectiveness* is power/proximity/band physics, not software-decidable,
 so it is FEASIBLE_UNVERIFIED_RANGE. **When the two takeover signals DISAGREE the
 conservative (fail-closed / NOT_FEASIBLE) verdict is taken and BOTH signals are
-surfaced in the rationale.**
+surfaced in the rationale.** The same fail-closed disagreement pattern governs
+the two Wi-Fi effectors: Wi-Fi deauth is honestly a LINK-DROP (forces the
+target's own link-loss failsafe), NEVER a takeover and NEVER ranked in the
+surgical/takeover preference tier -- FEASIBLE_UNVERIFIED_RANGE for a
+positively-identified Wi-Fi control link, NOT_FEASIBLE for a positively
+non-Wi-Fi link, UNKNOWN when the link cannot be identified either way (never a
+blanket assumption). ARSDK3/Tello UDP land-emergency inject is FEASIBLE only
+when a Wi-Fi control link AND the matched library's `arsdk_inject_applicable`
+flag BOTH positively confirm an unencrypted Parrot ARSDK3 / Ryze Tello
+airframe; otherwise NOT_FEASIBLE (encrypted/other) or UNKNOWN (undecidable),
+with disagreeing signals surfaced.
 
 Position honesty (two-lane, from sop_engine): proximity/range scoring ONLY for
 contacts with a real `position_source`; a position-less contact still gets full
@@ -113,12 +123,22 @@ _FEASIBLE_VERDICTS = frozenset(
 EFF_JAM = "jam"
 EFF_GNSS_DENY = "gnss_deny"
 EFF_MAVLINK_TAKEOVER = "mavlink_takeover"
+# Active Wi-Fi defeat (Parrot/Tello) -- two SEPARATE effects, never interchange-
+# able: EFF_WIFI_DEAUTH is an 802.11 link-drop (NOT a takeover); EFF_ARSDK_INJECT
+# is the unauthenticated ARSDK3/Tello UDP land/emergency command (unencrypted
+# Parrot/Tello ONLY).
+EFF_WIFI_DEAUTH = "wifi_deauth"
+EFF_ARSDK_INJECT = "arsdk_inject"
 
 # effector name -> availability snapshot key (the module READS these flags).
+# wifi_deauth / arsdk_inject match the keys _effector_availability_snapshot
+# emits for the wifi_defeat bridge consumer (server.py).
 _AVAILABILITY_KEY: Dict[str, str] = {
     EFF_JAM: "jam",
     EFF_GNSS_DENY: "gnss_spoof",
     EFF_MAVLINK_TAKEOVER: "mavlink_sdr_inject",
+    EFF_WIFI_DEAUTH: "wifi_deauth",
+    EFF_ARSDK_INJECT: "arsdk_inject",
 }
 
 # execution_paths -- DOCUMENTATION STRINGS ONLY. These describe the EXISTING
@@ -136,6 +156,25 @@ EXECUTION_PATHS: Dict[str, str] = {
         "POST /api/payloads/mavlink-sdr-inject with target_detection_id=<this "
         "id> (commander-gated: require_commander + TX-not-halted + fresh "
         "single-use arm token + range authorization; the human fires)."
+    ),
+    EFF_WIFI_DEAUTH: (
+        "POST /api/payloads/wifi-defeat mode=deauth, target_detection_id=<this "
+        "id> (commander-gated: require_commander + TX-not-halted master kill + "
+        "a fresh single-use target-bound arm token + a distinct Wi-Fi-defeat "
+        "two-step confirmation + range authorization + a PMF honesty gate + "
+        "target-softAP-BSSID scope; the human fires). LINK-DROP only -- forces "
+        "the target's own link-loss failsafe, never sold or ranked as a "
+        "takeover."
+    ),
+    EFF_ARSDK_INJECT: (
+        "POST /api/payloads/wifi-defeat mode=arsdk_land|arsdk_emergency|"
+        "tello_land|tello_emergency, target_detection_id=<this id> "
+        "(commander-gated: require_commander + TX-not-halted master kill + a "
+        "fresh single-use target-bound arm token + a distinct Wi-Fi-defeat "
+        "two-step confirmation + range authorization + an "
+        "unencrypted-Parrot/Tello identity honesty gate + target-softAP-BSSID "
+        "scope; the human fires). Unauthenticated UDP land/emergency only -- "
+        "unencrypted Parrot ARSDK3 / Ryze Tello, model/firmware-dependent."
     ),
 }
 
@@ -164,8 +203,17 @@ DOCTRINE_NOTE = (
     "applicable. Jam is a universal RF deny but its effectiveness is a "
     "power/proximity/band physics question, not software-decidable "
     "(FEASIBLE_UNVERIFIED_RANGE). GNSS denial is a v1 placeholder "
-    "(FEASIBLE_PLACEHOLDER_V1), never a proven kill. Recommendation TEXT only "
-    "-- never an autonomous switch."
+    "(FEASIBLE_PLACEHOLDER_V1), never a proven kill. Two Wi-Fi-specific "
+    "additions: an identified unencrypted Parrot ARSDK3 / Ryze Tello softAP is "
+    "best defeated by the surgical ARSDK/Tello UDP land-emergency inject "
+    "(same surgical preference tier as MAVLink RC-override) when feasible AND "
+    "currently clearable; Wi-Fi deauth is a LINK-DROP ONLY -- honestly NEVER a "
+    "takeover, so it is NEVER placed in that surgical tier and always sits "
+    "after jam in the preference order, offered for any identified Wi-Fi "
+    "control link as a best-effort supplement (no-op vs 802.11w/PMF, defeated "
+    "by MAC-randomization/renamed-SSID). Jam remains the universal defeat "
+    "across every link family. Recommendation TEXT only -- never an autonomous "
+    "switch."
 )
 
 
@@ -221,6 +269,36 @@ def _countermeasures_for(contact: Dict[str, Any],
     best = (match or {}).get("best") or {}
     cm = best.get("countermeasures")
     return cm if isinstance(cm, dict) else None
+
+
+# Positive-only Wi-Fi control-link tokens, read from the SAME identifier string
+# classify_override_link consumes (control_link_family / control_link_protocol
+# / protocol / family). A hit here is a genuine Wi-Fi cue; there is
+# deliberately NO negative/DJI-name token list -- some DJI (and other)
+# controller links ARE Wi-Fi-based, so "not obviously Wi-Fi" must never be
+# blanket-asserted as "not Wi-Fi" (position honesty applied to link identity).
+_WIFI_LINK_TOKENS = ("wifi", "wi-fi", "802.11", "arsdk", "ardrone")
+
+
+def _wifi_link_class(contact: Dict[str, Any], link_class: str) -> str:
+    """Classify a contact's control link for the two Wi-Fi effectors. Returns
+    one of:
+
+      'wifi'      -- a Wi-Fi token is present in the contact's own link fields.
+      'not_wifi'  -- no Wi-Fi token, AND classify_override_link positively
+                     identified a DIFFERENT real RF protocol (encrypted/FHSS or
+                     legacy MAVLink) -- a genuine non-Wi-Fi link, not a guess.
+      'unknown'   -- neither signal is decidable; never asserted either way.
+
+    `link_class` is the SAME classify_override_link(...) result already
+    computed for the MAVLink-takeover verdict -- reused, not recomputed, so
+    this module's only mavlink_codec call stays classify_override_link."""
+    link_str = _link_identifier(contact).lower()
+    if any(tok in link_str for tok in _WIFI_LINK_TOKENS):
+        return "wifi"
+    if link_class in ("encrypted", "legacy_mavlink"):
+        return "not_wifi"
+    return "unknown"
 
 
 def _availability_for(effector: str, availability: Dict[str, Any]) -> Dict[str, Any]:
@@ -392,7 +470,23 @@ def _feasibility(contact: Dict[str, Any],
     # conservative (fail-closed) verdict and surface BOTH signals. -------------
     mav = _takeover_verdict(link_class, cyber_applicable, contact)
 
-    return {"jam": jam, "gnss_deny": gnss, "mavlink_takeover": mav}
+    # ---- Wi-Fi deauth / ARSDK-Tello inject: the two Active Wi-Fi Defeat
+    # effectors. Both key off the SAME identity signals as the rest of this
+    # matrix -- the contact's own link fields (via _wifi_link_class, reusing
+    # link_class) and the matched library's countermeasures. -------------------
+    wifi_class = _wifi_link_class(contact, link_class)
+    wifi_deauth_applicable = cm.get("wifi_deauth_applicable")
+    arsdk_applicable = cm.get("arsdk_inject_applicable")
+    wifi_deauth = _wifi_deauth_verdict(wifi_class, wifi_deauth_applicable, contact)
+    arsdk_inject = _arsdk_inject_verdict(wifi_class, arsdk_applicable, contact)
+
+    return {
+        "jam": jam,
+        "gnss_deny": gnss,
+        "mavlink_takeover": mav,
+        "wifi_deauth": wifi_deauth,
+        "arsdk_inject": arsdk_inject,
+    }
 
 
 def _takeover_verdict(link_class: str,
@@ -463,20 +557,144 @@ def _takeover_verdict(link_class: str,
     return {"verdict": verdict, "rationale": rationale, "link_class": link_class}
 
 
+def _wifi_deauth_verdict(wifi_class: str,
+                         wifi_deauth_applicable: Optional[bool],
+                         contact: Dict[str, Any]) -> Dict[str, Any]:
+    """Honest verdict for EFF_WIFI_DEAUTH -- 802.11 deauth/disassoc against the
+    target's own softAP. This is ALWAYS a LINK-DROP (forces the target's
+    link-loss failsafe), never command takeover -- applies generally to any
+    IDENTIFIED Wi-Fi-class contact, never blanket-asserted for a link that has
+    not actually been shown to be Wi-Fi (e.g. a DJI OcuSync contact stays
+    NOT_FEASIBLE unless ITS OWN fields say Wi-Fi -- some DJI controller links
+    are Wi-Fi-based, so 'DJI' alone decides nothing here)."""
+    link_str = _link_identifier(contact) or "(none)"
+    sig = f"wifi_link_class({link_str!r})={wifi_class!r}"
+    if wifi_deauth_applicable is not None:
+        sig += f"; countermeasures.wifi_deauth_applicable={wifi_deauth_applicable!r}"
+
+    if wifi_class == "wifi":
+        verdict = FEASIBLE_UNVERIFIED_RANGE
+        rationale = (
+            "802.11 deauth = LINK-DROP (forces link-loss failsafe), NOT "
+            "command takeover; no-op vs 802.11w/PMF; defeated by "
+            f"MAC-randomization/renamed-SSID. [{sig}]"
+        )
+    elif wifi_class == "not_wifi":
+        verdict = NOT_FEASIBLE
+        rationale = (
+            "control link positively identifies as a non-Wi-Fi RF protocol -- "
+            "there is no 802.11 softAP link to deauth. NOT feasible at the "
+            f"command layer (jam remains the general RF defeat). [{sig}]"
+        )
+    else:  # unknown
+        verdict = UNKNOWN
+        rationale = (
+            "control link is unidentified/empty -- Wi-Fi deauth feasibility is "
+            "UNKNOWN (never blanket-asserted). Needs a positive Wi-Fi "
+            f"control-link identification. [{sig}]"
+        )
+
+    return {"verdict": verdict, "rationale": rationale, "link_class": wifi_class}
+
+
+def _arsdk_inject_verdict(wifi_class: str,
+                          arsdk_applicable: Optional[bool],
+                          contact: Dict[str, Any]) -> Dict[str, Any]:
+    """Honest verdict for EFF_ARSDK_INJECT -- the unauthenticated ARSDK3/Tello
+    UDP land/emergency command inject. Decided by BOTH the Wi-Fi link
+    classification AND countermeasures.arsdk_inject_applicable (mirrors
+    _takeover_verdict's fail-closed disagreement pattern): FEASIBLE only when
+    both signals positively agree on an identified unencrypted Parrot ARSDK3 /
+    Ryze Tello airframe; on DISAGREEMENT the conservative NOT_FEASIBLE verdict
+    is taken and BOTH signals are surfaced."""
+    link_str = _link_identifier(contact) or "(none)"
+    sig = (f"wifi_link_class({link_str!r})={wifi_class!r}; "
+           f"countermeasures.arsdk_inject_applicable={arsdk_applicable!r}")
+
+    if wifi_class == "not_wifi":
+        rationale = (
+            "control link positively identifies as a non-Wi-Fi RF protocol -- "
+            "the unauthenticated ARSDK3/Tello UDP command inject only works "
+            f"over an open Wi-Fi softAP link. NOT feasible. [{sig}]"
+        )
+        if arsdk_applicable is True:
+            rationale += (" SIGNALS DISAGREE (library flags arsdk-inject "
+                          "applicable, but the link classifies as non-Wi-Fi); "
+                          "taking the conservative fail-closed verdict.")
+        verdict = NOT_FEASIBLE
+
+    elif wifi_class == "wifi":
+        if arsdk_applicable is False:
+            verdict = NOT_FEASIBLE
+            rationale = (
+                "SIGNALS DISAGREE: the control link classifies as Wi-Fi (a "
+                "softAP is present), but the matched library entry reports "
+                "arsdk_inject_applicable=false (e.g. an encrypted/hardened "
+                "Wi-Fi airframe). Taking the conservative (fail-closed) "
+                f"NOT_FEASIBLE verdict. [{sig}]"
+            )
+        elif arsdk_applicable is True:
+            verdict = FEASIBLE
+            rationale = (
+                "both signals agree: Wi-Fi control link AND library "
+                "arsdk_inject_applicable=true -- an unauthenticated "
+                "ARSDK3/Tello UDP land/emergency command is viable against "
+                "this identified, unencrypted Parrot/Tello airframe; "
+                f"model/firmware-dependent. [{sig}]"
+            )
+        else:  # None -- Wi-Fi link but no positive make/model confirmation.
+            verdict = UNKNOWN
+            rationale = (
+                "control link classifies as Wi-Fi, but the threat library "
+                "carried no explicit arsdk_inject_applicable flag for this "
+                "contact -- honest UNKNOWN, not an assumed capability. The "
+                "unauthenticated ARSDK3/Tello UDP command inject only works "
+                "against an IDENTIFIED unencrypted Parrot ARSDK3 / Ryze Tello "
+                f"airframe. [{sig}]"
+            )
+
+    else:  # unknown link class
+        verdict = UNKNOWN
+        rationale = (
+            "control link is unidentified/empty -- ARSDK/Tello inject "
+            "feasibility is UNKNOWN (never assumed viable). Needs a positive "
+            "Wi-Fi link identification AND an unencrypted Parrot/Tello match "
+            f"before this can be upgraded. [{sig}]"
+        )
+        if arsdk_applicable is True:
+            rationale += (" NOTE: the matched library entry flags arsdk-inject "
+                          "applicable, but without a confirmed Wi-Fi link class "
+                          "this cannot be upgraded to feasible.")
+        elif arsdk_applicable is False:
+            rationale += (" NOTE: the matched library entry flags arsdk-inject "
+                          "NOT applicable, reinforcing non-viability.")
+
+    return {"verdict": verdict, "rationale": rationale, "link_class": wifi_class}
+
+
 # ==========================================================================
 # Recommended effector + failover (4.5.6/4.5.7) -- recommendation text ONLY
 # ==========================================================================
 def _doctrine_order(feasible: Dict[str, str]) -> List[str]:
     """Preference order over the FEASIBLE effectors per doctrine.
 
-    * legacy-MAVLink takeover feasible -> prefer the surgical takeover, then jam,
-      then a GNSS-deny layer.
-    * otherwise (encrypted / unknown / DJI) -> jam primary, GNSS-deny layer,
-      takeover last (it will not be in `feasible` for encrypted anyway)."""
-    if EFF_MAVLINK_TAKEOVER in feasible:
-        preference = [EFF_MAVLINK_TAKEOVER, EFF_JAM, EFF_GNSS_DENY]
+    * A surgical, positively-identified command effector -- legacy-MAVLink
+      RC-override OR the ARSDK3/Tello UDP inject -- is preferred FIRST when
+      feasible (both require a positive link + identity match). Wi-Fi deauth
+      is a LINK-DROP, NEVER a takeover, so it NEVER sits in this surgical
+      tier regardless of what else is feasible.
+    * otherwise (no surgical option feasible: encrypted / unknown / DJI /
+      unidentified Wi-Fi) -> jam stays the universal primary defeat, with
+      Wi-Fi deauth offered next (only when a Wi-Fi link was actually
+      identified -- see _wifi_deauth_verdict) as a best-effort link-drop
+      supplement, then the GNSS-deny layer, then the surgical command
+      effectors last (they will not be FEASIBLE in this branch anyway)."""
+    surgical = [e for e in (EFF_MAVLINK_TAKEOVER, EFF_ARSDK_INJECT) if e in feasible]
+    if surgical:
+        preference = surgical + [EFF_JAM, EFF_WIFI_DEAUTH, EFF_GNSS_DENY]
     else:
-        preference = [EFF_JAM, EFF_GNSS_DENY, EFF_MAVLINK_TAKEOVER]
+        preference = [EFF_JAM, EFF_WIFI_DEAUTH, EFF_GNSS_DENY,
+                      EFF_MAVLINK_TAKEOVER, EFF_ARSDK_INJECT]
     return [e for e in preference if e in feasible]
 
 

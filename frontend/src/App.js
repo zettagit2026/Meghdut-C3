@@ -9,6 +9,7 @@ import Signals from "@/pages/Signals";
 import Library from "@/pages/Library";
 import Takeover from "@/pages/Takeover";
 import Jamming from "@/pages/Jamming";
+import WifiDefeat from "@/pages/WifiDefeat";
 import GnssSpoof from "@/pages/GnssSpoof";
 import KillChain from "@/pages/KillChain";
 import DetectionHistory from "@/pages/DetectionHistory";
@@ -52,6 +53,7 @@ export default function App() {
             <Route path="jamming"   element={<Jamming />} />
             <Route path="gnss-spoof" element={<GnssSpoof />} />
             <Route path="takeover"  element={<Takeover />} />
+            <Route path="wifi-defeat" element={<WifiDefeat />} />
             <Route path="killchain" element={<KillChain />} />
             <Route path="decision"  element={<DecisionSupport />} />
             <Route path="history"   element={<DetectionHistory />} />

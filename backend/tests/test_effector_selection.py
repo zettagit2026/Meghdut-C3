@@ -45,15 +45,21 @@ from effector_selection import (  # noqa: E402
 # Fixture builders
 # --------------------------------------------------------------------------
 def _availability(tx_halted=False, jam=(True, True), gnss=(True, True),
-                  mav=(True, True)):
+                  mav=(True, True), wifi_deauth=(True, True), arsdk=(True, True)):
     """A read-only effector-availability snapshot, mirroring the contract shape
-    the server passes in ({tx_halted, jam, gnss_spoof, mavlink_sdr_inject})."""
+    the server passes in ({tx_halted, jam, gnss_spoof, mavlink_sdr_inject,
+    wifi_deauth, arsdk_inject})."""
     return {
         "tx_halted": tx_halted,
         "jam": {"bridge_up": jam[0], "range_auth_enabled": jam[1]},
         "gnss_spoof": {"bridge_up": gnss[0], "range_auth_enabled": gnss[1],
                        "maturity": "v1_placeholder"},
         "mavlink_sdr_inject": {"bridge_up": mav[0], "range_auth_enabled": mav[1]},
+        "wifi_deauth": {"bridge_up": wifi_deauth[0],
+                        "range_auth_enabled": wifi_deauth[1],
+                        "maturity": "link_drop_not_takeover"},
+        "arsdk_inject": {"bridge_up": arsdk[0], "range_auth_enabled": arsdk[1],
+                         "maturity": "unencrypted_parrot_tello_only"},
     }
 
 
@@ -135,6 +141,59 @@ def _disagreement_contact(**overrides):
             "jam_bands": ["915MHz"],
             "gnss_deny_applicable": False,
             "cyber_takeover_applicable": False,   # <- disagrees with classify
+        },
+    }
+    base.update(overrides)
+    return base
+
+
+def _wifi_parrot_contact(**overrides):
+    """Identified Wi-Fi/ARSDK Parrot contact: deauth link-drop AND the ARSDK
+    inject are both viable per the matched library countermeasures."""
+    base = {
+        "detection_id": "det-parrot",
+        "callsign": "ANAFI-7",
+        "protocol": "Wi-Fi 802.11 a/n (ARSDK3)",
+        "control_link_family": "Wi-Fi/ARSDK",
+        "family": "Wi-Fi/ARSDK",
+        "band": "2.4GHz",
+        "confidence_type": "rf_signature",
+        "threat_level": "MEDIUM",
+        "position_source": None,
+        "countermeasures": {
+            "jam_bands": ["2.4GHz", "5GHz-WiFi"],
+            "gnss_deny_applicable": True,
+            "cyber_takeover_applicable": False,
+            "wifi_deauth_applicable": True,
+            "arsdk_inject_applicable": True,
+        },
+    }
+    base.update(overrides)
+    return base
+
+
+def _wifi_unknown_make_contact(**overrides):
+    """A Wi-Fi-class control link with NO make/model identification -- an
+    explicit countermeasures block carrying no arsdk_inject_applicable flag
+    (unlike _countermeasures_for's library-match fallback, which would fuzzy-
+    match a generic 'Wi-Fi' band/family onto the nearest real entry and defeat
+    the point of this fixture): honest UNKNOWN for the identity-gated ARSDK
+    inject, but deauth still applies generally to any identified Wi-Fi link
+    (link-drop, not identity-gated)."""
+    base = {
+        "detection_id": "det-wifi-unk",
+        "callsign": "DIRECT-4F2A",
+        "protocol": "Wi-Fi 802.11 (generic softAP)",
+        "control_link_family": "Wi-Fi",
+        "family": None,
+        "band": "2.4GHz",
+        "confidence_type": "rf_signature",
+        "threat_level": "MEDIUM",
+        "position_source": None,
+        "countermeasures": {
+            "jam_bands": ["2.4GHz"],
+            "gnss_deny_applicable": None,
+            "cyber_takeover_applicable": None,
         },
     }
     base.update(overrides)
@@ -448,6 +507,112 @@ def test_missing_countermeasures_yields_honest_unknowns_no_crash():
     assert rec["feasibility"]["mavlink_takeover"]["verdict"] == "UNKNOWN"
     # jam remains universally feasible even with no library data.
     assert rec["feasibility"]["jam"]["verdict"] == "FEASIBLE_UNVERIFIED_RANGE"
+
+
+# --------------------------------------------------------------------------
+# Active Wi-Fi defeat (P4): wifi_deauth (link-drop) + arsdk_inject (unencrypted
+# Parrot/Tello only) -- HONEST feasibility, never sold/ranked as takeover.
+# --------------------------------------------------------------------------
+def test_wifi_parrot_deauth_is_link_drop_not_takeover_and_inject_feasible():
+    out = build_effector_recommendations(
+        [_wifi_parrot_contact()], _empty_plan(), _availability(), set())
+    fes = out["recommendations"][0]["feasibility"]
+    deauth = fes["wifi_deauth"]
+    assert deauth["verdict"] == "FEASIBLE_UNVERIFIED_RANGE"
+    assert "LINK-DROP" in deauth["rationale"]
+    assert "NOT command takeover" in deauth["rationale"]
+    inject = fes["arsdk_inject"]
+    assert inject["verdict"] == "FEASIBLE"
+
+
+def test_wifi_parrot_recommends_surgical_inject_over_deauth_and_jam():
+    """The surgical, positively-identified ARSDK inject is preferred -- deauth
+    (a mere link-drop) is never promoted ahead of it or of jam."""
+    out = build_effector_recommendations(
+        [_wifi_parrot_contact()], _empty_plan(), _availability(), set())
+    rec = out["recommendations"][0]
+    assert rec["recommended_effector"] == "arsdk_inject"
+    order = [f["effector"] for f in rec["failover_order"]]
+    assert order.index("jam") < order.index("wifi_deauth")
+
+
+def test_encrypted_dji_contact_inject_not_feasible_deauth_not_blanket_asserted():
+    """An encrypted/DJI OcuSync contact: arsdk_inject NOT_FEASIBLE, and deauth
+    is NOT blanket-asserted feasible since this detection's own fields do not
+    indicate a Wi-Fi control link (only mark deauth feasible where the
+    detection actually indicates one)."""
+    out = build_effector_recommendations(
+        [_encrypted_dji_contact()], _empty_plan(), _availability(), set())
+    fes = out["recommendations"][0]["feasibility"]
+    assert fes["arsdk_inject"]["verdict"] == "NOT_FEASIBLE"
+    assert fes["wifi_deauth"]["verdict"] != "FEASIBLE_UNVERIFIED_RANGE"
+    assert fes["wifi_deauth"]["verdict"] == "NOT_FEASIBLE"
+
+
+def test_wifi_contact_unknown_make_inject_fails_closed_but_deauth_still_applies():
+    """A Wi-Fi-class contact with no matched library entry: arsdk_inject fails
+    CLOSED (never a confident FEASIBLE for an unidentified airframe), while
+    deauth -- generic to any identified Wi-Fi link -- still applies."""
+    out = build_effector_recommendations(
+        [_wifi_unknown_make_contact()], _empty_plan(), _availability(), set())
+    fes = out["recommendations"][0]["feasibility"]
+    assert fes["arsdk_inject"]["verdict"] in ("UNKNOWN", "NOT_FEASIBLE")
+    assert fes["arsdk_inject"]["verdict"] != "FEASIBLE"
+    assert fes["wifi_deauth"]["verdict"] == "FEASIBLE_UNVERIFIED_RANGE"
+
+
+def test_wifi_inject_signal_disagreement_is_conservative_not_feasible():
+    """A Wi-Fi link positively identified, but the matched library entry says
+    arsdk_inject_applicable=false (e.g. an encrypted/hardened Wi-Fi airframe) --
+    SIGNALS DISAGREE -> conservative NOT_FEASIBLE, both signals surfaced."""
+    contact = _wifi_parrot_contact(countermeasures={
+        "jam_bands": ["2.4GHz"], "gnss_deny_applicable": True,
+        "cyber_takeover_applicable": False,
+        "wifi_deauth_applicable": True,
+        "arsdk_inject_applicable": False,
+    })
+    out = build_effector_recommendations(
+        [contact], _empty_plan(), _availability(), set())
+    inject = out["recommendations"][0]["feasibility"]["arsdk_inject"]
+    assert inject["verdict"] == "NOT_FEASIBLE"
+    assert "DISAGREE" in inject["rationale"]
+    # deauth is unaffected by the inject-only disagreement -- still the link-drop.
+    deauth = out["recommendations"][0]["feasibility"]["wifi_deauth"]
+    assert deauth["verdict"] == "FEASIBLE_UNVERIFIED_RANGE"
+
+
+def test_wifi_deauth_never_ranked_in_surgical_takeover_tier():
+    """Doctrine-order property: wifi_deauth is NEVER placed in the surgical
+    'takeover' preference slot that MAVLink-takeover / arsdk-inject occupy --
+    it always sits behind jam, whether or not a surgical option is feasible."""
+    feasible_with_surgical = {
+        "wifi_deauth": "FEASIBLE_UNVERIFIED_RANGE",
+        "jam": "FEASIBLE_UNVERIFIED_RANGE",
+        "arsdk_inject": "FEASIBLE",
+    }
+    order = effector_selection._doctrine_order(feasible_with_surgical)
+    assert order[0] == "arsdk_inject"
+    assert order.index("wifi_deauth") > order.index("jam")
+
+    feasible_no_surgical = {
+        "wifi_deauth": "FEASIBLE_UNVERIFIED_RANGE",
+        "jam": "FEASIBLE_UNVERIFIED_RANGE",
+    }
+    order2 = effector_selection._doctrine_order(feasible_no_surgical)
+    # jam -- the universal defeat -- is preferred ahead of the unreliable
+    # deauth link-drop; deauth is never promoted to the #1 recommendation.
+    assert order2[0] == "jam"
+    assert order2.index("wifi_deauth") > order2.index("jam")
+
+
+def test_wifi_deauth_alone_feasible_recommends_jam_not_deauth():
+    """When only jam + wifi_deauth are feasible (no surgical inject match),
+    jam -- the universal defeat -- is recommended, never the unreliable
+    deauth link-drop."""
+    out = build_effector_recommendations(
+        [_wifi_unknown_make_contact()], _empty_plan(), _availability(), set())
+    rec = out["recommendations"][0]
+    assert rec["recommended_effector"] == "jam"
 
 
 # ==========================================================================

@@ -2,7 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import {
   Crosshair, RefreshCw, ShieldAlert, ChevronDown, ChevronRight, Lock, ExternalLink,
-  Radio, Satellite, RadioTower, AlertTriangle,
+  Radio, Satellite, RadioTower, AlertTriangle, Wifi,
 } from "lucide-react";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
@@ -40,10 +40,15 @@ const THREAT_STYLE = {
 
 // The ONLY places a commander can actually act on a recommendation — the
 // pre-existing gated engagement pages. Route paths must match App.js.
+// `to` is normally a static path; wifi_deauth/arsdk_inject use a function so
+// the deep-link carries ?contact=<id> straight to the pre-filled target chip
+// on WifiDefeat.jsx (mirrors WifiDefeat.jsx's own ?contact= reader).
 const EFFECTOR_ROUTE = {
   jam: { to: "/jamming", label: "RF BARRAGE JAM", icon: Radio },
   gnss_deny: { to: "/gnss-spoof", label: "GNSS SPOOF", icon: Satellite },
   mavlink_takeover: { to: "/takeover", label: "MAVLINK TAKEOVER", icon: RadioTower },
+  wifi_deauth: { to: (id) => `/wifi-defeat?contact=${id}`, label: "WI-FI DEFEAT", icon: Wifi },
+  arsdk_inject: { to: (id) => `/wifi-defeat?contact=${id}`, label: "WI-FI DEFEAT", icon: Wifi },
 };
 
 function VerdictBadge({ verdict, testid }) {
@@ -62,7 +67,10 @@ function VerdictBadge({ verdict, testid }) {
 
 function FeasibilityCell({ kind, testidPrefix, id, feasibility }) {
   const f = feasibility || {};
-  const labelMap = { jam: "JAM", gnss_deny: "GNSS-DENY", mavlink_takeover: "TAKEOVER" };
+  const labelMap = {
+    jam: "JAM", gnss_deny: "GNSS-DENY", mavlink_takeover: "TAKEOVER",
+    wifi_deauth: "WIFI-DEAUTH", arsdk_inject: "WIFI-INJECT",
+  };
   return (
     <div className="flex flex-col gap-1">
       <div className="font-mono text-[9px] uppercase tracking-widest text-slate-500">{labelMap[kind]}</div>
@@ -217,10 +225,12 @@ function RecommendationRow({ rec }) {
         </button>
         {expanded && <ScoreBreakdown breakdown={rec.score_breakdown} />}
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 tactical-border-t">
+        <div className="grid grid-cols-1 sm:grid-cols-3 xl:grid-cols-5 gap-3 pt-2 tactical-border-t">
           <FeasibilityCell kind="jam" testidPrefix="jam" id={id} feasibility={rec.feasibility?.jam} />
           <FeasibilityCell kind="gnss_deny" testidPrefix="gnss" id={id} feasibility={rec.feasibility?.gnss_deny} />
           <FeasibilityCell kind="mavlink_takeover" testidPrefix="takeover" id={id} feasibility={rec.feasibility?.mavlink_takeover} />
+          <FeasibilityCell kind="wifi_deauth" testidPrefix="wifi-deauth" id={id} feasibility={rec.feasibility?.wifi_deauth} />
+          <FeasibilityCell kind="arsdk_inject" testidPrefix="wifi-inject" id={id} feasibility={rec.feasibility?.arsdk_inject} />
         </div>
 
         <div
@@ -240,7 +250,7 @@ function RecommendationRow({ rec }) {
           </div>
           {route ? (
             <Link
-              to={route.to}
+              to={typeof route.to === "function" ? route.to(id) : route.to}
               data-testid={`decision-engage-link-${id}`}
               className="flex items-center gap-2 px-3 py-2 tactical-border font-mono text-[10px] uppercase tracking-widest hover-accent-info transition-colors scanline-btn shrink-0"
               title="Opens the existing gated engagement page — arm/confirm/range-auth/tx-halt still apply there"

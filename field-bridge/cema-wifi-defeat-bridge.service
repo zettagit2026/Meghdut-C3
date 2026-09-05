@@ -1,0 +1,106 @@
+# =====================================================================
+# DO NOT ENABLE THIS UNIT UNTIL THE INJECTION-CAPABLE Wi-Fi NIC IS
+# VERIFIED ON THE UNIT.  (wifi-defeat-active-cuas-plan.md, §Hardware / §Crux)
+# =====================================================================
+# This bridge injects real 802.11 deauth frames and unauthenticated Parrot
+# ARSDK3 / Ryze-DJI Tello UDP commands over a DEDICATED injection NIC. Not every
+# Wi-Fi adapter can inject: the NIC named by WIFI_TX_IFACE must be a monitor-mode
+# injection-capable adapter (e.g. AR9271 / AWUS036NHA on ath9k_htc) and MUST be
+# PROVEN on THIS unit with `aireplay-ng --test <iface>` before this service is
+# ever enabled. It ships DORMANT (NOT enabled, like every other TX bridge) —
+# `systemctl enable` it ONLY after that hardware verification passes, and only
+# once a SECOND injection NIC exists so Kismet detection RX keeps its own NIC
+# (one NIC cannot be monitor-RX detection and monitor-TX injection at once — see
+# the plan's NIC mode-exclusivity crux). Enabling it before the NIC is verified
+# either transmits nothing (silent false capability) or keys the wrong / RX
+# detection NIC and takes detection off the air.
+[Unit]
+Description=CEMA cUAS - Wi-Fi defeat bridge (802.11 deauth + unencrypted Parrot ARSDK3 / Tello command injection, WS-driven, governed + DORMANT)
+After=network-online.target docker.service
+Wants=network-online.target
+
+# This bridge is a COMPANION of cema-jam-bridge.service, not an independently
+# started unit — IDENTICAL coupling to cema-sdr-mavlink-bridge.service /
+# cema-operator-jam-bridge.service. The GUI "Bring TX Online" starts
+# cema-jam-bridge via the root host-helper (scripts/host-helper/cema_tx_helper.py),
+# whose FROZEN whitelist we deliberately DO NOT touch. That unit's Wants=+Before=
+# pulls this one up alongside it, so the wifi_defeat TX consumer is running
+# whenever TX is online — without the operator ever starting it from a terminal.
+# The PartOf= below binds this unit's lifecycle to cema-jam-bridge so a
+# stop/restart of cema-jam-bridge propagates here — i.e. "Stand Down"
+# (`systemctl stop cema-jam-bridge`) stops this bridge too. After= keeps ordering
+# deterministic (jam-bridge settles first). NOTE: PartOf only propagates
+# stop/restart, not start; the start side comes from the jam-bridge unit's
+# Wants=. The operator must never start this unit from a terminal, and its
+# [Install] below is scoped to cema-jam-bridge (NOT multi-user.target) so it
+# never auto-starts at boot independently of TX-online — AND it must not be
+# enabled at all until the injection NIC is hardware-verified (see the header).
+PartOf=cema-jam-bridge.service
+After=cema-jam-bridge.service
+
+[Service]
+Type=simple
+# Change these three (User/WorkingDirectory/EnvironmentFile path) to match your
+# deployment — same convention as field-bridge/cema-jam-bridge.service /
+# cema-sdr-mavlink-bridge.service. There is deliberately only ONE copy of this
+# unit in the repo; do not fork per-host copies with hardcoded paths/users baked
+# in. Keep host-specific values out of this file — they belong in the
+# EnvironmentFile below.
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+
+# This bridge drives field-bridge/wifi_defeat_primitives.py (real 802.11 / UDP
+# TX) under the SAME governed spine as cema-jam-bridge.service. See
+# field-bridge/wifi_defeat_bridge.py + wifi_defeat_primitives.py + wifi_arsdk_encode.py.
+#
+# The EnvironmentFile must define at minimum (same as the other bridges):
+#   CEMA_API_URL=http://localhost:8001
+#   CEMA_EMAIL=operator@meghaduta.mil
+#   CEMA_PASSWORD=<this host's current admin password>
+# and SHOULD define (to enable the honest "TX bridge subscribed" signal):
+#   CEMA_BRIDGE_TOKEN=<same shared secret as the backend + other bridge .env>
+#
+# ONE value is REQUIRED for this bridge to actually radiate:
+#   WIFI_TX_IFACE=<dedicated injection NIC>   # e.g. wlan1 on an AR9271/AWUS036NHA.
+#                                             # wifi_defeat_primitives FAILS CLOSED
+#                                             # without it — it will NOT key the
+#                                             # RX/detection NIC (which would take
+#                                             # Kismet detection off the air). This
+#                                             # is the device-pin safety override,
+#                                             # the Wi-Fi analogue of the SDR
+#                                             # bridge's HACKRF_TX_SERIAL, and the
+#                                             # NIC it names MUST have passed
+#                                             # `aireplay-ng --test` on this unit.
+#
+# =====================================================================
+# CEMA_AUTHORIZED_RANGE — DELIBERATELY NOT SET IN THIS UNIT FILE.
+# =====================================================================
+# Identical to cema-jam-bridge.service / cema-sdr-mavlink-bridge.service: the live
+# range-authorization lease is an explicit, GUI-driven, auto-expiring
+# per-deployment decision (checked LIVE by this bridge at the moment of
+# transmission via GET /api/range-authorization/status?effect=wifi_deauth for
+# deauth and ?effect=arsdk_inject for command injection — SEPARATE leases). Do
+# NOT bake any static authorization into this committed unit, a shared default
+# .env, or any image — doing so would silently turn every deployment into a live
+# transmitter.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+
+# INTERPRETER: wifi_defeat_bridge.py needs only the PLAIN field-bridge venv
+# (requests + websocket-client; scapy is imported lazily by
+# wifi_defeat_primitives ONLY at real deauth TX time). It does NOT need GNU Radio.
+# So this ExecStart points at the SAME plain field-bridge venv as
+# cema-jam-bridge.service / cema-sdr-mavlink-bridge.service.
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u wifi_defeat_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/wifi_defeat_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/wifi_defeat_bridge.log
+
+[Install]
+# Scoped to the jam-bridge coupling, NOT multi-user.target: `systemctl enable`
+# installs this only into cema-jam-bridge.service.wants/, so it never comes up on
+# its own at boot — it is brought up only as a companion of cema-jam-bridge when
+# the GUI brings TX online. DO NOT run `systemctl enable` at all until the
+# injection NIC is verified on the unit (`aireplay-ng --test`), per the header
+# and the plan §Hardware — until then this unit stays DORMANT.
+WantedBy=cema-jam-bridge.service

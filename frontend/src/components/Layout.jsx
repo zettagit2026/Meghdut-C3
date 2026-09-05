@@ -15,7 +15,7 @@ import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import {
   Radar, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History, MapPin, BookOpen,
-  Satellite, RadioTower, Layers, Gauge,
+  Satellite, RadioTower, Layers, Gauge, Wifi,
 } from "lucide-react";
 
 // Grouped IA (FIGHT / PLAN / IDENTIFY / REVIEW). FIGHT stays always-visible —
@@ -35,6 +35,7 @@ const NAV_GROUPS = [
       { to: "/jamming",   label: "RF JAM",           icon: Zap,       testid: "nav-jamming" },
       { to: "/gnss-spoof",label: "GNSS DENY",        icon: Satellite, testid: "nav-gnss-spoof" },
       { to: "/takeover",  label: "MAVLINK TAKEOVER", icon: RadioTower,testid: "nav-takeover" },
+      { to: "/wifi-defeat",label: "WI-FI DEFEAT",    icon: Wifi,      testid: "nav-wifi-defeat" },
     ],
   },
   {
