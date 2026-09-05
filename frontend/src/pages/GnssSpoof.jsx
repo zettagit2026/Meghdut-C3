@@ -338,10 +338,10 @@ export default function GnssSpoof() {
             onClick={() => setGateOpen(true)}
             className={`w-full flex items-center justify-center gap-2 px-4 py-3 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors ${
               !canArm
-                ? "opacity-30 border-slate-700 text-slate-600 cursor-not-allowed"
+                ? "opacity-30 text-slate-600 cursor-not-allowed"
                 : "hover-accent-critical"
             }`}
-            style={!canArm ? undefined : { color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
+            style={!canArm ? { borderColor: "var(--border-col)" } : { color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
           >
             ARM GNSS SPOOF
           </button>

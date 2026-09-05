@@ -233,7 +233,8 @@ function SignatureDbPanel() {
               value={query}
               onChange={(e) => { setQuery(e.target.value); setPage(0); }}
               placeholder="Search name, manufacturer, modulation, category..."
-              className="bg-transparent outline-none font-mono text-xs w-full text-slate-200 placeholder:text-slate-600"
+              className="bg-transparent outline-none font-mono text-xs w-full placeholder:text-slate-600"
+              style={{ color: "var(--text-primary)" }}
             />
           </div>
           <select
