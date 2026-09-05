@@ -1,0 +1,642 @@
+{
+  "schema": "meghdut.threat_library.v1",
+  "version": "1.0.0",
+  "revision": 1,
+  "updated": "2026-09-05T00:00:00Z",
+  "source": "MEGHDUT C3 seed threat library",
+  "provenance_note": "Every entry is compiled from PUBLIC manufacturer specifications and open-source RF observations only. Fields that are not publicly documented are left null and are NEVER invented. RF-signature ranges are approximate open-source values, not lab-calibrated per-airframe measurements. No classified, export-controlled, or fabricated data is present. Military-class entries are class-level doctrine placeholders only (open-source), carrying NO specific classified parameters.",
+  "class_vocab": ["multirotor", "fixed-wing", "FPV", "VTOL", "loitering-munition-class", "ISR-class", "unknown"],
+  "threat_levels": ["LOW", "MEDIUM", "HIGH", "CRITICAL"],
+  "entries": [
+    {
+      "id": "dji-mavic-3",
+      "make": "DJI",
+      "model": "Mavic 3 (incl. Pro / Classic / Cine)",
+      "aliases": ["Mavic 3", "Mavic 3 Pro", "Mavic 3 Classic"],
+      "class": "multirotor",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "DJI OcuSync 3+ (O3+)",
+        "control_link_family": "DJI OcuSync",
+        "bands": ["2.4GHz", "5.8GHz"],
+        "video_band": ["2.4GHz", "5.8GHz"],
+        "video_type": "digital (OcuSync)",
+        "telemetry": "embedded in OcuSync downlink",
+        "remoteid_capable": true
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.4419, 5.7875],
+        "occupied_bw_mhz_range": [10, 40],
+        "fhss": true,
+        "hop_markers": "OcuSync adaptive frequency hopping across 2.4/5.8 GHz sub-channels",
+        "remoteid_marker": true,
+        "droneid_marker": {"make": "DJI", "models": ["Mavic 3", "Mavic 3 Pro", "Mavic 3 Classic"]},
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "5.8GHz"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "OcuSync control link is proprietary and encrypted -- NOT injectable. Defeat via RF denial (2.4/5.8 GHz jam) and/or GNSS denial."
+      }
+    },
+    {
+      "id": "dji-air-3",
+      "make": "DJI",
+      "model": "Air 3 / Air 3S",
+      "aliases": ["Air 3", "Air 3S"],
+      "class": "multirotor",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "DJI OcuSync 4 (O4)",
+        "control_link_family": "DJI OcuSync",
+        "bands": ["2.4GHz", "5.8GHz"],
+        "video_band": ["2.4GHz", "5.8GHz"],
+        "video_type": "digital (OcuSync)",
+        "telemetry": "embedded in OcuSync downlink",
+        "remoteid_capable": true
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.4419, 5.7875],
+        "occupied_bw_mhz_range": [10, 40],
+        "fhss": true,
+        "hop_markers": "OcuSync 4 adaptive hopping 2.4/5.8 GHz",
+        "remoteid_marker": true,
+        "droneid_marker": {"make": "DJI", "models": ["Air 3", "Air 3S"]},
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "5.8GHz"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "OcuSync 4 encrypted proprietary link -- NOT injectable."
+      }
+    },
+    {
+      "id": "dji-mini-4-pro",
+      "make": "DJI",
+      "model": "Mini 4 Pro",
+      "aliases": ["Mini 4 Pro", "Mini 4"],
+      "class": "multirotor",
+      "threat_level": "MEDIUM",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "DJI OcuSync 4 (O4)",
+        "control_link_family": "DJI OcuSync",
+        "bands": ["2.4GHz", "5.8GHz"],
+        "video_band": ["2.4GHz", "5.8GHz"],
+        "video_type": "digital (OcuSync)",
+        "telemetry": "embedded in OcuSync downlink",
+        "remoteid_capable": true
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.4419, 5.7875],
+        "occupied_bw_mhz_range": [10, 40],
+        "fhss": true,
+        "hop_markers": "OcuSync 4 adaptive hopping 2.4/5.8 GHz",
+        "remoteid_marker": true,
+        "droneid_marker": {"make": "DJI", "models": ["Mini 4 Pro"]},
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "5.8GHz"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "Sub-250g class; OcuSync encrypted -- NOT injectable. Small RCS makes radar cueing harder; RF/DroneID cueing preferred."
+      }
+    },
+    {
+      "id": "dji-phantom-4",
+      "make": "DJI",
+      "model": "Phantom 4 (Pro / Pro V2)",
+      "aliases": ["Phantom 4", "Phantom 4 Pro", "Phantom 4 Pro V2"],
+      "class": "multirotor",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "DJI Lightbridge / OcuSync (Pro V2)",
+        "control_link_family": "DJI OcuSync",
+        "bands": ["2.4GHz", "5.8GHz"],
+        "video_band": ["2.4GHz", "5.8GHz"],
+        "video_type": "digital",
+        "telemetry": "embedded downlink",
+        "remoteid_capable": true
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.4419, 5.7875],
+        "occupied_bw_mhz_range": [10, 20],
+        "fhss": true,
+        "hop_markers": "Lightbridge/OcuSync hopping 2.4/5.8 GHz",
+        "remoteid_marker": true,
+        "droneid_marker": {"make": "DJI", "models": ["Phantom 4", "Phantom 4 Pro", "Phantom 4 Pro V2"]},
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "5.8GHz"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "Lightbridge/OcuSync encrypted -- NOT injectable."
+      }
+    },
+    {
+      "id": "dji-avata",
+      "make": "DJI",
+      "model": "Avata / Avata 2",
+      "aliases": ["Avata", "Avata 2"],
+      "class": "FPV",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "DJI OcuSync 3 (O3) / O4",
+        "control_link_family": "DJI OcuSync",
+        "bands": ["2.4GHz", "5.8GHz"],
+        "video_band": ["2.4GHz", "5.8GHz"],
+        "video_type": "digital (low-latency FPV)",
+        "telemetry": "embedded downlink",
+        "remoteid_capable": true
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.4419, 5.7875],
+        "occupied_bw_mhz_range": [20, 40],
+        "fhss": true,
+        "hop_markers": "OcuSync FPV hopping 2.4/5.8 GHz",
+        "remoteid_marker": true,
+        "droneid_marker": {"make": "DJI", "models": ["Avata", "Avata 2"]},
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "5.8GHz"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "Digital FPV; OcuSync encrypted -- NOT injectable. FPV agility implies possible kamikaze use -> HIGH."
+      }
+    },
+    {
+      "id": "dji-fpv",
+      "make": "DJI",
+      "model": "FPV",
+      "aliases": ["DJI FPV"],
+      "class": "FPV",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "DJI OcuSync 3 (O3)",
+        "control_link_family": "DJI OcuSync",
+        "bands": ["2.4GHz", "5.8GHz"],
+        "video_band": ["2.4GHz", "5.8GHz"],
+        "video_type": "digital (low-latency FPV)",
+        "telemetry": "embedded downlink",
+        "remoteid_capable": true
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.4419, 5.7875],
+        "occupied_bw_mhz_range": [20, 40],
+        "fhss": true,
+        "hop_markers": "OcuSync FPV hopping",
+        "remoteid_marker": true,
+        "droneid_marker": {"make": "DJI", "models": ["FPV"]},
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "5.8GHz"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "OcuSync encrypted -- NOT injectable."
+      }
+    },
+    {
+      "id": "autel-evo-ii",
+      "make": "Autel Robotics",
+      "model": "EVO II (incl. Pro / Dual / V3)",
+      "aliases": ["EVO II", "EVO 2", "EVO II Pro"],
+      "class": "multirotor",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "Autel SkyLink",
+        "control_link_family": "Autel SkyLink",
+        "bands": ["900MHz", "2.4GHz", "5.8GHz"],
+        "video_band": ["2.4GHz", "5.8GHz"],
+        "video_type": "digital (SkyLink)",
+        "telemetry": "embedded downlink",
+        "remoteid_capable": true
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.4419, 5.7875],
+        "occupied_bw_mhz_range": [10, 20],
+        "fhss": true,
+        "hop_markers": "SkyLink adaptive hopping; note Autel does NOT emit DJI DroneID",
+        "remoteid_marker": true,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["900MHz", "2.4GHz", "5.8GHz"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "SkyLink proprietary encrypted -- NOT injectable. No DJI DroneID beacon, so DroneID-decode ID does not apply; use ASTM RemoteID (if enabled) or RF-signature/class ID."
+      }
+    },
+    {
+      "id": "autel-max-4t",
+      "make": "Autel Robotics",
+      "model": "Dragonfish / EVO Max 4T",
+      "aliases": ["Max 4T", "EVO Max 4T"],
+      "class": "multirotor",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "Autel SkyLink 3.0",
+        "control_link_family": "Autel SkyLink",
+        "bands": ["900MHz", "2.4GHz", "5.8GHz"],
+        "video_band": ["2.4GHz", "5.8GHz"],
+        "video_type": "digital (SkyLink)",
+        "telemetry": "embedded downlink",
+        "remoteid_capable": true
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.4419, 5.7875],
+        "occupied_bw_mhz_range": [10, 20],
+        "fhss": true,
+        "hop_markers": "SkyLink 3.0 adaptive hopping; triple-band capable",
+        "remoteid_marker": true,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["900MHz", "2.4GHz", "5.8GHz"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "SkyLink 3.0 encrypted -- NOT injectable. Enterprise-grade payload/thermal platform -> HIGH."
+      }
+    },
+    {
+      "id": "parrot-anafi",
+      "make": "Parrot",
+      "model": "ANAFI (incl. USA / Ai)",
+      "aliases": ["Anafi", "ANAFI USA", "ANAFI Ai"],
+      "class": "multirotor",
+      "threat_level": "MEDIUM",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "Wi-Fi 802.11 a/n (ARSDK3)",
+        "control_link_family": "Wi-Fi/ARSDK",
+        "bands": ["2.4GHz", "5GHz-WiFi"],
+        "video_band": ["2.4GHz", "5GHz-WiFi"],
+        "video_type": "digital over Wi-Fi (H.264)",
+        "telemetry": "ARSDK3 over Wi-Fi",
+        "remoteid_capable": true
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.437, 5.2],
+        "occupied_bw_mhz_range": [20, 40],
+        "fhss": false,
+        "hop_markers": "802.11 channel (no classic FHSS); ARSDK3 command frames",
+        "remoteid_marker": true,
+        "droneid_marker": null,
+        "wifi_oui": ["90:3A:E6", "00:26:7E", "A0:14:3D"],
+        "wifi_ssid_pattern": "^ANAFI-"
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "5GHz-WiFi"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": "Wi-Fi/ARSDK3",
+        "cyber_takeover_note": "Wi-Fi control layer: Wi-Fi deauth / DoS is possible against the AP link, but reliable command TAKEOVER is not assured (newer ANAFI USA hardens the link). Distinctive 'ANAFI-' SSID gives a strong make/model cue."
+      }
+    },
+    {
+      "id": "skydio-x10",
+      "make": "Skydio",
+      "model": "X10 / X2",
+      "aliases": ["X10", "X2", "Skydio 2"],
+      "class": "multirotor",
+      "threat_level": "MEDIUM",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "Skydio Link (Wi-Fi based) / optional Mesh",
+        "control_link_family": "Wi-Fi/Skydio",
+        "bands": ["2.4GHz", "5GHz-WiFi"],
+        "video_band": ["2.4GHz", "5GHz-WiFi"],
+        "video_type": "digital",
+        "telemetry": "embedded downlink",
+        "remoteid_capable": true
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.437, 5.2],
+        "occupied_bw_mhz_range": [20, 40],
+        "fhss": false,
+        "hop_markers": "Wi-Fi channelized link; autonomy makes GPS-denial less effective (visual navigation)",
+        "remoteid_marker": true,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "5GHz-WiFi"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "HONEST LIMITATION: Skydio airframes use strong onboard visual autonomy -- GNSS denial and even link loss are partially mitigated by the drone's own navigation. RF denial degrades the operator link but may not force a landing."
+      }
+    },
+    {
+      "id": "yuneec-typhoon-h",
+      "make": "Yuneec",
+      "model": "Typhoon H / H520",
+      "aliases": ["Typhoon H", "H520"],
+      "class": "multirotor",
+      "threat_level": "MEDIUM",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "2.4 GHz control + 5.8 GHz video",
+        "control_link_family": "2.4GHz-generic",
+        "bands": ["2.4GHz", "5.8GHz"],
+        "video_band": ["5.8GHz"],
+        "video_type": "digital",
+        "telemetry": "2.4 GHz downlink",
+        "remoteid_capable": null
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.4419, 5.7875],
+        "occupied_bw_mhz_range": [8, 20],
+        "fhss": true,
+        "hop_markers": "2.4 GHz control hopping; separate 5.8 GHz video",
+        "remoteid_marker": null,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "5.8GHz"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "Proprietary link -- NOT injectable via this system."
+      }
+    },
+    {
+      "id": "generic-analog-fpv-racer",
+      "make": "Generic / DIY",
+      "model": "Analog FPV Racer (5.8 GHz video)",
+      "aliases": ["FPV racer", "analog FPV", "5.8GHz FPV"],
+      "class": "FPV",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "FrSky / FlySky / ELRS (varies); analog 5.8 GHz video",
+        "control_link_family": "Analog-FPV",
+        "bands": ["2.4GHz", "5.8GHz"],
+        "video_band": ["5.8GHz"],
+        "video_type": "analog FM (raceband)",
+        "telemetry": "optional (varies)",
+        "remoteid_capable": false
+      },
+      "signatures": {
+        "control_band_centers_ghz": [5.658, 5.732, 5.8, 5.917],
+        "occupied_bw_mhz_range": [6, 20],
+        "fhss": false,
+        "hop_markers": "Analog video is a FIXED fat carrier on a raceband channel (5.658-5.917 GHz) -- distinctive vs digital; control link separate",
+        "remoteid_marker": false,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "5.8GHz"],
+        "gnss_deny_applicable": null,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "Analog video carries no injectable control. Many racers fly manual/acro with NO GPS, so GNSS denial may have no effect. Weaponizable (FPV kamikaze) -> HIGH. Defeat via 2.4/5.8 GHz control+video jam."
+      }
+    },
+    {
+      "id": "elrs-longrange",
+      "make": "ExpressLRS (open-source)",
+      "model": "ELRS long-range control link",
+      "aliases": ["ELRS", "ExpressLRS", "CRSF"],
+      "class": "FPV",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "ExpressLRS (CRSF) FHSS",
+        "control_link_family": "ELRS/CRSF-class",
+        "bands": ["2.4GHz", "915MHz", "868MHz"],
+        "video_band": null,
+        "video_type": "separate (analog or digital) -- ELRS is control only",
+        "telemetry": "CRSF telemetry uplink",
+        "remoteid_capable": false
+      },
+      "signatures": {
+        "control_band_centers_ghz": [2.44, 0.915, 0.868],
+        "occupied_bw_mhz_range": [0.5, 4],
+        "fhss": true,
+        "hop_markers": "Fast FHSS (up to 500-1000 Hz packet rate), narrow instantaneous BW; binding-phrase keyed",
+        "remoteid_marker": false,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["2.4GHz", "915MHz", "868MHz"],
+        "gnss_deny_applicable": null,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "ELRS is FHSS with a binding phrase -- NOT reliably injectable. It is a control link only (identifies the platform's control family, not the airframe). Long-range capable -> HIGH."
+      }
+    },
+    {
+      "id": "tbs-crossfire",
+      "make": "Team BlackSheep",
+      "model": "Crossfire / Tracer",
+      "aliases": ["Crossfire", "TBS Crossfire", "Tracer"],
+      "class": "FPV",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "TBS Crossfire (868/915 MHz) / Tracer (2.4 GHz) FHSS",
+        "control_link_family": "Crossfire",
+        "bands": ["868MHz", "915MHz", "2.4GHz"],
+        "video_band": null,
+        "video_type": "separate -- Crossfire is control only",
+        "telemetry": "CRSF telemetry",
+        "remoteid_capable": false
+      },
+      "signatures": {
+        "control_band_centers_ghz": [0.868, 0.915, 2.44],
+        "occupied_bw_mhz_range": [0.25, 2],
+        "fhss": true,
+        "hop_markers": "Sub-GHz FHSS long-range control; very narrow instantaneous BW",
+        "remoteid_marker": false,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["868MHz", "915MHz", "2.4GHz"],
+        "gnss_deny_applicable": null,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "Sub-GHz FHSS -- NOT reliably injectable. Control link only; long-range capable -> HIGH."
+      }
+    },
+    {
+      "id": "legacy-mavlink-sik",
+      "make": "Generic (ArduPilot/PX4)",
+      "model": "Legacy MAVLink-over-SiK airframe",
+      "aliases": ["MAVLink", "SiK radio", "ArduPilot", "PX4"],
+      "class": "fixed-wing",
+      "threat_level": "HIGH",
+      "data_source": "public-spec",
+      "rf_profile": {
+        "control_link_protocol": "MAVLink over 433/915 MHz SiK telemetry radio (often UNENCRYPTED)",
+        "control_link_family": "MAVLink-SiK",
+        "bands": ["433MHz", "915MHz", "868MHz"],
+        "video_band": null,
+        "video_type": "separate",
+        "telemetry": "MAVLink telemetry (plaintext on legacy links)",
+        "remoteid_capable": false
+      },
+      "signatures": {
+        "control_band_centers_ghz": [0.433, 0.915, 0.868],
+        "occupied_bw_mhz_range": [0.05, 0.5],
+        "fhss": true,
+        "hop_markers": "SiK FHSS; MAVLink HEARTBEAT/COMMAND frames decodable when unencrypted",
+        "remoteid_marker": false,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": ["433MHz", "915MHz", "868MHz"],
+        "gnss_deny_applicable": true,
+        "cyber_takeover_applicable": true,
+        "cyber_takeover_protocol": "MAVLink",
+        "cyber_takeover_note": "ONLY class in this library where cyber-takeover is genuinely applicable: an UNENCRYPTED MAVLink-over-RF link permits command/RC injection (see PL-001..PL-011). If the specific link is encrypted, takeover is NOT applicable -- verify before relying on it."
+      }
+    },
+    {
+      "id": "mil-loitering-munition-class",
+      "make": "(class-level placeholder)",
+      "model": "Loitering munition (generic class)",
+      "aliases": ["kamikaze drone", "loitering munition"],
+      "class": "loitering-munition-class",
+      "threat_level": "CRITICAL",
+      "data_source": "class-level-open-source",
+      "rf_profile": {
+        "control_link_protocol": null,
+        "control_link_family": null,
+        "bands": null,
+        "video_band": null,
+        "video_type": null,
+        "telemetry": null,
+        "remoteid_capable": false
+      },
+      "signatures": {
+        "control_band_centers_ghz": null,
+        "occupied_bw_mhz_range": null,
+        "fhss": null,
+        "hop_markers": "CLASS-LEVEL PLACEHOLDER: specific emitter parameters are NOT publicly available and are deliberately null. Populate ONLY from an authorized signature import.",
+        "remoteid_marker": false,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": null,
+        "gnss_deny_applicable": null,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "HONEST LIMITATION: many loitering munitions fly a pre-programmed / terminally-guided profile and may be RF-silent or on an encrypted/anti-jam link -- RF countermeasures may be INEFFECTIVE, and this class is a doctrine placeholder, NOT a validated signature. No classified parameters are asserted."
+      }
+    },
+    {
+      "id": "mil-isr-fixedwing-class",
+      "make": "(class-level placeholder)",
+      "model": "Military ISR fixed-wing UAS (generic class)",
+      "aliases": ["ISR drone", "reconnaissance UAV"],
+      "class": "ISR-class",
+      "threat_level": "HIGH",
+      "data_source": "class-level-open-source",
+      "rf_profile": {
+        "control_link_protocol": null,
+        "control_link_family": null,
+        "bands": null,
+        "video_band": null,
+        "video_type": null,
+        "telemetry": null,
+        "remoteid_capable": false
+      },
+      "signatures": {
+        "control_band_centers_ghz": null,
+        "occupied_bw_mhz_range": null,
+        "fhss": null,
+        "hop_markers": "CLASS-LEVEL PLACEHOLDER: specific parameters not publicly available; null by design.",
+        "remoteid_marker": false,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": null,
+        "gnss_deny_applicable": null,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "HONEST LIMITATION: military ISR platforms typically use encrypted, frequency-agile, anti-jam datalinks and may operate beyond effective RF-DEW range. Doctrine placeholder only."
+      }
+    },
+    {
+      "id": "mil-vtol-class",
+      "make": "(class-level placeholder)",
+      "model": "Military VTOL / tactical UAS (generic class)",
+      "aliases": ["VTOL UAS", "tactical drone"],
+      "class": "VTOL",
+      "threat_level": "HIGH",
+      "data_source": "class-level-open-source",
+      "rf_profile": {
+        "control_link_protocol": null,
+        "control_link_family": null,
+        "bands": null,
+        "video_band": null,
+        "video_type": null,
+        "telemetry": null,
+        "remoteid_capable": false
+      },
+      "signatures": {
+        "control_band_centers_ghz": null,
+        "occupied_bw_mhz_range": null,
+        "fhss": null,
+        "hop_markers": "CLASS-LEVEL PLACEHOLDER: parameters null by design.",
+        "remoteid_marker": false,
+        "droneid_marker": null,
+        "wifi_oui": null,
+        "wifi_ssid_pattern": null
+      },
+      "countermeasures": {
+        "jam_bands": null,
+        "gnss_deny_applicable": null,
+        "cyber_takeover_applicable": false,
+        "cyber_takeover_protocol": null,
+        "cyber_takeover_note": "HONEST LIMITATION: encrypted/anti-jam military datalink assumed. Doctrine placeholder only; no classified data asserted."
+      }
+    }
+  ]
+}

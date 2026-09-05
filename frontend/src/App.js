@@ -9,6 +9,7 @@ import Signals from "@/pages/Signals";
 import MavlinkConsole from "@/pages/MavlinkConsole";
 import Payloads from "@/pages/Payloads";
 import ProtocolLibrary from "@/pages/ProtocolLibrary";
+import ThreatLibrary from "@/pages/ThreatLibrary";
 import Jamming from "@/pages/Jamming";
 import GnssSpoof from "@/pages/GnssSpoof";
 import SdrMavlinkInject from "@/pages/SdrMavlinkInject";
@@ -49,6 +50,7 @@ export default function App() {
             <Route path="mavlink"   element={<MavlinkConsole />} />
             <Route path="payloads"  element={<Payloads />} />
             <Route path="protocols" element={<ProtocolLibrary />} />
+            <Route path="threat-library" element={<ThreatLibrary />} />
             <Route path="jamming"   element={<Jamming />} />
             <Route path="gnss-spoof" element={<GnssSpoof />} />
             <Route path="sdr-mavlink-inject" element={<SdrMavlinkInject />} />

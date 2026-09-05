@@ -142,6 +142,11 @@ from engagement_planner import build_engagement_plan
 # dependency-free derivation lives in protocol_status.py so it is unit-testable
 # without booting FastAPI/Mongo -- server.py only owns the runtime report store.
 import protocol_status
+# Inbuilt drone threat library + matching/classification engine (RFI Sec
+# 4.2.12). Pure, dependency-free (load/validate/merge/match) so the engine and
+# the offline/online update-merge logic are unit-testable without FastAPI/Mongo;
+# server.py only owns the in-memory active-library handle + auth-gated routes.
+import threat_library
 # Container->host privilege bridge for the GUI TX-bridge SiK handoff. Talks to
 # the hard-whitelisted cema-tx-helper root daemon over a bind-mounted Unix
 # socket (see backend/tx_bridge_control.py + scripts/host-helper/README.md).
@@ -3817,6 +3822,123 @@ async def parrot_latest(user: Dict = Depends(get_current_user)):
     if _last_parrot_decode is None:
         return {"available": False}
     return {"available": True, **_last_parrot_decode}
+
+
+# =====================================================================
+# Routes: Threat Library (RFI Northern Command Sec 4.2.12)
+# =====================================================================
+# An inbuilt, VERSIONED library of COTS + class-level military threat drones
+# (4.2.12.1); ID + classification of a live/selected detection (4.2.12.2, feeding
+# 4.2.5.4 make/model/serial/protocol); and offline/online file import to update
+# it WITHOUT OEM intervention (4.2.12.3/4.2.12.4). The pure engine lives in
+# backend/threat_library.py; this holds the in-memory active-library handle and
+# the auth-gated routes. A read is get_current_user; an import (which mutates the
+# active library) is require_commander.
+_threat_lib: Dict[str, Any] = threat_library.load_library()
+
+
+class ThreatMatchBody(BaseModel):
+    """Observed detection attributes to match against the library. Every field is
+    optional -- a real contact carries only what was actually observed. A decoded
+    broadcast id (remoteid/droneid) yields an EXACT make/model/serial; an
+    RF-signature-only observation (band/bw/family) yields ranked CLASS/FAMILY
+    candidates, never a fabricated exact model."""
+    band: Optional[str] = None
+    bands: Optional[List[str]] = None
+    center_freq_ghz: Optional[float] = None
+    occupied_bw_mhz: Optional[float] = None
+    fhss: Optional[bool] = None
+    control_link_family: Optional[str] = None
+    control_link_label: Optional[str] = None
+    video_type: Optional[str] = None
+    remoteid: Optional[Dict[str, Any]] = None
+    droneid: Optional[Dict[str, Any]] = None
+    wifi: Optional[Dict[str, Any]] = None
+    max_candidates: int = 5
+
+
+class ThreatLibraryImportBody(BaseModel):
+    """A full threat-library JSON file to import (offline export from another
+    MEGHDUT node, or an online-fetched update). It is schema-validated and merged
+    (add/update by entry id, revision bumped, change audited) -- an OEM is never
+    in the loop. `dry_run` validates + previews the merge without persisting."""
+    library: Dict[str, Any]
+    dry_run: bool = False
+
+
+@api.get("/threat-library")
+async def threat_library_list(user: Dict = Depends(get_current_user)):
+    """The full threat library + summary (version, revision, updated, counts).
+    Read-only; any authenticated operator may browse it."""
+    return {
+        "summary": threat_library.library_summary(_threat_lib),
+        "entries": _threat_lib.get("entries", []),
+        "import_history": _threat_lib.get("import_history", []),
+    }
+
+
+@api.get("/threat-library/export")
+async def threat_library_export(user: Dict = Depends(get_current_user)):
+    """Export the current library as a JSON object -- the OFFLINE half of the
+    4.2.12.3/4 file-import update path (export here, import on another node)."""
+    await log_event(
+        "THREAT_LIBRARY_EXPORT",
+        f"Threat library exported: version={_threat_lib.get('version')} "
+        f"revision={_threat_lib.get('revision')} entries={len(_threat_lib.get('entries', []))}",
+        actor=user["email"],
+    )
+    return _threat_lib
+
+
+@api.post("/threat-library/match")
+async def threat_library_match(body: ThreatMatchBody,
+                               user: Dict = Depends(get_current_user)):
+    """Match one detection's observed attributes -> ranked candidate threats with
+    HONEST tiered confidence + classified threat level. See threat_library.py."""
+    obs = body.dict(exclude_none=True)
+    result = threat_library.match_detection(obs, _threat_lib,
+                                            max_candidates=body.max_candidates)
+    return result
+
+
+@api.post("/threat-library/import")
+async def threat_library_import(body: ThreatLibraryImportBody,
+                                user: Dict = Depends(require_commander)):
+    """Import + merge a threat-library file WITHOUT OEM intervention (4.2.12.3/4).
+    Validates the incoming file, merges by entry id (add/update), bumps the
+    revision, records a change audit, and persists the merged active library.
+    COMMANDER-gated (it mutates the fielded threat picture). A malformed file is
+    rejected with 400 and never applied."""
+    global _threat_lib
+    try:
+        threat_library.validate_library(body.library)
+        merged, audit = threat_library.merge_library(_threat_lib, body.library)
+    except threat_library.ThreatLibraryError as e:
+        raise HTTPException(status_code=400, detail=f"invalid threat library: {e}")
+    if body.dry_run:
+        return {"ok": True, "dry_run": True, "audit": audit,
+                "summary": threat_library.library_summary(merged)}
+    threat_library.save_active_library(merged)
+    _threat_lib = merged
+    await log_event(
+        "THREAT_LIBRARY_IMPORT",
+        f"Threat library updated: rev {audit['from_revision']}->{audit['to_revision']} "
+        f"added={audit['added_count']} updated={audit['updated_count']} "
+        f"version={merged.get('version')}",
+        actor=user["email"],
+    )
+    return {"ok": True, "dry_run": False, "audit": audit,
+            "summary": threat_library.library_summary(_threat_lib)}
+
+
+@api.get("/threat-library/{entry_id}")
+async def threat_library_get(entry_id: str,
+                             user: Dict = Depends(get_current_user)):
+    """One threat entry by id, or 404."""
+    e = next((x for x in _threat_lib.get("entries", []) if x.get("id") == entry_id), None)
+    if e is None:
+        raise HTTPException(status_code=404, detail=f"no threat entry '{entry_id}'")
+    return e
 
 
 @api.get("/protocols/status")
