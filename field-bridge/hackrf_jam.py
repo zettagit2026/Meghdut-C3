@@ -70,6 +70,52 @@ def _tx_device_args() -> list:
     return ["-d", HACKRF_TX_SERIAL] if HACKRF_TX_SERIAL else []
 
 
+# FAIL-CLOSED TX PINNING AT THE SOURCE (safety-critical). On the production box
+# there are TWO HackRFs — …930c (PA + antenna) is the TX radiator, …a063 is the
+# RX/detection unit. If HACKRF_TX_SERIAL is UNSET, hackrf_transfer runs with NO
+# `-d` and grabs index-0 / whichever unit answers libusb first — which can be
+# the RX radio, keying the wrong antenna (fratricide / wrong radiator). The
+# governed bridges (jam_bridge.py / operator_jam_bridge.py) pin HACKRF_TX_SERIAL
+# via their systemd EnvironmentFile, so production is pinned and this guard is a
+# no-op there. But the shared primitive itself must REFUSE an unpinned transmit
+# rather than silently fall back to index-0: no `hackrf_transfer` process is
+# ever spawned on the refuse path.
+#
+# DEV OPT-OUT — HACKRF_ALLOW_UNPINNED_TX=1: legitimate single-HackRF development
+# (and this repo's unit tests, which never own a real radio) explicitly permits
+# the old unpinned behavior ONLY by setting this flag. Default (flag absent) =
+# fail-closed. It is read LIVE from the environment at each transmit (NOT cached
+# at import) so a dev/test can toggle it per-call, and — crucially — it is
+# consulted ONLY when HACKRF_TX_SERIAL is unset: the SET-serial (governed /
+# production) path never looks at it and is byte-for-byte unchanged.
+HACKRF_ALLOW_UNPINNED_TX_ENV = "HACKRF_ALLOW_UNPINNED_TX"
+
+
+def _tx_pinning_error() -> Optional[str]:
+    """Fail-closed TX pinning gate, shared by every transmit entry point below.
+
+    Returns None when the transmit is permitted (either HACKRF_TX_SERIAL is
+    pinned — the governed/production path, unchanged — or the explicit
+    HACKRF_ALLOW_UNPINNED_TX=1 dev opt-out is set), and a human-readable error
+    string when the transmit must be REFUSED (no serial pinned, no opt-out).
+    Never spawns a subprocess. When the dev opt-out IS in effect, emits a single
+    one-line WARNING to stderr so an unpinned transmit can never be mistaken for
+    a governed run."""
+    if HACKRF_TX_SERIAL:
+        return None  # pinned -> governed/production path, byte-for-byte unchanged
+    if os.environ.get(HACKRF_ALLOW_UNPINNED_TX_ENV) == "1":
+        print("WARNING: HACKRF_TX_SERIAL is unset — transmitting UNPINNED "
+              "(HACKRF_ALLOW_UNPINNED_TX=1). Single-HackRF DEV ONLY; on a "
+              "dual-radio box an unpinned transmit can key the RX antenna.",
+              file=sys.stderr)
+        return None
+    return ("REFUSING TX (fail-closed): HACKRF_TX_SERIAL is not set. An unpinned "
+            "hackrf_transfer would grab index-0 / whichever HackRF responds first "
+            "and could key the RX radio. Pin the TX unit's serial via "
+            "HACKRF_TX_SERIAL (the governed bridges do this through systemd), or "
+            "set HACKRF_ALLOW_UNPINNED_TX=1 for explicit single-HackRF dev use.")
+
+
 # RETAINED as a NON-binding default only (e.g. the CLI --duration-s default and
 # backward-compatible imports in operator_jam_wrapper.py / jam_bridge.py). It is
 # NO LONGER a hard auto-stop cap — per the commander directive there is no
@@ -314,6 +360,11 @@ def transmit_iq_file(
     Returns {"ok": bool, "error": Optional[str], "stopped_early": bool}.
     Never raises for TX-side failures — same convention as transmit_burst().
     """
+    # Fail-closed TX pinning: refuse before spawning anything if no TX serial is
+    # pinned and the dev opt-out is not set (see _tx_pinning_error).
+    pin_err = _tx_pinning_error()
+    if pin_err:
+        return {"ok": False, "error": pin_err, "stopped_early": False}
     continuous = _is_continuous(duration_s)
     cmd = [
         "hackrf_transfer",
@@ -469,6 +520,12 @@ def transmit_burst(
     HackrfDeviceBusy, so jam_bridge.py sends a normal "failed" jam_ack for
     this request rather than the whole service dying.
     """
+    # Fail-closed TX pinning: refuse before building IQ or spawning anything if
+    # no TX serial is pinned and the dev opt-out is not set (see
+    # _tx_pinning_error). The SET-serial governed path is unaffected.
+    pin_err = _tx_pinning_error()
+    if pin_err:
+        return {"ok": False, "error": pin_err, "stopped_early": False}
     continuous = _is_continuous(duration_s)
     # For a continuous or long run, build ONE short chunk and loop it on the
     # radio (-R) rather than materializing a giant IQ buffer. For a short
@@ -609,6 +666,12 @@ def transmit_sweep(
     string" hook for unit tests; default = a real hackrf_transfer subprocess.
     Returns {"ok", "error", "stopped_early"} like transmit_burst.
     """
+    # Fail-closed TX pinning: refuse before building IQ or entering the sweep
+    # loop if no TX serial is pinned and the dev opt-out is not set (see
+    # _tx_pinning_error). The SET-serial governed path is unaffected.
+    pin_err = _tx_pinning_error()
+    if pin_err:
+        return {"ok": False, "error": pin_err, "stopped_early": False}
     continuous = _is_continuous(duration_s)
     dwell_s = max(0.001, float(dwell_ms) / 1000.0)
     # Frequency-scope safety bound (SECOND layer; backend deploy_jam is primary).
@@ -720,6 +783,17 @@ def main() -> None:
     args = ap.parse_args()
 
     check_authorized(args.i_confirm_authorized_range)
+
+    # Fail-closed TX pinning (interactive CLI): refuse — with a clear message
+    # and a non-zero exit — before building any IQ or spawning hackrf_transfer
+    # if no TX serial is pinned and the dev opt-out is not set. Covers BOTH the
+    # swept-barrage branch and the single-center continuous/bounded branch below
+    # in one place, so no CLI transmit path can fall back to index-0. The
+    # SET-serial governed path is unaffected.
+    pin_err = _tx_pinning_error()
+    if pin_err:
+        print(f"ERROR: {pin_err}", file=sys.stderr)
+        sys.exit(1)
 
     if args.max_gain:
         args.tx_gain = MAX_TX_VGA_GAIN
