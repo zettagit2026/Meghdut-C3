@@ -138,6 +138,13 @@ from detection_state import (
 from swarm_classifier import build_swarm_clusters, SWARM_TAXONOMY
 from track_manager import TrackManager, STATE_DROPPED as TRACK_STATE_DROPPED
 from engagement_planner import build_engagement_plan
+# Effector-Selection engine (RFI 4.5.4/4.5.6/4.5.7): a PURE sibling of
+# engagement_planner/sop_engine that turns the current contacts + engagement
+# PLAN + a READ-ONLY effector-availability snapshot into ranked, PROPOSED,
+# commander-cued effector recommendations. It imports nothing that can transmit
+# and has no execute path; server.py only assembles the read-only inputs and
+# exposes the same PROPOSED-only, commander-gated posture as /engagement/plan.
+import effector_selection
 # Protocol-Library status board (over-the-air decoders vs forensic). Pure,
 # dependency-free derivation lives in protocol_status.py so it is unit-testable
 # without booting FastAPI/Mongo -- server.py only owns the runtime report store.
@@ -3564,6 +3571,147 @@ async def recompute_engagement_plan(user: Dict = Depends(require_commander)):
         actor=user["email"],
     )
     return plan
+
+
+# =====================================================================
+# Routes: Effector-Selection recommendations (RFI 4.5.4/4.5.6/4.5.7).
+# Same PROPOSED-only, commander-cued posture as /engagement/plan above:
+# effector_selection.build_effector_recommendations is a PURE function over
+# dicts that imports nothing that can transmit. This wiring only ASSEMBLES the
+# read-only inputs -- the current SOP contacts, the ranked engagement plan, a
+# READ-ONLY availability snapshot (tx_halted / bridge-subscribed / range-auth
+# lease flags, all READ, never mutated), and the already-engaged detection ids
+# from the pending-engagement maps -- and hands them to the recommender. The
+# ACTUAL execution of any recommended effector MUST go through the existing
+# fully-gated payload endpoints (POST /api/payloads/jam, /api/payloads/gnss-
+# spoof, /api/mavlink-sdr-inject), each of which independently re-enforces, at
+# fire time and for THAT specific target: commander role, TX-not-halted master
+# kill, a fresh single-use arm token (CRITICAL), the IFF friendly-fire
+# interlock, and range authorization. Exactly as with the engagement plan, we
+# deliberately do NOT provide an "execute-recommendation" convenience endpoint:
+# there is intentionally no orchestration wrapper that could fire, so there is
+# no surface on which a gate-bypass/auto-fire path could ever exist. The
+# commander reviews the recommendation here, then engages each proposal one at a
+# time through the existing fully-gated payload paths.
+# =====================================================================
+def _effector_availability_snapshot() -> Dict[str, Any]:
+    """Assemble the READ-ONLY effector-availability snapshot the recommender
+    consumes. Every field is READ from existing state -- the master TX-halt
+    flag, whether a TX bridge is subscribed for the effect (has_tx_consumer),
+    and whether the range-authorization lease is enabled for the effect. This
+    NEVER clears the TX halt, mints a token, or mutates any lease; it only reads
+    the flags so the recommender can say whether an effector is *currently
+    clearable*. Effect keys match the existing code exactly: 'jam' (deploy_jam /
+    range-auth 'jam'), 'gnss_spoof' (deploy_gnss_spoof / range-auth
+    'gnss_spoof'), 'mavlink_sdr_inject' (SDR MAVLink inject / range-auth
+    'mavlink_sdr_inject')."""
+    return {
+        "tx_halted": _tx_halted,
+        "jam": {
+            "bridge_up": ws_manager.has_tx_consumer("jam"),
+            "range_auth_enabled": _range_auth_status("jam")["enabled"],
+        },
+        "gnss_spoof": {
+            "bridge_up": ws_manager.has_tx_consumer("gnss_spoof"),
+            "range_auth_enabled": _range_auth_status("gnss_spoof")["enabled"],
+            "maturity": "v1_placeholder",
+        },
+        "mavlink_sdr_inject": {
+            "bridge_up": ws_manager.has_tx_consumer("mavlink_sdr_inject"),
+            "range_auth_enabled": _range_auth_status("mavlink_sdr_inject")["enabled"],
+        },
+    }
+
+
+async def _compute_effector_recommendations() -> Dict[str, Any]:
+    """Shared read-only computation of the PROPOSED effector recommendations
+    from the current SOP contacts + the ranked engagement plan + a read-only
+    effector-availability snapshot + the already-engaged detection ids.
+
+    Performs NO transmission and NO detection/track/lease mutation. It reuses
+    _sop_current_contacts() and _compute_engagement_plan() (both side-effect-
+    free) and reads the pending-engagement maps for duplicate-avoidance. Returns
+    a plain recommendation dict; the caller decides whether to audit-log it (the
+    POST does; the GET stays side-effect-free per HTTP semantics, mirroring
+    /engagement/plan)."""
+    contacts = await _sop_current_contacts()
+    plan = await _compute_engagement_plan()
+    availability = _effector_availability_snapshot()
+    # Duplicate-avoidance: a detection already under an active MAVLink-inject or
+    # GNSS-spoof engagement (present in the pending-engagement maps) must not be
+    # re-engaged. Drop None (a pending entry with no bound target_detection_id,
+    # e.g. a fake-position GNSS spoof).
+    already_engaged = {
+        p.get("target_detection_id") for p in _pending_mavlink_inject.values()
+    } | {
+        p.get("target_detection_id") for p in _pending_gnss_spoof.values()
+    }
+    already_engaged.discard(None)
+    return effector_selection.build_effector_recommendations(
+        contacts,
+        plan,
+        availability,
+        already_engaged,
+        threat_lib=_threat_lib,
+        now=datetime.now(timezone.utc),
+    )
+
+
+@api.get("/effector/recommendations")
+async def get_effector_recommendations(user: Dict = Depends(require_commander)):
+    """Read-only: return the current PROPOSED effector recommendations for the
+    commander to review. NO side effects -- computes nothing persistent,
+    transmits nothing, mutates nothing, and (per HTTP GET safe-method semantics,
+    exactly like GET /engagement/plan) does not write an audit entry. Use POST
+    /api/effector/recommendations/recompute to recompute AND record the
+    computation in the hash-chained mission log.
+
+    Every recommendation is stamped
+    status=PROPOSED_REQUIRES_HUMAN_AUTHORIZATION and lists (as documentation
+    strings only) the exact existing commander-gated payload endpoints a human
+    must use, clearing the full safety-gate chain, to actually engage. This
+    endpoint cannot and does not engage anything. Commander-gated so the
+    recommendation (which reveals targeting priorities) is not exposed to
+    lower-privilege operators."""
+    return await _compute_effector_recommendations()
+
+
+@api.post("/effector/recommendations/recompute")
+async def recompute_effector_recommendations(user: Dict = Depends(require_commander)):
+    """Recompute the PROPOSED effector recommendations and record the
+    computation in the hash-chained mission-log audit chain (the recompute is
+    the side effect -- verb semantics mirror the GET/POST /engagement/plan
+    split). Still engages NOTHING: this only produces and audits a
+    recommendation object. The human commander must separately clear the full
+    arm-token/TX-halt/range-auth/IFF gate chain per engagement via the existing
+    gated payload endpoints to actually fire."""
+    recs = await _compute_effector_recommendations()
+    summary = recs["summary"]
+    await log_event(
+        "EFFECTOR_RECOMMENDATION",
+        f"Effector recommendations recomputed: {summary['recommendation_count']} "
+        f"proposed target(s), {summary['excluded_count']} excluded, "
+        f"{summary['recommendations_with_clearable_effector']} with a currently "
+        f"clearable effector, {summary['already_engaged_count']} already under "
+        "active engagement (dedup). PROPOSAL ONLY -- no engagement performed; "
+        "each requires human commander gate clearance via the existing gated "
+        "payload endpoints.",
+        meta={
+            "summary": summary,
+            "effector_availability_echo": recs["effector_availability_echo"],
+            "recommendations": [
+                {"detection_id": r["detection_id"], "callsign": r.get("callsign"),
+                 "threat_level": r.get("threat_level"), "threat_score": r["threat_score"],
+                 "recommended_effector": r["recommended_effector"],
+                 "already_engaged": r["dedup_status"]["already_engaged"],
+                 "status": r["status"]}
+                for r in recs["recommendations"]
+            ],
+            "excluded": recs["excluded"],
+        },
+        actor=user["email"],
+    )
+    return recs
 
 
 def _interval_stats(timestamps_iso: List[str]) -> Optional[Dict[str, Any]]:

@@ -577,6 +577,7 @@ _SOP_SYMBOLS = [
     "get_c2_mode", "set_c2_mode", "_get_c2_mode",
     "_sop_eval_loop", "_sop_eval_tick", "_sop_emit_firing",
     "_sop_current_contacts", "_sop_contact_from_detection", "_sop_positioned_contacts",
+    "_sop_strip",
     "_sop_reload_config_if_stale", "_validate_sop_action", "_bump_sop_version",
     "_sop_apply_threat_enrichment", "_sop_contact_ref", "_sop_dedup_key",
 ]

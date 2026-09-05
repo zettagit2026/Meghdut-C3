@@ -19,6 +19,7 @@ import MissionLog from "@/pages/MissionLog";
 import MapView from "@/pages/Map";
 import Zones from "@/pages/Zones";
 import SopRules from "@/pages/SopRules";
+import DecisionSupport from "@/pages/DecisionSupport";
 import "@/App.css";
 
 function Protected({ children }) {
@@ -57,6 +58,7 @@ export default function App() {
             <Route path="gnss-spoof" element={<GnssSpoof />} />
             <Route path="sdr-mavlink-inject" element={<SdrMavlinkInject />} />
             <Route path="killchain" element={<KillChain />} />
+            <Route path="decision"  element={<DecisionSupport />} />
             <Route path="history"   element={<DetectionHistory />} />
             <Route path="map"       element={<MapView />} />
             <Route path="zones"     element={<Zones />} />
