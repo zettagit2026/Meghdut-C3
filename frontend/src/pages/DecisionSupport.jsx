@@ -228,6 +228,48 @@ function RecommendationRow({ rec }) {
   );
 }
 
+function ExcludedList({ excluded }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!excluded || excluded.length === 0) return null;
+  return (
+    <div className="tactical-border p-4" style={{ background: "var(--bg-surface)" }} data-testid="decision-excluded">
+      <button
+        onClick={() => setExpanded((e) => !e)}
+        data-testid="decision-excluded-toggle"
+        className="w-full flex items-center justify-between gap-2 hover-accent-info transition-colors"
+      >
+        <span className="font-heading font-bold text-sm flex items-center gap-2">
+          <AlertTriangle size={14} strokeWidth={1.5} style={{ color: "var(--accent-warning)" }} />
+          EXCLUDED ({excluded.length})
+        </span>
+        <span className="flex items-center gap-1 font-mono text-[9px] uppercase tracking-widest text-slate-500">
+          {expanded ? "hide" : "show"} {expanded ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+        </span>
+      </button>
+      {expanded && (
+        <div className="space-y-1 mt-3">
+          {excluded.map((ex, i) => (
+            <div
+              key={`${ex.detection_id || "unknown"}-${i}`}
+              data-testid="decision-excluded-item"
+              className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1 sm:gap-3 font-mono text-[10px] tactical-border px-2 py-1.5"
+              style={{ background: "var(--bg-elev)" }}
+            >
+              <span className="text-slate-300 uppercase tracking-widest shrink-0">
+                {ex.callsign || ex.detection_id || "UNKNOWN CONTACT"}
+                {ex.threat_level && <span className="text-slate-500 normal-case"> · threat {ex.threat_level}</span>}
+              </span>
+              <span className="text-slate-500 sm:text-right">
+                {ex.reason ? `excluded: ${ex.reason}` : "excluded: no reason reported"}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CommanderRequired() {
   return (
     <div
@@ -358,7 +400,7 @@ export default function DecisionSupport() {
         <span><span className="uppercase tracking-widest text-[9px] text-slate-500">recommendations </span>{recommendations.length}</span>
         <span><span className="uppercase tracking-widest text-[9px] text-slate-500">excluded </span>{excluded.length}</span>
         {Object.entries(summary).map(([k, v]) => (
-          <span key={k}><span className="uppercase tracking-widest text-[9px] text-slate-500">{k} </span>{typeof v === "object" ? JSON.stringify(v) : String(v)}</span>
+          <span key={k}><span className="uppercase tracking-widest text-[9px] text-slate-500">{k} </span>{String(v)}</span>
         ))}
       </div>
 
@@ -385,17 +427,7 @@ export default function DecisionSupport() {
         ))}
       </div>
 
-      {excluded.length > 0 && (
-        <div className="tactical-border p-4" style={{ background: "var(--bg-surface)" }}>
-          <div className="font-heading font-bold text-sm mb-2 flex items-center gap-2">
-            <AlertTriangle size={14} strokeWidth={1.5} style={{ color: "var(--accent-warning)" }} />
-            EXCLUDED
-          </div>
-          <pre className="font-mono text-[10px] leading-relaxed text-slate-500 whitespace-pre-wrap overflow-x-auto">
-            {JSON.stringify(excluded, null, 2)}
-          </pre>
-        </div>
-      )}
+      <ExcludedList excluded={excluded} />
 
       <div className="font-mono text-[10px] leading-relaxed text-slate-500 tactical-border p-3" style={{ background: "var(--bg-surface)" }}>
         The ONLY way to act on a recommendation is the button above, which navigates to the existing gated
