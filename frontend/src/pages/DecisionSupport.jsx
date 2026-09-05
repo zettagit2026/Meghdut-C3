@@ -77,6 +77,50 @@ function FeasibilityCell({ kind, testidPrefix, id, feasibility }) {
   );
 }
 
+// score_breakdown entries are NOT primitives (see effector_selection.py
+// _score_breakdown): threat_weight/controller_bonus are {value, basis},
+// confidence_factor/proximity_factor are {category, value, basis} or (for
+// proximity_factor only) null, and proximity_note is a plain string or null.
+// Render each via its named field -- never String(v) on a bare object.
+function ScoreBreakdownTile({ label, entryKey, value }) {
+  let body;
+  if (value === null || value === undefined) {
+    body = (
+      <div className="text-slate-200 mt-0.5">
+        {entryKey === "proximity_factor" ? "no position" : "—"}
+      </div>
+    );
+  } else if (typeof value === "object" && !Array.isArray(value)) {
+    const { value: v, basis, category } = value;
+    body = (
+      <>
+        {category && (
+          <div className="text-[8px] uppercase tracking-widest text-slate-400">{category}</div>
+        )}
+        <div className="text-slate-200 mt-0.5 font-bold">
+          {v === null || v === undefined ? "—" : String(v)}
+        </div>
+        {basis && (
+          <div className="text-[9px] text-slate-500 mt-0.5 leading-relaxed">{basis}</div>
+        )}
+      </>
+    );
+  } else {
+    // Defensive: an already-primitive value (e.g. proximity_note, a plain string).
+    body = <div className="text-slate-200 mt-0.5">{String(value)}</div>;
+  }
+  return (
+    <div
+      className="tactical-border p-2"
+      style={{ background: "var(--bg-elev)" }}
+      title={typeof value === "object" && value?.basis ? value.basis : undefined}
+    >
+      <div className="text-[9px] uppercase tracking-widest text-slate-500">{label}</div>
+      {body}
+    </div>
+  );
+}
+
 function ScoreBreakdown({ breakdown }) {
   const b = breakdown || {};
   const entries = Object.entries(b);
@@ -86,10 +130,7 @@ function ScoreBreakdown({ breakdown }) {
   return (
     <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 font-mono text-[10px]">
       {entries.map(([k, v]) => (
-        <div key={k} className="tactical-border p-2" style={{ background: "var(--bg-elev)" }}>
-          <div className="text-[9px] uppercase tracking-widest text-slate-500">{k}</div>
-          <div className="text-slate-200 mt-0.5">{v === null || v === undefined ? "—" : String(v)}</div>
-        </div>
+        <ScoreBreakdownTile key={k} entryKey={k} label={k.replace(/_/g, " ")} value={v} />
       ))}
     </div>
   );
