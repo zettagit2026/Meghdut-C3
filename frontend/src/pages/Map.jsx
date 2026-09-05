@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import maplibregl from "maplibre-gl";
 import "maplibre-gl/dist/maplibre-gl.css";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
-import { MapPin, AlertTriangle, ShieldAlert } from "lucide-react";
+import { MapPin, AlertTriangle, ShieldAlert, Pencil, Hexagon, X, Info } from "lucide-react";
 import { getThreatHex } from "@/lib/threatLevels";
 import { useTheme } from "@/context/ThemeContext";
+import { useAuth } from "@/context/AuthContext";
 
 // ---------------------------------------------------------------------------
 // BASEMAP STRATEGY (offline-first, graceful, never a blank/"API key" tile)
@@ -112,6 +113,57 @@ function buildGraticule(bounds, zoom) {
 const CTX_RING_COLOR = { dark: "#1E2A3F", light: "#94A3B8" };
 
 // ---------------------------------------------------------------------------
+// ZONE PALETTE (Phase D1 — zone/SOP engine).
+//
+// Five distinct tactical colors, one per zone_type. maplibre-gl paint props
+// cannot read CSS custom properties, so — like THREAT_COLOR_HEX_* in
+// lib/threatLevels.js — the hex is mirrored here per theme. The dark values
+// track the console's --accent-*/--threat-* tokens; the light values are the
+// darker AA-safe counterparts used elsewhere in the app.
+// ---------------------------------------------------------------------------
+const ZONE_TYPES = ["DETECTION", "TRACKING", "ALERT", "MITIGATION", "CLUTTER"];
+const ZONE_COLOR_HEX = {
+  dark: {
+    DETECTION: "#38BDF8", // info cyan
+    TRACKING: "#A78BFA",  // violet
+    ALERT: "#EAB308",     // amber
+    MITIGATION: "#EF4444",// critical red
+    CLUTTER: "#64748B",   // slate (low-signal)
+  },
+  light: {
+    DETECTION: "#155E75",
+    TRACKING: "#6D28D9",
+    ALERT: "#92600A",
+    MITIGATION: "#B91C1C",
+    CLUTTER: "#475569",
+  },
+};
+
+// Data-driven maplibre `match` expression: zone_type -> color (CLUTTER as the
+// safe fallback for any unknown type).
+function zoneColorExpr(pal) {
+  return [
+    "match", ["get", "zone_type"],
+    "DETECTION", pal.DETECTION,
+    "TRACKING", pal.TRACKING,
+    "ALERT", pal.ALERT,
+    "MITIGATION", pal.MITIGATION,
+    "CLUTTER", pal.CLUTTER,
+    pal.CLUTTER,
+  ];
+}
+
+// Id of the first contact/context range-ring layer, if any, so zone fill/line
+// layers can be inserted BENEATH the rings (and thus beneath the DOM contact
+// markers, which always paint above every canvas layer) yet above the
+// graticule/scrim. Returns undefined when no ring layer exists yet.
+function firstRingLayerId(map) {
+  const layers = map.getStyle()?.layers || [];
+  const ring = layers.find((l) => l.id.startsWith("ring-"));
+  return ring ? ring.id : undefined;
+}
+
+// ---------------------------------------------------------------------------
 // HONESTY NOTE (read before touching this file):
 //
 // This map CANNOT plot real drone/contact positions. Absolute lat/lon for a
@@ -160,6 +212,8 @@ function ringGeoJSON(centerLat, centerLon, radiusM, points = 72) {
 
 export default function MapView() {
   const { theme } = useTheme();
+  const { user } = useAuth();
+  const isCommander = user?.role === "commander";
   const mapContainer = useRef(null);
   const mapRef = useRef(null);
   const [sensor, setSensor] = useState(null);
@@ -169,6 +223,23 @@ export default function MapView() {
   const [lastSuccessAt, setLastSuccessAt] = useState(null);
   const [consecutiveFailures, setConsecutiveFailures] = useState(0);
   const [now, setNow] = useState(() => Date.now());
+
+  // ----- Zone state (Phase D1) -------------------------------------------
+  const [zones, setZones] = useState([]);
+  const [drawMode, setDrawMode] = useState(false);
+  const [ringCoords, setRingCoords] = useState([]); // in-progress ring: [lon,lat][]
+  const [ringClosed, setRingClosed] = useState(false);
+  const [showForm, setShowForm] = useState(false);
+  const [zoneName, setZoneName] = useState("");
+  const [zoneType, setZoneType] = useState("DETECTION");
+  const [zoneNotes, setZoneNotes] = useState("");
+  const [confirmPhrase, setConfirmPhrase] = useState("");
+  const [saving, setSaving] = useState(false);
+  // Refs mirror the mutable draw state so the (once-attached) map click
+  // handler always reads current values without re-binding on every point.
+  const ringCoordsRef = useRef([]);
+  const ringClosedRef = useRef(false);
+  const ZONE_CONFIRM_PHRASE = "CREATE ZONE";
 
   const load = async (cancelled) => {
     try {
@@ -190,12 +261,109 @@ export default function MapView() {
     }
   };
 
+  // Zone list loads on its own lane so a not-yet-live endpoint (404 while
+  // Phase A lands) or an empty result degrades cleanly to "no zones" and
+  // NEVER fails the sensor/detection load. No fabricated zones.
+  const loadZones = async (cancelled) => {
+    try {
+      const { data } = await api.get("/zones");
+      if (cancelled?.current) return;
+      const list = Array.isArray(data) ? data : (Array.isArray(data?.zones) ? data.zones : []);
+      setZones(list);
+    } catch {
+      if (cancelled?.current) return;
+      setZones([]); // 404 / not-live / empty -> render clean empty case
+    }
+  };
+
   useEffect(() => {
     const cancelled = { current: false };
     load(cancelled);
+    loadZones(cancelled);
     const id = setInterval(() => load(cancelled), 10000);
     return () => { cancelled.current = true; clearInterval(id); };
   }, []);
+
+  // Keep the click-handler refs in sync with draw state.
+  useEffect(() => { ringCoordsRef.current = ringCoords; }, [ringCoords]);
+  useEffect(() => { ringClosedRef.current = ringClosed; }, [ringClosed]);
+
+  const resetDraw = useCallback(() => {
+    setDrawMode(false);
+    setRingCoords([]);
+    setRingClosed(false);
+    setShowForm(false);
+    setZoneName("");
+    setZoneType("DETECTION");
+    setZoneNotes("");
+    setConfirmPhrase("");
+  }, []);
+
+  const startDraw = useCallback(() => {
+    if (!isCommander) return;
+    setRingCoords([]);
+    setRingClosed(false);
+    setShowForm(false);
+    setZoneName("");
+    setZoneNotes("");
+    setConfirmPhrase("");
+    setDrawMode(true);
+  }, [isCommander]);
+
+  // Close the in-progress ring: >=3 vertices required (honest hard gate),
+  // otherwise surface a clear message and keep drawing.
+  const closeRing = useCallback(() => {
+    if (ringCoordsRef.current.length < 3) {
+      toast.error("A zone needs at least 3 vertices", {
+        description: "Click at least three points on the map before closing the ring.",
+      });
+      return;
+    }
+    setRingClosed(true);
+    setShowForm(true);
+  }, []);
+
+  const phraseOk = confirmPhrase.trim() === ZONE_CONFIRM_PHRASE;
+  const canSave =
+    isCommander && ringClosed && ringCoords.length >= 3 && zoneName.trim().length > 0 && phraseOk && !saving;
+
+  const saveZone = async () => {
+    const coords = ringCoordsRef.current;
+    if (!isCommander) return;
+    if (coords.length < 3) {
+      toast.error("A zone needs at least 3 vertices");
+      return;
+    }
+    if (!zoneName.trim()) {
+      toast.error("Zone name is required");
+      return;
+    }
+    if (!phraseOk) {
+      toast.error(`Type the exact phrase "${ZONE_CONFIRM_PHRASE}" to confirm`);
+      return;
+    }
+    // Build a closed GeoJSON linear ring (first == last vertex).
+    const ring = coords.map((c) => [c[0], c[1]]);
+    const [fx, fy] = ring[0];
+    const [lx, ly] = ring[ring.length - 1];
+    if (fx !== lx || fy !== ly) ring.push([fx, fy]);
+    setSaving(true);
+    try {
+      await api.post("/zones", {
+        name: zoneName.trim(),
+        zone_type: zoneType,
+        polygon: { type: "Polygon", coordinates: [ring] },
+        notes: zoneNotes.trim() || null,
+      });
+      toast.success("ZONE CREATED", { description: `${zoneName.trim()} — ${zoneType}` });
+      resetDraw();
+      loadZones();
+    } catch (e) {
+      toast.error("Failed to save zone", { description: formatApiError(e) });
+    } finally {
+      setSaving(false);
+    }
+  };
 
   useEffect(() => {
     const tickId = setInterval(() => setNow(Date.now()), 1000);
@@ -487,6 +655,125 @@ export default function MapView() {
     else map.once("load", drawLayer);
   }, [hasSensor, sensor, activeContacts, theme]);
 
+  // Render saved zones as a single GeoJSON source with data-driven fill+line
+  // colored by zone_type. Layers are inserted beneath the contact range rings
+  // (and thus beneath the DOM contact markers) but above the graticule/scrim.
+  // Empty `zones` => an empty FeatureCollection renders nothing (clean empty).
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const pal = ZONE_COLOR_HEX[theme] || ZONE_COLOR_HEX.dark;
+    const render = () => {
+      const fc = {
+        type: "FeatureCollection",
+        features: (zones || [])
+          .filter((z) => z?.polygon?.type === "Polygon" && Array.isArray(z.polygon.coordinates))
+          .map((z) => ({
+            type: "Feature",
+            properties: { zone_type: z.zone_type, name: z.name, id: z.id },
+            geometry: z.polygon,
+          })),
+      };
+      if (map.getSource("zones")) {
+        map.getSource("zones").setData(fc);
+      } else {
+        const before = firstRingLayerId(map);
+        map.addSource("zones", { type: "geojson", data: fc });
+        map.addLayer(
+          { id: "zones-fill", type: "fill", source: "zones", paint: { "fill-color": zoneColorExpr(pal), "fill-opacity": 0.14 } },
+          before
+        );
+        map.addLayer(
+          { id: "zones-line", type: "line", source: "zones", paint: { "line-color": zoneColorExpr(pal), "line-width": 2, "line-opacity": 0.9 } },
+          before
+        );
+      }
+      if (map.getLayer("zones-fill")) map.setPaintProperty("zones-fill", "fill-color", zoneColorExpr(pal));
+      if (map.getLayer("zones-line")) map.setPaintProperty("zones-line", "line-color", zoneColorExpr(pal));
+    };
+    if (map.isStyleLoaded()) render();
+    else map.once("load", render);
+  }, [zones, theme]);
+
+  // Render the in-progress draw ring (dashed line + vertex dots), previewed in
+  // the currently-selected zone_type's color. Cleared when not drawing.
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const pal = ZONE_COLOR_HEX[theme] || ZONE_COLOR_HEX.dark;
+    const color = pal[zoneType] || pal.DETECTION;
+    const draw = () => {
+      const coords = ringCoords;
+      const features = [];
+      if (coords.length >= 1) {
+        const lineCoords = ringClosed && coords.length >= 3 ? [...coords, coords[0]] : coords;
+        if (lineCoords.length >= 2) {
+          features.push({ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: lineCoords } });
+        }
+        coords.forEach((c, i) => features.push({ type: "Feature", properties: { idx: i }, geometry: { type: "Point", coordinates: c } }));
+      }
+      const fc = { type: "FeatureCollection", features };
+      if (map.getSource("zone-draw")) {
+        map.getSource("zone-draw").setData(fc);
+      } else {
+        map.addSource("zone-draw", { type: "geojson", data: fc });
+        map.addLayer({
+          id: "zone-draw-line",
+          type: "line",
+          source: "zone-draw",
+          filter: ["==", "$type", "LineString"],
+          paint: { "line-color": color, "line-width": 2, "line-dasharray": [2, 1], "line-opacity": 0.95 },
+        });
+        map.addLayer({
+          id: "zone-draw-verts",
+          type: "circle",
+          source: "zone-draw",
+          filter: ["==", "$type", "Point"],
+          paint: { "circle-radius": 4, "circle-color": color, "circle-stroke-width": 1, "circle-stroke-color": "#000" },
+        });
+      }
+      if (map.getLayer("zone-draw-line")) map.setPaintProperty("zone-draw-line", "line-color", color);
+      if (map.getLayer("zone-draw-verts")) map.setPaintProperty("zone-draw-verts", "circle-color", color);
+    };
+    if (map.isStyleLoaded()) draw();
+    else map.once("load", draw);
+  }, [ringCoords, ringClosed, zoneType, theme]);
+
+  // Draw-mode map interaction: each click appends a [lon,lat] vertex; a quick
+  // second click (double-click) closes the ring. Uses refs so the handler is
+  // attached once per draw session. lat clamped to the same [-85,85] the grid
+  // uses; lon clamped to [-180,180].
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !drawMode) return;
+    const lastClick = { current: 0 };
+    const onClick = (e) => {
+      if (ringClosedRef.current) return; // ring already closed, awaiting save
+      const t = Date.now();
+      if (lastClick.current && t - lastClick.current < 350) {
+        lastClick.current = 0;
+        closeRing();
+        return;
+      }
+      lastClick.current = t;
+      const lng = Math.max(Math.min(e.lngLat.lng, 180), -180);
+      const lat = Math.max(Math.min(e.lngLat.lat, 85), -85);
+      setRingCoords((c) => [...c, [lng, lat]]);
+    };
+    map.doubleClickZoom.disable();
+    const canvas = map.getCanvas();
+    const prevCursor = canvas.style.cursor;
+    canvas.style.cursor = "crosshair";
+    map.on("click", onClick);
+    return () => {
+      map.off("click", onClick);
+      map.doubleClickZoom.enable();
+      canvas.style.cursor = prevCursor;
+    };
+  }, [drawMode, closeRing]);
+
+  const zonePal = ZONE_COLOR_HEX[theme] || ZONE_COLOR_HEX.dark;
+
   return (
     <div className="space-y-6">
       <div>
@@ -535,6 +822,196 @@ export default function MapView() {
           </span>
         </div>
       )}
+
+      {/* -------- ZONE CONTROL PANEL (Phase D1) -------- */}
+      <div className="tactical-border p-4 space-y-3" style={{ background: "var(--bg-surface)" }}>
+        <div className="flex items-center justify-between flex-wrap gap-3">
+          <div className="flex items-center gap-2">
+            <Hexagon size={14} strokeWidth={1.5} style={{ color: "var(--accent-info)" }} />
+            <span className="font-mono text-[10px] uppercase tracking-widest" style={{ color: "var(--accent-info)" }}>
+              Tactical Zones {zones.length > 0 ? `— ${zones.length} defined` : "— none defined"}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-2">
+            {!drawMode ? (
+              <button
+                data-testid="draw-zone-btn"
+                onClick={startDraw}
+                disabled={!isCommander}
+                title={isCommander ? "Draw a new tactical zone" : "Commander role required to draw zones"}
+                className="flex items-center gap-2 px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest tactical-border transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                style={{ color: "var(--accent-info)", borderColor: "var(--accent-info)" }}
+              >
+                <Pencil size={13} strokeWidth={1.75} />
+                Draw Zone
+              </button>
+            ) : (
+              <>
+                <button
+                  data-testid="close-ring-btn"
+                  onClick={closeRing}
+                  disabled={ringCoords.length < 3 || ringClosed}
+                  className="flex items-center gap-2 px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest tactical-border transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                  style={{ color: "var(--accent-success)", borderColor: "var(--accent-success)" }}
+                >
+                  <Hexagon size={13} strokeWidth={1.75} />
+                  Close Ring
+                </button>
+                <button
+                  data-testid="zone-cancel-btn"
+                  onClick={resetDraw}
+                  className="flex items-center gap-2 px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest tactical-border text-slate-400 hover-surface"
+                >
+                  <X size={13} strokeWidth={1.75} />
+                  Cancel
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+
+        {/* Zone-type -> color legend */}
+        <div data-testid="zone-legend" className="flex items-center gap-4 flex-wrap pt-1">
+          {ZONE_TYPES.map((zt) => (
+            <div key={zt} className="flex items-center gap-2">
+              <span
+                className="inline-block"
+                style={{ width: 12, height: 12, background: zonePal[zt], border: "1px solid rgba(0,0,0,0.4)" }}
+              />
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-400">{zt}</span>
+            </div>
+          ))}
+        </div>
+
+        {/* In-draw guidance */}
+        {drawMode && !ringClosed && (
+          <div
+            className="tactical-border px-3 py-2 font-mono text-[11px]"
+            style={{ background: "rgba(56,189,248,0.06)", color: "var(--accent-info)" }}
+          >
+            DRAW MODE ACTIVE — click the map to add vertices ({ringCoords.length} placed). Double-click,
+            or press CLOSE RING, to close the polygon. Minimum 3 vertices required.
+          </div>
+        )}
+
+        {/* Honesty caption — spatial vs non-spatial evaluation */}
+        <div
+          className="tactical-border px-3 py-2 flex items-start gap-2"
+          style={{ background: "rgba(234,179,8,0.05)", borderColor: "var(--accent-warning)" }}
+        >
+          <Info size={13} strokeWidth={1.75} style={{ color: "var(--accent-warning)", flexShrink: 0, marginTop: 2 }} />
+          <div className="font-mono text-[10px] leading-relaxed" style={{ color: "var(--accent-warning)" }}>
+            Zones are absolute geographic areas. Spatial (in-zone) SOP rules apply only to contacts with a
+            real decoded position — RemoteID / ADS-B / DJI DroneID. Position-less RF-sweep / WiFi /
+            control-link contacts are evaluated by non-spatial rules only (no DF hardware = no bearing).
+          </div>
+        </div>
+
+        {/* Save form (shown after the ring is closed) */}
+        {showForm && ringClosed && (
+          <div
+            data-testid="zone-save-form"
+            className="tactical-border p-4 space-y-4"
+            style={{ background: "rgba(56,189,248,0.04)", borderColor: "var(--accent-info)" }}
+          >
+            <div className="font-mono text-[10px] uppercase tracking-widest" style={{ color: "var(--accent-info)" }}>
+              New Zone — {ringCoords.length} vertices
+            </div>
+
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Name (required)</span>
+              <input
+                data-testid="zone-name-input"
+                type="text"
+                value={zoneName}
+                onChange={(e) => setZoneName(e.target.value)}
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+                placeholder="e.g. NORTH APPROACH — ALERT"
+                required
+              />
+            </label>
+
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Zone type</span>
+              <select
+                data-testid="zone-type-select"
+                value={zoneType}
+                onChange={(e) => setZoneType(e.target.value)}
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+              >
+                {ZONE_TYPES.map((zt) => (
+                  <option key={zt} value={zt}>{zt}</option>
+                ))}
+              </select>
+            </label>
+
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Notes (optional)</span>
+              <textarea
+                data-testid="zone-notes-input"
+                value={zoneNotes}
+                onChange={(e) => setZoneNotes(e.target.value)}
+                rows={2}
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+                placeholder="Optional context / ROE reference"
+              />
+            </label>
+
+            {/* Commander confirm-phrase gate (idiom reused from RangeAuthorizationControl / SafetyGate) */}
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
+                Type the exact phrase to confirm: <span style={{ color: "var(--text-primary)" }}>{ZONE_CONFIRM_PHRASE}</span>
+              </span>
+              <input
+                data-testid="zone-confirm-phrase"
+                type="text"
+                autoComplete="off"
+                value={confirmPhrase}
+                onChange={(e) => setConfirmPhrase(e.target.value)}
+                className={`mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none ${
+                  confirmPhrase && !phraseOk ? "border-accent-critical" : "focus-accent-info"
+                }`}
+                placeholder={ZONE_CONFIRM_PHRASE}
+                required
+              />
+            </label>
+
+            {!isCommander && (
+              <div
+                data-testid="zone-commander-required"
+                className="tactical-border px-3 py-2 font-mono text-[10px]"
+                style={{ borderColor: "var(--accent-critical)", color: "var(--accent-critical)" }}
+              >
+                COMMANDER ROLE REQUIRED — only a commander may create a zone. Zone writes are
+                commander-gated server-side (require_commander) and audited to the mission log.
+              </div>
+            )}
+
+            <div className="pt-1 flex items-center justify-between" style={{ borderTop: "1px solid var(--border-col)" }}>
+              <button
+                data-testid="zone-cancel-btn-form"
+                onClick={resetDraw}
+                className="px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest text-slate-400 hover-surface"
+              >
+                Cancel
+              </button>
+              <button
+                data-testid="zone-save-btn"
+                onClick={saveZone}
+                disabled={!canSave}
+                className={`flex items-center gap-2 px-4 py-2 font-mono text-xs font-bold uppercase tracking-widest border scanline-btn transition-colors ${
+                  !canSave ? "opacity-30 border-slate-700 text-slate-600 cursor-not-allowed" : "text-white"
+                }`}
+                style={canSave ? { background: "var(--accent-info)", borderColor: "var(--accent-info)" } : undefined}
+              >
+                <Hexagon size={13} strokeWidth={1.75} />
+                {saving ? "SAVING…" : "SAVE ZONE"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
 
       <div className="tactical-border overflow-hidden" style={{ background: "var(--bg-surface)" }}>
         <div

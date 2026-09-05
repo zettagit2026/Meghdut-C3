@@ -147,6 +147,18 @@ import protocol_status
 # the offline/online update-merge logic are unit-testable without FastAPI/Mongo;
 # server.py only owns the in-memory active-library handle + auth-gated routes.
 import threat_library
+# Zone/SOP engine geospatial primitives (RFI 4.5.2.1/4.5.2.3). Pure
+# point-in-polygon / ring-validation, no I/O and NO TX-spine coupling (see
+# backend/geo_zone.py + .omc/plans/zone-sop-engine.md). server.py owns only the
+# db.zones store + commander-gated CRUD; containment eval is a later phase.
+import geo_zone
+# Zone/SOP no-code rules engine -- pure evaluator (RFI 4.5.2.1/4.5.2.3/4.5.23).
+# evaluate(contact, zones, rules) -> firings. Plain dicts in/out, NO Mongo/ws and
+# -- governing invariant #1 -- NO transmit-spine coupling: its strongest output
+# is a PROPOSED cue label a commander still clears through the existing gated
+# endpoints (see backend/sop_engine.py). server.py owns only the db.sop_rules /
+# db.rule_alerts stores, the commander-gated CRUD, and the background eval loop.
+import sop_engine
 # Container->host privilege bridge for the GUI TX-bridge SiK handoff. Talks to
 # the hard-whitelisted cema-tx-helper root daemon over a bind-mounted Unix
 # socket (see backend/tx_bridge_control.py + scripts/host-helper/README.md).
@@ -1360,6 +1372,20 @@ async def startup() -> None:
     # Bounded by distinct-MAC count (upsert-by-MAC, latest-seen wins).
     await db.wifi_ground_truth.create_index("mac", unique=True)
     await db.wifi_ground_truth.create_index([("center_freq_ghz", 1), ("last_seen", 1)])
+    # Zone/SOP engine (Phase A): commander-defined geofence zones. id is the
+    # stable external key (uuid); enabled is queried by the later eval loop to
+    # skip disabled zones cheaply. Zones are pure data + audit -- no TX coupling.
+    await db.zones.create_index("id", unique=True)
+    await db.zones.create_index("enabled")
+    # Zone/SOP engine (Phase B+C): no-code SOP rules + append-only rule-alerts
+    # feed. sop_rules.id is the stable external key; enabled is queried by the
+    # eval loop to skip disabled rules cheaply. rule_alerts is time-ordered
+    # (feed) and looked up by id (ack). These are pure data + audit -- no TX
+    # coupling; the eval loop's strongest action is a PROPOSED cue.
+    await db.sop_rules.create_index("id", unique=True)
+    await db.sop_rules.create_index("enabled")
+    await db.rule_alerts.create_index("id", unique=True)
+    await db.rule_alerts.create_index("ts")
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
     if existing is None:
         await db.users.insert_one({
@@ -1414,6 +1440,13 @@ async def startup() -> None:
     global _track_sweep_task
     _track_sweep_task = asyncio.create_task(_track_sweep_loop())
 
+    # Zone/SOP engine (Phase B+C): the background rule-evaluation loop. Mirrors
+    # the track sweep -- a periodic asyncio task started here, cancelled at
+    # shutdown. Evaluates live contacts against the no-code SOP rules and, in
+    # AUTO C2 mode, emits alert/cue firings. It NEVER touches the TX spine.
+    global _sop_eval_task
+    _sop_eval_task = asyncio.create_task(_sop_eval_loop())
+
     # Task: periodic external anchoring of the audit-chain head (see
     # _audit_anchor_loop / AUDIT_ANCHOR). Emit one anchor immediately at
     # startup so there is a fresh anchor point right after boot.
@@ -1433,6 +1466,10 @@ async def shutdown() -> None:
         _track_sweep_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await _track_sweep_task
+    if _sop_eval_task is not None:
+        _sop_eval_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _sop_eval_task
     if _audit_anchor_task is not None:
         _audit_anchor_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -2328,6 +2365,774 @@ async def list_users(user: Dict = Depends(require_commander)):
              "clearance": 1, "created_at": 1},
     ).sort("created_at", 1).to_list(1000)
     return {"users": users, "count": len(users)}
+
+
+# =====================================================================
+# Routes: Zones (Zone/SOP engine — Phase A)
+# =====================================================================
+# Commander-defined geofence zones (RFI 4.5.2.1/4.5.2.3). This phase is pure
+# data + audit: a zone is a named GeoJSON Polygon with a type and priority,
+# stored in db.zones, created/edited/deleted ONLY by a commander and recorded on
+# the hash-chained mission log (ZONE_CREATE/UPDATE/DELETE). It has NO coupling to
+# the TX spine — creating a zone can never arm, key, mint a token, or clear
+# _tx_halted. The point-in-polygon containment eval (which consumes these zones)
+# is a later phase; nothing here evaluates contacts. Polygon geometry is
+# validated with geo_zone.validate_ring (>=3 distinct vertices, ring closure,
+# lon/lat in range) so a degenerate/out-of-range ring is rejected at write time.
+ZONE_TYPES = ("DETECTION", "TRACKING", "ALERT", "MITIGATION", "CLUTTER")
+_ZONE_TYPE_PATTERN = "^(DETECTION|TRACKING|ALERT|MITIGATION|CLUTTER)$"
+
+
+class ZoneBody(BaseModel):
+    # name/notes bounded to avoid unbounded stored input. zone_type constrained
+    # to the five real zone classes (no way to smuggle another). polygon is a
+    # GeoJSON Polygon dict validated in the handler via geo_zone.validate_ring
+    # (Pydantic only checks it is a dict here; ring geometry is checked there so
+    # the 422 message can name the offending ring/vertex).
+    name: str = Field(..., min_length=1, max_length=120)
+    zone_type: str = Field(..., pattern=_ZONE_TYPE_PATTERN)
+    polygon: Dict[str, Any]
+    enabled: bool = True
+    priority: int = 0
+    notes: Optional[str] = Field(None, max_length=2000)
+
+
+class ZoneUpdateBody(BaseModel):
+    # PUT is a partial update: every field optional, only provided fields are
+    # applied. Same bounds/pattern as ZoneBody so an edit can't relax them.
+    name: Optional[str] = Field(None, min_length=1, max_length=120)
+    zone_type: Optional[str] = Field(None, pattern=_ZONE_TYPE_PATTERN)
+    polygon: Optional[Dict[str, Any]] = None
+    enabled: Optional[bool] = None
+    priority: Optional[int] = None
+    notes: Optional[str] = Field(None, max_length=2000)
+
+
+def _validate_zone_polygon(polygon: Any) -> None:
+    """Validate a GeoJSON Polygon dict for db.zones, raising HTTPException(422)
+    with a clear message on bad geometry. Every ring (exterior + holes) is run
+    through geo_zone.validate_ring (>=3 distinct vertices, numeric [lon,lat]
+    pairs, lon in [-180,180]/lat in [-90,90]). Pure validation — no side
+    effects, no fabricated coordinates."""
+    if not isinstance(polygon, dict):
+        raise HTTPException(422, "polygon must be a GeoJSON Polygon object")
+    if polygon.get("type") != "Polygon":
+        raise HTTPException(422, "polygon.type must be 'Polygon'")
+    rings = polygon.get("coordinates")
+    if not isinstance(rings, (list, tuple)) or len(rings) == 0:
+        raise HTTPException(
+            422, "polygon.coordinates must be a non-empty list of rings")
+    for idx, ring in enumerate(rings):
+        ok, reason = geo_zone.validate_ring(ring)
+        if not ok:
+            where = "exterior ring" if idx == 0 else f"hole ring {idx}"
+            raise HTTPException(422, f"invalid polygon {where}: {reason}")
+
+
+@api.get("/zones")
+async def list_zones(user: Dict = Depends(get_current_user)):
+    # Any authenticated user may read zones; only commanders mutate them.
+    zones = await db.zones.find({}, {"_id": 0}).sort("created_at", 1).to_list(2000)
+    return {"zones": zones, "count": len(zones)}
+
+
+@api.post("/zones", status_code=201)
+async def create_zone(body: ZoneBody, user: Dict = Depends(require_commander)):
+    _validate_zone_polygon(body.polygon)
+    now = datetime.now(timezone.utc).isoformat()
+    new_id = str(uuid.uuid4())
+    actor = user["email"]
+    doc = {
+        "id": new_id,
+        "name": body.name,
+        "zone_type": body.zone_type,
+        "polygon": body.polygon,
+        "enabled": body.enabled,
+        "priority": body.priority,
+        "notes": body.notes,
+        "created_by": actor,
+        "created_at": now,
+        "updated_by": actor,
+        "updated_at": now,
+    }
+    # insert a copy so the returned doc is not mutated with Mongo's _id
+    # (same convention as log_event).
+    await db.zones.insert_one(doc.copy())
+    # A zone CRUD change bumps the SOP config version so the background eval
+    # loop's version-stamped cache hot-reloads it on the next tick (no redeploy).
+    _bump_sop_version()
+    await log_event(
+        "ZONE_CREATE",
+        f"Zone created: {body.name} (type={body.zone_type})",
+        meta={"zone_id": new_id, "zone_type": body.zone_type,
+              "enabled": body.enabled, "priority": body.priority},
+        actor=actor,
+    )
+    return doc
+
+
+@api.put("/zones/{zone_id}")
+async def update_zone(zone_id: str, body: ZoneUpdateBody,
+                      user: Dict = Depends(require_commander)):
+    existing = await db.zones.find_one({"id": zone_id}, {"_id": 0})
+    if existing is None:
+        raise HTTPException(404, "Zone not found")
+    updates: Dict[str, Any] = {}
+    for field in ("name", "zone_type", "enabled", "priority", "notes"):
+        value = getattr(body, field)
+        if value is not None:
+            updates[field] = value
+    if body.polygon is not None:
+        _validate_zone_polygon(body.polygon)
+        updates["polygon"] = body.polygon
+    actor = user["email"]
+    now = datetime.now(timezone.utc).isoformat()
+    updates["updated_by"] = actor
+    updates["updated_at"] = now
+    await db.zones.update_one({"id": zone_id}, {"$set": updates})
+    _bump_sop_version()  # hot-reload the SOP eval loop's cache next tick
+    await log_event(
+        "ZONE_UPDATE",
+        f"Zone updated: {zone_id}",
+        meta={"zone_id": zone_id, "fields": sorted(updates.keys())},
+        actor=actor,
+    )
+    updated = await db.zones.find_one({"id": zone_id}, {"_id": 0})
+    return updated
+
+
+@api.delete("/zones/{zone_id}")
+async def delete_zone(zone_id: str, user: Dict = Depends(require_commander)):
+    result = await db.zones.delete_one({"id": zone_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "Zone not found")
+    _bump_sop_version()  # hot-reload the SOP eval loop's cache next tick
+    await log_event(
+        "ZONE_DELETE",
+        f"Zone deleted: {zone_id}",
+        meta={"zone_id": zone_id},
+        actor=user["email"],
+    )
+    return {"deleted": True, "id": zone_id}
+
+
+# =====================================================================
+# Routes: SOP no-code rules + rule-alerts feed + C2 mode + eval loop
+# (Zone/SOP engine -- Phase B+C)
+# =====================================================================
+# The no-code SOP layer (RFI 4.5.2.1/4.5.2.3/4.5.23). A commander authors rules
+# as plain data (db.sop_rules): a set of conditions over a contact's
+# protocol/class/family/band/confidence/threat + optional zone membership, and
+# an ACTION that is deliberately alert/cue ONLY. A background loop
+# (_sop_eval_loop) evaluates live contacts against the rules every ~2s using the
+# PURE sop_engine.evaluate (which this module does not duplicate), records
+# firings to db.rule_alerts, and pushes them over the websocket.
+#
+# GOVERNING INVARIANT #1 -- TX SPINE IS SACROSANCT. Nothing in this section
+# clears _tx_halted, mints an arm/confirm token, or calls a deploy/transmit
+# endpoint. The action-type enum has NO fire/engage/deploy member; a rule asking
+# for one is rejected at 422 (_validate_sop_action). The strongest action is a
+# CUE_RECOMMENDATION carrying a PROPOSED_REQUIRES_HUMAN_AUTHORIZATION label the
+# commander still clears through the EXISTING gated engagement endpoints. This is
+# enforced by an introspection test (test_sop_rules.py).
+#
+# GOVERNING INVARIANT #2 -- NO FABRICATED POSITIONS. The spatial (zone-
+# containment) lane runs ONLY on contacts carrying a real position_source
+# (RemoteID / ADS-B / DroneID-with-position). A position-less detection is
+# evaluated on non-spatial conditions only; a spatial rule simply does not match
+# it (honest miss). No coordinate is ever invented.
+
+SOP_ALLOWED_ACTION_TYPES = frozenset(sop_engine.ALLOWED_ACTION_TYPES)  # authoritative set
+SOP_SEVERITIES = ("INFO", "CAUTION", "WARNING", "CRITICAL")
+SOP_C2_MODES = ("MANUAL", "AUTO")
+DEFAULT_C2_MODE = "MANUAL"  # fail-safe: absent singleton => operator-pull, no auto-emission
+_ZONE_MEMBERSHIP_PATTERN = "^(inside|outside|any)$"
+
+# Eval-loop cadence + a small in-memory de-dup so a contact that keeps matching
+# the same rule does not flood the append-only feed every tick.
+SOP_EVAL_INTERVAL_S = 2
+SOP_ALERT_COOLDOWN_S = 30
+SOP_MAX_ALERTS_RETURNED = 200
+
+_sop_eval_task: Optional[asyncio.Task] = None
+
+# Version-stamped hot-apply cache. Every zone/rule CRUD bumps _sop_config_version;
+# the eval loop reloads enabled zones+rules from Mongo whenever the version it
+# last loaded differs -- rules are Mongo docs, nothing compiled/restarted, so a
+# rule edit takes effect on the next (<=2s) tick with no redeploy (satisfies
+# 4.5.2.3 literally). Kept as module globals so the loop, the endpoints, and the
+# tests share exactly one source of truth.
+_sop_config_version = 0
+_sop_cache: Dict[str, Any] = {"version": None, "zones": [], "rules": []}
+# key -> monotonic timestamp of last emitted alert, for cooldown de-dup.
+_sop_recent_emits: Dict[str, float] = {}
+
+
+def _bump_sop_version() -> None:
+    """Invalidate the eval loop's config cache. Called by every zone/rule CRUD
+    write so the next tick hot-reloads -- the no-redeploy path."""
+    global _sop_config_version
+    _sop_config_version += 1
+
+
+# --------------------------------------------------------------------------
+# Pydantic models -- the no-code rule schema (1:1 with the contract).
+# --------------------------------------------------------------------------
+class SopConditions(BaseModel):
+    # zone_membership/require_position are the SPATIAL gate (see sop_engine):
+    # "any" + require_position False is purely non-spatial and applies to every
+    # contact; "inside"/"outside" or require_position True make the rule spatial
+    # and thus an honest miss against a position-less contact. The *_in lists are
+    # membership filters where an empty list means "don't care". min_confidence is
+    # a numeric floor (>=). threat_level_in uses the LOW|MEDIUM|HIGH|CRITICAL
+    # vocabulary. No field can smuggle a transmit action -- these are read-only
+    # predicates over an already-observed contact.
+    zone_membership: str = Field("any", pattern=_ZONE_MEMBERSHIP_PATTERN)
+    require_position: bool = False
+    protocol_in: List[str] = []
+    class_in: List[str] = []
+    family_in: List[str] = []
+    band_in: List[str] = []
+    min_confidence: Optional[float] = None
+    confidence_type_in: List[str] = []
+    threat_level_in: List[str] = []
+
+
+class SopAction(BaseModel):
+    # `type` is a PLAIN str here (not a pattern-constrained enum) so a malformed/
+    # malicious "ENGAGE"/"FIRE"/"DEPLOY" body still constructs and is then
+    # rejected with an explicit HTTPException(422) by _validate_sop_action -- the
+    # same "model accepts, handler validates with a clear 422" idiom used for
+    # zone polygons. This keeps the safety rejection testable at the handler and
+    # guarantees there is NO code path from an action string to a transmit call.
+    type: str
+    severity: str = "INFO"
+    message_template: str = ""
+    rank_boost: Optional[int] = None
+    # DISPLAY LABEL ONLY (jam|gnss_spoof|mavlink). Never an effect call -- a CUE
+    # is a proposal, not an authorization. See sop_engine PROPOSED_STATUS.
+    recommended_effect: Optional[str] = None
+
+
+class SopRuleBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    enabled: bool = True
+    priority: int = 0
+    zone_id: Optional[str] = None  # null => global/non-spatial rule
+    conditions: SopConditions = Field(default_factory=SopConditions)
+    action: SopAction
+
+
+class SopRuleUpdateBody(BaseModel):
+    # All-optional twin for PUT: only provided fields are applied. Same bounds so
+    # an edit can't relax them; action, when provided, is re-validated.
+    name: Optional[str] = Field(None, min_length=1, max_length=120)
+    enabled: Optional[bool] = None
+    priority: Optional[int] = None
+    zone_id: Optional[str] = None
+    conditions: Optional[SopConditions] = None
+    action: Optional[SopAction] = None
+
+
+class C2ModeBody(BaseModel):
+    mode: str  # validated in the handler => explicit 422 on a bad value
+
+
+def _validate_sop_action(action: Dict[str, Any]) -> None:
+    """Reject any rule action outside the alert/cue set with HTTPException(422).
+    This is the enforced form of governing invariant #1 at the write boundary:
+    action.type must be one of ALERT/ANNUNCIATE/PRIORITIZE/CUE_RECOMMENDATION --
+    there is deliberately no fire/engage/deploy member, so a mis-authored or
+    malicious 'ENGAGE' action is refused here and can never be persisted."""
+    if not isinstance(action, dict):
+        raise HTTPException(422, "action must be an object")
+    atype = action.get("type")
+    if atype not in SOP_ALLOWED_ACTION_TYPES:
+        raise HTTPException(
+            422,
+            f"action.type '{atype}' is not permitted. Allowed: "
+            f"{sorted(SOP_ALLOWED_ACTION_TYPES)} -- there is deliberately no "
+            f"fire/engage/deploy action (an SOP rule can only alert or propose a "
+            f"cue a commander still clears through the gated endpoints).",
+        )
+    severity = action.get("severity", "INFO")
+    if severity not in SOP_SEVERITIES:
+        raise HTTPException(
+            422, f"action.severity '{severity}' invalid. Allowed: {SOP_SEVERITIES}")
+
+
+# --------------------------------------------------------------------------
+# Contact assembly + enrichment (shared by the loop and /sop/rules/validate).
+# --------------------------------------------------------------------------
+def _sop_apply_threat_enrichment(contact: Dict[str, Any], obs: Dict[str, Any]) -> None:
+    """Enrich a contact with class/family/threat_level from the inbuilt threat
+    library (threat_library.match_detection). Best-effort: a library/matching
+    failure must never crash the eval loop, and it never fabricates -- an
+    UNKNOWN threat match is ignored so any real threat_level already on the
+    contact is preserved."""
+    try:
+        match = threat_library.match_detection(obs, _threat_lib)
+    except Exception:
+        return
+    best = match.get("best") or {}
+    if contact.get("class") is None:
+        contact["class"] = best.get("class")
+    if contact.get("family") is None:
+        contact["family"] = best.get("family")
+    threat_level = match.get("threat_level")
+    if threat_level and threat_level != "UNKNOWN":
+        contact["threat_level"] = threat_level
+
+
+def _sop_contact_from_detection(det: Dict[str, Any]) -> Dict[str, Any]:
+    """Build one SOP contact dict from a stored db.detections doc.
+
+    Non-spatial fields (protocol/band/confidence/confidence_type/threat_level)
+    always populate. A `position_source` is set ONLY when the detection carries a
+    real DroneID broadcast position (drone_lat/drone_lon) -- otherwise the
+    contact is position-less and a spatial rule honestly does not match it
+    (governing invariant #2). No coordinate is ever invented."""
+    contact: Dict[str, Any] = {
+        "detection_id": det.get("id"),
+        "contact_kind": "detection",
+        "source": det.get("source"),
+        "callsign": det.get("callsign"),
+        "protocol": det.get("protocol"),
+        "class": None,
+        "family": None,
+        "band": threat_library.band_for_freq_ghz(det.get("center_freq_ghz")),
+        "confidence": det.get("ml_confidence"),
+        "confidence_type": det.get("confidence_type"),
+        "threat_level": det.get("threat_level"),
+    }
+    # DroneID-with-position => real position => spatial-lane eligible.
+    if det.get("drone_lat") is not None and det.get("drone_lon") is not None:
+        contact["position_source"] = "DRONEID"
+        contact["lat"] = det.get("drone_lat")
+        contact["lon"] = det.get("drone_lon")
+    _sop_apply_threat_enrichment(contact, {"center_freq_ghz": det.get("center_freq_ghz")})
+    return contact
+
+
+def _sop_positioned_contacts() -> List[Dict[str, Any]]:
+    """Assemble the spatial-lane contacts that live OUTSIDE db.detections: the
+    latest decoded RemoteID and ADS-B broadcasts. Each is included ONLY when it
+    carries a real decoded lat/lon; a decode without a position is skipped (never
+    given a synthetic pin). DroneID positioned contacts are NOT assembled here --
+    they ride on their db.detections doc (see _sop_contact_from_detection)."""
+    contacts: List[Dict[str, Any]] = []
+
+    rid = _last_remoteid_decode
+    if rid and rid.get("latitude_deg") is not None and rid.get("longitude_deg") is not None:
+        contact = {
+            "contact_kind": "remoteid",
+            "position_source": "REMOTEID",
+            "lat": rid.get("latitude_deg"),
+            "lon": rid.get("longitude_deg"),
+            "protocol": "remoteid",
+            "uas_id": rid.get("uas_id"),
+            "class": None,
+            "family": None,
+            "band": None,
+            "confidence": None,
+            "confidence_type": "protocol_verified",
+            "threat_level": None,
+        }
+        _sop_apply_threat_enrichment(
+            contact,
+            {"remoteid": {"uas_id": rid.get("uas_id"), "ua_type": rid.get("ua_type"),
+                          "operator_id": rid.get("operator_id")}},
+        )
+        contacts.append(contact)
+
+    adsb = _last_adsb_decode
+    if adsb and adsb.get("latitude_deg") is not None and adsb.get("longitude_deg") is not None:
+        contact = {
+            "contact_kind": "adsb",
+            "position_source": "ADSB",
+            "lat": adsb.get("latitude_deg"),
+            "lon": adsb.get("longitude_deg"),
+            "protocol": "adsb",
+            "icao24": adsb.get("icao24"),
+            "callsign": adsb.get("callsign"),
+            "class": None,
+            "family": None,
+            "band": None,
+            "confidence": None,
+            "confidence_type": "protocol_verified",
+            "threat_level": None,
+        }
+        _sop_apply_threat_enrichment(contact, {})
+        contacts.append(contact)
+
+    return contacts
+
+
+async def _sop_current_contacts() -> List[Dict[str, Any]]:
+    """All live contacts the SOP engine evaluates this instant: every ACTIVE
+    detection (non-spatial, plus DroneID-positioned) followed by the latest
+    positioned RemoteID/ADS-B broadcasts. Used by BOTH the eval loop and the
+    /sop/rules/validate dry-run so a preview matches exactly what the loop sees."""
+    contacts: List[Dict[str, Any]] = []
+    active = await db.detections.find({"status": "ACTIVE"}, {"_id": 0}).to_list(500)
+    for det in active:
+        contacts.append(_sop_contact_from_detection(det))
+    contacts.extend(_sop_positioned_contacts())
+    return contacts
+
+
+def _sop_contact_ref(contact: Dict[str, Any]) -> Dict[str, Any]:
+    """A compact, position-honest reference to the contact a firing came from --
+    stored on the alert and returned by the validate preview. Includes lon/lat
+    ONLY when the contact genuinely carries a position_source."""
+    ref: Dict[str, Any] = {
+        "kind": contact.get("contact_kind"),
+        "detection_id": contact.get("detection_id"),
+        "position_source": contact.get("position_source"),
+        "protocol": contact.get("protocol"),
+        "callsign": contact.get("callsign"),
+        "uas_id": contact.get("uas_id"),
+        "icao24": contact.get("icao24"),
+    }
+    if contact.get("position_source"):
+        ref["lon"] = contact.get("lon")
+        ref["lat"] = contact.get("lat")
+    return {k: v for k, v in ref.items() if v is not None}
+
+
+def _sop_dedup_key(rule_id: Any, contact: Dict[str, Any]) -> str:
+    """Stable key identifying a (rule, contact) pair for cooldown de-dup."""
+    contact_key = (contact.get("detection_id")
+                   or contact.get("uas_id")
+                   or contact.get("icao24")
+                   or f"{contact.get('contact_kind')}:{contact.get('position_source')}")
+    return f"{rule_id}::{contact_key}"
+
+
+# --------------------------------------------------------------------------
+# Rule persistence + endpoints
+# --------------------------------------------------------------------------
+def _sop_strip(doc: Dict[str, Any]) -> Dict[str, Any]:
+    d = dict(doc)
+    d.pop("_id", None)
+    return d
+
+
+@api.get("/sop/rules")
+async def list_sop_rules(user: Dict = Depends(get_current_user)):
+    """List all SOP rules. Any authenticated user may read; only commanders
+    mutate. Highest priority first (the order the engine applies them)."""
+    rules = await db.sop_rules.find({}, {"_id": 0}).sort("priority", -1).to_list(2000)
+    return {"rules": rules, "count": len(rules)}
+
+
+@api.post("/sop/rules", status_code=201)
+async def create_sop_rule(body: SopRuleBody, user: Dict = Depends(require_commander)):
+    """Create an SOP rule (commander only). Rejects any fire/engage/deploy action
+    at 422 (_validate_sop_action). Bumps the config version so the eval loop
+    hot-applies it on the next tick, and audits the create."""
+    _validate_sop_action(body.action.dict())
+    now = datetime.now(timezone.utc).isoformat()
+    new_id = str(uuid.uuid4())
+    actor = user["email"]
+    doc = {
+        "id": new_id,
+        "name": body.name,
+        "enabled": body.enabled,
+        "priority": body.priority,
+        "version": 1,
+        "zone_id": body.zone_id,
+        "conditions": body.conditions.dict(),
+        "action": body.action.dict(),
+        "created_by": actor,
+        "created_at": now,
+        "updated_by": actor,
+        "updated_at": now,
+    }
+    await db.sop_rules.insert_one(doc.copy())
+    _bump_sop_version()
+    await log_event(
+        "SOP_RULE_CREATE",
+        f"SOP rule created: {body.name} (action={body.action.type})",
+        meta={"rule_id": new_id, "action_type": body.action.type,
+              "enabled": body.enabled, "priority": body.priority,
+              "zone_id": body.zone_id},
+        actor=actor,
+    )
+    return doc
+
+
+@api.put("/sop/rules/{rule_id}")
+async def update_sop_rule(rule_id: str, body: SopRuleUpdateBody,
+                          user: Dict = Depends(require_commander)):
+    """Edit an SOP rule (commander only), hot-applied on the next eval tick. A
+    provided action is re-validated (fire/engage/deploy => 422). Bumps the
+    per-rule version and the global config version, and audits the edit."""
+    existing = await db.sop_rules.find_one({"id": rule_id}, {"_id": 0})
+    if existing is None:
+        raise HTTPException(404, "SOP rule not found")
+    updates: Dict[str, Any] = {}
+    for field in ("name", "enabled", "priority", "zone_id"):
+        value = getattr(body, field)
+        if value is not None:
+            updates[field] = value
+    if body.conditions is not None:
+        updates["conditions"] = body.conditions.dict()
+    if body.action is not None:
+        _validate_sop_action(body.action.dict())
+        updates["action"] = body.action.dict()
+    actor = user["email"]
+    now = datetime.now(timezone.utc).isoformat()
+    updates["updated_by"] = actor
+    updates["updated_at"] = now
+    updates["version"] = int(existing.get("version") or 1) + 1
+    await db.sop_rules.update_one({"id": rule_id}, {"$set": updates})
+    _bump_sop_version()
+    await log_event(
+        "SOP_RULE_UPDATE",
+        f"SOP rule updated: {rule_id}",
+        meta={"rule_id": rule_id, "fields": sorted(updates.keys()),
+              "version": updates["version"]},
+        actor=actor,
+    )
+    updated = await db.sop_rules.find_one({"id": rule_id}, {"_id": 0})
+    return updated
+
+
+@api.delete("/sop/rules/{rule_id}")
+async def delete_sop_rule(rule_id: str, user: Dict = Depends(require_commander)):
+    """Delete an SOP rule (commander only). Hot-applied on the next tick."""
+    result = await db.sop_rules.delete_one({"id": rule_id})
+    if result.deleted_count == 0:
+        raise HTTPException(404, "SOP rule not found")
+    _bump_sop_version()
+    await log_event(
+        "SOP_RULE_DELETE",
+        f"SOP rule deleted: {rule_id}",
+        meta={"rule_id": rule_id},
+        actor=user["email"],
+    )
+    return {"deleted": True, "id": rule_id}
+
+
+@api.post("/sop/rules/validate")
+async def validate_sop_rule(body: SopRuleBody, user: Dict = Depends(get_current_user)):
+    """Dry-run: validate a rule body AND preview how many/which CURRENT contacts
+    it would match -- NO persistence, NO ws push, NO side effects. This is also
+    the operator-PULL path in MANUAL C2 mode (the loop suppresses auto-emission
+    there). Uses the exact same contact assembly + pure sop_engine.evaluate the
+    loop uses, against an ephemeral non-persisted rule."""
+    _validate_sop_action(body.action.dict())
+    preview_rule = {
+        "id": "__preview__",
+        "name": body.name,
+        "enabled": True,
+        "priority": body.priority,
+        "zone_id": body.zone_id,
+        "conditions": body.conditions.dict(),
+        "action": body.action.dict(),
+    }
+    zones = await db.zones.find({"enabled": True}, {"_id": 0}).to_list(2000)
+    contacts = await _sop_current_contacts()
+    matches = []
+    for contact in contacts:
+        firings = sop_engine.evaluate(contact, zones, [preview_rule])
+        if firings:
+            matches.append({
+                "contact_ref": _sop_contact_ref(contact),
+                "action_type": firings[0].get("action_type"),
+                "severity": firings[0].get("severity"),
+                "message": firings[0].get("message"),
+                "cue": firings[0].get("cue"),
+            })
+    return {"ok": True, "would_match_count": len(matches),
+            "contacts_evaluated": len(contacts), "matches": matches}
+
+
+# --------------------------------------------------------------------------
+# Rule-alerts feed (append-only firings) + acknowledge
+# --------------------------------------------------------------------------
+@api.get("/sop/alerts")
+async def list_sop_alerts(user: Dict = Depends(get_current_user)):
+    """Recent SOP rule firings, newest first, capped. Ordering is adjusted by a
+    firing's rank_boost (a PRIORITIZE rule's ADDITIVE feed-ordering hint) so
+    higher-boost alerts surface first within the recent window -- this ONLY
+    reorders the feed, it never changes engagement fire-gating."""
+    alerts = await db.rule_alerts.find({}, {"_id": 0}).sort("ts", -1).to_list(SOP_MAX_ALERTS_RETURNED)
+    alerts.sort(key=lambda a: ((a.get("rank_boost") or 0), a.get("ts") or ""), reverse=True)
+    return {"alerts": alerts, "count": len(alerts)}
+
+
+@api.post("/sop/alerts/{alert_id}/ack")
+async def ack_sop_alert(alert_id: str, user: Dict = Depends(get_current_user)):
+    """Acknowledge a rule firing (stamp acknowledged_by/at). Any authenticated
+    user may acknowledge -- an annunciation ack is situational-awareness, not a
+    transmit action, so it is not commander-gated."""
+    existing = await db.rule_alerts.find_one({"id": alert_id}, {"_id": 0})
+    if existing is None:
+        raise HTTPException(404, "SOP alert not found")
+    now = datetime.now(timezone.utc).isoformat()
+    await db.rule_alerts.update_one(
+        {"id": alert_id},
+        {"$set": {"acknowledged_by": user["email"], "acknowledged_at": now}},
+    )
+    updated = await db.rule_alerts.find_one({"id": alert_id}, {"_id": 0})
+    return updated
+
+
+# --------------------------------------------------------------------------
+# C2 mode singleton (MANUAL|AUTO) in db.system_state (_id="c2")
+# --------------------------------------------------------------------------
+async def _get_c2_mode() -> str:
+    """Current C2 mode, defaulting to MANUAL (fail-safe: operator-pull, no
+    auto-emission) when the singleton is absent or malformed."""
+    doc = await db.system_state.find_one({"_id": "c2"})
+    if not doc:
+        return DEFAULT_C2_MODE
+    mode = doc.get("mode")
+    return mode if mode in SOP_C2_MODES else DEFAULT_C2_MODE
+
+
+@api.get("/c2/mode")
+async def get_c2_mode(user: Dict = Depends(get_current_user)):
+    """Current C2 mode (MANUAL|AUTO). MANUAL = engine evaluates but auto-emission
+    is suppressed (operator pulls via /sop/rules/validate); AUTO = the loop
+    auto-emits alerts/cues (and NOTHING else -- no arm, no confirm, no TX)."""
+    doc = await db.system_state.find_one({"_id": "c2"}, {"_id": 0})
+    if not doc:
+        return {"mode": DEFAULT_C2_MODE, "updated_by": None,
+                "updated_at": None, "default": True}
+    return {"mode": doc.get("mode", DEFAULT_C2_MODE),
+            "updated_by": doc.get("updated_by"),
+            "updated_at": doc.get("updated_at"), "default": False}
+
+
+@api.post("/c2/mode")
+async def set_c2_mode(body: C2ModeBody, user: Dict = Depends(require_commander)):
+    """Set the C2 mode (commander only, audited -- 4.5.23). Bound to Increment-1
+    semantics: AUTO may auto-emit ALERT/ANNUNCIATE/PRIORITIZE/CUE and boost
+    proposal ranking, and NOTHING else. This endpoint never touches the TX
+    spine."""
+    if body.mode not in SOP_C2_MODES:
+        raise HTTPException(
+            422, f"mode '{body.mode}' invalid. Allowed: {SOP_C2_MODES}")
+    now = datetime.now(timezone.utc).isoformat()
+    actor = user["email"]
+    await db.system_state.update_one(
+        {"_id": "c2"},
+        {"$set": {"_id": "c2", "mode": body.mode,
+                  "updated_by": actor, "updated_at": now}},
+        upsert=True,
+    )
+    await log_event(
+        "C2_MODE_CHANGE",
+        f"C2 mode set to {body.mode}",
+        meta={"mode": body.mode}, actor=actor,
+    )
+    return {"mode": body.mode, "updated_by": actor, "updated_at": now}
+
+
+# --------------------------------------------------------------------------
+# Background eval loop
+# --------------------------------------------------------------------------
+async def _sop_reload_config_if_stale() -> tuple:
+    """Return (zones, rules) from the version-stamped cache, reloading enabled
+    zones + enabled rules from Mongo iff a zone/rule CRUD bumped the config
+    version since the last load. This is the hot-apply/no-redeploy path."""
+    global _sop_cache
+    if _sop_cache["version"] != _sop_config_version:
+        loaded_version = _sop_config_version  # snapshot BEFORE the awaits
+        zones = await db.zones.find({"enabled": True}, {"_id": 0}).to_list(2000)
+        rules = await db.sop_rules.find({"enabled": True}, {"_id": 0}).to_list(2000)
+        _sop_cache = {"version": loaded_version, "zones": zones, "rules": rules}
+    return _sop_cache["zones"], _sop_cache["rules"]
+
+
+async def _sop_emit_firing(firing: Dict[str, Any], contact: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Persist ONE firing to db.rule_alerts (append-only) and push it over the
+    websocket. Cooldown-de-duplicated so a persistently-matching (rule, contact)
+    pair does not flood the feed every tick. Returns the stored alert, or None if
+    de-duplicated. Called ONLY in AUTO mode (MANUAL suppresses auto-emission)."""
+    key = _sop_dedup_key(firing.get("rule_id"), contact)
+    loop_now = asyncio.get_event_loop().time()
+    last = _sop_recent_emits.get(key)
+    if last is not None and (loop_now - last) < SOP_ALERT_COOLDOWN_S:
+        return None
+    _sop_recent_emits[key] = loop_now
+    # Opportunistic prune so the de-dup table cannot grow unbounded.
+    if len(_sop_recent_emits) > 4096:
+        for k in [k for k, t in _sop_recent_emits.items()
+                  if (loop_now - t) > SOP_ALERT_COOLDOWN_S]:
+            _sop_recent_emits.pop(k, None)
+
+    now = datetime.now(timezone.utc).isoformat()
+    alert = {
+        "id": str(uuid.uuid4()),
+        "ts": now,
+        "rule_id": firing.get("rule_id"),
+        "rule_name": firing.get("rule_name"),
+        "zone_id": firing.get("zone_id"),
+        "detection_id": contact.get("detection_id"),
+        "contact_ref": _sop_contact_ref(contact),
+        "action_type": firing.get("action_type"),
+        "severity": firing.get("severity"),
+        "message": firing.get("message"),
+        "rank_boost": firing.get("rank_boost"),
+        # A CUE is a PROPOSED recommendation only (stamped by sop_engine as
+        # PROPOSED_REQUIRES_HUMAN_AUTHORIZATION). It is never an effect call.
+        "cue": firing.get("cue"),
+        "acknowledged_by": None,
+        "acknowledged_at": None,
+    }
+    await db.rule_alerts.insert_one(alert.copy())
+    await ws_manager.broadcast_json({"type": "sop_alert", "alert": alert})
+    return alert
+
+
+async def _sop_eval_tick() -> Dict[str, Any]:
+    """One evaluation pass: load (cached) zones+rules, read the C2 mode, evaluate
+    every live contact through the PURE sop_engine, and -- ONLY in AUTO mode --
+    persist + push each firing. Returns a small summary (used by tests). This
+    method touches the TX spine in no way whatsoever."""
+    zones, rules = await _sop_reload_config_if_stale()
+    if not rules:
+        return {"mode": await _get_c2_mode(), "contacts": 0,
+                "firings": 0, "emitted": 0}
+    mode = await _get_c2_mode()
+    emit = (mode == "AUTO")
+    contacts = await _sop_current_contacts()
+    firing_count = 0
+    emitted = 0
+    for contact in contacts:
+        firings = sop_engine.evaluate(contact, zones, rules)
+        for firing in firings:
+            firing_count += 1
+            # MANUAL mode: evaluate fully (proving the engine runs and rules are
+            # valid) but SUPPRESS auto-emission -- do not persist or push. The
+            # operator pulls current matches via POST /sop/rules/validate. AUTO:
+            # emit (persist + ws), cooldown-de-duplicated.
+            if emit:
+                alert = await _sop_emit_firing(firing, contact)
+                if alert is not None:
+                    emitted += 1
+    return {"mode": mode, "contacts": len(contacts),
+            "firings": firing_count, "emitted": emitted}
+
+
+async def _sop_eval_loop() -> None:
+    """Background task (started at startup, cancelled at shutdown) running the
+    SOP evaluation every ~2s. Mirrors _track_sweep_loop: a single bad iteration
+    is logged and retried, never allowed to kill the loop or the process, and a
+    failure NEVER emits a fake firing (the tick either fully completes or raises
+    before any emission for that contact)."""
+    while True:
+        try:
+            await _sop_eval_tick()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("_sop_eval_loop: eval iteration failed")
+        await asyncio.sleep(SOP_EVAL_INTERVAL_S)
 
 
 # =====================================================================
@@ -3310,6 +4115,20 @@ class DetectionIngestBody(BaseModel):
     # yet updated to set it -- absence means "render as before" (backward
     # compatible), same pattern as distance_estimated/protocol_confirmed above.
     confidence_type: Optional[str] = None
+    # --- DJI DroneID decoded broadcast position (field-bridge/droneid_cued_capture.py) ---
+    # A CRC-verified DJI DroneID decode carries a REAL broadcast position for the
+    # drone (drone_lat/drone_lon) and, separately, the operator/app position
+    # (app_lat/app_lon). This is the ONE detection-stream source that legitimately
+    # carries a lat/lon (governing invariant #2, honesty): only when both
+    # drone_lat AND drone_lon are present is the detection eligible for the SOP
+    # spatial (zone-containment) lane. Every other detection source stays
+    # position-less and is NEVER given a synthetic pin. Defaults None so no source
+    # that omits them ever gets a fabricated position; the ingest handler persists
+    # them onto the stored doc ONLY when they are actually present.
+    drone_lat: Optional[float] = None
+    drone_lon: Optional[float] = None
+    app_lat: Optional[float] = None
+    app_lon: Optional[float] = None
 
 
 class WifiReferenceIngestBody(BaseModel):
@@ -4921,6 +5740,16 @@ async def detection_ingest(body: DetectionIngestBody,
                 )
             updates["authorized_target"] = False
             updates["iff_override_authorized"] = False  # legacy field: force-cleared, never a license
+        # DroneID decoded broadcast position (honesty enabler, governing
+        # invariant #2): on a re-confirmation carrying a real drone_lat/drone_lon,
+        # persist it so the merged detection becomes eligible for the SOP spatial
+        # lane. ONLY written when actually present -- a position-less
+        # re-confirmation never clobbers a prior real position with a null, and a
+        # source that never carries a position never gets a fabricated one.
+        for _pos_field in ("drone_lat", "drone_lon", "app_lat", "app_lon"):
+            _pos_val = getattr(body, _pos_field)
+            if _pos_val is not None:
+                updates[_pos_field] = _pos_val
         await db.detections.update_one(
             {"id": existing["id"]},
             {
@@ -5053,6 +5882,16 @@ async def detection_ingest(body: DetectionIngestBody,
         # field; consumers ignore it when absent.
         "wifi_fusion": wifi_fusion_meta,
     })
+
+    # DroneID decoded broadcast position (honesty enabler, governing invariant
+    # #2): persist the REAL lat/lon ONLY when the ingest actually carries it, so
+    # a position-less source never gets a null that could be mistaken for a pin.
+    # A stored drone_lat/drone_lon is what makes this detection eligible for the
+    # SOP spatial (zone-containment) lane.
+    for _pos_field in ("drone_lat", "drone_lon", "app_lat", "app_lon"):
+        _pos_val = getattr(body, _pos_field)
+        if _pos_val is not None:
+            det[_pos_field] = _pos_val
 
     # IFF suppression (task #60) -- see identical comment in the
     # update-existing branch above for what this does and does not check.

@@ -17,6 +17,8 @@ import KillChain from "@/pages/KillChain";
 import DetectionHistory from "@/pages/DetectionHistory";
 import MissionLog from "@/pages/MissionLog";
 import MapView from "@/pages/Map";
+import Zones from "@/pages/Zones";
+import SopRules from "@/pages/SopRules";
 import "@/App.css";
 
 function Protected({ children }) {
@@ -57,6 +59,8 @@ export default function App() {
             <Route path="killchain" element={<KillChain />} />
             <Route path="history"   element={<DetectionHistory />} />
             <Route path="map"       element={<MapView />} />
+            <Route path="zones"     element={<Zones />} />
+            <Route path="sop-rules" element={<SopRules />} />
             <Route path="logs"      element={<MissionLog />} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />

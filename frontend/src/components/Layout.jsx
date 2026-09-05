@@ -9,11 +9,13 @@ import ErrorBoundary from "@/components/ErrorBoundary";
 // (localStorage, see ThemeContext).
 import ThemeToggle from "@/components/ThemeToggle";
 import TxStatusChips from "@/components/TxStatusChips";
+import AnnunciationPanel from "@/components/AnnunciationPanel";
+import AutoManualToggle from "@/components/AutoManualToggle";
 import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import {
   Radar, Waves, Radio, Bomb, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History, MapPin, BookOpen,
-  Satellite, RadioTower, Target,
+  Satellite, RadioTower, Target, Layers,
 } from "lucide-react";
 
 const NAV = [
@@ -29,6 +31,8 @@ const NAV = [
   { to: "/killchain",   label: "KILL CHAIN",       icon: Crosshair, testid: "nav-killchain" },
   { to: "/history",     label: "DETECTION HISTORY",icon: History,   testid: "nav-history" },
   { to: "/map",         label: "TACTICAL MAP",     icon: MapPin,    testid: "nav-map" },
+  { to: "/zones",       label: "ZONES",            icon: Layers,    testid: "nav-zones" },
+  { to: "/sop-rules",   label: "SOP RULES",        icon: ScrollText,testid: "nav-sop-rules" },
   { to: "/logs",        label: "MISSION LOG",      icon: ScrollText,testid: "nav-logs" },
 ];
 
@@ -133,6 +137,8 @@ export default function Layout() {
               </span>
               <span className="mx-1 text-slate-600 shrink-0">|</span>
               <span className="shrink-0 whitespace-nowrap" style={{ color: "var(--accent-info)" }}>WS CLIENTS: {health?.ws_clients ?? "—"}</span>
+              <span className="mx-1 text-slate-600 shrink-0">|</span>
+              <AutoManualToggle />
             </div>
             <div className="flex items-center gap-4 shrink-0">
               <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
@@ -143,7 +149,8 @@ export default function Layout() {
             </div>
           </div>
 
-          <div className="p-8 flex-1">
+          <div className="p-8 flex-1 space-y-4">
+            <AnnunciationPanel />
             {/* Per-page fault isolation: a render throw in a routed module shows
                 a tactical MODULE FAULT card here while the console chrome and
                 EmergencyAbort stay live. Keyed on pathname so navigating away
