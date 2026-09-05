@@ -24,10 +24,13 @@ from hackrf_rx import (
     ELRS_HOP_RATE_RANGE_HZ,
     EXTRA_BANDS_MHZ,
     HOP_CONFIRM_CYCLES,
+    HOP_FREQ_MIN_MOVE_MHZ,
+    SUBGHZ_900_HOP_BAND,
     classify_hop_interval,
     load_bands_config,
     update_hop_track,
 )
+from rf_features import compute_bandwidth_mhz
 
 
 def test_default_bands_unchanged():
@@ -251,3 +254,93 @@ def test_update_hop_track_large_power_jump_treated_as_different_emitter():
     consistent, rate = update_hop_track(track, now, -10.0, is_hit=True, is_real_data=True)
     assert consistent is False
     assert rate is None
+
+
+# --- 902-928 MHz (SiK-915 band) GUARDED hop tracking (item 3, FIX C) ---------
+# The SiK-915 band hosts continuous SiK/MAVLink telemetry, low-duty LoRa AND
+# ELRS-900/Crossfire LRS. Its hop tracking runs with require_freq_hop=True so a
+# fixed-frequency continuous carrier is never mislabeled as a wideband-FHSS
+# hopper, even when its reappearance TIMING would otherwise look ELRS-consistent.
+
+
+def test_subghz_900_hop_band_constant():
+    """The 902-928 hop band is SiK-915 and is distinct from the two existing
+    (unguarded) hop-tracked bands."""
+    assert SUBGHZ_900_HOP_BAND == "SiK-915"
+    assert HOP_FREQ_MIN_MOVE_MHZ > 0
+
+
+def test_update_hop_track_900_frequency_hopping_contact_flags():
+    """A frequency-HOPPING contact in 902-928 (peak lands far apart across the
+    band each cycle) at ELRS-consistent timing DOES flag hop_consistent once
+    corroborated -- this is the reachable-on-live-data half of FIX C."""
+    track = _fresh_track()
+    now = 7000.0
+    freq = 903.0
+    update_hop_track(track, now, -40.0, is_hit=True, is_real_data=True,
+                     peak_freq_mhz=freq, require_freq_hop=True)
+    consistent = False
+    rate = None
+    for _ in range(HOP_CONFIRM_CYCLES + 2):
+        now += 1.0 / 50.0            # 50 Hz-consistent reappearance interval
+        freq += HOP_FREQ_MIN_MOVE_MHZ + 2.0   # hops well beyond the move threshold
+        if freq > 927.0:
+            freq = 903.0
+        consistent, rate = update_hop_track(track, now, -40.0, is_hit=True, is_real_data=True,
+                                            peak_freq_mhz=freq, require_freq_hop=True)
+    assert consistent is True
+    assert rate is not None and abs(rate - 50.0) < 1.0
+
+
+def test_update_hop_track_900_continuous_carrier_not_mislabeled_hopping():
+    """A CONTINUOUS SiK-915 telemetry carrier (fixed frequency, reappears every
+    cycle) must NEVER be flagged hop_consistent -- even with identical ELRS-
+    range timing to the hopping case above. The frequency-movement guard is the
+    only difference, and it must be decisive."""
+    track = _fresh_track()
+    now = 8000.0
+    freq = 915.0  # fixed -- a continuous carrier does not hop across the band
+    update_hop_track(track, now, -40.0, is_hit=True, is_real_data=True,
+                     peak_freq_mhz=freq, require_freq_hop=True)
+    for _ in range(10):
+        now += 1.0 / 50.0  # ELRS-consistent TIMING, but the frequency never moves
+        consistent, rate = update_hop_track(track, now, -40.0, is_hit=True, is_real_data=True,
+                                            peak_freq_mhz=freq, require_freq_hop=True)
+        assert consistent is False
+        assert rate is None
+
+
+def test_update_hop_track_freq_guard_off_by_default_preserves_lrs_behavior():
+    """Without require_freq_hop (the LRS-433/SRD-868 path), a fixed-frequency
+    contact at ELRS timing still flags -- the existing bands are unchanged by
+    the new guard."""
+    track = _fresh_track()
+    now = 9000.0
+    update_hop_track(track, now, -40.0, is_hit=True, is_real_data=True, peak_freq_mhz=868.0)
+    consistent = False
+    for _ in range(HOP_CONFIRM_CYCLES + 1):
+        now += 1.0 / 50.0
+        consistent, _ = update_hop_track(track, now, -40.0, is_hit=True, is_real_data=True,
+                                         peak_freq_mhz=868.0)  # fixed freq, guard OFF
+    assert consistent is True
+
+
+# --- Occupied bandwidth (FIX B): occupied_bw_mhz distinct from band-width ----
+
+
+def test_occupied_bandwidth_is_narrow_and_distinct_from_band_width():
+    """rf_features.compute_bandwidth_mhz measures the OCCUPIED width (contiguous
+    run within DETECT_THRESHOLD_DB/2 of the peak), which for a narrowband
+    control-link emission is far smaller than the whole sweep-band width. This
+    distinctness is what makes the classifier's narrow/wide divider correct."""
+    floor = -58.0
+    detect_threshold_db = 15.0        # half-threshold = floor + 7.5 = -50.5 dBm
+    band_width_mhz = 83               # 2400-2483 sweep band, 1 MHz bins
+    # A narrow 3-bin peak well above the half-threshold; everything else buried.
+    powers = [-60.0] * band_width_mhz
+    powers[40] = -35.0
+    powers[41] = -34.0
+    powers[42] = -36.0
+    occupied = compute_bandwidth_mhz(powers, floor, detect_threshold_db, bin_width_mhz=1.0)
+    assert occupied == 3.0
+    assert occupied < band_width_mhz  # occupied width is NOT the band width

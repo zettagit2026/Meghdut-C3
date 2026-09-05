@@ -87,7 +87,16 @@ def classify_control_link(
     # These come from real decodes elsewhere in the pipeline, not from energy
     # features, so they earn "protocol_verified" (or at least a confident
     # family call) rather than the heuristic tiers below.
-    if "mavlink" in proto or src == "SIK_RADIO":
+    #
+    # HONEST GUARD (item 4): a MAVLink/SiK family call is made ONLY on a real
+    # decode signal -- a protocol-confirmed decode, or the dedicated SiK-radio
+    # bridge source (SIK_RADIO). A bare "SiK/MAVLink" protocol STRING on an
+    # energy-sweep detection (source SIK_RF_HEURISTIC, protocol_confirmed False)
+    # is NOT a decode and must NOT be called MAVLink -- it falls through to the
+    # sub-GHz band logic below, where 902-928 without hop corroboration is
+    # honestly labeled a "915 MHz continuous telemetry (candidate)" instead of
+    # overclaiming a decoded MAVLink link.
+    if src == "SIK_RADIO" or ("mavlink" in proto and protocol_confirmed):
         return {
             "link_type": "MAVLink over SiK telemetry radio",
             "link_family": "mavlink_sik",
@@ -95,16 +104,34 @@ def classify_control_link(
             "rationale": (
                 "MAVLink/SiK-radio hint on the contact"
                 + (" (protocol-confirmed decode)" if protocol_confirmed
-                   else " (source/protocol tag, not a fresh decode)")
+                   else " (SiK-radio bridge source tag, not a fresh CRC-verified decode)")
             ),
             "evidence": evidence,
         }
-    if "ocusync" in proto or "droneid" in proto or "dji" in mdl:
+    # HONEST GUARD (item 4): a DJI OcuSync FAMILY call is made only on a genuine
+    # DJI/OcuSync/DroneID identification -- and protocol_verified ONLY when a
+    # DroneID frame actually CRC-decodes (protocol_confirmed). The coarse energy
+    # band-default that hackrf_rx.py attaches to EVERY 2.4/5.8 GHz confirmed
+    # contact ("DJI Mini (candidate)" model + the ambiguous "OcuSync/Wi-Fi"
+    # protocol) is NOT such an identification -- the "/Wi-Fi" says outright the
+    # energy sweep cannot tell OcuSync from ordinary Wi-Fi. Treating it as DJI
+    # would (a) overclaim and (b) short-circuit every 2.4 GHz contact past the
+    # occupied-bandwidth divider, keeping the hobby_rc_2g4 family unreachable.
+    # So the ambiguous band-default falls through to the band/bandwidth logic
+    # below, where FIX B's occupied bandwidth honestly splits narrowband hobby-
+    # RC control links from wideband OFDM/video.
+    dji_band_default = "wi-fi" in proto or "wifi" in proto
+    dji_signal = "droneid" in proto or "ocusync" in proto or "dji" in mdl
+    if dji_signal and not dji_band_default:
         return {
             "link_type": "DJI OcuSync (digital video + control)",
             "link_family": "dji_ocusync",
             "confidence_type": "protocol_verified" if protocol_confirmed else "advisory_only",
-            "rationale": "DJI/OcuSync tag already attached to this contact",
+            "rationale": (
+                "DJI/OcuSync/DroneID identification on this contact"
+                + (" (DroneID CRC-decoded)" if protocol_confirmed
+                   else " (tag only, not a fresh DroneID CRC decode)")
+            ),
             "evidence": evidence,
         }
 
@@ -127,19 +154,29 @@ def classify_control_link(
                 ),
                 "evidence": evidence,
             }
-        # Narrowband 2.4/5.8: hobby-RC FHSS control links.
+        # Narrowband 2.4: hobby-RC FHSS control links -- FAMILY LEVEL ONLY.
+        # HONEST CEILING (item 4): the determination is the family, never a
+        # specific protocol. A passive energy/bandwidth sweep physically cannot
+        # separate the 2.4 GHz FHSS hobby-RC protocols from one another, so no
+        # protocol name is emitted as a call. In the live pipeline 2.4 GHz is
+        # not hop-tracked, so fhss_hop_consistent is not set and this is
+        # advisory_only in practice; the heuristic_binary tier remains reachable
+        # only for a caller that supplies genuine FHSS hop corroboration.
         if _in(BAND_ISM_2G4_GHZ, center_freq_ghz):
             confident = fhss_hop_consistent is True
             return {
-                "link_type": "2.4 GHz hobby-RC LRS-class (ELRS 2.4 / DSMX / FrSky / Flysky)",
+                "link_type": "2.4 GHz FHSS hobby-RC control link (family)",
                 "link_family": "hobby_rc_2g4",
                 "confidence_type": "heuristic_binary" if confident else "advisory_only",
                 "rationale": (
                     "Narrowband 2.4 GHz emission"
-                    + (" WITH ELRS/Crossfire-class FHSS hop consistency (task #88)"
+                    + (" WITH FHSS hop corroboration"
                        if confident else
                        " (bandwidth-only; no FHSS hop corroboration this cycle)")
-                    + " -- family-level RC control-link class, not a specific protocol decode."
+                    + " -- family-level hobby-RC control-link class. An energy/"
+                    "bandwidth sweep cannot separate the specific 2.4 GHz FHSS "
+                    "hobby-RC protocols, so only the family is asserted, never a "
+                    "specific protocol decode."
                 ),
                 "evidence": evidence,
             }
@@ -153,15 +190,38 @@ def classify_control_link(
 
     # --- Sub-GHz LRS / telemetry (433 / 868-928 MHz) ------------------------
     if _in(BAND_LRS_433_GHZ, center_freq_ghz) or _in(BAND_ISM_900_GHZ, center_freq_ghz):
-        band_label = "433 MHz" if _in(BAND_LRS_433_GHZ, center_freq_ghz) else "868/915 MHz"
+        is_433 = _in(BAND_LRS_433_GHZ, center_freq_ghz)
+        band_label = "433 MHz" if is_433 else "868/915 MHz"
         if fhss_hop_consistent is True:
+            # Hop-corroborated: family-level long-range control-link class.
+            # "ELRS-Crossfire-class" names the FAMILY, not a determination of
+            # ELRS-vs-Crossfire -- a hop-consistency heuristic can't separate
+            # them, and it deliberately does not name SiK either.
             return {
-                "link_type": f"Sub-GHz LRS control-class (ELRS 900 / TBS Crossfire, {band_label})",
+                "link_type": f"Sub-GHz LRS / ELRS-Crossfire-class ({band_label})",
                 "link_family": "lrs_subghz",
                 "confidence_type": "heuristic_binary",
                 "rationale": (
                     f"Sub-GHz {band_label} emission WITH ELRS/Crossfire-class FHSS hop "
-                    "consistency (task #88) -- long-range control-link class."
+                    "consistency -- family-level long-range control-link class, not a "
+                    "specific-protocol decode."
+                ),
+                "evidence": evidence,
+            }
+        if not is_433:
+            # 902-928 without hop corroboration: honestly a continuous-telemetry
+            # candidate (SiK/MAVLink, LoRa, or ambient consumer-IoT) -- NOT a
+            # decoded MAVLink link (that would take a real decode; see the SiK
+            # branch above) and NOT an LRS hopping call (no FHSS corroboration).
+            return {
+                "link_type": "915 MHz continuous telemetry (candidate)",
+                "link_family": "subghz_ism",
+                "confidence_type": "advisory_only",
+                "rationale": (
+                    "902-928 MHz emission WITHOUT ELRS/Crossfire FHSS hop corroboration "
+                    "and WITHOUT a real MAVLink/SiK decode -- honestly a continuous-"
+                    "telemetry candidate (SiK/MAVLink, LoRa, or ambient consumer-IoT), "
+                    "not a decoded link and not an LRS hopping call."
                 ),
                 "evidence": evidence,
             }

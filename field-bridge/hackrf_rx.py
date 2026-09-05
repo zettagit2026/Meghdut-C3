@@ -52,6 +52,7 @@ import requests
 
 from hackrf_device_lock import HackrfDeviceBusy, hackrf_device_lock
 from consumer_iot_signatures import consumer_iot_annotation
+from rf_features import compute_bandwidth_mhz
 
 # See MULTI-DEVICE NOTE above. Empty/unset = backward-compatible default
 # (no device selector passed to hackrf_sweep, first-responding HackRF wins).
@@ -343,6 +344,31 @@ HOP_CONFIRM_CYCLES = 3  # require this many consecutive real-data reappearances
                          # match can never trigger this on its own.
 HOP_TRACKED_BANDS = ("LRS-433", "SRD-868")  # additive only -- see module docstring
 
+# --- 902-928 MHz (SiK-915 band) hop tracking, GUARDED -----------------------
+# US ELRS-900 / TBS Crossfire-915 long-range control links share the SiK-915
+# band (902-928 MHz) with SiK/MAVLink telemetry and low-duty LoRa/consumer-IoT
+# traffic. Extending the ELRS/Crossfire hop-interval-consistency heuristic to
+# this band lets a genuinely hopping LRS emitter be corroborated, but it MUST
+# be guarded so the band's OTHER occupants are never mislabeled as hopping:
+#   1. LoRa guard: if the SiK-915 low-duty-cycle exclusion (likely_low_duty_
+#      cycle_device, see LORA_WINDOW_CYCLES) fired this cycle, the hop tracker
+#      is reset and never contributes evidence -- a low-duty LoRa burst can't
+#      become an "LRS hopping" call.
+#   2. Continuous-carrier guard: a real ELRS-900/Crossfire link is wideband
+#      FHSS -- it lands on a DIFFERENT in-band frequency across observations.
+#      A fixed-frequency continuous telemetry carrier does not. So a cycle
+#      only counts toward hop-consistency when the peak actually MOVED in
+#      frequency by more than HOP_FREQ_MIN_MOVE_MHZ (require_freq_hop=True in
+#      update_hop_track). This is corroboration in ADDITION to the existing
+#      timing check (classify_hop_interval already rejects the several-second
+#      sweep-cadence reappearance of a continuous link as "no_match").
+# Labels stay family-level "Sub-GHz LRS / ELRS-Crossfire-class" -- never an
+# ELRS-vs-Crossfire-vs-SiK determination.
+SUBGHZ_900_HOP_BAND = "SiK-915"
+HOP_FREQ_MIN_MOVE_MHZ = 3.0  # a wideband-FHSS LRS link lands far apart across
+                              # the 26 MHz band; a continuous carrier stays put
+                              # (well under this, and under BT_MOVE_TOL_MHZ's slop).
+
 
 def classify_hop_interval(interval_s: Optional[float],
                            hop_range_hz: Tuple[float, float] = ELRS_HOP_RATE_RANGE_HZ,
@@ -379,13 +405,25 @@ def classify_hop_interval(interval_s: Optional[float],
 
 
 def update_hop_track(track: Dict, now: float, peak_dbm: float, is_hit: bool,
-                      is_real_data: bool) -> Tuple[bool, Optional[float]]:
+                      is_real_data: bool, peak_freq_mhz: Optional[float] = None,
+                      require_freq_hop: bool = False,
+                      freq_hop_min_move_mhz: float = HOP_FREQ_MIN_MOVE_MHZ
+                      ) -> Tuple[bool, Optional[float]]:
     """Update a per-band ELRS hop-interval-consistency tracker in place (same
     shape/pattern as wifi_persist/bt_track/sik_hit_window above) and return
     (hop_consistent, last_rate_hz).
 
     `track` keys: last_time (float|None), last_power_dbm (float|None),
-    consistent_cycles (int).
+    consistent_cycles (int); when require_freq_hop is used, also
+    last_freq_mhz (float|None).
+
+    require_freq_hop / peak_freq_mhz (default off, so existing LRS-433/SRD-868
+    callers are byte-for-byte unchanged): when True, an otherwise timing-
+    consistent cycle only counts if the peak also MOVED in frequency by more
+    than freq_hop_min_move_mhz since the previous hit. This is the
+    continuous-carrier guard used for the SiK-915 (902-928 MHz) band, where a
+    fixed-frequency continuous telemetry carrier must never be mislabeled as a
+    wideband-FHSS ELRS-900/Crossfire hopper (see SUBGHZ_900_HOP_BAND above).
 
     Only called for HOP_TRACKED_BANDS (LRS-433/SRD-868). Only real-data hit
     cycles (is_real_data and is_hit) advance/verify the pattern -- a wedge/
@@ -412,12 +450,14 @@ def update_hop_track(track: Dict, now: float, peak_dbm: float, is_hit: bool,
     if not is_hit:
         track["last_time"] = None
         track["last_power_dbm"] = None
+        track["last_freq_mhz"] = None
         track["consistent_cycles"] = 0
         track["last_rate_hz"] = None
         return False, None
 
     prev_time = track.get("last_time")
     prev_power = track.get("last_power_dbm")
+    prev_freq = track.get("last_freq_mhz")
     classification = "insufficient"
     rate_hz = None
     if prev_time is not None and prev_power is not None:
@@ -429,6 +469,17 @@ def update_hop_track(track: Dict, now: float, peak_dbm: float, is_hit: bool,
         else:
             classification = "no_match"  # power jumped too much -- likely a different emitter
 
+    # Continuous-carrier guard (SiK-915 band, require_freq_hop=True): a wideband
+    # FHSS LRS link lands on a DIFFERENT in-band frequency each observation; a
+    # fixed-frequency continuous telemetry carrier does not. Downgrade an
+    # otherwise timing-consistent cycle to "no_match" when the peak did NOT move
+    # far enough in frequency, so a continuous link is never called hopping.
+    if (classification == "elrs_consistent" and require_freq_hop
+            and prev_freq is not None and peak_freq_mhz is not None
+            and abs(peak_freq_mhz - prev_freq) <= freq_hop_min_move_mhz):
+        classification = "no_match"
+        rate_hz = None
+
     if classification == "elrs_consistent":
         track["consistent_cycles"] = track.get("consistent_cycles", 0) + 1
         track["last_rate_hz"] = rate_hz
@@ -438,6 +489,7 @@ def update_hop_track(track: Dict, now: float, peak_dbm: float, is_hit: bool,
 
     track["last_time"] = now
     track["last_power_dbm"] = peak_dbm
+    track["last_freq_mhz"] = peak_freq_mhz
 
     return track["consistent_cycles"] >= HOP_CONFIRM_CYCLES, track.get("last_rate_hz")
 
@@ -873,8 +925,9 @@ def main() -> None:
     # ELRS/Crossfire-class hop-interval-consistency trackers, LRS-433/SRD-868
     # only -- see update_hop_track()/classify_hop_interval() above (task #88).
     hop_track = {name: {"last_time": None, "last_power_dbm": None,
+                         "last_freq_mhz": None,
                          "consistent_cycles": 0, "last_rate_hz": None}
-                 for name in HOP_TRACKED_BANDS}
+                 for name in HOP_TRACKED_BANDS + (SUBGHZ_900_HOP_BAND,)}
     i = 0
     while args.iterations == 0 or i < args.iterations:
         rows = []
@@ -1034,6 +1087,23 @@ def main() -> None:
                 is_hit = peak > floor + DETECT_THRESHOLD_DB
                 hop_consistent, hop_rate_hz = update_hop_track(
                     hop_track[name], time.time(), peak, is_hit, is_real_data)
+            elif name == SUBGHZ_900_HOP_BAND:
+                # 902-928 MHz hosts SiK/MAVLink telemetry, low-duty LoRa/IoT AND
+                # ELRS-900/Crossfire LRS. Track hop-consistency here too, but
+                # GUARDED (see SUBGHZ_900_HOP_BAND): a low-duty LoRa burst resets
+                # the tracker outright, and the require_freq_hop guard means only
+                # a peak that actually MOVES across the band (wideband FHSS)
+                # corroborates -- a fixed-frequency continuous carrier can't.
+                is_hit = peak > floor + DETECT_THRESHOLD_DB
+                if likely_low_duty_cycle_device:
+                    hop_track[name].update(
+                        {"last_time": None, "last_power_dbm": None,
+                         "last_freq_mhz": None, "consistent_cycles": 0,
+                         "last_rate_hz": None})
+                else:
+                    hop_consistent, hop_rate_hz = update_hop_track(
+                        hop_track[name], time.time(), peak, is_hit, is_real_data,
+                        peak_freq_mhz=peak_freq_mhz, require_freq_hop=True)
 
             likely_excluded = likely_wifi_ap or likely_bluetooth or likely_low_duty_cycle_device
 
@@ -1098,7 +1168,18 @@ def main() -> None:
                     "protocol": meta["protocol"],
                     "threat_level": "MEDIUM",
                     "center_freq_ghz": peak_freq_mhz / 1000.0,
-                    "bandwidth_mhz": high - low,
+                    "bandwidth_mhz": high - low,  # whole SWEEP-BAND width (backward-compat)
+                    # OCCUPIED bandwidth: width of the contiguous run of bins
+                    # within DETECT_THRESHOLD_DB/2 of the peak (rf_features.
+                    # compute_bandwidth_mhz -- the SAME coarse estimate the
+                    # inline Bluetooth-exclusion block uses, now emitted for
+                    # every confirmed detection). This, NOT the band width, is
+                    # what the control-link classifier's wide/narrow divider
+                    # needs so a narrowband 2.4 GHz hobby-RC link is not lumped
+                    # in with wideband video. Coarse by design -- not a
+                    # spectral-mask measurement.
+                    "occupied_bw_mhz": round(
+                        compute_bandwidth_mhz(powers, floor, DETECT_THRESHOLD_DB, bin_width_mhz), 1),
                     "rssi_dbm": peak,
                     "snr_db": peak - floor,
                     "bearing_deg": None,  # honest: no DF array -> direction unknown (was 0.0 fake)
@@ -1116,7 +1197,7 @@ def main() -> None:
                 # evidence, NOT a protocol decode and NOT below-noise-floor
                 # detection (that would require real IQ-level LoRa correlation,
                 # out of scope -- see ELRS_HOP_RATE_RANGE_HZ comment block).
-                if name in HOP_TRACKED_BANDS and hop_consistent:
+                if hop_consistent:  # LRS-433/SRD-868/SiK-915 hop-corroborated
                     det["rf_signature_only"] = True
                     det["hop_rate_hz"] = round(hop_rate_hz, 1) if hop_rate_hz is not None else None
                     det["notes"] = (

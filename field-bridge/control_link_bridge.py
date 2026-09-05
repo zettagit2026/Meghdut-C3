@@ -49,13 +49,35 @@ PROTOCOL_ID = "control_link"
 
 def classification_for_detection(det: Dict) -> Dict:
     """Build the /api/control-link/ingest body for one detection doc, from its
-    observable RF fields only. `fhss_hop_consistent` is not stored on the
-    detection document today, so it is passed as None -- the classifier then
-    degrades sub-GHz calls to advisory_only honestly rather than overclaiming."""
+    observable RF fields only.
+
+    Two live-data wirings (previously stranded) are threaded here:
+
+    * fhss_hop_consistent: hackrf_rx.py records the ELRS/Crossfire-class hop-
+      interval-consistency signature as ``rf_signature_only`` (with a
+      ``hop_rate_hz``), NOT under a ``fhss_hop_consistent`` key. Bridging that
+      real field into the classifier's ``fhss_hop_consistent`` input is what
+      lets the sub-GHz LRS branch fire on live contacts (a hop-corroborated
+      902-928 / 863-870 / 420-450 MHz emitter) instead of always degrading to
+      advisory_only. A detection with no hop evidence yields False (honest: no
+      corroboration this cycle), never a fabricated True.
+
+    * bandwidth_mhz: hackrf_rx.py's ``bandwidth_mhz`` is the whole SWEEP-BAND
+      width (e.g. ~83 MHz for the 2.4 GHz band), which always trips the
+      classifier's wideband divider and makes the narrowband hobby_rc_2g4
+      family branch unreachable. The confirmed-detection path now also emits
+      an OCCUPIED bandwidth (``occupied_bw_mhz``); we feed THAT into the
+      wide/narrow divider so a genuinely narrowband 2.4 GHz control link is
+      classified as the hobby-RC family, not lumped in with wideband video.
+      Falls back to ``bandwidth_mhz`` for detection sources that don't emit an
+      occupied-bandwidth field, preserving backward compatibility.
+    """
+    occupied = det.get("occupied_bw_mhz")
+    bandwidth_for_divider = occupied if occupied is not None else det.get("bandwidth_mhz")
     result = classify_control_link(
         center_freq_ghz=det.get("center_freq_ghz"),
-        bandwidth_mhz=det.get("bandwidth_mhz"),
-        fhss_hop_consistent=det.get("fhss_hop_consistent"),  # None unless a future field adds it
+        bandwidth_mhz=bandwidth_for_divider,
+        fhss_hop_consistent=bool(det.get("rf_signature_only")),
         protocol=det.get("protocol"),
         protocol_confirmed=bool(det.get("protocol_confirmed")),
         source=det.get("source"),
