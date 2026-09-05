@@ -54,7 +54,8 @@ class TestProtocolStatusBoard:
     def test_board_shape(self, auth_headers):
         board = _status(auth_headers)
         assert {o["id"] for o in board["operational"]} == \
-            {"remoteid", "droneid", "control_link", "fpv_osd", "adsb", "parrot"}
+            {"remoteid", "droneid", "control_link", "fpv_osd", "adsb", "parrot",
+             "wifi_drone", "fpv_analog_5g8", "gnss_l1_jammer", "lora_subghz"}
         assert len(board["forensic"]) == 12
         assert all(f["status"] == "FORENSIC" for f in board["forensic"])
         # Wire decoders must be forensic, never operational.
@@ -198,3 +199,74 @@ class TestParrotIngest:
             assert r.status_code == 200, r.text
         latest = requests.get(f"{API}/parrot/latest", headers=auth_headers, timeout=10).json()
         assert latest["ssid"] == second  # latest-only: last write wins
+
+
+class TestWifiDroneIngest:
+    def test_match_takes_wifi_drone_live_and_stores_latest(self, auth_headers):
+        mac = f"60:60:1F:{secrets.token_hex(1).upper()}:11:22"
+        body = {
+            "ssid": f"TELLO-{secrets.token_hex(3)}", "oui": "60:60:1F", "manuf": "SZ DJI",
+            "make_candidate": "DJI/Ryze Tello", "match_basis": "ssid+oui",
+            "channel": 6, "signal_dbm": -48.0, "source_mac": mac,
+        }
+        r = requests.post(f"{API}/wifi-drone/ingest", headers=auth_headers, json=body, timeout=10)
+        assert r.status_code == 200, r.text
+        board = _status(auth_headers)
+        assert _op(board, "wifi_drone")["status"] == "LIVE"
+        assert _op(board, "wifi_drone")["decode_count"] >= 1
+        # HONEST: the board copy must state the candidate/spoofable caveat, never a serial.
+        assert "candidate" in _op(board, "wifi_drone")["identifies"].lower()
+        latest = requests.get(f"{API}/wifi-drone/latest", headers=auth_headers, timeout=10).json()
+        assert latest["available"] is True
+        assert latest["make_candidate"] == "DJI/Ryze Tello"
+
+
+class TestFpvAnalogIngest:
+    def test_channel_id_takes_fpv_analog_live_and_stores_latest(self, auth_headers):
+        body = {
+            "band": "Raceband", "channel": "R4", "carrier_mhz": 5769.0,
+            "center_freq_mhz": 5769.5, "offset_mhz": 0.5, "rssi_dbm": -40.0,
+        }
+        r = requests.post(f"{API}/fpv-analog/ingest", headers=auth_headers, json=body, timeout=10)
+        assert r.status_code == 200, r.text
+        board = _status(auth_headers)
+        assert _op(board, "fpv_analog_5g8")["status"] == "LIVE"
+        latest = requests.get(f"{API}/fpv-analog/latest", headers=auth_headers, timeout=10).json()
+        assert latest["available"] is True
+        assert latest["channel"] == "R4"
+
+
+class TestGnssL1JammerIngest:
+    def test_jamming_true_takes_live_clean_is_ready(self, auth_headers):
+        # jamming=True -> LIVE (a real jammer assessment).
+        jam = {"jamming": True, "center_freq_mhz": 1575.42, "peak_dbm": -20.0,
+               "median_dbm": -35.0, "elevation_db": 23.0, "occupied_frac": 0.8}
+        r = requests.post(f"{API}/gnss-l1-jammer/ingest", headers=auth_headers, json=jam, timeout=10)
+        assert r.status_code == 200, r.text
+        assert _op(_status(auth_headers), "gnss_l1_jammer")["status"] == "LIVE"
+        # A clean (jamming=False) assessment is a heartbeat only -> stays READY/LIVE,
+        # never OFFLINE, and never fabricates a jamming decode.
+        clean = {"jamming": False, "center_freq_mhz": 1575.42, "peak_dbm": -55.0,
+                 "median_dbm": -58.0, "elevation_db": 0.0, "occupied_frac": 0.0}
+        r = requests.post(f"{API}/gnss-l1-jammer/ingest", headers=auth_headers, json=clean, timeout=10)
+        assert r.status_code == 200, r.text
+        assert r.json()["jamming"] is False
+        # HONEST: the board must say jamming, NOT spoofing.
+        ident = _op(_status(auth_headers), "gnss_l1_jammer")["identifies"].lower()
+        assert "jamming" in ident and "not" in ident and "spoof" in ident
+
+
+class TestLoRaSubghzIngest:
+    def test_present_takes_lora_live_absent_is_heartbeat(self, auth_headers):
+        present = {"present": True, "center_freq_mhz": 915.0, "peak_dbm": -40.0,
+                   "hit_ratio": 0.25, "window_cycles": 8}
+        r = requests.post(f"{API}/lora-subghz/ingest", headers=auth_headers, json=present, timeout=10)
+        assert r.status_code == 200, r.text
+        assert _op(_status(auth_headers), "lora_subghz")["status"] == "LIVE"
+        absent = {"present": False, "center_freq_mhz": 915.0, "peak_dbm": -70.0,
+                  "hit_ratio": 0.9, "window_cycles": 8}
+        r = requests.post(f"{API}/lora-subghz/ingest", headers=auth_headers, json=absent, timeout=10)
+        assert r.status_code == 200, r.text
+        assert r.json()["present"] is False
+        # HONEST: advisory/presence only, explicitly no decode.
+        assert "advisory" in _op(_status(auth_headers), "lora_subghz")["identifies"].lower()

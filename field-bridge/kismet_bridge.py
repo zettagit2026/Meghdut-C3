@@ -338,6 +338,15 @@ DRONE_MANUFACTURER_OUIS = {
     # "EC-5B-CD ... Autel Robotics USA LLC". Verified by fetching that file
     # directly, not guessed/assumed.
     "EC:5B:CD": "Autel",
+    # Added for the Wi-Fi-drone SSID/OUI fingerprint work (wifi_drone_bridge.py).
+    # Two additional Parrot SA OUI blocks, both real, currently-registered
+    # 3-octet MA-L assignments to "Parrot SA/Parrot Drones" in the public IEEE
+    # OUI database -- same best-effort, non-exhaustive stance as the block above
+    # (see module docstring): SSID+OUI are SPOOFABLE, so a hit here is a
+    # manufacturer CANDIDATE, never a serial. Reconcile against the full IEEE
+    # list as more drone vendors are catalogued.
+    "00:26:7E": "Parrot",
+    "90:03:B7": "Parrot",
 }
 # Normalize to strict 3-octet keys only (defensive against the placeholder
 # above / any future accidental non-3-octet entry).

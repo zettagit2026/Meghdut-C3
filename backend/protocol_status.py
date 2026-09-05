@@ -35,6 +35,21 @@ is split into two clearly-separated groups:
                                     dump1090/readsb feed -- not the primary SDR)
                    * parrot        (Parrot ARSDK3 over Wi-Fi, via the EXISTING
                                     Kismet monitor NIC)
+                   * wifi_drone    (drone Wi-Fi SSID/OUI fingerprint, via the
+                                    EXISTING Kismet feed -- make/model CANDIDATE
+                                    only; SSID+OUI is spoofable, NOT a serial)
+                   * fpv_analog_5g8 (5.8 GHz analog FPV video carrier channel-plan
+                                    ID off the existing HackRF sweep -- detect +
+                                    coarse channel ID of the ANALOG carrier only;
+                                    digital DJI O3/O4/HDZero/Walksnail video is
+                                    encrypted and stays family-level wideband)
+                   * gnss_l1_jammer (GPS L1 1575.42 MHz broadband JAMMER-energy
+                                    detection off a passive RX sweep band -- a
+                                    jammer, NOT a spoofer; spoofing looks like a
+                                    valid signal and needs a GNSS receiver)
+                   * lora_subghz   (LoRa / low-duty sub-GHz emitter PRESENCE
+                                    advisory from the SiK-915 duty-cycle/RF-
+                                    signature proxy -- advisory only, NO decode)
 
   FORENSIC    -- recovered / own airframe, bench, requires physical access
                  (USB-UART / CAN electrical tap). NOT for airborne engagement:
@@ -81,7 +96,7 @@ DEFAULT_LIVE_WINDOW_S = 45.0
 # forever after a single stale decode.
 DEFAULT_DECODE_WINDOW_S = 120.0
 
-# The six over-the-air operational protocols. `id` is the key each field
+# The over-the-air operational protocols. `id` is the key each field
 # bridge reports under (POST /api/protocols/heartbeat and the per-protocol
 # ingest endpoints). Order here is the display order on the board.
 OPERATIONAL_PROTOCOLS: List[Dict[str, str]] = [
@@ -135,6 +150,52 @@ OPERATIONAL_PROTOCOLS: List[Dict[str, str]] = [
                         "(no new radio) -- reads a Parrot drone's own Wi-Fi link",
         "service": "parrot_arsdk_ingest_bridge.py",
         "identifies": "ARSDK project / class / command id observed off a Parrot drone's Wi-Fi",
+    },
+    {
+        "id": "wifi_drone",
+        "name": "Wi-Fi Drone Fingerprint (SSID / OUI)",
+        "aka": "Drone Wi-Fi softAP SSID pattern + manufacturer OUI match",
+        "over_the_air": "Passive 802.11 capture on the EXISTING Kismet monitor-mode NIC "
+                        "(no new radio) -- reuses the same Kismet device feed",
+        "service": "wifi_drone_bridge.py",
+        "identifies": "Manufacturer/model CANDIDATE from SSID pattern (^TELLO-/^ANAFI-/"
+                      "^Autel/^DIRECT-) + drone OUI. HONEST: SSID+OUI are SPOOFABLE -- a "
+                      "make/model CANDIDATE, NOT a serial or an exact-confirmed identity",
+    },
+    {
+        "id": "fpv_analog_5g8",
+        "name": "5.8 GHz Analog FPV Video (channel-plan ID)",
+        "aka": "Raceband / Fatshark-Boscam A/B/E/F analog FPV video carrier",
+        "over_the_air": "Channel-plan mapping of the DJI-5G8 (5725-5850 MHz) energy peak "
+                        "already produced by the passive HackRF sweep (no new radio)",
+        "service": "hackrf_rx.py",
+        "identifies": "The ANALOG FPV video carrier band + channel (detect + coarse ID); "
+                      "cues the analog OSD-OCR for telemetry. HONEST: analog carrier only "
+                      "-- digital video (DJI O3/O4/HDZero/Walksnail) is encrypted and stays "
+                      "family-level wideband, NOT decoded",
+    },
+    {
+        "id": "gnss_l1_jammer",
+        "name": "GPS L1 Jamming / Interference Detection",
+        "aka": "1575.42 MHz GPS L1 broadband/CW jammer energy (passive RX)",
+        "over_the_air": "Elevated-noise-floor / broadband-energy rule over a passive "
+                        "1575.42 MHz (GPS L1) RX sweep band on the existing HackRF (RX ONLY)",
+        "service": "hackrf_rx.py",
+        "identifies": "A GNSS JAMMER's broadband energy at GPS L1. HONEST: detects JAMMING "
+                      "/ interference -- it does NOT detect SPOOFING (a spoofer emits a "
+                      "valid-looking signal; that needs a GNSS receiver, a hardware "
+                      "follow-up)",
+    },
+    {
+        "id": "lora_subghz",
+        "name": "LoRa / Low-Duty Sub-GHz (advisory)",
+        "aka": "Low-duty-cycle sub-GHz (LoRa/LoRaWAN-class) emitter in 902-928 MHz",
+        "over_the_air": "Surfaces the SiK-915 (902-928 MHz) low-duty-cycle window already "
+                        "computed by the passive HackRF sweep (no new radio)",
+        "service": "hackrf_rx.py",
+        "identifies": "PRESENCE of a low-duty sub-GHz emitter via a duty-cycle / RF-signature "
+                      "proxy. HONEST: advisory / presence only -- NO packet decode, no device "
+                      "identity",
     },
 ]
 

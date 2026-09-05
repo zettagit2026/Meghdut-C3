@@ -279,7 +279,13 @@ INGEST_PATHS = {"/api/detections/ingest", "/api/spectrum/ingest", "/api/fpv/inge
                 "/api/control-link/ingest", "/api/protocols/heartbeat",
                 # ADS-B (1090 MHz Mode-S) + Parrot ARSDK3 (Wi-Fi) over-the-air
                 # decoder ingest -- same X-Bridge-Name ingest-health tracking.
-                "/api/adsb/ingest", "/api/parrot/ingest"}
+                "/api/adsb/ingest", "/api/parrot/ingest",
+                # 4 no-new-hardware over-the-air detection wins: Wi-Fi drone
+                # SSID/OUI fingerprint (via Kismet), 5.8 GHz analog-FPV channel
+                # ID + GPS-L1 jammer detection + LoRa/low-duty sub-GHz advisory
+                # (all three off the existing HackRF sweep) -- same tracking.
+                "/api/wifi-drone/ingest", "/api/fpv-analog/ingest",
+                "/api/gnss-l1-jammer/ingest", "/api/lora-subghz/ingest"}
 AUTH_FAIL_CONSECUTIVE_THRESHOLD = 3
 
 # ---- Audit-chain anchor (lightweight external anchoring) -------------------
@@ -3541,6 +3547,10 @@ _last_fpv_osd_telemetry: Optional[Dict] = None
 _last_control_link: Optional[Dict] = None
 _last_adsb_decode: Optional[Dict] = None
 _last_parrot_decode: Optional[Dict] = None
+_last_wifi_drone: Optional[Dict] = None
+_last_fpv_analog: Optional[Dict] = None
+_last_gnss_l1_jammer: Optional[Dict] = None
+_last_lora_subghz: Optional[Dict] = None
 
 
 def _now_iso() -> str:
@@ -3670,6 +3680,72 @@ class ParrotArsdkIngestBody(BaseModel):
     ssid: Optional[str] = None            # Parrot AP SSID (e.g. "ANAFI-xxxxxx")
     rssi_dbm: Optional[float] = None
     source: str = "PARROT_ARSDK_KISMET"
+    caveats: List[str] = []
+
+
+class WifiDroneIngestBody(BaseModel):
+    """One Wi-Fi drone SSID/OUI fingerprint match read off the EXISTING Kismet
+    monitor NIC by field-bridge/wifi_drone_bridge.py. HONEST: an SSID pattern
+    (^TELLO-/^ANAFI-/^Autel/^DIRECT-) and/or a drone-manufacturer OUI are both
+    SPOOFABLE, so `make_candidate` is a CANDIDATE make/model -- NOT a serial or
+    an exact-confirmed identity. Stored latest-only."""
+    ssid: Optional[str] = None            # observed softAP SSID (may be null for an OUI-only match)
+    oui: Optional[str] = None             # 3-octet MAC OUI prefix (e.g. "60:60:1F")
+    manuf: Optional[str] = None           # Kismet-reported manufacturer string, if any
+    make_candidate: Optional[str] = None  # CANDIDATE make/model (spoofable -- not a serial)
+    match_basis: Optional[str] = None     # "ssid" | "oui" | "ssid+oui"
+    channel: Optional[int] = None
+    signal_dbm: Optional[float] = None
+    source_mac: Optional[str] = None
+    source: str = "WIFI_DRONE_KISMET"
+    caveats: List[str] = []
+
+
+class FpvAnalogIngestBody(BaseModel):
+    """One 5.8 GHz ANALOG FPV video carrier channel-plan match, produced by
+    hackrf_rx.py mapping a DJI-5G8 sweep peak onto the standard analog FPV
+    channel plan (Raceband / Fatshark-Boscam A/B/E/F). HONEST: this identifies
+    the ANALOG video CARRIER band+channel (detect + coarse ID) so the analog
+    OSD-OCR can be cued -- it does NOT decode video, and digital DJI/HDZero/
+    Walksnail links are encrypted and stay family-level wideband. Latest-only."""
+    band: Optional[str] = None            # e.g. "Raceband", "Fatshark", "Boscam A"
+    channel: Optional[str] = None         # e.g. "R4", "A1", "E2"
+    carrier_mhz: Optional[float] = None    # the channel-plan carrier the peak matched
+    center_freq_mhz: Optional[float] = None  # the measured sweep peak frequency
+    offset_mhz: Optional[float] = None     # |peak - carrier|, how close the match is
+    rssi_dbm: Optional[float] = None
+    source: str = "HACKRF_FPV_ANALOG_5G8"
+    caveats: List[str] = []
+
+
+class GnssL1JammerIngestBody(BaseModel):
+    """One GPS L1 (1575.42 MHz) JAMMING/interference assessment from hackrf_rx.py's
+    passive L1 RX sweep band. HONEST: this flags a JAMMER's broadband/elevated
+    energy -- it does NOT detect SPOOFING (a spoofer emits a valid-looking GNSS
+    signal that this energy rule cannot distinguish; detecting spoofing needs a
+    GNSS receiver, a hardware follow-up). RX ONLY -- passive detection, never a
+    transmit path. Latest-only."""
+    jamming: bool = False                 # True only when the broadband-energy rule fired
+    center_freq_mhz: Optional[float] = None
+    peak_dbm: Optional[float] = None
+    median_dbm: Optional[float] = None     # band median power (broadband floor elevation)
+    elevation_db: Optional[float] = None   # median above the quiet reference floor
+    occupied_frac: Optional[float] = None  # fraction of band bins elevated (broadband-ness)
+    source: str = "HACKRF_GNSS_L1"
+    caveats: List[str] = []
+
+
+class LoRaSubghzIngestBody(BaseModel):
+    """One LoRa / low-duty sub-GHz PRESENCE advisory, surfacing the SiK-915
+    (902-928 MHz) low-duty-cycle window hackrf_rx.py already computes. HONEST:
+    this is a duty-cycle / RF-signature PROXY -- presence/advisory only, NO
+    packet decode and no device identity. Latest-only."""
+    present: bool = False                 # a low-duty sub-GHz emitter was flagged this cycle
+    center_freq_mhz: Optional[float] = None
+    peak_dbm: Optional[float] = None
+    hit_ratio: Optional[float] = None      # duty-cycle proxy over the rolling real-data window
+    window_cycles: Optional[int] = None
+    source: str = "HACKRF_SIK915_LORA"
     caveats: List[str] = []
 
 
@@ -3822,6 +3898,134 @@ async def parrot_latest(user: Dict = Depends(get_current_user)):
     if _last_parrot_decode is None:
         return {"available": False}
     return {"available": True, **_last_parrot_decode}
+
+
+@api.post("/wifi-drone/ingest")
+async def wifi_drone_ingest(body: WifiDroneIngestBody,
+                            user: Dict = Depends(get_current_user)):
+    """Ingest one Wi-Fi drone SSID/OUI fingerprint match (via the EXISTING Kismet
+    NIC). A real match takes wifi_drone LIVE on the status board. HONEST: this is
+    a make/model CANDIDATE (SSID+OUI are spoofable), never a serial. Latest-only."""
+    global _last_wifi_drone
+    _last_wifi_drone = {**body.dict(), "received_at": _now_iso()}
+    ident = body.make_candidate or body.ssid or body.manuf or body.source_mac or "unknown"
+    _protocol_touch_decode("wifi_drone", summary=f"Wi-Fi drone candidate {ident}")
+    await log_event(
+        "WIFI_DRONE_FINGERPRINT",
+        f"Wi-Fi drone fingerprint: candidate={body.make_candidate or 'n/a'} "
+        f"ssid={body.ssid or 'n/a'} oui={body.oui or 'n/a'} basis={body.match_basis or 'n/a'} "
+        f"mac={body.source_mac or 'n/a'} (SSID+OUI spoofable -- candidate, not a serial)",
+        actor=user["email"],
+    )
+    return {"ok": True, "stored": True}
+
+
+@api.get("/wifi-drone/latest")
+async def wifi_drone_latest(user: Dict = Depends(get_current_user)):
+    """Most recent Wi-Fi drone SSID/OUI fingerprint match, or an honest 'none yet'."""
+    if _last_wifi_drone is None:
+        return {"available": False}
+    return {"available": True, **_last_wifi_drone}
+
+
+@api.post("/fpv-analog/ingest")
+async def fpv_analog_ingest(body: FpvAnalogIngestBody,
+                            user: Dict = Depends(get_current_user)):
+    """Ingest one 5.8 GHz ANALOG FPV video carrier channel-plan match from the
+    HackRF sweep. A real channel match takes fpv_analog_5g8 LIVE. HONEST: coarse
+    ID of the ANALOG carrier only -- digital video stays family-level. Latest-only."""
+    global _last_fpv_analog
+    _last_fpv_analog = {**body.dict(), "received_at": _now_iso()}
+    _protocol_touch_decode(
+        "fpv_analog_5g8",
+        summary=f"Analog FPV {body.band or '?'} {body.channel or '?'} "
+                f"@ {body.carrier_mhz} MHz")
+    await log_event(
+        "FPV_ANALOG_CHANNEL_ID",
+        f"5.8 GHz analog FPV carrier: band={body.band or 'n/a'} ch={body.channel or 'n/a'} "
+        f"carrier={body.carrier_mhz}MHz peak={body.center_freq_mhz}MHz "
+        f"(analog carrier ID only -- digital video not decoded)",
+        actor=user["email"],
+    )
+    return {"ok": True, "stored": True}
+
+
+@api.get("/fpv-analog/latest")
+async def fpv_analog_latest(user: Dict = Depends(get_current_user)):
+    """Most recent 5.8 GHz analog FPV channel-plan match, or an honest 'none yet'."""
+    if _last_fpv_analog is None:
+        return {"available": False}
+    return {"available": True, **_last_fpv_analog}
+
+
+@api.post("/gnss-l1-jammer/ingest")
+async def gnss_l1_jammer_ingest(body: GnssL1JammerIngestBody,
+                                user: Dict = Depends(get_current_user)):
+    """Ingest one GPS L1 JAMMING/interference assessment from the passive L1 RX
+    sweep. A `jamming: true` assessment takes gnss_l1_jammer LIVE; a clean cycle
+    (jamming false) is a heartbeat only (running, no jamming seen -> READY).
+    HONEST: detects a JAMMER's broadband energy, NOT spoofing. Latest-only."""
+    global _last_gnss_l1_jammer
+    _last_gnss_l1_jammer = {**body.dict(), "received_at": _now_iso()}
+    if body.jamming:
+        _protocol_touch_decode(
+            "gnss_l1_jammer",
+            summary=f"GPS L1 JAMMING: median {body.median_dbm}dBm "
+                    f"(+{body.elevation_db}dB), {body.occupied_frac} band occupied")
+        await log_event(
+            "GNSS_L1_JAMMING",
+            f"GPS L1 jamming/interference detected: median={body.median_dbm}dBm "
+            f"elevation={body.elevation_db}dB occupied_frac={body.occupied_frac} "
+            f"peak={body.peak_dbm}dBm (JAMMING, NOT spoofing -- spoofing needs a GNSS receiver)",
+            actor=user["email"],
+        )
+    else:
+        _protocol_touch_heartbeat("gnss_l1_jammer",
+                                  note="L1 band swept, no jamming energy (clean)")
+    return {"ok": True, "stored": True, "jamming": body.jamming}
+
+
+@api.get("/gnss-l1-jammer/latest")
+async def gnss_l1_jammer_latest(user: Dict = Depends(get_current_user)):
+    """Most recent GPS L1 jamming assessment, or an honest 'none yet'."""
+    if _last_gnss_l1_jammer is None:
+        return {"available": False}
+    return {"available": True, **_last_gnss_l1_jammer}
+
+
+@api.post("/lora-subghz/ingest")
+async def lora_subghz_ingest(body: LoRaSubghzIngestBody,
+                             user: Dict = Depends(get_current_user)):
+    """Ingest one LoRa / low-duty sub-GHz PRESENCE advisory (the SiK-915 low-duty
+    window). `present: true` takes lora_subghz LIVE; a cycle with no low-duty
+    emitter is a heartbeat only (running -> READY). HONEST: duty-cycle/RF-signature
+    proxy -- presence/advisory only, NO packet decode. Latest-only."""
+    global _last_lora_subghz
+    _last_lora_subghz = {**body.dict(), "received_at": _now_iso()}
+    if body.present:
+        _protocol_touch_decode(
+            "lora_subghz",
+            summary=f"Low-duty sub-GHz emitter: peak {body.peak_dbm}dBm, "
+                    f"duty {body.hit_ratio}")
+        await log_event(
+            "LORA_SUBGHZ_ADVISORY",
+            f"Low-duty sub-GHz (LoRa-class) emitter advisory: peak={body.peak_dbm}dBm "
+            f"hit_ratio={body.hit_ratio} over {body.window_cycles} cycles "
+            f"(presence/advisory only -- no packet decode)",
+            actor=user["email"],
+        )
+    else:
+        _protocol_touch_heartbeat("lora_subghz",
+                                  note="902-928 MHz swept, no low-duty emitter this cycle")
+    return {"ok": True, "stored": True, "present": body.present}
+
+
+@api.get("/lora-subghz/latest")
+async def lora_subghz_latest(user: Dict = Depends(get_current_user)):
+    """Most recent LoRa / low-duty sub-GHz advisory, or an honest 'none yet'."""
+    if _last_lora_subghz is None:
+        return {"available": False}
+    return {"available": True, **_last_lora_subghz}
 
 
 # =====================================================================

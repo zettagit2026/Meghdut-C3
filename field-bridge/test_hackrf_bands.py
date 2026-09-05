@@ -23,11 +23,14 @@ from hackrf_rx import (
     ELRS_BT_LIKE_MIN_HZ,
     ELRS_HOP_RATE_RANGE_HZ,
     EXTRA_BANDS_MHZ,
+    GNSS_L1_CENTER_MHZ,
     HOP_CONFIRM_CYCLES,
     HOP_FREQ_MIN_MOVE_MHZ,
     SUBGHZ_900_HOP_BAND,
+    assess_gnss_l1_jamming,
     classify_hop_interval,
     load_bands_config,
+    map_fpv_5g8_channel,
     update_hop_track,
 )
 from rf_features import compute_bandwidth_mhz
@@ -49,7 +52,8 @@ def test_default_env_enables_extra_bands():
     coverage now."""
     bands = load_bands_config(env={})
     names = [b[0] for b in bands]
-    assert names == ["SiK-915", "DJI-2G4", "DJI-5G8", "LRS-433", "SRD-868", "FPV-1G3"]
+    assert names == ["SiK-915", "DJI-2G4", "DJI-5G8", "LRS-433", "SRD-868",
+                     "FPV-1G3", "GNSS-L1"]
     # existing bands' (low, high, label) fields must be untouched
     for b in DEFAULT_BANDS_MHZ:
         assert b in bands
@@ -344,3 +348,110 @@ def test_occupied_bandwidth_is_narrow_and_distinct_from_band_width():
     occupied = compute_bandwidth_mhz(powers, floor, detect_threshold_db, bin_width_mhz=1.0)
     assert occupied == 3.0
     assert occupied < band_width_mhz  # occupied width is NOT the band width
+
+
+# --- 5.8 GHz analog FPV video channel-plan ID (fpv_analog_5g8 win) -----------
+# map_fpv_5g8_channel() maps a measured 5.8 GHz peak onto the standard analog
+# FPV channel plan. HONEST: analog carrier/channel ID only -- no digital-video
+# decode claim (a digital OFDM peak between the analog grid points maps to None).
+
+
+def test_gnss_l1_center_constant():
+    """The passive L1 band is centred on the real GPS L1 carrier."""
+    assert GNSS_L1_CENTER_MHZ == 1575.42
+
+
+def test_gnss_l1_is_a_configured_extra_band():
+    names = [b[0] for b in EXTRA_BANDS_MHZ]
+    assert "GNSS-L1" in names
+    band = next(b for b in EXTRA_BANDS_MHZ if b[0] == "GNSS-L1")
+    # the 20 MHz window brackets the 1575.42 MHz L1 carrier
+    assert band[1] <= 1575 <= band[2]
+
+
+def test_fpv_maps_raceband_r4_carrier():
+    """A peak on the Raceband R4 carrier (5769 MHz, in the DJI-5G8 5725-5850
+    swept band) maps to that exact channel."""
+    m = map_fpv_5g8_channel(5769.0)
+    assert m is not None
+    assert m["band"] == "Raceband"
+    assert m["channel"] == "R4"
+    assert m["carrier_mhz"] == 5769.0
+    assert m["offset_mhz"] == 0.0
+
+
+def test_fpv_maps_within_tolerance_and_reports_offset():
+    m = map_fpv_5g8_channel(5807.5)  # 1.5 MHz off Raceband R5 (5806)
+    assert m is not None
+    assert m["channel"] == "R5"
+    assert abs(m["offset_mhz"] - 1.5) < 1e-6
+
+
+def test_fpv_no_match_between_analog_grid_points_is_none():
+    """A peak that lands in a genuine gap between analog carriers (e.g. a
+    wideband digital-video link's centre falling off the analog grid) maps to
+    None -- NO analog-channel overclaim on an off-grid signal. 5795 MHz is 5 MHz
+    from Boscam B6 (5790) and Fatshark F4 (5800), well outside the 2 MHz tol."""
+    assert map_fpv_5g8_channel(5795.0) is None
+
+
+def test_fpv_outside_swept_band_carrier_still_maps_only_within_tol():
+    """A carrier outside the 5725-5850 sweep (Raceband R1 5658) is only returned
+    when the peak is actually near it -- a peak inside the band never spuriously
+    reports an out-of-band channel."""
+    # exact R1 carrier maps (function is pure over the whole plan)...
+    assert map_fpv_5g8_channel(5658.0)["channel"] == "R1"
+    # ...but a mid-band peak does not resolve to a far-away out-of-band carrier.
+    m = map_fpv_5g8_channel(5769.0)
+    assert m["carrier_mhz"] == 5769.0
+
+
+# --- GPS L1 jammer detection (gnss_l1_jammer win) ---------------------------
+# assess_gnss_l1_jamming() flags a JAMMER's broadband energy. HONEST: it detects
+# JAMMING, never SPOOFING (a spoofer's valid-looking signal cannot be told from
+# clean sky by an energy rule). A quiet band and a lone narrow spike must NOT
+# trip it; only sustained broadband elevation does.
+
+
+def test_gnss_jamming_fires_on_broadband_elevation():
+    floor = -58.0
+    # whole band lifted ~25 dB above the quiet floor across every bin (broadband
+    # jammer): median high AND nearly all bins elevated.
+    powers = [-33.0] * 40
+    a = assess_gnss_l1_jamming(powers, floor)
+    assert a["jamming"] is True
+    assert a["elevation_db"] >= 10.0
+    assert a["occupied_frac"] >= 0.5
+
+
+def test_gnss_no_jamming_on_quiet_band():
+    floor = -58.0
+    # bare receiver noise near the quiet floor (real GPS is BELOW this) -> no jam.
+    powers = [-58.0, -59.0, -57.0, -58.5, -58.0, -59.5, -57.5, -58.0] * 5
+    a = assess_gnss_l1_jamming(powers, floor)
+    assert a["jamming"] is False
+
+
+def test_gnss_no_jamming_on_lone_narrow_spike():
+    """A single strong narrow bin (not broadband) must NOT be called jamming --
+    the median stays at the floor and occupied_frac stays low."""
+    floor = -58.0
+    powers = [-58.0] * 40
+    powers[20] = -10.0  # one hot bin only
+    a = assess_gnss_l1_jamming(powers, floor)
+    assert a["jamming"] is False
+    assert a["occupied_frac"] < 0.5
+
+
+def test_gnss_assessment_never_claims_spoofing():
+    """The assessment dict exposes only jamming-energy fields -- there is no
+    spoofing verdict anywhere in it (spoofing needs a GNSS receiver)."""
+    a = assess_gnss_l1_jamming([-33.0] * 40, -58.0)
+    assert set(a.keys()) == {"jamming", "peak_dbm", "median_dbm",
+                             "elevation_db", "occupied_frac"}
+    assert "spoof" not in " ".join(a.keys()).lower()
+
+
+def test_gnss_empty_powers_is_safe_not_jamming():
+    a = assess_gnss_l1_jamming([], -58.0)
+    assert a["jamming"] is False

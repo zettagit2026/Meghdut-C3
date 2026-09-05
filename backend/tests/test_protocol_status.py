@@ -55,19 +55,20 @@ def test_unparseable_timestamps_are_offline_not_crash():
 # --------------------------------------------------------------------------
 # build_board
 # --------------------------------------------------------------------------
-def test_board_has_six_operational_and_twelve_forensic():
+def test_board_has_ten_operational_and_twelve_forensic():
     board = ps.build_board({}, NOW)
-    assert len(board["operational"]) == 6
+    assert len(board["operational"]) == 10
     assert len(board["forensic"]) == 12
     ids = {o["id"] for o in board["operational"]}
-    assert ids == {"remoteid", "droneid", "control_link", "fpv_osd", "adsb", "parrot"}
+    assert ids == {"remoteid", "droneid", "control_link", "fpv_osd", "adsb", "parrot",
+                   "wifi_drone", "fpv_analog_5g8", "gnss_l1_jammer", "lora_subghz"}
 
 
-def test_all_ids_unique_across_the_18():
+def test_all_ids_unique_across_the_22():
     board = ps.build_board({}, NOW)
     all_ids = [p["id"] for p in board["operational"]] + [p["id"] for p in board["forensic"]]
-    assert len(all_ids) == 18
-    assert len(set(all_ids)) == 18  # no duplicate ids anywhere on the board
+    assert len(all_ids) == 22
+    assert len(set(all_ids)) == 22  # no duplicate ids anywhere on the board
 
 
 def test_forensic_ids_are_the_expected_twelve():

@@ -116,6 +116,18 @@ EXTRA_BANDS_MHZ: List[Tuple[str, int, int, str]] = [
     ("LRS-433", 420, 450, "433MHz ISM/70cm-ham LRS & telemetry (Crossfire/ExpressLRS-class)"),
     ("SRD-868", 863, 870, "868MHz EU SRD860 ISM LRS/telemetry"),
     ("FPV-1G3", 1080, 1300, "1.2/1.3GHz analog FPV video (legacy/DIY racing drones)"),
+    # GNSS-L1 (added for the GPS-L1-jammer-detection win): a PASSIVE receive
+    # band centred on GPS L1 (1575.42 MHz). This band is NOT a drone-detection
+    # band -- it is handled by its own dedicated jamming-energy branch in main()
+    # (see assess_gnss_l1_jamming()), which `continue`s BEFORE the drone
+    # Wi-Fi/BT/LoRa/hop/detection logic, so an L1 emitter is never mislabeled as
+    # a drone contact. RX-ONLY: this is passive jammer DETECTION, wholly separate
+    # from the GNSS-spoof TRANSMIT path (which is a governed, gated capability
+    # elsewhere and is NOT touched here). REVISIT-RATE NOTE: like every band
+    # added to the cycle, this L1 band runs in series once per outer loop
+    # iteration, so it proportionally lowers the revisit rate of EVERY other
+    # band (see the DEFAULT/EXTRA band comment above) -- documented, not hidden.
+    ("GNSS-L1", 1565, 1585, "GPS L1 1575.42MHz (passive jammer/interference detection, RX-only)"),
 ]
 
 
@@ -181,6 +193,12 @@ BAND_NOISE_FLOOR_DBM = {
     "LRS-433": -58.0,  # placeholder, not site-calibrated -- see note above
     "SRD-868": -58.0,  # placeholder, not site-calibrated -- see note above
     "FPV-1G3": -58.0,  # placeholder, not site-calibrated -- see note above
+    # GNSS-L1 QUIET reference floor: real GPS L1 signals arrive BELOW the thermal
+    # noise floor, so a QUIET L1 band looks like bare receiver noise (~this
+    # value). A jammer's job is to raise the whole band well ABOVE this -- that
+    # broadband elevation is exactly what assess_gnss_l1_jamming() keys on.
+    # Placeholder (not site-calibrated) until hackrf_baseline_test.py is run at L1.
+    "GNSS-L1": -58.0,
 }
 DEFAULT_NOISE_FLOOR_DBM = -58.0  # fallback for any band name not in the table
                                    # above (e.g. a custom HACKRF_BANDS_JSON
@@ -212,6 +230,14 @@ BAND_DETECTION_META = {
                 "protocol": "868MHz SRD LRS/telemetry", "source": "HACKRF"},
     "FPV-1G3": {"model": "Analog FPV video craft (candidate)",
                 "protocol": "1.2/1.3GHz analog FPV video", "source": "HACKRF"},
+    # GNSS-L1 is NOT a drone-detection band -- its own branch in main() handles
+    # it (jammer-energy detection) and `continue`s before this generic detection
+    # metadata is ever used. This entry exists ONLY so
+    # test_every_configured_band_has_detection_metadata does not see it degrade
+    # to the generic fallback; it is honest about being a passive RX-only jammer
+    # DETECTION band, never a drone contact.
+    "GNSS-L1": {"model": "GPS L1 jammer/interference (energy detection)",
+                "protocol": "GNSS L1 jamming (RX-only, not spoofing)", "source": "HACKRF"},
 }
 # Fallback for any band name not in the table above (e.g. a custom band added
 # only via HACKRF_BANDS_JSON) -- degrades to a generic, honestly-unclassified
@@ -510,6 +536,156 @@ def estimate_distance_m(band_name: str, rssi_dbm: float) -> float:
     exponent = PATH_LOSS_EXPONENT.get(band_name, 2.5)
     distance = 10 ** ((ref - rssi_dbm) / (10 * exponent))
     return max(DISTANCE_MIN_M, min(DISTANCE_MAX_M, distance))
+
+
+# --- 5.8 GHz ANALOG FPV video channel plan (channel-plan ID win) -------------
+# Standard analog-FPV video carriers (MHz). These are the fixed transmit
+# frequencies analog 5.8 GHz video TX (Raceband / Fatshark / Boscam) use --
+# publicly standardized, identical across every hobby VTX. Mapping the DJI-5G8
+# sweep's energy peak onto this plan identifies WHICH analog channel a carrier
+# sits on (detect + COARSE ID of the analog video carrier). It cues the existing
+# analog OSD-OCR to read telemetry off that video.
+#
+# HONEST SCOPE: this IDs the ANALOG video carrier/channel only. DIGITAL video
+# links (DJI O3/O4, HDZero, Walksnail) are encrypted/OFDM wideband and are NOT
+# demodulated here -- they stay family-level wideband (the DJI-5G8 detection),
+# never claimed as a decoded channel. Also: the DJI-5G8 sweep band is 5725-5850
+# MHz, so only channel-plan carriers within that range are observable/mappable
+# here; carriers below 5725 or above 5850 (e.g. Raceband R1/R2, R8, Band E
+# 5645/5945) fall outside the swept band and correctly map to None.
+FPV_ANALOG_CHANNEL_PLAN_MHZ: List[Tuple[str, List[int]]] = [
+    # Prioritized band order: Raceband first (by far the most common on modern
+    # FPV craft), then Fatshark/Boscam. Several plans share near-identical
+    # carriers (e.g. Raceband R3 5732 ~ Boscam B1 5733; R7 5880 = Fatshark F8
+    # 5880), so on a near-tie the earlier band in this list wins the label -- an
+    # honestly approximate band attribution (see FPV_ANALOG_MATCH_TOL_MHZ).
+    ("Raceband", [5658, 5695, 5732, 5769, 5806, 5843, 5880, 5917]),
+    ("Fatshark",  [5740, 5760, 5780, 5800, 5820, 5840, 5860, 5880]),
+    ("Boscam A",  [5865, 5845, 5825, 5805, 5785, 5765, 5745, 5725]),
+    ("Boscam B",  [5733, 5752, 5771, 5790, 5809, 5828, 5847, 5866]),
+    ("Boscam E",  [5705, 5685, 5665, 5645, 5885, 5905, 5925, 5945]),
+]
+FPV_ANALOG_BAND_LETTER = {"Raceband": "R", "Fatshark": "F",
+                          "Boscam A": "A", "Boscam B": "B", "Boscam E": "E"}
+FPV_ANALOG_MATCH_TOL_MHZ = 2.0  # a peak within this of a plan carrier is called
+                                 # that channel. Analog VTX carriers sit on EXACT
+                                 # grid frequencies and the sweep's 1 MHz bins put
+                                 # a real peak within ~1 MHz of truth, so 2 MHz
+                                 # captures an on-grid analog carrier. Kept tight
+                                 # (not loose) on purpose: the combined multi-band
+                                 # 5.8 grid is dense, and a tight tolerance means
+                                 # a hit is the peak sitting ON a carrier -- it
+                                 # reduces (not eliminates) a wideband DIGITAL
+                                 # link's peak coincidentally landing on the grid,
+                                 # which the honest caveats also flag.
+
+
+def map_fpv_5g8_channel(peak_freq_mhz: float,
+                        tol_mhz: float = FPV_ANALOG_MATCH_TOL_MHZ) -> Optional[Dict]:
+    """Map a measured 5.8 GHz peak frequency onto the analog-FPV channel plan.
+
+    Returns {band, channel, carrier_mhz, offset_mhz} for the closest plan
+    carrier within tol_mhz (band order breaks near-ties, see the plan comment),
+    or None if the peak matches no analog channel carrier (e.g. it is a digital
+    OFDM link whose peak lands between the analog grid points, or it is outside
+    the swept band). Pure/testable -- no hardware.
+    """
+    best: Optional[Dict] = None
+    best_offset = tol_mhz
+    for band, carriers in FPV_ANALOG_CHANNEL_PLAN_MHZ:
+        for idx, carrier in enumerate(carriers, start=1):
+            offset = abs(peak_freq_mhz - carrier)
+            # strict < so an earlier band wins an exact tie (Raceband-first).
+            if offset < best_offset:
+                best_offset = offset
+                best = {
+                    "band": band,
+                    "channel": f"{FPV_ANALOG_BAND_LETTER[band]}{idx}",
+                    "carrier_mhz": float(carrier),
+                    "offset_mhz": round(offset, 2),
+                }
+    return best
+
+
+def fpv_analog_caveats() -> List[str]:
+    return [
+        "identifies the ANALOG FPV video CARRIER/channel only (detect + coarse ID), it does NOT decode video",
+        "digital video (DJI O3/O4, HDZero, Walksnail) is encrypted/OFDM wideband -- stays family-level, never decoded here",
+        "analog channel plans overlap (Raceband/Fatshark/Boscam share near-identical carriers) -- band attribution is approximate",
+    ]
+
+
+# --- GPS L1 (1575.42 MHz) JAMMER / interference detection (RX-only) ----------
+# A GNSS jammer floods L1 with strong broadband (chirp/noise) or CW energy to
+# bury the real satellite signals (which arrive BELOW the thermal noise floor).
+# So a jammer's signature at L1 is: the WHOLE band's energy is elevated well
+# above the quiet receiver-noise floor, across MANY bins (broadband) -- not a
+# single narrow spike. assess_gnss_l1_jamming() keys on exactly that.
+#
+# HONEST SCOPE, stated plainly: this detects a JAMMER's broadband energy. It
+# does NOT and CANNOT detect GNSS SPOOFING -- a spoofer transmits a
+# valid-LOOKING GNSS signal at roughly normal power, which this energy rule
+# cannot distinguish from clean sky. Detecting spoofing requires a real GNSS
+# receiver comparing observables (C/N0, clock, position-consistency) -- flagged
+# as the hardware follow-up, never claimed here.
+GNSS_L1_CENTER_MHZ = 1575.42
+GNSS_JAM_ELEVATION_DB = 10.0  # band-median must sit at least this far ABOVE the
+                               # quiet reference floor (broadband floor lifted).
+GNSS_JAM_BROADBAND_FRAC = 0.5  # at least this fraction of band bins must be
+                                # elevated -- forces a BROADBAND signature, so a
+                                # lone narrow spike (median stays low) is NOT
+                                # called jamming.
+GNSS_JAM_BIN_MARGIN_DB = 6.0  # a bin counts as "elevated" when it is this far
+                               # above the quiet reference floor.
+
+
+def assess_gnss_l1_jamming(powers: List[float], quiet_floor_dbm: float,
+                           elevation_db: float = GNSS_JAM_ELEVATION_DB,
+                           broadband_frac: float = GNSS_JAM_BROADBAND_FRAC,
+                           bin_margin_db: float = GNSS_JAM_BIN_MARGIN_DB) -> Dict:
+    """Assess a GPS-L1 power-spectrum for a JAMMER's broadband energy.
+
+    Returns {"jamming": bool, "peak_dbm", "median_dbm", "elevation_db",
+    "occupied_frac"}. `jamming` is True only when BOTH the band median is
+    >= elevation_db above the quiet floor AND >= broadband_frac of the bins are
+    elevated (broadband signature). A quiet L1 band (bare receiver noise) and a
+    lone narrow spike both correctly return jamming=False. Pure/testable.
+
+    HONEST: jamming detection only -- this says nothing about SPOOFING.
+    """
+    if not powers:
+        return {"jamming": False, "peak_dbm": None, "median_dbm": None,
+                "elevation_db": None, "occupied_frac": None}
+    arr = np.asarray(powers, dtype=float)
+    median_dbm = float(np.median(arr))
+    peak_dbm = float(np.max(arr))
+    band_elevation = median_dbm - quiet_floor_dbm
+    occupied_frac = float(np.mean(arr > (quiet_floor_dbm + bin_margin_db)))
+    jamming = bool(band_elevation >= elevation_db and occupied_frac >= broadband_frac)
+    return {
+        "jamming": jamming,
+        "peak_dbm": round(peak_dbm, 1),
+        "median_dbm": round(median_dbm, 1),
+        "elevation_db": round(band_elevation, 1),
+        "occupied_frac": round(occupied_frac, 3),
+    }
+
+
+def gnss_l1_caveats() -> List[str]:
+    return [
+        "detects a GNSS JAMMER's broadband energy at GPS L1 -- it does NOT detect SPOOFING",
+        "a spoofer emits a valid-looking GNSS signal at normal power; distinguishing that needs a GNSS receiver (hardware follow-up)",
+        "RX-ONLY passive detection -- wholly separate from the governed GNSS-spoof transmit capability",
+    ]
+
+
+def lora_subghz_caveats() -> List[str]:
+    return [
+        "duty-cycle / RF-signature PROXY for a low-duty sub-GHz (LoRa/LoRaWAN-class) emitter -- PRESENCE/advisory only",
+        "NO packet decode and no device identity -- energy-detection over sweep cycles, not a demodulated LoRa frame",
+        "a weak/marginal real drone SiK link can also read as low-duty here (same tradeoff as the SiK-915 exclusion heuristic)",
+    ]
+
 
 SWEEPS_PER_CYCLE = 2  # DJI OcuSync is frequency-hopping/bursty; one-shot sweeps miss it often.
                        # Kept low (not 4) so a full band cycle stays well under the console's
@@ -945,6 +1121,44 @@ def main() -> None:
                 )
             except requests.RequestException as e:
                 print(f"spectrum ingest failed: {e}", file=sys.stderr)
+
+            # --- GPS L1 (1575.42 MHz) JAMMER detection (gnss_l1_jammer) -------
+            # PASSIVE, RX-only, and NOT a drone band: handle it in its own branch
+            # and `continue` BEFORE any drone Wi-Fi/BT/LoRa/hop/detection logic,
+            # so an L1 emitter can never be mislabeled as a drone contact. Assess
+            # + report ONLY on real sweep data -- a filler cycle would be a
+            # meaningless assessment, and NOT posting then keeps the tile honestly
+            # OFFLINE when the radio is not actually delivering L1 samples (never
+            # a fake READY). The ingest endpoint derives LIVE (jamming) vs READY
+            # (clean) itself, so one post per real cycle covers both. HONEST:
+            # this detects JAMMING energy, NOT spoofing.
+            if name == "GNSS-L1":
+                if is_real_data:
+                    quiet_floor = BAND_NOISE_FLOOR_DBM.get(name, DEFAULT_NOISE_FLOOR_DBM)
+                    assess = assess_gnss_l1_jamming(powers, quiet_floor)
+                    gnss_body = {
+                        "jamming": assess["jamming"],
+                        "center_freq_mhz": GNSS_L1_CENTER_MHZ,
+                        "peak_dbm": assess["peak_dbm"],
+                        "median_dbm": assess["median_dbm"],
+                        "elevation_db": assess["elevation_db"],
+                        "occupied_frac": assess["occupied_frac"],
+                        "source": "HACKRF_GNSS_L1",
+                        "caveats": gnss_l1_caveats(),
+                    }
+                    try:
+                        _post_with_reauth(args.console_url, "/api/gnss-l1-jammer/ingest",
+                                          gnss_body, headers, args.email, args.password,
+                                          timeout=5)
+                        if assess["jamming"]:
+                            print(f"[{label}] GPS L1 JAMMING detected: median "
+                                  f"{assess['median_dbm']}dBm (+{assess['elevation_db']}dB over "
+                                  f"floor), {assess['occupied_frac']} of band occupied — JAMMING, "
+                                  f"NOT spoofing (spoofing needs a GNSS receiver)")
+                    except requests.RequestException as e:
+                        print(f"gnss-l1 ingest failed: {e}", file=sys.stderr)
+                continue
+
             peak = max(powers)
             # Real per-detection peak frequency (bin_width_mhz = 1.0 matches
             # sweep_band's default bin width of 1000 kHz), computed once per
@@ -1004,6 +1218,46 @@ def main() -> None:
                 # else: this cycle used wedge/fallback filler data (is_real_data is
                 # False) — see WIFI_PERSIST_CYCLES comment block above for why we
                 # deliberately leave persist_state untouched here instead of resetting.
+
+            # --- 5.8 GHz ANALOG FPV video channel-plan ID (fpv_analog_5g8) ------
+            # Post-process the DJI-5G8 sweep peak: on a real in-band hit that is
+            # NOT a persistent Wi-Fi AP and whose peak maps onto the analog FPV
+            # channel plan, ingest that channel (-> LIVE); otherwise heartbeat
+            # (running, watching 5.8 -> READY). Only on real sweep data (filler
+            # cycles keep the tile honestly OFFLINE). HONEST: this IDs the ANALOG
+            # video carrier/channel only (detect + coarse ID, cues the OSD-OCR);
+            # digital DJI/HDZero/Walksnail video is encrypted and stays
+            # family-level wideband (the DJI-5G8 detection), never a claimed channel.
+            if name == "DJI-5G8" and is_real_data:
+                is_hit_5g8 = peak > floor + DETECT_THRESHOLD_DB
+                fpv_chan = (map_fpv_5g8_channel(peak_freq_mhz)
+                            if (is_hit_5g8 and not likely_wifi_ap) else None)
+                if fpv_chan is not None:
+                    fpv_body = {
+                        **fpv_chan,
+                        "center_freq_mhz": round(peak_freq_mhz, 2),
+                        "rssi_dbm": round(peak, 1),
+                        "source": "HACKRF_FPV_ANALOG_5G8",
+                        "caveats": fpv_analog_caveats(),
+                    }
+                    try:
+                        _post_with_reauth(args.console_url, "/api/fpv-analog/ingest",
+                                          fpv_body, headers, args.email, args.password,
+                                          timeout=5)
+                        print(f"[{label}] analog FPV channel ID: {fpv_chan['band']} "
+                              f"{fpv_chan['channel']} @ {fpv_chan['carrier_mhz']}MHz "
+                              f"(peak {peak_freq_mhz:.1f}MHz — analog carrier only, "
+                              f"digital video not decoded)")
+                    except requests.RequestException as e:
+                        print(f"fpv-analog ingest failed: {e}", file=sys.stderr)
+                else:
+                    try:
+                        _post_with_reauth(args.console_url, "/api/protocols/heartbeat",
+                                          {"protocol": "fpv_analog_5g8",
+                                           "note": "5.8GHz swept, no analog FPV carrier mapped"},
+                                          headers, args.email, args.password, timeout=5)
+                    except requests.RequestException:
+                        pass
 
             # --- Bluetooth exclusion (DJI-2G4 only) -- see BT_NONPERSIST_CYCLES
             # comment block above for full rationale and honestly-stated limitations.
@@ -1072,6 +1326,33 @@ def main() -> None:
             # appended to, so a run of wedged cycles doesn't get counted as
             # "silence" and doesn't dilute the real-data duty-cycle estimate --
             # same is_real_data-aware pattern as the Wi-Fi/Bluetooth checks above.
+
+            # --- LoRa / low-duty sub-GHz POSITIVE advisory tile (lora_subghz) --
+            # Surface the ALREADY-COMPUTED SiK-915 low-duty-cycle signal
+            # (likely_low_duty_cycle_device) as a POSITIVE advisory emitter tile,
+            # not only as the jam-suppression exclusion it already drives above.
+            # Heartbeat every real-data SiK-915 cycle (running -> READY); the
+            # ingest endpoint promotes to LIVE when present=True. Reuses the
+            # existing computed signal -- nothing recomputed. HONEST: duty-cycle/
+            # RF-signature proxy -- PRESENCE/advisory only, NO packet decode.
+            if name == "SiK-915" and is_real_data:
+                lora_hit_ratio = ((sum(sik_hit_window) / len(sik_hit_window))
+                                  if sik_hit_window else None)
+                lora_body = {
+                    "present": likely_low_duty_cycle_device,
+                    "center_freq_mhz": round(peak_freq_mhz, 2),
+                    "peak_dbm": round(peak, 1),
+                    "hit_ratio": round(lora_hit_ratio, 3) if lora_hit_ratio is not None else None,
+                    "window_cycles": len(sik_hit_window),
+                    "source": "HACKRF_SIK915_LORA",
+                    "caveats": lora_subghz_caveats(),
+                }
+                try:
+                    _post_with_reauth(args.console_url, "/api/lora-subghz/ingest",
+                                      lora_body, headers, args.email, args.password,
+                                      timeout=5)
+                except requests.RequestException as e:
+                    print(f"lora-subghz ingest failed: {e}", file=sys.stderr)
 
             # --- ELRS/Crossfire-class hop-interval-consistency heuristic
             # (LRS-433/SRD-868 only) -- see update_hop_track()/

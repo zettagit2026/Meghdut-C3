@@ -1,0 +1,28 @@
+[Unit]
+Description=CEMA cUAS - Wi-Fi drone SSID/OUI fingerprint: Kismet -> SSID+OUI match -> /api/wifi-drone/ingest
+After=network-online.target docker.service cema-kismet.service
+Wants=network-online.target
+Requires=cema-kismet.service
+
+[Service]
+Type=simple
+User=biswajit
+WorkingDirectory=/CEMA/joydipdemo/field-bridge
+# Host-specific values (CEMA_API_URL/EMAIL/PASSWORD, KISMET_URL, KISMET_APIKEY,
+# WIFI_DRONE_POLL_INTERVAL_S) live in the EnvironmentFile, never hardcoded here.
+# NOTE for the SRE deploy: this rides the SAME Kismet feed as the RemoteID/Parrot
+# bridges (no new radio). It flags Wi-Fi drone CANDIDATES from SSID/OUI (both
+# spoofable -- never a serial). If Kismet is down, the service logs OFFLINE and
+# does NOT heartbeat (board shows OFFLINE, not a fake READY) -- that is honest.
+EnvironmentFile=/CEMA/joydipdemo/field-bridge/.env
+# Cold-boot readiness gate: wait up to 60s for BOTH the backend (127.0.0.1:8001)
+# and Kismet REST (127.0.0.1:2501) to accept a connection before starting.
+ExecStartPre=/bin/sh -c 'for i in $(seq 1 60); do curl -s -o /dev/null http://127.0.0.1:8001/ && curl -s -o /dev/null http://127.0.0.1:2501/ && exit 0; sleep 1; done; exit 0'
+ExecStart=/CEMA/joydipdemo/field-bridge/.venv/bin/python3 -u wifi_drone_bridge.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/CEMA/joydipdemo/field-bridge/wifi_drone_bridge.log
+StandardError=append:/CEMA/joydipdemo/field-bridge/wifi_drone_bridge.log
+
+[Install]
+WantedBy=multi-user.target
