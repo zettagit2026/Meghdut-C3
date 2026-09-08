@@ -9,7 +9,7 @@ import EngagementControl from "@/components/EngagementControl";
 import MlClassifierBadge from "@/components/MlClassifierBadge";
 import ConfidenceTypeBadge from "@/components/ConfidenceTypeBadge";
 import UnconfirmedTag from "@/components/UnconfirmedTag";
-import { isUnconfirmedDetection, shouldShowUnconfirmedTag, getOriginalModelAnnotation } from "@/lib/detectionConfidence";
+import { isUnconfirmedDetection, shouldShowUnconfirmedTag, getOriginalModelAnnotation, isProtectedContact, isTargetGrade } from "@/lib/detectionConfidence";
 import { isRecentCritical, isStaticCritical } from "@/lib/threatSalience";
 import { announceNewCriticalContacts, isCriticalAlertMuted, setCriticalAlertMuted } from "@/lib/criticalAlertSound";
 import { THREAT_COLOR } from "@/lib/threatLevels";
@@ -311,6 +311,19 @@ export default function Dashboard() {
   }, []);
 
   const active = detections.filter((d) => d.status === "ACTIVE");
+  // PRIORITY TARGETS honesty split (P2 of no-strike-registry.md): protected
+  // civilian/friendly contacts and low-confidence unidentified RF emitters are
+  // pulled OFF the priority board into their own collapsed lanes -- never
+  // deleted, always visible. A `no_strike_conflict` contact (a decoded drone
+  // that ALSO matched a no-strike entry) STAYS on priority behind an Adjudicate
+  // badge -- it is a target-grade decode and is never silently suppressed.
+  const protectedContacts = active.filter((d) => isProtectedContact(d) || d.threat_level === "NON_THREAT");
+  const priorityTargets = active.filter(
+    (d) => !isProtectedContact(d) && d.threat_level !== "NON_THREAT" && (isTargetGrade(d) || d.no_strike_conflict)
+  );
+  const lowConfidenceContacts = active.filter(
+    (d) => !isProtectedContact(d) && d.threat_level !== "NON_THREAT" && !isTargetGrade(d) && !d.no_strike_conflict
+  );
   const swarmCount = new Set(active.filter((d) => d.swarm_id).map((d) => d.swarm_id)).size;
   const critical = active.filter((d) => d.threat_level === "CRITICAL").length;
   const neutralized = detections.filter((d) => d.status === "NEUTRALIZED").length;
@@ -541,7 +554,7 @@ export default function Dashboard() {
               <span className="font-mono text-xs uppercase tracking-widest">Priority Targets</span>
             </div>
           <div className="p-4 space-y-3">
-            {active
+            {priorityTargets
               .slice()
               .sort((a, b) => ({ CRITICAL: 3, HIGH: 2, MEDIUM: 1, LOW: 0 }[b.threat_level] - { CRITICAL: 3, HIGH: 2, MEDIUM: 1, LOW: 0 }[a.threat_level]))
               .slice(0, 6)
@@ -571,6 +584,16 @@ export default function Dashboard() {
                       {d.threat_level}
                     </span>
                   </div>
+                  {d.no_strike_conflict && (
+                    <div
+                      className="mb-2 px-2 py-1 tactical-border font-mono text-[10px] uppercase tracking-wide"
+                      style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}
+                      title="This contact carries a CRC-verified drone decode AND matches a no-strike registry entry. It is NOT auto-suppressed and NOT auto-engageable — a commander must adjudicate (reclassify or confirm) before any engagement. Fire-time still hard-blocks a civilian match."
+                      data-testid={`no-strike-conflict-${d.id}`}
+                    >
+                      ⚠ Adjudicate — matches no-strike AND drone signature
+                    </div>
+                  )}
                   <div className="font-mono text-[10px] text-slate-500 space-y-0.5">
                     <div>
                       MODEL: <span className="text-slate-300">{d.model}</span>
@@ -592,8 +615,52 @@ export default function Dashboard() {
                 </div>
                 );
               })}
-            {active.length === 0 && (
+            {priorityTargets.length === 0 && (
               <div className="font-mono text-xs text-slate-600 text-center py-4">— NO ACTIVE TARGETS —</div>
+            )}
+
+            {/* Protected civilian/friendly no-strike matches — pulled OFF the
+                priority board, never deleted. Collapsed by default. */}
+            {protectedContacts.length > 0 && (
+              <details className="tactical-border" data-testid="protected-lane">
+                <summary className="cursor-pointer select-none px-3 py-2 font-mono text-[10px] uppercase tracking-wide"
+                         style={{ color: "var(--accent-success)" }}>
+                  Protected / Civilian infrastructure ({protectedContacts.length})
+                </summary>
+                <div className="px-3 pb-2 space-y-1">
+                  {protectedContacts.map((d) => (
+                    <div key={d.id} className="font-mono text-[10px] flex items-center justify-between gap-2"
+                         data-testid={`protected-row-${d.id}`}>
+                      <span className="text-slate-300">{d.callsign}</span>
+                      <span className="text-slate-500 truncate">{d.model}</span>
+                      <span style={{ color: "var(--accent-success)" }}>{d.threat_level}</span>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+
+            {/* Low-confidence unidentified RF emitters — cleared no
+                corroboration tier, off priority, honestly labelled. */}
+            {lowConfidenceContacts.length > 0 && (
+              <details className="tactical-border" data-testid="low-confidence-lane">
+                <summary className="cursor-pointer select-none px-3 py-2 font-mono text-[10px] uppercase tracking-wide"
+                         style={{ color: "var(--text-secondary)" }}>
+                  Low-confidence RF ({lowConfidenceContacts.length})
+                </summary>
+                <div className="px-3 pb-2 space-y-1">
+                  {lowConfidenceContacts.map((d) => (
+                    <div key={d.id} className="font-mono text-[10px] flex items-center justify-between gap-2"
+                         data-testid={`low-confidence-row-${d.id}`}>
+                      <span className="text-slate-300">{d.callsign}</span>
+                      <span className="text-slate-500 truncate">{d.model}</span>
+                      <span className="text-slate-500">
+                        {d.ml_probability_note ? d.ml_probability_note : d.threat_level}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </details>
             )}
           </div>
           </div>

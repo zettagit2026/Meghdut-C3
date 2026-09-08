@@ -90,6 +90,9 @@ android-sdk/
 .env
 .env.*
 *.env
+# .env.example is a checked-in template (no real values) -- keep it trackable
+# despite the .env.* glob above.
+!.env.example
 credentials.json
 *.key
 .credentials
@@ -102,5 +105,10 @@ caddy/*.crt
 # No live secrets in these (just env-var name references), but they are
 # host-local scratch artifacts, not something to track in git.
 *.pre-*-backup
+
+# Runtime artifacts -- generated locally, never source
+backend/audit_anchor.log
+scripts/deploy_log/
+graphify-out/
 *.bak.*
 *.bak-*

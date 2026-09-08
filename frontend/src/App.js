@@ -17,7 +17,14 @@ import MissionLog from "@/pages/MissionLog";
 import MapView from "@/pages/Map";
 import Zones from "@/pages/Zones";
 import SopRules from "@/pages/SopRules";
-import DecisionSupport from "@/pages/DecisionSupport";
+// DecisionSupport (DECIDE hub) is intentionally kept on disk but unrouted —
+// removed from the operator console nav for the time being per operator
+// directive. The effector-recommendation engine it fronted keeps running
+// silently behind the one-tap /api/engage flow (backend/effector_selection.py,
+// untouched). To re-add: import it here, restore the nav item in
+// Layout.jsx, and replace the /decision redirect below with a routed page.
+// import DecisionSupport from "@/pages/DecisionSupport";
+import WifiEnvironment from "@/pages/WifiEnvironment";
 import "@/App.css";
 
 function Protected({ children }) {
@@ -55,7 +62,7 @@ export default function App() {
             <Route path="takeover"  element={<Takeover />} />
             <Route path="wifi-defeat" element={<WifiDefeat />} />
             <Route path="killchain" element={<KillChain />} />
-            <Route path="decision"  element={<DecisionSupport />} />
+            <Route path="wifi-environment" element={<WifiEnvironment />} />
             <Route path="history"   element={<DetectionHistory />} />
             <Route path="map"       element={<MapView />} />
             <Route path="zones"     element={<Zones />} />
@@ -67,6 +74,11 @@ export default function App() {
             <Route path="payloads"           element={<Navigate to="/takeover" replace />} />
             <Route path="sdr-mavlink-inject" element={<Navigate to="/takeover" replace />} />
             <Route path="mavlink"            element={<Navigate to="/takeover" replace />} />
+            {/* DECIDE hub removed from nav for the time being — redirect any
+                existing /decision deep-link to the Command Center instead of
+                404-ing. See the DecisionSupport import comment above to
+                re-add the routed page. */}
+            <Route path="decision"           element={<Navigate to="/dashboard" replace />} />
           </Route>
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>

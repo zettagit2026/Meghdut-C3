@@ -283,19 +283,21 @@ def test_synthesize_iq_file_placeholder_mode_produces_correct_size(monkeypatch):
 
 # ---------------------------------------------------------------------
 # Regression: hackrf_jam.transmit_burst()'s core params stay stable; the only
-# additive change is the trailing `tx_halt_check` kwarg (default None), added
-# with the continuous-jam kill-switch backstop (commit a0fa362) so the burst
-# polls tx_halt directly like the sweep/iq_file paths — backward-compatible.
+# additive changes are the trailing optional kwargs `tx_halt_check` (default
+# None, continuous-jam kill-switch backstop, commit a0fa362) and `profile`
+# (default None => MAX => today's `-a 1 -x <tx_gain>`, anti-fade Phase 1) — both
+# keyword, both default None, so every positional caller is unbroken.
 # ---------------------------------------------------------------------
 def test_transmit_burst_signature_stable_plus_tx_halt_check():
     import inspect
     sig = inspect.signature(hackrf_jam.transmit_burst)
     assert list(sig.parameters.keys()) == [
         "freq_mhz", "bandwidth_khz", "duration_s", "tx_gain", "stop_event", "on_started",
-        "tx_halt_check",
+        "tx_halt_check", "profile",
     ]
-    # additive + backward-compatible: the new kwarg defaults to None
+    # additive + backward-compatible: the new kwargs default to None
     assert sig.parameters["tx_halt_check"].default is None
+    assert sig.parameters["profile"].default is None
 
 
 def test_transmit_burst_missing_binary_behavior_unchanged():

@@ -80,6 +80,7 @@ import logging
 import math
 import os
 import statistics
+import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
@@ -154,6 +155,13 @@ import protocol_status
 # the offline/online update-merge logic are unit-testable without FastAPI/Mongo;
 # server.py only owns the in-memory active-library handle + auth-gated routes.
 import threat_library
+# Read-only Kismet Wi-Fi AP survey -> RF situational-awareness shape (backs
+# GET /api/wifi-environment). STRICTLY a passive visibility layer: it reshapes
+# a running Kismet server's own device list for display and creates NO
+# detections, writes nothing, and has NO engage/target/TX coupling whatsoever.
+# Pure parse/build helpers (unit-testable without FastAPI/Mongo) + a read-only
+# `requests` GET client. See backend/kismet_survey.py module docstring.
+import kismet_survey
 # Zone/SOP engine geospatial primitives (RFI 4.5.2.1/4.5.2.3). Pure
 # point-in-polygon / ring-validation, no I/O and NO TX-spine coupling (see
 # backend/geo_zone.py + .omc/plans/zone-sop-engine.md). server.py owns only the
@@ -166,6 +174,14 @@ import geo_zone
 # endpoints (see backend/sop_engine.py). server.py owns only the db.sop_rules /
 # db.rule_alerts stores, the commander-gated CRUD, and the background eval loop.
 import sop_engine
+# No-strike / civilian-protection registry -- pure matcher (P1 of
+# no-strike-registry.md). match(identity, entries) -> verdict. Plain dicts
+# in/out, NO Mongo/ws and NO transmit-spine coupling: its strongest output is a
+# DISPLAY-LABEL match verdict (see backend/no_strike.py). server.py owns only
+# the db.no_strike_registry store + commander-gated CRUD + the version-stamped
+# hot-load cache. This is the safe foundation: P1 adds NO fire-path change and
+# NO classification consult (those consume this matcher in P2/P3).
+import no_strike
 # Container->host privilege bridge for the GUI TX-bridge SiK handoff. Talks to
 # the hard-whitelisted cema-tx-helper root daemon over a bind-mounted Unix
 # socket (see backend/tx_bridge_control.py + scripts/host-helper/README.md).
@@ -999,6 +1015,220 @@ def _check_tx_not_halted() -> None:
                                   "A commander must POST /api/emergency/resume first.")
 
 
+# ---- WEAPONS-HOT posture (ONE-TAP ENGAGE, Phase 1 — TIGHT only) ------------
+# The STANDING, deliberate authorization the one-tap POST /api/engage path draws
+# on. It does NOT replace or weaken any interlock — it is an ADDITIONAL required
+# condition layered ON TOP of the UNCHANGED per-fire gate chain (commander +
+# tx_halt + single-use effect+target-bound arm token + effect-specific confirm
+# token + fire-time IFF fratricide interlock + range-auth lease + per-target
+# scope) that `_execute_engagement` still runs, byte-identical, on every shot.
+#
+# In-memory ONLY, HOLD at boot, lazily expired — same convention as
+# `_range_authorization` / `_tx_halted` (NOT new persistence). A restart always
+# drops to HOLD and never silently re-arms.
+#
+# Load-bearing arming conditions (NEVER watered down — see the build contract):
+#   * commander role + password step-up re-verify (a stolen JWT alone cannot arm)
+#   * a deliberate confirm phrase "WEAPONS <STATE> <AO>"
+#   * the AO-level SafetyGate checklist acknowledged ONCE (stored in safety_ack)
+#   * iff_registry_loaded == True (the IFF / no-strike registry is loaded so the
+#     fratricide interlock has data)
+#   * the matching per-effect range-auth leases armed through the EXISTING
+#     /range-authorization path (range-auth stays the real fire-time gate).
+# Auto-expiry + /emergency/abort + disarm all drop it back to HOLD.
+WEAPONS_POSTURE_TTL_S = 30 * 60  # 30 min — within the 30-60 min design band
+# FREE (zone auto-engage) is DEFERRED to P3 and intentionally NOT armable here:
+# it needs a SEPARATE supervisor + separate arming (build contract §P3). P1 arms
+# only HOLD (disarm) / TIGHT.
+WEAPONS_POSTURE_ARMABLE_STATES = ("TIGHT",)
+# The effects /api/engage can compose via `_execute_engagement` (the P0 shared
+# primitive). gnss_spoof is DELIBERATELY EXCLUDED: it is not an
+# `_execute_engagement` branch, AND it requires a human-typed friendly-asset
+# attestation that cannot be auto-minted without forging human intent (an
+# ROE-floor violation). GNSS-deny stays the deliberate POST /api/payloads/
+# gnss-spoof flow, never one-tap.
+ENGAGE_COMPOSABLE_EFFECTS = ("jam", "mavlink_sdr_inject", "wifi_deauth", "arsdk_inject")
+# AO-level SafetyGate checklist keys — ALL must be acknowledged (truthy) once at
+# posture-arm time. A missing/false item refuses the arm (no partial ack).
+WEAPONS_POSTURE_SAFETY_CHECKLIST = (
+    "airspace_deconflicted",
+    "friendly_forces_clear",
+    "collateral_assessed",
+    "roe_confirmed",
+    "abort_authority_ready",
+)
+# Recommender effector name (effector_selection.EFF_*) -> range-auth/engage effect
+# key. gnss_deny maps to gnss_spoof, which is NOT in ENGAGE_COMPOSABLE_EFFECTS, so
+# a gnss recommendation is SURFACED (verdict + reason) and never fired one-tap.
+_EFFECTOR_TO_ENGAGE_EFFECT = {
+    "jam": "jam",
+    "mavlink_takeover": "mavlink_sdr_inject",
+    "wifi_deauth": "wifi_deauth",
+    "arsdk_inject": "arsdk_inject",
+    "gnss_deny": "gnss_spoof",
+}
+# Threat levels that count as CLASSIFIED HOSTILE for the ROE floor. Anything else
+# (FRIENDLY / UNKNOWN / empty / neutral / civilian) is NEVER a valid one-tap
+# target — see _detection_is_classified_hostile.
+_HOSTILE_THREAT_LEVELS = frozenset({"CRITICAL", "HIGH", "MEDIUM", "LOW"})
+
+_weapons_posture: Dict[str, Any] = {
+    "state": "HOLD",
+    "ao": None,
+    "permitted_effects": [],
+    "expires_at": None,
+    "armed_by": None,
+    "armed_at": None,
+    "safety_ack": None,
+    "iff_registry_loaded": False,
+    # The range-auth effect-leases this posture-arm actually turned ON (leases the
+    # commander had already armed independently are NOT recorded here). When the
+    # posture drops to HOLD — explicit disarm, TTL expiry, or /emergency/abort —
+    # exactly these leases are cascade-disabled so HOLD means holstered: the
+    # legacy manual /payloads/* path goes dark too, not just the one-tap path.
+    "leases_armed_by_posture": [],
+}
+
+# ---- Per-target one-tap-engage in-flight guard (GAP 1: concurrent-engage race).
+# At most ONE POST /api/engage may be in flight per target_detection_id at a time,
+# so a double-tap from a laggy UI (or two operators on the same track) cannot mint
+# two independent token sets and reach dispatch twice ("one tap = one shot"). This
+# is an in-flight SET with an atomic check-and-add: the check + add happen with no
+# await between them, so on the single-threaded event loop they are indivisible —
+# the loser sees the id already present and gets a clean 409 (it never waits and
+# never fires). Every /api/engage exit path (success AND every refusal/exception)
+# discards the id in a finally block, so the guard is provably leak-free: a target
+# can always be engaged again once the prior call has fully returned.
+_engage_in_flight: set = set()
+
+
+def _weapons_posture_status() -> Dict[str, Any]:
+    p = _weapons_posture
+    seconds_remaining = None
+    if p["state"] != "HOLD" and p["expires_at"] is not None:
+        seconds_remaining = max(
+            0, int((p["expires_at"] - datetime.now(timezone.utc)).total_seconds()))
+    return {
+        "state": p["state"],
+        "ao": p["ao"],
+        "permitted_effects": list(p["permitted_effects"]),
+        "expires_at": p["expires_at"].isoformat() if p["expires_at"] else None,
+        "seconds_remaining": seconds_remaining,
+        "armed_by": p["armed_by"],
+        "armed_at": p["armed_at"].isoformat() if p["armed_at"] else None,
+        "safety_ack": p["safety_ack"],
+        "iff_registry_loaded": bool(p["iff_registry_loaded"]),
+    }
+
+
+def _reset_weapons_posture_fields() -> None:
+    _weapons_posture.update({
+        "state": "HOLD", "ao": None, "permitted_effects": [], "expires_at": None,
+        "armed_by": None, "armed_at": None, "safety_ack": None,
+        "iff_registry_loaded": False, "leases_armed_by_posture": [],
+    })
+
+
+async def _drop_weapons_posture_to_hold(reason: str, actor: str,
+                                        *, kind: str = "WEAPONS_POSTURE_HOLD") -> None:
+    """Drop the posture to HOLD and loudly (hash-chain) audit it. Idempotent: if
+    the posture was already HOLD there is nothing to drop and no event is written
+    (so an /emergency/abort with no active posture stays quiet)."""
+    was_state = _weapons_posture["state"]
+    was_ao = _weapons_posture["ao"]
+    # Capture BEFORE the reset clears it — the range-auth leases this posture
+    # itself armed, which must be cascade-disabled so HOLD holsters the manual
+    # /payloads/* path too (GAP 2).
+    leases_to_drop = list(_weapons_posture.get("leases_armed_by_posture") or [])
+    _reset_weapons_posture_fields()
+    if was_state != "HOLD":
+        await log_event(
+            kind,
+            f"WEAPONS POSTURE -> HOLD ({reason}); was {was_state} over AO={was_ao}. "
+            f"One-tap POST /api/engage is now refused until re-armed.",
+            meta={"reason": reason, "was_state": was_state, "was_ao": was_ao},
+            actor=actor,
+        )
+        await ws_manager.broadcast_json({"type": "weapons_posture", **_weapons_posture_status()})
+        # ---- GAP 2 cascade: drop EXACTLY the leases this posture armed ----
+        # HOLD must mean holstered. posture-arm turned these range-auth leases ON;
+        # if we left them lit until their own TTL, the console would read WEAPONS
+        # HOLD while the legacy manual /payloads/* path stayed LIVE. So disable the
+        # posture-armed leases here (disarm + expiry + abort all route through this
+        # helper). We only cascade leases the posture itself armed — a lease the
+        # commander armed independently (recorded nowhere in leases_armed_by_posture)
+        # is deliberately left alone. Each drop mirrors the range-auth disable path
+        # (flip OFF, clear fields, broadcast) and is loudly audited.
+        dropped = []
+        for eff in leases_to_drop:
+            lease = _range_authorization.get(eff)
+            if lease is None or not lease["enabled"]:
+                continue
+            lease["enabled"] = False
+            lease["expires_at"] = None
+            lease["enabled_by"] = None
+            lease["enabled_at"] = None
+            dropped.append(eff)
+            await ws_manager.broadcast_json(
+                {"type": "range_authorization", **_range_auth_status(eff)})
+        if dropped:
+            await log_event(
+                "RANGE_AUTH_DISABLE",
+                f"WEAPONS posture -> HOLD ({reason}) CASCADED range authorization OFF for "
+                f"posture-armed effect(s)={dropped}. The manual /payloads/* path for these "
+                f"effects is now holstered too — HOLD means holstered, not merely 'one-tap off'.",
+                meta={"reason": reason, "cascade": "weapons_posture_hold",
+                      "effects_disabled": dropped, "was_state": was_state, "was_ao": was_ao},
+                actor=actor,
+            )
+
+
+async def _expire_weapons_posture() -> None:
+    """Lazy/on-read expiry (same pattern as _expire_range_authorization): a
+    posture past its TTL is dropped to HOLD before any read/use, so a stale
+    non-HOLD state can never be observed — or fired under — past its TTL."""
+    p = _weapons_posture
+    if (p["state"] != "HOLD" and p["expires_at"] is not None
+            and datetime.now(timezone.utc) > p["expires_at"]):
+        await _drop_weapons_posture_to_hold(
+            f"auto-expired ({WEAPONS_POSTURE_TTL_S}s TTL)", "SYSTEM",
+            kind="WEAPONS_POSTURE_EXPIRED")
+
+
+def _detection_is_confirmed_friendly(det: Dict[str, Any]) -> bool:
+    """A CONFIRMED-FRIENDLY (IFF-verified) contact — identical predicate to
+    `_enforce_fire_time_iff`. The ROE floor and the fire-time interlock agree."""
+    return bool(det.get("iff_verified")) or det.get("threat_level") == "FRIENDLY (IFF verified)"
+
+
+def _detection_is_classified_hostile(det: Dict[str, Any]) -> bool:
+    """ROE-floor positive predicate: a contact is a valid one-tap target ONLY
+    when it is NOT a confirmed friendly AND its threat_level is a classified
+    hostile weight. Neutral / civilian / UNKNOWN / unclassified all return
+    False (fail-closed)."""
+    if _detection_is_confirmed_friendly(det):
+        return False
+    return det.get("threat_level") in _HOSTILE_THREAT_LEVELS
+
+
+def _detection_live_position(det: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    """The target's live {lat, lon} for AO containment, or None if it carries no
+    real broadcast position (DroneID drone_lat/lon, else a plain lat/lon). No
+    coordinate is ever invented — a position-less target fails the AO check
+    closed."""
+    lat = det.get("drone_lat")
+    lon = det.get("drone_lon")
+    if lat is None or lon is None:
+        lat = det.get("lat")
+        lon = det.get("lon")
+    if lat is None or lon is None:
+        return None
+    try:
+        return {"lat": float(lat), "lon": float(lon)}
+    except (TypeError, ValueError):
+        return None
+
+
 # ---- Bridge TX acknowledgment (closes the "silent success" gap) ----
 # Root cause of the earlier live-demo failure: /payloads/deploy and
 # /mavlink/broadcast used to build a frame, broadcast it over the WS to
@@ -1542,6 +1772,17 @@ async def startup() -> None:
     await db.sop_rules.create_index("enabled")
     await db.rule_alerts.create_index("id", unique=True)
     await db.rule_alerts.create_index("ts")
+    # No-strike / civilian-protection registry (no-strike-registry.md P1).
+    # id is the stable external key; enabled is queried by the version-stamped
+    # hot-load cache to skip disabled entries. The oui/bssid/ssid_exact match
+    # indexes are SPARSE (an entry sets only the keys it matches on) to speed the
+    # P2/P3 identity lookup. Pure data + audit -- NO TX coupling (mirrors the
+    # db.iff_friendlies index creation above; disable-not-delete, audited).
+    await db.no_strike_registry.create_index("id", unique=True)
+    await db.no_strike_registry.create_index("enabled")
+    await db.no_strike_registry.create_index("match.oui", sparse=True)
+    await db.no_strike_registry.create_index("match.bssid", sparse=True)
+    await db.no_strike_registry.create_index("match.ssid_exact", sparse=True)
     existing = await db.users.find_one({"email": ADMIN_EMAIL})
     if existing is None:
         await db.users.insert_one({
@@ -1749,7 +1990,12 @@ class JamRequestBody(BaseModel):
     # stoppable — that invariant is preserved.
     duration_s: float = 5.0
     continuous: bool = False
-    tx_gain: int = 20
+    # tx_gain is server-side clamped to the HackRF IF-VGA range [0,47] (reject
+    # out-of-range with 422 at the API boundary) so the field-bridge clamp's
+    # precondition always holds — the backend never forwards a nonsensical gain.
+    # Only the MAX profile actually consumes tx_gain; FLAT/EXTERNAL_PA use a
+    # fixed internal VGA (see `profile` below and hackrf_jam._tx_amp_vga_args).
+    tx_gain: int = Field(20, ge=0, le=47)
     # Swept-barrage (MEGHDUT full-band coverage): a single ~20MHz-instantaneous
     # HackRF center only covers a slice of an ~80MHz hop band. sweep=True steps
     # the TX center across [freq_start_mhz, freq_stop_mhz] so a frequency-hopping
@@ -1772,6 +2018,19 @@ class JamRequestBody(BaseModel):
     # mode supports only the four bands the operator's per-band callers cover
     # (see OPERATOR_JAM_BANDS / the deploy_jam validation below).
     jam_mode: str = Field("meghdut", pattern="^(meghdut|operator)$")
+    # Jam POWER profile (anti-fade), mirrored from field-bridge/hackrf_jam.py's
+    # JAM_PROFILE_* (max|flat|external_pa):
+    #   "max"         (default) — highest power; -a 1 -x <tx_gain>. Fades on
+    #                             continuous TX as the exciter heats (thermal droop).
+    #   "flat"        — steady, zero-fade; amp OFF, fixed internal VGA. Lower power.
+    #   "external_pa" — cool low-level exciter drive for an EXTERNAL power amp.
+    # VALIDATED at the API boundary (pattern below) → a typo'd/unknown value is
+    # rejected with 422, NOT silently normalized to MAX. The backend does NOT
+    # rely on the bridge's own defensive _normalize_jam_profile: an operator who
+    # typo'd the profile must get an error here, not a silent power change. This
+    # is a plain PARAMETER on the already-fully-gated jam path — it changes only
+    # the radiator's power shaping and the audit label, NO gate/authorization.
+    profile: str = Field("max", pattern="^(max|flat|external_pa)$")
     arm_token: str  # required unconditionally — jamming is always CRITICAL severity
     jam_confirm_token: str  # required unconditionally — see /jam/confirm
 
@@ -2723,6 +2982,491 @@ async def delete_zone(zone_id: str, user: Dict = Depends(require_commander)):
 
 
 # =====================================================================
+# Routes: No-strike / civilian-protection registry (no-strike-registry.md P1)
+# =====================================================================
+# The civilian-protection SAFETY FLOOR's foundation. A commander authors
+# registry entries as plain data (db.no_strike_registry): a `match` block over a
+# contact's ssid/bssid/oui/manuf, a `category`
+# (CIVILIAN_INFRASTRUCTURE/FRIENDLY_OWN_FORCE/NEUTRAL), a display `label`, and a
+# `hard` flag. This phase is PURE data + audit + a version-stamped hot-load
+# cache -- it has NO coupling to the TX spine (creating/editing an entry can
+# never arm, key, mint a token, or clear _tx_halted) and NO fire-path or
+# classification consult (those consume no_strike.match in P2/P3). Entries are
+# DISABLED, never hard-deleted (DELETE sets enabled:false), so a protection is
+# always recoverable and its removal is auditable. Every mutation bumps the
+# hot-load version and writes a hash-chained NO_STRIKE_CREATE/UPDATE/DISABLE
+# audit. The `match` block is validated server-side (>=1 key, MAC/OUI shape,
+# regex compiles) via no_strike.validate_match, mirroring how zones validate
+# geometry via geo_zone.validate_ring.
+NO_STRIKE_CATEGORIES = ("CIVILIAN_INFRASTRUCTURE", "FRIENDLY_OWN_FORCE", "NEUTRAL")
+_NO_STRIKE_CATEGORY_PATTERN = (
+    "^(CIVILIAN_INFRASTRUCTURE|FRIENDLY_OWN_FORCE|NEUTRAL)$")
+
+
+class NoStrikeMatch(BaseModel):
+    # Every match key is optional; the handler enforces >=1 present and the
+    # MAC/OUI shape + regex-compiles via no_strike.validate_match (so the 422
+    # message can name the offending field). Lengths are bounded to avoid
+    # unbounded stored input; vendor_regex is additionally capped SHORT (64) and
+    # screened for a catastrophic-backtracking shape by no_strike.validate_match
+    # (defence-in-depth against a ReDoS pattern that would freeze the single-
+    # threaded event loop, run only against a length-capped manuf string).
+    ssid_exact: Optional[str] = Field(None, min_length=1, max_length=64)
+    ssid_prefix: Optional[str] = Field(None, min_length=1, max_length=64)
+    bssid: Optional[str] = Field(None, min_length=1, max_length=32)
+    oui: Optional[str] = Field(None, min_length=1, max_length=16)
+    vendor_regex: Optional[str] = Field(None, min_length=1, max_length=64)
+
+
+class NoStrikeBody(BaseModel):
+    # category constrained to the three real classes (no way to smuggle
+    # another). `hard` is optional here: it defaults to True for
+    # CIVILIAN_INFRASTRUCTURE (the un-overridable floor) and False otherwise,
+    # applied in the handler.
+    category: str = Field(..., pattern=_NO_STRIKE_CATEGORY_PATTERN)
+    match: NoStrikeMatch
+    label: str = Field(..., min_length=1, max_length=120)
+    hard: Optional[bool] = None
+    enabled: bool = True
+    notes: Optional[str] = Field(None, max_length=2000)
+
+
+class NoStrikeUpdateBody(BaseModel):
+    # PUT is a partial update: every field optional, only provided fields are
+    # applied. Same bounds/pattern as NoStrikeBody so an edit cannot relax them.
+    category: Optional[str] = Field(None, pattern=_NO_STRIKE_CATEGORY_PATTERN)
+    match: Optional[NoStrikeMatch] = None
+    label: Optional[str] = Field(None, min_length=1, max_length=120)
+    hard: Optional[bool] = None
+    enabled: Optional[bool] = None
+    notes: Optional[str] = Field(None, max_length=2000)
+
+
+def _validate_no_strike_match(match_block: Any) -> None:
+    """Validate a no-strike `match` block for db.no_strike_registry, raising
+    HTTPException(422) with a clear message on bad input. Delegates the actual
+    rules (>=1 match key, 48-bit bssid / 24-bit oui shape, vendor_regex
+    compiles) to the pure no_strike.validate_match so the CRUD write path and
+    any future consult share one definition. Pure -- no side effects."""
+    ok, reason = no_strike.validate_match(match_block)
+    if not ok:
+        raise HTTPException(422, f"invalid no-strike match block: {reason}")
+
+
+def _no_strike_hard_default(category: str, hard: Optional[bool]) -> bool:
+    """Resolve the effective `hard` flag: an explicit value wins; otherwise
+    CIVILIAN_INFRASTRUCTURE defaults to the un-overridable hard floor (True) and
+    every other category defaults to False."""
+    if hard is not None:
+        return bool(hard)
+    return category == "CIVILIAN_INFRASTRUCTURE"
+
+
+# Version-stamped hot-apply cache -- COPY of the SOP pattern (_sop_config_version
+# / _sop_reload_config_if_stale). Every no-strike CRUD write bumps
+# _no_strike_version; a consumer's _no_strike_entries() reloads the enabled
+# entries from Mongo only when the version it last loaded differs, so a
+# commander's edit takes effect on the next consult with no redeploy. Kept as
+# module globals so the endpoints, the (P2/P3) consumers, and the tests share
+# exactly one source of truth. P1 defines the accessor; no fire-path consumes it
+# yet.
+_no_strike_version = 0
+_no_strike_cache: Dict[str, Any] = {"version": None, "entries": []}
+
+
+def _bump_no_strike_version() -> None:
+    """Invalidate the no-strike hot-load cache. Called by every no-strike CRUD
+    write so the next _no_strike_entries() reload picks the change up -- the
+    no-redeploy path."""
+    global _no_strike_version
+    _no_strike_version += 1
+
+
+async def _no_strike_entries() -> List[Dict[str, Any]]:
+    """Return the ENABLED no-strike registry entries from the version-stamped
+    cache, reloading from Mongo iff a CRUD write bumped the version since the
+    last load. This is the hot-apply/no-redeploy read path P2/P3 will consult;
+    it reads only (no TX coupling)."""
+    global _no_strike_cache
+    if _no_strike_cache["version"] != _no_strike_version:
+        loaded_version = _no_strike_version  # snapshot BEFORE the await
+        entries = await db.no_strike_registry.find(
+            {"enabled": True}, {"_id": 0}).to_list(5000)
+        # Precompile each entry's vendor_regex ONCE here (compile-and-store) so
+        # the hot classification path (no_strike.match, run per tick) uses a
+        # precompiled object and never re-compiles, and a broken/dangerous
+        # pattern is turned into a skipped sentinel (None) that can never reach
+        # the matcher. compile_vendor_regex rejects over-length / catastrophic
+        # shapes too -- defence-in-depth for any legacy row stored before the
+        # write-time ReDoS guard.
+        for e in entries:
+            blk = e.get("match")
+            if not isinstance(blk, dict):
+                continue
+            pat = blk.get("vendor_regex")
+            if not (isinstance(pat, str) and pat.strip()):
+                continue
+            compiled = no_strike.compile_vendor_regex(pat)
+            blk["_vendor_regex_compiled"] = compiled
+            if compiled is None:
+                logger.warning(
+                    "no-strike entry %s has an unusable vendor_regex "
+                    "(over-length, catastrophic-backtracking shape, or "
+                    "uncompilable); it is skipped by the matcher, never fatal",
+                    e.get("id"))
+        _no_strike_cache = {"version": loaded_version, "entries": entries}
+    return _no_strike_cache["entries"]
+
+
+# ==========================================================================
+# P2 — CLASSIFICATION + DISPLAY HONESTY (no-strike consult + confidence gate)
+# ==========================================================================
+# The NEW threat_level sentinel a civilian/neutral no-strike match (that is NOT
+# a protocol-confirmed decode) is demoted to. It is DELIBERATELY OUTSIDE
+# `_HOSTILE_THREAT_LEVELS` (see server.py:1073) -- so a NON_THREAT contact is
+# already False at `_detection_is_classified_hostile` (the ROE floor) with NO
+# change to that predicate or the frozenset (that hard-floor/ROE wiring is P3),
+# and it sorts below LOW on the priority board. Adding it here changes NOTHING
+# on the fire path; it is a labelling/display sentinel only.
+_NON_THREAT_LEVEL = "NON_THREAT"
+
+_NO_STRIKE_CIVILIAN_CATEGORIES = ("CIVILIAN_INFRASTRUCTURE", "NEUTRAL")
+
+# Honest badge for the ML "%" on a not-target-grade contact: the 3-class model
+# has no reject class, so a bare "76%" next to a drone name is a lie. This says
+# what the number actually is.
+_ML_CLASS_PROB_NOTE = "ML class probability (no reject class)"
+
+
+def is_target_grade(det: Dict[str, Any]) -> bool:
+    """Confidence gate (no-strike-registry.md §3): a contact carries drone
+    identity / threat weight on the board ONLY if it clears >=1 corroboration
+    tier. Pure, read-only, never raises on a partial dict.
+
+      T1  protocol decode        -- protocol_confirmed / confidence_type
+                                    == "protocol_verified" (DroneID/MAVLink/...)
+      T2  real DF bearing        -- bearing_available AND NOT bearing_estimated
+      T3  Wi-Fi drone-OUI softAP -- a CLASSIFIED wifi drone candidate
+                                    (match_protocol == "wifi" + make_candidate)
+                                    whose vendor is NOT a no-strike civilian
+      T4  multi-sensor fusion    -- confidence_type == "multidomain_fused"
+
+    Clears none -> NOT target-grade (an unconfirmed RF emitter). Belt-and-braces
+    on T3's "non-civilian vendor": a contact already stamped with a
+    CIVILIAN/NEUTRAL no_strike match is never target-grade via T3.
+    """
+    if not isinstance(det, dict):
+        return False
+    # T1 -- protocol decode.
+    if det.get("protocol_confirmed") or det.get("confidence_type") == "protocol_verified":
+        return True
+    # T2 -- real (measured, not estimated) DF bearing.
+    if det.get("bearing_available") and not det.get("bearing_estimated"):
+        return True
+    # T4 -- multi-sensor fusion.
+    if det.get("confidence_type") == "multidomain_fused":
+        return True
+    # T3 -- a classified Wi-Fi drone softAP (drone-manufacturer OUI/SSID), so
+    # long as it is not itself a civilian no-strike match.
+    ns = det.get("no_strike") or {}
+    civilian = bool(ns.get("matched")) and ns.get("category") in _NO_STRIKE_CIVILIAN_CATEGORIES
+    if (not civilian
+            and det.get("match_protocol") == "wifi"
+            and _nonempty_str(det.get("make_candidate"))):
+        return True
+    return False
+
+
+def _nonempty_str(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return value.strip() != ""
+    return True
+
+
+def _corroboration_basis(det: Dict[str, Any]) -> str:
+    """Name the corroboration tier that makes `det` target-grade, for the
+    `no_strike_conflict.drone_basis` stamp (so the adjudication queue shows WHY
+    the contact is treated as a real drone despite the civilian match). Mirrors
+    the is_target_grade tier order (T1..T4); read-only, never raises."""
+    if not isinstance(det, dict):
+        return "target_grade"
+    if det.get("confidence_type") == "protocol_verified":
+        return "protocol_verified"          # T1
+    if det.get("protocol_confirmed"):
+        return "protocol_confirmed"         # T1
+    if det.get("bearing_available") and not det.get("bearing_estimated"):
+        return "df_bearing"                 # T2
+    if det.get("confidence_type") == "multidomain_fused":
+        return "multidomain_fused"          # T4
+    if det.get("match_protocol") == "wifi" and _nonempty_str(det.get("make_candidate")):
+        return "wifi_softap"                # T3
+    return "target_grade"
+
+
+def _no_strike_confidence_stamps(det: Dict[str, Any],
+                                 entries: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """The P2 consult, as a PURE function of a fully-resolved detection view
+    (post display/fusion/IFF overrides) and the no-strike registry entries.
+    Returns ADDITIVE stamps to merge into the detection BEFORE the DB write --
+    it NEVER touches `match_model`/`match_protocol` (kept byte-identical so
+    re-confirmation merging is unaffected) and never clears an existing field.
+
+    Honesty invariants (no-strike-registry.md §5):
+      * CONFLICT GUARD FIRST -- ANY target-grade contact (T1 protocol decode /
+        T2 real DF bearing / T3 non-civilian wifi softAP / T4 multidomain
+        fusion) that ALSO matches a civilian/neutral no-strike entry is a
+        corroborated drone: it is NEVER demoted/suppressed. It keeps its
+        target-grade + threat_level and gets a `no_strike_conflict` stamp for
+        human adjudication (and, deliberately, is NOT given a `no_strike.matched`
+        stamp, so the board keeps it on the priority lane behind an "Adjudicate"
+        badge rather than hiding it). target-gradeness is evaluated on the
+        ORIGINAL corroboration fields, BEFORE any demotion stamp mutates display,
+        so the conflict decision sees the true corroboration.
+      * Only a NON-target-grade civilian/neutral contact is ever demoted.
+      * A NON-target-grade civilian/neutral match -> NON_THREAT sentinel
+        + honest "Protected"/"Civilian infrastructure" display.
+      * A friendly-own-force match defers to an existing IFF relabel; otherwise
+        it is labelled "FRIENDLY (registry)".
+      * A contact that clears no confidence tier -> capped LOW, honest
+        "Unidentified RF emitter" label, ML "%" badged as class-probability.
+    """
+    stamps: Dict[str, Any] = {}
+    if not isinstance(det, dict):
+        return stamps
+
+    # Identity: the contact's own fields PLUS the Wi-Fi fusion cross-ref. An
+    # RF-energy contact carries no OUI of its own -- the civilian OUI/manuf is
+    # only known via the Kismet fusion result, so read it when the direct field
+    # is absent.
+    fusion = det.get("wifi_fusion") or {}
+    identity = {
+        "ssid": det.get("ssid") or (fusion.get("matched_ssid") if isinstance(fusion, dict) else None),
+        "bssid": det.get("bssid"),
+        "oui": det.get("oui") or (fusion.get("matched_mac_oui") if isinstance(fusion, dict) else None),
+        "manuf": det.get("manuf") or (fusion.get("matched_manuf") if isinstance(fusion, dict) else None),
+    }
+    ns = no_strike.match(identity, entries)
+
+    category = ns.get("category") if ns.get("matched") else None
+
+    demoted_civilian = False
+    conflict = False
+
+    if category in _NO_STRIKE_CIVILIAN_CATEGORIES:
+        # WIDENED CONFLICT NET (no-strike-registry.md §5): a corroborated real
+        # drone must NEVER be laundered off the board just because it is
+        # co-located with a civilian OUI/SSID. The conflict guard therefore
+        # triggers on ANY target-grade tier (T1 protocol / T2 real DF bearing /
+        # T3 non-civilian wifi softAP / T4 multidomain fusion), not protocol
+        # decode alone. is_target_grade is computed on the ORIGINAL corroboration
+        # fields (protocol_confirmed / bearing / confidence_type / wifi softAP)
+        # BEFORE any demotion stamp mutates display fields, so the conflict
+        # decision sees the true corroboration. The civilian match is made
+        # visible to that check (via a temporary no_strike marker) ONLY so a
+        # wifi-OUI-only civilian AP correctly fails T3 -- a genuine DF/fusion/
+        # protocol drone still clears T1/T2/T4 regardless.
+        eval_view = {**det, "no_strike": {"matched": True, "category": category}}
+        corroborated = is_target_grade(eval_view)
+        if corroborated:
+            # CONFLICT -- a target-grade contact that also matches a civilian/
+            # neutral entry is NEVER silently suppressed. Keep it target-grade,
+            # keep threat_level, do NOT demote/relabel, and do NOT stamp a
+            # `no_strike.matched` (so the board keeps it on the priority lane
+            # behind an "Adjudicate" badge rather than hiding it).
+            conflict = True
+            stamps["no_strike_conflict"] = {
+                "registry_entry_id": ns.get("entry_id"),
+                "category": category,
+                "drone_basis": _corroboration_basis(det),
+            }
+        else:
+            # NON-target-grade civilian/neutral (a genuine low-confidence
+            # civilian RF emitter) -> demote to the NON_THREAT sentinel and
+            # relabel honestly. match_model/match_protocol stay untouched.
+            demoted_civilian = True
+            label = ns.get("label")
+            stamps["threat_level"] = _NON_THREAT_LEVEL
+            stamps["no_strike"] = {
+                "matched": True,
+                "category": category,
+                "entry_id": ns.get("entry_id"),
+                "label": label,
+                "basis": ns.get("basis"),
+                "randomized": bool(ns.get("randomized")),
+            }
+            stamps["original_model"] = det.get("original_model") or det.get("model")
+            stamps["original_protocol"] = det.get("original_protocol") or det.get("protocol")
+            stamps["model"] = f"Protected — {label}" if _nonempty_str(label) else "Civilian infrastructure"
+            stamps["protocol"] = "Civilian infrastructure"
+    elif category == "FRIENDLY_OWN_FORCE":
+        stamps["no_strike"] = {
+            "matched": True,
+            "category": category,
+            "entry_id": ns.get("entry_id"),
+            "label": ns.get("label"),
+            "basis": ns.get("basis"),
+            "randomized": bool(ns.get("randomized")),
+        }
+        already_iff = bool(det.get("iff_verified")) or \
+            det.get("threat_level") == "FRIENDLY (IFF verified)"
+        if not already_iff:
+            stamps["threat_level"] = "FRIENDLY (registry)"
+
+    # Confidence gate. Evaluate target-gradeness on the view AS IT WILL STAND
+    # after the stamps so far (so a civilian no_strike stamp correctly fails T3).
+    resolved_view = {**det, **stamps}
+    target_grade = is_target_grade(resolved_view)
+    stamps["target_grade"] = target_grade
+
+    if not target_grade and not demoted_civilian and not conflict:
+        # A contact that clears no corroboration tier and is not already a
+        # protected/friendly/conflict case: cap a hostile weight to LOW and give
+        # it the honest "unidentified RF" label. Never RAISE a level (a
+        # NON_THREAT/FRIENDLY was handled above and is excluded here anyway).
+        current_level = stamps.get("threat_level", det.get("threat_level"))
+        if current_level in _HOSTILE_THREAT_LEVELS:
+            stamps["threat_level"] = "LOW"
+            stamps["original_model"] = stamps.get("original_model") \
+                or det.get("original_model") or det.get("model")
+            stamps["original_protocol"] = stamps.get("original_protocol") \
+                or det.get("original_protocol") or det.get("protocol")
+            stamps["model"] = "Unidentified RF emitter — unconfirmed, no bearing"
+        # Badge any ML "%" as what it actually is (class probability, no reject
+        # class) so it is never read as a bare drone-likelihood.
+        if det.get("ml_confidence") is not None:
+            stamps["ml_probability_note"] = _ML_CLASS_PROB_NOTE
+
+    return stamps
+
+
+async def _apply_no_strike_classification(det: Dict[str, Any]) -> Dict[str, Any]:
+    """Async wrapper: load the hot-cached no-strike registry and run the pure
+    P2 consult over `det`. Returns the additive stamps to merge before the DB
+    write. Read-only w.r.t. the registry + TX spine."""
+    entries = await _no_strike_entries()
+    return _no_strike_confidence_stamps(det, entries)
+
+
+@api.get("/no-strike")
+async def list_no_strike(user: Dict = Depends(require_commander)):
+    """List no-strike registry entries (commander only -- this is a
+    protection-doctrine surface). Newest first. Disabled entries are included so
+    a commander can see and re-enable a previously removed protection."""
+    entries = await db.no_strike_registry.find(
+        {}, {"_id": 0}).sort("created_at", -1).to_list(5000)
+    return {"entries": entries, "count": len(entries)}
+
+
+@api.post("/no-strike", status_code=201)
+async def create_no_strike(body: NoStrikeBody,
+                           user: Dict = Depends(require_commander)):
+    """Create a no-strike registry entry (commander only). Validates the match
+    block (>=1 key, MAC/OUI shape, regex compiles) at 422. Bumps the hot-load
+    version so any consult hot-applies it, and writes a NO_STRIKE_CREATE audit.
+    Touches NO TX-spine state."""
+    _validate_no_strike_match(body.match.dict())
+    now = datetime.now(timezone.utc).isoformat()
+    new_id = str(uuid.uuid4())
+    actor = user["email"]
+    doc = {
+        "id": new_id,
+        "category": body.category,
+        "match": body.match.dict(),
+        "label": body.label,
+        "hard": _no_strike_hard_default(body.category, body.hard),
+        "enabled": body.enabled,
+        "notes": body.notes,
+        "created_by": actor,
+        "created_at": now,
+        "updated_by": actor,
+        "updated_at": now,
+    }
+    # insert a copy so the returned doc is not mutated with Mongo's _id (same
+    # convention as log_event / zones).
+    await db.no_strike_registry.insert_one(doc.copy())
+    _bump_no_strike_version()
+    await log_event(
+        "NO_STRIKE_CREATE",
+        f"No-strike entry created: {body.label} (category={body.category})",
+        meta={"entry_id": new_id, "category": body.category,
+              "hard": doc["hard"], "enabled": body.enabled},
+        actor=actor,
+    )
+    return doc
+
+
+@api.put("/no-strike/{entry_id}")
+async def update_no_strike(entry_id: str, body: NoStrikeUpdateBody,
+                           user: Dict = Depends(require_commander)):
+    """Edit a no-strike registry entry (commander only), hot-applied on the next
+    consult. A provided match block is re-validated (bad shape/regex => 422).
+    Bumps the hot-load version and audits the edit. Touches NO TX-spine state."""
+    existing = await db.no_strike_registry.find_one({"id": entry_id}, {"_id": 0})
+    if existing is None:
+        raise HTTPException(404, "No-strike entry not found")
+    updates: Dict[str, Any] = {}
+    for field in ("category", "label", "enabled", "notes"):
+        value = getattr(body, field)
+        if value is not None:
+            updates[field] = value
+    if body.match is not None:
+        _validate_no_strike_match(body.match.dict())
+        updates["match"] = body.match.dict()
+    # `hard` may be explicitly set on an edit. If the category changes without an
+    # explicit hard, re-resolve the default for the (possibly new) category so a
+    # CIVILIAN_INFRASTRUCTURE entry can never silently lose its hard floor.
+    if body.hard is not None:
+        updates["hard"] = bool(body.hard)
+    elif "category" in updates:
+        # Category changed without an explicit hard: re-resolve the DEFAULT for
+        # the new category (pass None, not the old value) so moving TO
+        # CIVILIAN_INFRASTRUCTURE restores the hard floor.
+        updates["hard"] = _no_strike_hard_default(updates["category"], None)
+    actor = user["email"]
+    now = datetime.now(timezone.utc).isoformat()
+    updates["updated_by"] = actor
+    updates["updated_at"] = now
+    await db.no_strike_registry.update_one({"id": entry_id}, {"$set": updates})
+    _bump_no_strike_version()
+    await log_event(
+        "NO_STRIKE_UPDATE",
+        f"No-strike entry updated: {entry_id}",
+        meta={"entry_id": entry_id, "fields": sorted(updates.keys())},
+        actor=actor,
+    )
+    updated = await db.no_strike_registry.find_one({"id": entry_id}, {"_id": 0})
+    return updated
+
+
+@api.delete("/no-strike/{entry_id}")
+async def delete_no_strike(entry_id: str,
+                           user: Dict = Depends(require_commander)):
+    """DISABLE a no-strike registry entry (commander only) -- NEVER a hard
+    delete. Sets enabled:false so the protection drops out of the hot-load cache
+    on the next consult but the entry (and its removal) remain auditable and
+    re-enablable. Bumps the version and writes a NO_STRIKE_DISABLE audit."""
+    existing = await db.no_strike_registry.find_one({"id": entry_id}, {"_id": 0})
+    if existing is None:
+        raise HTTPException(404, "No-strike entry not found")
+    actor = user["email"]
+    now = datetime.now(timezone.utc).isoformat()
+    await db.no_strike_registry.update_one(
+        {"id": entry_id},
+        {"$set": {"enabled": False, "updated_by": actor, "updated_at": now}},
+    )
+    _bump_no_strike_version()
+    await log_event(
+        "NO_STRIKE_DISABLE",
+        f"No-strike entry disabled: {entry_id}",
+        meta={"entry_id": entry_id},
+        actor=actor,
+    )
+    return {"disabled": True, "id": entry_id}
+
+
+# =====================================================================
 # Routes: SOP no-code rules + rule-alerts feed + C2 mode + eval loop
 # (Zone/SOP engine -- Phase B+C)
 # =====================================================================
@@ -3579,6 +4323,128 @@ async def get_sensor_position(user: Dict = Depends(get_current_user)):
         # (distance known, direction unknown), never as absolute pins.
         "bearing_available": False,
     }
+
+
+# =====================================================================
+# Route: Wi-Fi Environment (RF situational awareness) -- READ ONLY
+# =====================================================================
+# GET /api/wifi-environment returns the current ambient Wi-Fi AP survey from a
+# running Kismet server, so the operator can SEE every AP/device in range. It
+# is a VISIBILITY feature, strictly separate from targeting:
+#
+#   * READ-ONLY. It proxies a read-only, field-projected POST to Kismet's REST
+#     API server-side (POST is only Kismet's field-simplification convention --
+#     the body carries a "fields" projection, mutating NO Kismet state; it reads
+#     the device LIST and nothing else). The Kismet apikey NEVER reaches the
+#     browser, and the result is reshaped for display. It
+#     creates NO detections, writes NOTHING to the database, and has NO side
+#     effects. It does NOT touch the target/engage lists, the wifi-defeat fire
+#     path, or any TX/arm/IFF/range-auth/safety-spine code.
+#   * NON-ACTIONABLE. APs here are NOT engageable. A "possible UAS" tag is a
+#     visual hint only; real engagement stays on the drone-contact target flow.
+#   * Auth: same as other read endpoints (any authenticated operator/commander
+#     via get_current_user).
+#   * Bounded: server-side short-TTL cache (rate-limits Kismet, which can hold
+#     thousands of devices) + sort-by-RSSI + top-N cap keep the response small.
+#
+# Kismet access reuses the SAME route/auth pattern as
+# field-bridge/kismet_bridge.py; the pure parse/build helpers live in
+# backend/kismet_survey.py (unit-testable without FastAPI/Mongo).
+KISMET_URL = os.environ.get("KISMET_URL", "").strip()
+KISMET_APIKEY = os.environ.get("KISMET_APIKEY", "").strip()
+KISMET_SURVEY_TOP_N = int(os.environ.get("KISMET_SURVEY_TOP_N", "250"))
+# Short server-side cache TTL: the frontend polls every few seconds, but we
+# never hammer Kismet faster than this regardless of how many operators are
+# watching.
+_WIFI_ENV_CACHE_TTL_S = float(os.environ.get("KISMET_SURVEY_CACHE_TTL_S", "3"))
+_wifi_env_cache: Dict[str, Any] = {"at": 0.0, "payload": None}
+
+
+def _sanitize_kismet_error(exc: Exception) -> str:
+    """Build a human-readable Kismet error status that NEVER leaks the apikey.
+
+    `requests` embeds the full request URL -- including the `?KISMET=<apikey>`
+    query param -- in its exception text. Returning that verbatim to the
+    operator would expose the server-side Kismet key. This redacts the key and
+    strips any query string, returning a clean host:port + reason only.
+    """
+    import re
+    from urllib.parse import urlsplit
+
+    reason = str(exc)
+    if KISMET_APIKEY:
+        reason = reason.replace(KISMET_APIKEY, "<redacted>")
+    # Strip any URL query string (which may carry ?KISMET=<apikey>) from the msg.
+    reason = re.sub(r"\?[^\s'\")]*", "", reason)
+    host = urlsplit(KISMET_URL).netloc or KISMET_URL
+    return f"Kismet at {host} unreachable or errored: {reason}"
+
+
+@api.get("/wifi-environment")
+async def get_wifi_environment(user: Dict = Depends(get_current_user)):
+    """Read-only ambient Wi-Fi AP survey from Kismet (RF situational awareness).
+
+    Degrades gracefully and honestly: if Kismet is not configured or is
+    unreachable, returns an empty list with configured/available flags and a
+    human-readable status -- it NEVER raises a 500 for a Kismet-side problem.
+    """
+    now = time.time()
+    if not KISMET_URL:
+        return {
+            "configured": False,
+            "available": False,
+            "status": "KISMET_URL not configured on the backend.",
+            "source": "KISMET",
+            "polled_at": _now_iso(),
+            "ap_count": 0,
+            "total_seen": 0,
+            "top_n": KISMET_SURVEY_TOP_N,
+            "aps": [],
+        }
+
+    # Serve a fresh-enough cached survey to rate-limit Kismet.
+    cached = _wifi_env_cache.get("payload")
+    if cached is not None and (now - _wifi_env_cache.get("at", 0.0)) < _WIFI_ENV_CACHE_TTL_S:
+        return cached
+
+    try:
+        # requests is synchronous; run it off the event loop so a slow/timing-
+        # out Kismet never blocks the backend. READ-ONLY: a field-projected POST
+        # (Kismet's field-simplification convention) that only reads the device
+        # list; it mutates no Kismet state.
+        devices = await asyncio.to_thread(
+            kismet_survey.fetch_kismet_devices, KISMET_URL, KISMET_APIKEY or None
+        )
+    except Exception as e:  # noqa: BLE001 -- honest degrade, never crash the console
+        logger.warning("wifi-environment: Kismet fetch failed: %s", e)
+        return {
+            "configured": True,
+            "available": False,
+            "status": _sanitize_kismet_error(e),
+            "source": "KISMET",
+            "polled_at": _now_iso(),
+            "ap_count": 0,
+            "total_seen": 0,
+            "top_n": KISMET_SURVEY_TOP_N,
+            "aps": [],
+        }
+
+    total_seen = len(devices)
+    aps = kismet_survey.build_survey(devices, top_n=KISMET_SURVEY_TOP_N)
+    payload = {
+        "configured": True,
+        "available": True,
+        "status": "ok",
+        "source": "KISMET",
+        "polled_at": _now_iso(),
+        "ap_count": len(aps),
+        "total_seen": total_seen,
+        "top_n": KISMET_SURVEY_TOP_N,
+        "aps": aps,
+    }
+    _wifi_env_cache["at"] = now
+    _wifi_env_cache["payload"] = payload
+    return payload
 
 
 @api.get("/detections")
@@ -4877,6 +5743,15 @@ class WifiDroneIngestBody(BaseModel):
     channel: Optional[int] = None
     signal_dbm: Optional[float] = None
     source_mac: Optional[str] = None
+    # The softAP's own MAC IS its BSSID -- the EXACT key the governed
+    # Wi-Fi-defeat endpoint resolves as the deauth/inject target (see
+    # deploy_wifi_defeat: detection.get("bssid") or "softap_bssid" or
+    # "target_bssid"). CANDIDATE (SSID/OUI/MAC are all spoofable); carried so a
+    # classified candidate becomes a RESOLVABLE contact -- every fire-time gate
+    # (arm/confirm/IFF/range-auth/tx-halt + the endpoint's own broadcast-BSSID
+    # fail-closed) still applies unchanged. softap_bssid is an accepted alias.
+    bssid: Optional[str] = None
+    softap_bssid: Optional[str] = None
     source: str = "WIFI_DRONE_KISMET"
     caveats: List[str] = []
 
@@ -5080,16 +5955,151 @@ async def parrot_latest(user: Dict = Depends(get_current_user)):
     return {"available": True, **_last_parrot_decode}
 
 
+def _wifi_channel_to_ghz(channel: Optional[int]) -> Optional[float]:
+    """Standard 802.11 channel-number -> center-frequency (GHz). This is the
+    deterministic spec mapping of a REAL observed channel number, NOT a
+    fabricated RF measurement. Returns None for an absent/out-of-plan channel
+    (never a guessed frequency)."""
+    if channel is None:
+        return None
+    try:
+        ch = int(channel)
+    except (TypeError, ValueError):
+        return None
+    if 1 <= ch <= 13:          # 2.4 GHz: ch1 = 2412 MHz, +5 MHz per channel
+        return round((2407 + ch * 5) / 1000.0, 4)
+    if ch == 14:
+        return 2.484
+    if 32 <= ch <= 177:        # 5 GHz: 5000 + ch*5 MHz
+        return round((5000 + ch * 5) / 1000.0, 4)
+    return None
+
+
+async def _upsert_wifi_drone_detection(body: "WifiDroneIngestBody", bssid: str,
+                                       user: Dict) -> str:
+    """Dedupe-by-BSSID upsert of an ACTIVE db.detections contact for a CLASSIFIED
+    Wi-Fi-drone candidate, so it (a) shows in /detections (the targets panel) and
+    (b) is RESOLVABLE by the governed Wi-Fi-defeat flow via its real softAP BSSID
+    (deploy_wifi_defeat reads detection.get("bssid")/"softap_bssid"/"target_bssid").
+
+    HONEST candidate tier (matches every other SSID/heuristic guess): confidence_type
+    stays "heuristic_binary" (an SSID/OUI regex + drone-OUI match is a SPOOFABLE
+    binary heuristic, NOT a confirmed protocol decode -> renders as unconfirmed via
+    isUnconfirmedDetection); threat_level MEDIUM; protocol_confirmed False. It is
+    NEVER auto-marked hostile or authorized_target -- engagement authorization stays
+    a separate commander/IFF step enforced at fire time (untouched here).
+
+    Re-ingest refreshes the SAME row (no duplicate beacon-per-row) and, critically,
+    NEVER clears an operator's engagement authorization, IFF verdict, or threat_level
+    -- only liveness/signal/channel are refreshed on merge."""
+    bssid = bssid.strip().upper()
+    now = _now_iso()
+    center_freq_ghz = _wifi_channel_to_ghz(body.channel)
+    rssi = body.signal_dbm if body.signal_dbm is not None else -80.0
+
+    # Dedupe by BSSID across ALL statuses (not just ACTIVE): a re-ingest after a
+    # stale->LOST expiry must re-activate the SAME record, never spawn a duplicate.
+    existing = await db.detections.find_one({"source": body.source, "bssid": bssid})
+    if existing:
+        updates = {
+            "status": "ACTIVE",          # re-activate if it had gone stale/LOST
+            "last_seen": now,
+            "rssi_dbm": rssi,
+            "signal_dbm": body.signal_dbm,
+            "channel": body.channel,
+        }
+        if center_freq_ghz is not None:
+            updates["center_freq_ghz"] = center_freq_ghz
+        # Deliberately NOT overwritten on merge: threat_level, authorized_target,
+        # iff_* -- so an IFF re-classification or an operator authorization/downgrade
+        # is sticky and a stream of beacons can't silently reset a fire-time gate.
+        await db.detections.update_one({"id": existing["id"]}, {"$set": updates})
+        return existing["id"]
+
+    det = _new_detection_skeleton()  # id/callsign-label/state/timestamps only
+    det.update({
+        "model": body.make_candidate,
+        "protocol": "wifi",
+        # Immutable merge/identity fields (mirrors detection_ingest): the BSSID is
+        # the natural stable key here, captured on the doc + as match_model.
+        "match_model": body.make_candidate,
+        "match_protocol": "wifi",
+        "threat_level": "MEDIUM",
+        "source": body.source,
+        "bssid": bssid,
+        "softap_bssid": bssid,     # alias the wifi-defeat resolver also accepts
+        "channel": body.channel,
+        "ssid": body.ssid,
+        "oui": body.oui,
+        "manuf": body.manuf,
+        "make_candidate": body.make_candidate,
+        "match_basis": body.match_basis,
+        "signal_dbm": body.signal_dbm,
+        "rssi_dbm": rssi,
+        # We do NOT know the softAP's encryption/PMF posture from an SSID/OUI
+        # fingerprint; default encrypted False (honest unknown). This does NOT
+        # enable a false inject: _wifi_inject_target_identity still fails closed
+        # unless a Parrot/ARSDK/Tello marker is present (a DJI FLOW candidate has
+        # none), so only the honestly-labeled best-effort deauth link-drop applies.
+        "encrypted": False,
+        "protocol_confirmed": False,
+        "confidence_type": "heuristic_binary",
+        "ml_label": None,
+        "caveats": body.caveats,
+    })
+    if center_freq_ghz is not None:
+        det["center_freq_ghz"] = center_freq_ghz
+
+    # P2 no-strike CLASSIFICATION + confidence consult (no-strike-registry.md
+    # §2A/§3): AFTER the display fields are set, BEFORE the insert. A classified
+    # wifi drone candidate is target-grade (T3) and non-civilian, so this mostly
+    # stamps target_grade=True; a candidate whose OUI/SSID matched a civilian/
+    # neutral registry entry is honestly demoted/labelled here instead.
+    det.update(await _apply_no_strike_classification(det))
+
+    await db.detections.insert_one(det.copy())
+    await log_event(
+        "DETECTION",
+        f"[{body.source}] Wi-Fi drone CANDIDATE promoted to targetable contact "
+        f"{det['callsign']} — {body.make_candidate} ssid={body.ssid or 'n/a'} "
+        f"bssid={bssid} ch={body.channel} (SSID+OUI spoofable — candidate, not a "
+        f"confirmed ID; engagement still requires separate IFF/commander authorization)",
+        meta={"detection_id": det["id"], "source": body.source, "bssid": bssid},
+        actor=user["email"],
+    )
+    det.pop("_id", None)
+    # Track-manager layer (mirrors detection_ingest): additive, does not alter det.
+    await _observe_track_for_detection(det, user["email"])
+    return det["id"]
+
+
 @api.post("/wifi-drone/ingest")
 async def wifi_drone_ingest(body: WifiDroneIngestBody,
                             user: Dict = Depends(get_current_user)):
     """Ingest one Wi-Fi drone SSID/OUI fingerprint match (via the EXISTING Kismet
     NIC). A real match takes wifi_drone LIVE on the status board. HONEST: this is
-    a make/model CANDIDATE (SSID+OUI are spoofable), never a serial. Latest-only."""
+    a make/model CANDIDATE (SSID+OUI are spoofable), never a serial. Latest-only.
+
+    ENGAGEABILITY (2026-09): a CLASSIFIED candidate (make_candidate set) that also
+    carries a CONCRETE softAP BSSID is additionally promoted to a targetable
+    db.detections contact (see _upsert_wifi_drone_detection) so it becomes a real
+    target the governed Wi-Fi-defeat flow can resolve. A generic softAP
+    (make_candidate None) or an absent/broadcast BSSID is NOT promoted — it only
+    refreshes the latest-only board, never a spurious/untargetable contact."""
     global _last_wifi_drone
     _last_wifi_drone = {**body.dict(), "received_at": _now_iso()}
     ident = body.make_candidate or body.ssid or body.manuf or body.source_mac or "unknown"
     _protocol_touch_decode("wifi_drone", summary=f"Wi-Fi drone candidate {ident}")
+
+    # Promote a classified candidate with a concrete softAP BSSID to a targetable
+    # detection. The BSSID resolver accepts bssid / softap_bssid / source_mac (the
+    # softAP's own MAC IS its BSSID). Fail-closed on absent/broadcast BSSID via the
+    # SAME _wifi_bssid_missing_or_broadcast guard the fire path uses.
+    detection_id = None
+    raw_bssid = body.bssid or body.softap_bssid or body.source_mac
+    if body.make_candidate and not _wifi_bssid_missing_or_broadcast(raw_bssid):
+        detection_id = await _upsert_wifi_drone_detection(body, raw_bssid, user)
+
     await log_event(
         "WIFI_DRONE_FINGERPRINT",
         f"Wi-Fi drone fingerprint: candidate={body.make_candidate or 'n/a'} "
@@ -5097,7 +6107,8 @@ async def wifi_drone_ingest(body: WifiDroneIngestBody,
         f"mac={body.source_mac or 'n/a'} (SSID+OUI spoofable -- candidate, not a serial)",
         actor=user["email"],
     )
-    return {"ok": True, "stored": True}
+    return {"ok": True, "stored": True, "detection_id": detection_id,
+            "targetable": detection_id is not None}
 
 
 @api.get("/wifi-drone/latest")
@@ -6111,6 +7122,12 @@ async def detection_ingest(body: DetectionIngestBody,
             _pos_val = getattr(body, _pos_field)
             if _pos_val is not None:
                 updates[_pos_field] = _pos_val
+        # P2 no-strike CLASSIFICATION + confidence consult (no-strike-registry.md
+        # §2A/§3): runs AFTER every display/fusion/IFF override above, BEFORE the
+        # DB write, over the FULLY-RESOLVED view (existing merged with updates).
+        # Additive stamps only -- never touches match_model/match_protocol, never
+        # demotes a protocol-confirmed decode (conflict is stamped, not hidden).
+        updates.update(await _apply_no_strike_classification({**existing, **updates}))
         await db.detections.update_one(
             {"id": existing["id"]},
             {
@@ -6262,6 +7279,11 @@ async def detection_ingest(body: DetectionIngestBody,
         det["iff_verified"] = True
         det["iff_asset_id"] = iff_friendly["asset_id"]
         det["iff_callsign"] = iff_friendly["callsign"]
+
+    # P2 no-strike CLASSIFICATION + confidence consult (no-strike-registry.md
+    # §2A/§3): AFTER every display/fusion/IFF override, BEFORE the insert.
+    # Additive stamps only; conflict is stamped, a decoded drone is never hidden.
+    det.update(await _apply_no_strike_classification(det))
 
     await db.detections.insert_one(det.copy())
     await log_event("DETECTION",
@@ -6939,6 +7961,559 @@ async def jam_confirm(user: Dict = Depends(require_commander)):
     return tok
 
 
+async def _execute_engagement(effect: str, body, user: Dict) -> Dict:
+    """Shared post-authorization engagement primitive (Phase 0 extraction).
+
+    Runs the fire-time gate chain + dispatch that was previously inlined,
+    IDENTICALLY, at the tail of each of the three kinetic/TX deploy
+    endpoints: arm-token consume -> effect-specific confirm-token consume ->
+    (per-effect) detection load / friendly-fire interlock / _enforce_fire_time_iff
+    -> _require_range_authorized -> per-effect scope checks (jam freq-scope;
+    sdr-inject system_id-0 + encrypted-link honesty; wifi PMF/identity +
+    BSSID/no-broadcast) -> AWAITING_ACK / WS dispatch. `_check_tx_not_halted()`
+    is still run by the caller BEFORE this (design step 2); this helper is
+    design steps 5-10. Each effect keeps its OWN confirm-token type and its
+    OWN scope logic -- this dispatches to the correct per-effect branch, it
+    does NOT merge them into a lowest-common-denominator. Behavior is
+    byte-identical to the pre-refactor endpoints (same gates, order, error
+    codes/messages, tokens consumed, audit events, dispatch, and return).
+
+    This is the single engagement primitive the future /api/engage (Phase 1)
+    will also call -- one gate implementation, zero drift.
+    """
+    if effect == "jam":
+        _consume_arm_token(body.arm_token, effect="jam")  # F3: bound to jam effect
+        _consume_jam_confirm_token(body.jam_confirm_token)
+        # F4: backend-side range-authorization gate (jam effect lease) — no longer
+        # relying solely on the field-bridge's own poll at TX time.
+        await _require_range_authorized("jam", user["email"])
+
+        # jam_mode routing (NOT a new authz path — every gate above already ran for
+        # both modes). Operator mode is band-fixed to the operator's own presets and
+        # rejects an arbitrary freq_mhz / the GNSS bands its flowgraph doesn't cover.
+        jam_mode = body.jam_mode
+        if jam_mode == "operator":
+            if body.sweep:
+                raise HTTPException(400, "Operator Jam mode is band-fixed and cannot sweep — the "
+                                         "operator's flowgraph transmits at one center. Use "
+                                         "jam_mode=meghdut for a swept barrage.")
+            if body.freq_mhz is not None:
+                raise HTTPException(400, "Operator Jam mode is band-fixed — omit `freq_mhz` and "
+                                         "select one of its supported bands (433|915|2g4|5g8).")
+            if body.band not in OPERATOR_JAM_BANDS:
+                raise HTTPException(400, "Operator Jam mode supports only bands 433|915|2g4|5g8 "
+                                         "(its per-band callers cover 435/915/2450/5800 MHz).")
+
+        # Swept-barrage requires an explicit band span; a single-center jam requires
+        # a resolvable center frequency.
+        if body.sweep:
+            if body.freq_start_mhz is None or body.freq_stop_mhz is None:
+                raise HTTPException(400, "Swept barrage requires `freq_start_mhz` and `freq_stop_mhz` "
+                                         "(e.g. 2400 and 2483.5 for the 2.4GHz ISM hop band).")
+            if body.freq_stop_mhz <= body.freq_start_mhz:
+                raise HTTPException(400, "`freq_stop_mhz` must be greater than `freq_start_mhz`.")
+            # FREQUENCY-SCOPE safety bounds (NOT a timing/effectiveness cap). Keep the
+            # sweep inside the HackRF tunable range and cap the span so a single
+            # request cannot blanket aviation/GNSS/cellular. See MAX_SWEEP_SPAN_MHZ.
+            if (body.freq_start_mhz < HACKRF_MIN_FREQ_MHZ
+                    or body.freq_stop_mhz > HACKRF_MAX_FREQ_MHZ):
+                raise HTTPException(400, f"Sweep band must lie within the HackRF tunable range "
+                                         f"[{HACKRF_MIN_FREQ_MHZ:g}, {HACKRF_MAX_FREQ_MHZ:g}] MHz.")
+            if (body.freq_stop_mhz - body.freq_start_mhz) > MAX_SWEEP_SPAN_MHZ:
+                raise HTTPException(400, f"Sweep span must not exceed {MAX_SWEEP_SPAN_MHZ:g} MHz "
+                                         f"(frequency-scope safety bound — covers any single drone "
+                                         f"band; not a timing limit). Requested span "
+                                         f"{body.freq_stop_mhz - body.freq_start_mhz:g} MHz.")
+            if body.step_mhz <= 0:
+                raise HTTPException(400, "`step_mhz` must be > 0.")
+            if body.dwell_ms <= 0:
+                raise HTTPException(400, "`dwell_ms` must be > 0.")
+            freq_mhz = None
+        else:
+            freq_mhz = body.freq_mhz if body.freq_mhz is not None else JAM_BAND_PRESETS_MHZ.get(body.band)
+            if not freq_mhz:
+                raise HTTPException(400, "Provide either `band` (433|915|2g4|bt_2g4|5g8|gps_l1|galileo_e1|beidou_b1|"
+                                          "glonass_l1), an explicit `freq_mhz`, or a `sweep` band span.")
+
+        # NO artificial cap (commander directive): a continuous jam carries
+        # duration_s=None (runs until the operator stops it — always stoppable via
+        # Stand Down / EMERGENCY ABORT / tx_halt); otherwise the operator-set
+        # bounded window is honored verbatim.
+        continuous = bool(body.continuous) or float(body.duration_s) <= 0.0
+        duration_s = None if continuous else float(body.duration_s)
+        # Human-readable duration for logs/records (JSON-safe: None -> "continuous").
+        duration_desc = "continuous" if duration_s is None else f"{duration_s}s"
+
+        request_id = str(uuid.uuid4())
+
+        if body.band in JAM_GNSS_BANDS and freq_mhz is not None:
+            # Logging only — NOT an additional gate. The extra GNSS-denial-radius
+            # warning is surfaced to the operator in the SAME SafetyGate confirm
+            # flow (frontend/src/pages/Jamming.jsx), before arm_token/
+            # jam_confirm_token were ever minted for this request.
+            logger.warning(
+                "GNSS-target jam request %s: band=%s freq=%.3fMHz — GNSS denial has a "
+                "proportionally larger effective radius than comms jamming at the same "
+                "TX power (GPS-band receive levels are ~-130dBm).", request_id, body.band, freq_mhz,
+            )
+        # Common jam parameters, shared by the pending record + the WS broadcast so
+        # the bridge sees exactly what is logged/tracked. continuous / sweep drive
+        # the field bridge (hackrf_jam.transmit_burst continuous / transmit_sweep).
+        jam_fields = {
+            "band": body.band,
+            "freq_mhz": freq_mhz,
+            "bandwidth_khz": body.bandwidth_khz,
+            "duration_s": duration_s,          # None => continuous (JSON null)
+            "continuous": continuous,
+            "sweep": body.sweep,
+            "freq_start_mhz": body.freq_start_mhz,
+            "freq_stop_mhz": body.freq_stop_mhz,
+            "step_mhz": body.step_mhz,
+            "dwell_ms": body.dwell_ms,
+            "tx_gain": body.tx_gain,
+            "jam_mode": jam_mode,  # surfaced in GET /jam/status so the UI shows which jammer fired
+            # Jam POWER profile → jam_bridge reads data["profile"] and passes it to
+            # hackrf_jam. Validated at the API boundary (JamRequestBody.profile);
+            # a plain param on the already-gated path (adds NO authorization).
+            "profile": body.profile,
+        }
+        _pending_jam[request_id] = {
+            "ts": datetime.now(timezone.utc),
+            "status": "AWAITING_ACK",
+            **jam_fields,
+            "actor": user["email"],
+        }
+
+        await ws_manager.broadcast_json({
+            "type": "jam_request",
+            "request_id": request_id,
+            **jam_fields,
+            # Routes the request to the correct bridge: jam_bridge.py (meghdut)
+            # vs operator_jam_bridge.py (operator). Each ignores the other's mode
+            # so the two bridges never double-fire on this shared WS channel.
+            # Forwarded AFTER being consumed above — its presence here is the
+            # bridge's evidence a real UI confirmation happened, not a live
+            # credential the bridge itself validates against the backend.
+            "jam_confirm_token": body.jam_confirm_token,
+            "actor": user["email"],
+        })
+
+        span_desc = (f"SWEEP {body.freq_start_mhz}-{body.freq_stop_mhz} MHz"
+                     if body.sweep else f"{freq_mhz} MHz")
+        await log_event(
+            "JAM",
+            f"Requested RF jam [{jam_mode.upper()}]: {span_desc}, {body.bandwidth_khz}kHz BW, "
+            f"{duration_desc}, gain={body.tx_gain}, profile={body.profile.upper()} — "
+            f"awaiting bridge TX confirmation (request {request_id})",
+            # jam_mode is audited distinctly (OPERATOR vs MEGHDUT) so the mission
+            # log unambiguously records WHICH jammer radiated each burst. profile
+            # records WHICH power mode actually radiated (MAX/FLAT/EXTERNAL_PA).
+            meta={"request_id": request_id, "freq_mhz": freq_mhz, "duration_s": duration_s,
+                  "continuous": continuous, "sweep": body.sweep, "jam_mode": jam_mode.upper(),
+                  "profile": body.profile},
+            actor=user["email"],
+        )
+        await ws_manager.broadcast_json({"type": "jam_status", "request_id": request_id, "status": "AWAITING_ACK"})
+
+        # ---- Honest "no jam TX bridge subscribed" signal (false-green hardening) --
+        # Same rationale as /payloads/deploy: the AWAITING_ACK -> jam_ack ->
+        # JAM_ACTIVE/JAM_COMPLETE (or lazy TX_TIMEOUT) state machine already prevents
+        # a silent false success, and this neither gates the request nor changes the
+        # status/HTTP code. It only lets the console warn AT FIRE TIME that no
+        # cema-jam-bridge is subscribed to actually radiate — instead of the request
+        # looking "in flight" until the timeout. has_tx_consumer('jam') is true only
+        # when a real jam bridge advertised itself (not merely when a browser is on
+        # the same WS).
+        tx_bridge_subscribed = ws_manager.has_tx_consumer("jam")
+        if not tx_bridge_subscribed:
+            await log_event(
+                "JAM",
+                f"WARNING: NO jam TX bridge subscribed — jam request {request_id} will not "
+                f"radiate and will TX_TIMEOUT. Start cema-jam-bridge on the transmit host "
+                f"before engaging.",
+                meta={"request_id": request_id, "tx_bridge_subscribed": False},
+                actor="SYSTEM",
+            )
+
+        return {
+            "request_id": request_id,
+            "status": "AWAITING_ACK",
+            "freq_mhz": freq_mhz,
+            "bandwidth_khz": body.bandwidth_khz,
+            "duration_s": duration_s,       # null => continuous (runs until stopped)
+            "continuous": continuous,
+            "sweep": body.sweep,
+            "freq_start_mhz": body.freq_start_mhz,
+            "freq_stop_mhz": body.freq_stop_mhz,
+            "tx_gain": body.tx_gain,
+            "jam_mode": jam_mode,  # which jammer fired: "meghdut" | "operator"
+            "profile": body.profile,  # which power mode radiated: "max" | "flat" | "external_pa"
+            # Additive, informational (never changes status/HTTP code): False means
+            # "nothing will radiate — no jam bridge subscribed". Console warns on it.
+            "tx_bridge_subscribed": tx_bridge_subscribed,
+        }
+    elif effect == "mavlink_sdr_inject":
+        _consume_arm_token(body.arm_token, effect="mavlink_sdr_inject",
+                           target_detection_id=body.target_detection_id)  # F3: effect+target bound
+        _consume_mavlink_sdr_inject_confirm_token(body.mavlink_sdr_inject_confirm_token)
+
+        detection = await db.detections.find_one({"id": body.target_detection_id})
+        if not detection:
+            raise HTTPException(404, "Target detection not found")
+
+        is_friendly = (
+            detection.get("iff_verified")
+            or detection.get("threat_level") == "FRIENDLY (IFF verified)"
+        )
+        # Friendly-fire interlock: a non-friendly must be an authorized target; a
+        # CONFIRMED-FRIENDLY is exempt from this routine check because its ONLY
+        # licence is the single-use commander friendly-fire ack enforced (consumed +
+        # loudly audited) in _enforce_fire_time_iff just below — so a friendly with
+        # no ack still cannot fire. Identical posture to /payloads/deploy.
+        if not is_friendly and not detection.get("authorized_target"):
+            raise HTTPException(
+                403,
+                "Target not authorized — friendly-fire interlock: "
+                "POST /api/detections/{id}/authorize-target first.",
+            )
+        # Fire-time IFF re-check (fratricide interlock). For a CONFIRMED-FRIENDLY
+        # this is the SOLE authorization gate and requires the single-use,
+        # target-bound commander friendly-fire ack from this request (consumed here).
+        await _enforce_fire_time_iff(detection, user, context="SDR MAVLink inject",
+                                     friendly_fire_ack=body.iff_friendly_fire_ack)
+
+        target_sys = detection.get("system_id", 1)
+        target_comp = detection.get("component_id", 1)
+        # A target_system of 0 in a MAVLink command is a BROADCAST to every craft in
+        # range — it defeats the target-bound arm-token + IFF interlocks above.
+        # Refuse before building/sending any frame (mirrors /payloads/deploy F-4).
+        if target_sys in (0, None):
+            raise HTTPException(
+                422,
+                "Refusing targeted SDR inject: target detection has system_id 0/None, which in "
+                "MAVLink broadcasts the command to ALL craft in range and defeats the "
+                "target-bound gates. Re-detect the craft with a concrete system id.",
+            )
+
+        # HONESTY GATE: SDR MAVLink injection is inapplicable to an encrypted/FHSS
+        # link (there is no unauthenticated MAVLink to inject into), and an
+        # unknown/empty link fails closed unless the operator attests it is legacy
+        # MAVLink. Same single-source-of-truth classifier the paired takeover uses.
+        proto = detection.get("protocol")
+        if not _codec_link_is_overridable(proto, legacy_attested=body.target_link_legacy_mavlink):
+            cls = classify_override_link(proto)
+            if cls == "encrypted":
+                reason = (
+                    f"target link '{proto}' is encrypted/frequency-hopping. SDR MAVLink "
+                    "injection cannot inject into it (no unauthenticated MAVLink; a "
+                    "fixed-frequency burst does not follow an FHSS hop pattern) — the defeat "
+                    "for such a link is JAMMING, not injection. Refusing to transmit uselessly."
+                )
+            else:  # unknown / empty, and no legacy attestation
+                reason = (
+                    f"target link protocol '{proto}' is unknown/unrecognized and the operator "
+                    "did not attest it is legacy MAVLink (target_link_legacy_mavlink=true). For "
+                    "an SDR MAVLink injection an unknown link type fails closed — refusing to "
+                    "transmit."
+                )
+            await log_event(
+                "MAVLINK_SDR_INJECT",
+                f"SDR MAVLink inject NOT APPLICABLE against {detection.get('callsign','?')} "
+                f"— {reason} No RF transmitted.",
+                meta={"target_detection_id": body.target_detection_id, "protocol": proto,
+                      "classification": cls, "legacy_attested": body.target_link_legacy_mavlink,
+                      "command": body.command, "not_applicable": True},
+                actor=user["email"],
+            )
+            raise HTTPException(422, f"SDR MAVLink inject not applicable: {reason}")
+
+        # Backend-side range-authorization gate (effect=mavlink_sdr_inject). This is
+        # a SEPARATE lease from effect=mavlink / effect=jam — arming those does NOT
+        # arm this (same principle as gnss_spoof). Two-sided gate: this 409 plus the
+        # field bridge's own live poll as defense in depth.
+        await _require_range_authorized("mavlink_sdr_inject", user["email"])
+
+        # Build the byte-accurate frame for the audit record (the field bridge
+        # rebuilds identical bytes via sdr_mavlink_inject.py before modulating).
+        builder = MAVLINK_SDR_INJECT_COMMAND_BUILDERS[body.command]
+        frame = builder(target_sys, target_comp, 0)
+
+        request_id = str(uuid.uuid4())
+        _pending_mavlink_inject[request_id] = {
+            "ts": datetime.now(timezone.utc),
+            "status": "AWAITING_ACK",
+            "command": body.command,
+            "target_detection_id": body.target_detection_id,
+            "target_system": target_sys,
+            "center_freq_mhz": body.center_freq_mhz,
+            "air_rate_bps": body.air_rate_bps,
+            "repeat": body.repeat,
+            "continuous": body.continuous,
+            "tx_gain": body.tx_gain,
+            "actor": user["email"],
+        }
+
+        await log_event(
+            "MAVLINK_SDR_INJECT",
+            f"Requested SDR MAVLink inject [{body.command.upper()}] over the air at "
+            f"{body.center_freq_mhz} MHz (air rate {body.air_rate_bps:.0f} bps, "
+            f"repeat={body.repeat}, gain={body.tx_gain}) against "
+            f"{detection.get('callsign','?')} (sys {target_sys}) — GFSK modulation of a "
+            f"byte-accurate {body.command} COMMAND_LONG onto baseband IQ, no pairing. "
+            f"Awaiting bridge TX confirmation (request {request_id})",
+            # Audited DISTINCTLY (kind MAVLINK_SDR_INJECT) with the command type in meta.
+            meta={"request_id": request_id, "command": body.command,
+                  "target_detection_id": body.target_detection_id, "target_system": target_sys,
+                  "center_freq_mhz": body.center_freq_mhz, "air_rate_bps": body.air_rate_bps,
+                  "deviation_hz": body.deviation_hz, "bt": body.bt, "bit_order": body.bit_order,
+                  "preamble_hex": body.preamble_hex.upper(), "sync_word_hex": body.sync_word_hex.upper(),
+                  "fec": body.fec, "repeat": body.repeat, "tx_gain": body.tx_gain,
+                  "frame_hex": frame.hex().upper(), "decoded": describe_packet(frame)},
+            actor=user["email"],
+        )
+
+        await ws_manager.broadcast_json({
+            "type": "mavlink_inject_request",
+            "request_id": request_id,
+            "command": body.command,
+            "target_system": target_sys,
+            "target_component": target_comp,
+            "center_freq_mhz": body.center_freq_mhz,
+            "air_rate_bps": body.air_rate_bps,
+            "deviation_hz": body.deviation_hz,
+            "bt": body.bt,
+            "bit_order": body.bit_order,
+            "preamble_hex": body.preamble_hex,
+            "sync_word_hex": body.sync_word_hex,
+            "fec": body.fec,
+            "repeat": body.repeat,
+            "continuous": body.continuous,
+            "tx_gain": body.tx_gain,
+            # Forwarded AFTER being consumed above — same convention as the
+            # jam_request/gnss_spoof_request confirm-token forwarding. Its presence
+            # is the bridge's evidence a real UI confirmation happened, not a live
+            # credential the bridge validates against the backend.
+            "mavlink_sdr_inject_confirm_token": body.mavlink_sdr_inject_confirm_token,
+            "actor": user["email"],
+        })
+        await ws_manager.broadcast_json({"type": "mavlink_inject_status", "request_id": request_id,
+                                         "status": "AWAITING_ACK"})
+
+        # Honest "no TX bridge subscribed" signal (false-green hardening) — the
+        # AWAITING_ACK -> mavlink_inject_ack -> ACTIVE/COMPLETE (or lazy TX_TIMEOUT)
+        # machinery already prevents a silent false success; this neither gates nor
+        # changes the status/HTTP code. It only lets the console warn AT FIRE TIME
+        # that no sdr-mavlink bridge is subscribed to actually radiate.
+        tx_bridge_subscribed = ws_manager.has_tx_consumer("mavlink_sdr_inject")
+        if not tx_bridge_subscribed:
+            await log_event(
+                "MAVLINK_SDR_INJECT",
+                f"WARNING: NO SDR-MAVLink-inject TX bridge subscribed — request {request_id} "
+                f"will not radiate and will TX_TIMEOUT. Start cema-sdr-mavlink-bridge on the "
+                f"transmit host (bring TX online) before engaging.",
+                meta={"request_id": request_id, "tx_bridge_subscribed": False},
+                actor="SYSTEM",
+            )
+
+        return {
+            "request_id": request_id,
+            "status": "AWAITING_ACK",
+            "command": body.command,
+            "target_system": target_sys,
+            "center_freq_mhz": body.center_freq_mhz,
+            "air_rate_bps": body.air_rate_bps,
+            "repeat": body.repeat,
+            "tx_gain": body.tx_gain,
+            "tx_bridge_subscribed": tx_bridge_subscribed,
+        }
+    elif effect in ("wifi_deauth", "arsdk_inject"):
+        mode = body.mode
+        effect = _wifi_defeat_effect_for_mode(mode)  # wifi_deauth | arsdk_inject
+
+        _consume_arm_token(body.arm_token, effect=effect,
+                           target_detection_id=body.target_detection_id)  # F3: effect+target bound
+        _consume_wifi_defeat_confirm_token(body.wifi_defeat_confirm_token)
+
+        detection = await db.detections.find_one({"id": body.target_detection_id})
+        if not detection:
+            raise HTTPException(404, "Target detection not found")
+
+        is_friendly = (
+            detection.get("iff_verified")
+            or detection.get("threat_level") == "FRIENDLY (IFF verified)"
+        )
+        # Friendly-fire interlock: a non-friendly must be an authorized target; a
+        # CONFIRMED-FRIENDLY is exempt from this routine check because its ONLY licence
+        # is the single-use commander friendly-fire ack enforced in
+        # _enforce_fire_time_iff just below — a friendly with no ack still cannot fire.
+        # Identical posture to /payloads/deploy and /payloads/mavlink-sdr-inject.
+        if not is_friendly and not detection.get("authorized_target"):
+            raise HTTPException(
+                403,
+                "Target not authorized — friendly-fire interlock: "
+                "POST /api/detections/{id}/authorize-target first.",
+            )
+        # Fire-time IFF re-check (fratricide interlock). For a CONFIRMED-FRIENDLY this
+        # is the SOLE authorization gate and requires the single-use, target-bound
+        # commander friendly-fire ack from this request (consumed here). NEVER deauth a
+        # friendly/registered AP without it.
+        await _enforce_fire_time_iff(detection, user, context=f"Wi-Fi defeat [{mode}]",
+                                     friendly_fire_ack=body.iff_friendly_fire_ack)
+
+        # Backend-side range-authorization gate (effect=wifi_deauth / arsdk_inject).
+        # SEPARATE lease from every other effect. Two-sided gate: this 409 plus the
+        # field bridge's own live poll (Gate A) as defense in depth.
+        await _require_range_authorized(effect, user["email"])
+
+        # HONESTY GATES (fratricide + no-overclaim). Based on the detection's REAL
+        # fields; fail closed where the needed signal is absent for the inject modes.
+        if mode == "deauth":
+            if _wifi_target_has_pmf(detection):
+                reason = (
+                    "target softAP advertises 802.11w / PMF (Protected Management Frames). "
+                    "An 802.11 deauth against a PMF-protected AP is a NO-OP — the management "
+                    "frames are cryptographically protected. Refusing to transmit a useless "
+                    "deauth and claim an effect."
+                )
+                await log_event(
+                    "WIFI_DEFEAT",
+                    f"Wi-Fi deauth NOT APPLICABLE against {detection.get('callsign','?')} "
+                    f"— {reason} No RF transmitted.",
+                    meta={"target_detection_id": body.target_detection_id, "mode": mode,
+                          "pmf": True, "not_applicable": True},
+                    actor=user["email"],
+                )
+                raise HTTPException(422, f"Wi-Fi deauth not applicable: {reason}")
+        else:
+            family = "arsdk" if mode in ("arsdk_land", "arsdk_emergency") else "tello"
+            ok, reason = _wifi_inject_target_identity(detection, family)
+            if not ok:
+                await log_event(
+                    "WIFI_DEFEAT",
+                    f"Wi-Fi {family} inject NOT APPLICABLE against {detection.get('callsign','?')} "
+                    f"— {reason} No RF transmitted.",
+                    meta={"target_detection_id": body.target_detection_id, "mode": mode,
+                          "family": family, "encrypted": bool(detection.get("encrypted")),
+                          "control_link_family": detection.get("control_link_family"),
+                          "not_applicable": True},
+                    actor=user["email"],
+                )
+                raise HTTPException(422, f"Wi-Fi {family} inject not applicable: {reason}")
+
+        # softAP BSSID scope resolution (FRATRICIDE-CRITICAL). The wifi_drone candidate
+        # carries the softAP BSSID/channel; resolve from the detection's real fields.
+        # A broadcast/absent BSSID is refused fail-closed BEFORE any forward — the
+        # bridge + primitive also refuse it, but this endpoint must never be the thing
+        # that forwards a band-wide deauth.
+        target_bssid = (detection.get("bssid") or detection.get("softap_bssid")
+                        or detection.get("target_bssid"))
+        if _wifi_bssid_missing_or_broadcast(target_bssid):
+            await log_event(
+                "WIFI_DEFEAT",
+                f"Wi-Fi defeat REFUSED against {detection.get('callsign','?')} — target "
+                f"detection has no concrete softAP BSSID (or a broadcast BSSID {target_bssid!r}). "
+                f"A targeted deauth/inject requires a specific AP BSSID; a broadcast/absent BSSID "
+                f"would deauth every AP on the channel (fratricide) and defeats the target-bound "
+                f"gates. No RF transmitted.",
+                meta={"target_detection_id": body.target_detection_id, "mode": mode,
+                      "target_bssid": target_bssid, "refused": True},
+                actor=user["email"],
+            )
+            raise HTTPException(
+                422,
+                "Refusing Wi-Fi defeat: target detection has no concrete softAP BSSID (or a "
+                "broadcast BSSID), which would deauth every AP on the channel (fratricide) and "
+                "defeats the target-bound gates. Re-detect the drone softAP with a concrete BSSID.",
+            )
+        target_bssid = target_bssid.strip().upper()
+        # softAP host (UDP inject target) + channel, from the detection's real fields.
+        softap = detection.get("softap") or detection.get("softap_ip")
+        channel = detection.get("channel")
+        # deauth is CONTINUOUS by default (count None/<=0 -> until abort/lease-expiry);
+        # a positive count is a bounded burst. Only meaningful for deauth.
+        is_continuous = (mode == "deauth" and not body.count)
+
+        request_id = str(uuid.uuid4())
+        _pending_wifi_defeat[request_id] = {
+            "ts": datetime.now(timezone.utc),
+            "status": "AWAITING_ACK",
+            "mode": mode,
+            "effect": effect,
+            "target_detection_id": body.target_detection_id,
+            "target_bssid": target_bssid,
+            "softap": softap,
+            "channel": channel,
+            "count": body.count,
+            "continuous": is_continuous,
+            "actor": user["email"],
+        }
+
+        await log_event(
+            "WIFI_DEFEAT",
+            f"Requested Wi-Fi defeat [{mode.upper()}] (effect={effect}) against "
+            f"{detection.get('callsign','?')} softAP {target_bssid}"
+            f"{f' ch {channel}' if channel is not None else ''} — "
+            + ("802.11 deauth link-drop (forces the drone's OWN link-loss failsafe; NOT command "
+               "takeover, defeated by PMF/MAC-rand)" if mode == "deauth" else
+               "unauthenticated ARSDK/Tello UDP land/emergency to the OPEN softAP (unencrypted "
+               "Parrot/Tello only; NOT takeover of an arbitrary drone)")
+            + f". Awaiting bridge TX confirmation (request {request_id})",
+            # Audited DISTINCTLY (kind WIFI_DEFEAT) with the mode in meta.
+            meta={"request_id": request_id, "mode": mode, "effect": effect,
+                  "target_detection_id": body.target_detection_id, "target_bssid": target_bssid,
+                  "softap": softap, "channel": channel, "count": body.count,
+                  "continuous": is_continuous},
+            actor=user["email"],
+        )
+
+        await ws_manager.broadcast_json({
+            "type": "wifi_defeat_request",
+            "request_id": request_id,
+            "mode": mode,
+            "target_bssid": target_bssid,
+            "softap": softap,
+            "client_mac": body.client_mac,
+            "channel": channel,
+            "count": body.count,
+            # Forwarded AFTER being consumed above — same convention as the
+            # jam_request / mavlink_inject_request confirm-token forwarding. Its
+            # presence is the bridge's evidence a real UI confirmation happened, not a
+            # live credential the bridge validates against the backend.
+            "wifi_defeat_confirm_token": body.wifi_defeat_confirm_token,
+            "actor": user["email"],
+        })
+        await ws_manager.broadcast_json({"type": "wifi_defeat_status", "request_id": request_id,
+                                         "status": "AWAITING_ACK"})
+
+        # Honest "no TX bridge subscribed" signal (false-green hardening). The
+        # wifi-defeat bridge advertises a SINGLE consumer role "wifi_defeat" for BOTH
+        # effects (see its bridge_hello). This neither gates nor changes the HTTP code;
+        # it only lets the console warn AT FIRE TIME that no wifi-defeat bridge is
+        # subscribed to actually radiate.
+        tx_bridge_subscribed = ws_manager.has_tx_consumer("wifi_defeat")
+        if not tx_bridge_subscribed:
+            await log_event(
+                "WIFI_DEFEAT",
+                f"WARNING: NO wifi-defeat TX bridge subscribed — request {request_id} will not "
+                f"radiate and will TX_TIMEOUT. Start cema-wifi-defeat-bridge on the transmit host "
+                f"(bring TX online, WIFI_TX_IFACE pinned) before engaging.",
+                meta={"request_id": request_id, "tx_bridge_subscribed": False},
+                actor="SYSTEM",
+            )
+
+        return {
+            "request_id": request_id,
+            "status": "AWAITING_ACK",
+            "mode": mode,
+            "effect": effect,
+            "target_bssid": target_bssid,
+            "channel": channel,
+            "continuous": is_continuous,
+            "tx_bridge_subscribed": tx_bridge_subscribed,
+        }
+    raise HTTPException(500, f"_execute_engagement: unknown effect {effect!r}")
+
+
 @api.post("/payloads/jam")
 async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commander)):
     """Request a real, bounded-duration HackRF barrage-jam burst.
@@ -6955,168 +8530,7 @@ async def deploy_jam(body: JamRequestBody, user: Dict = Depends(require_commande
     severity-dependent arm_token) — every jam request needs both, every time.
     """
     _check_tx_not_halted()
-    _consume_arm_token(body.arm_token, effect="jam")  # F3: bound to jam effect
-    _consume_jam_confirm_token(body.jam_confirm_token)
-    # F4: backend-side range-authorization gate (jam effect lease) — no longer
-    # relying solely on the field-bridge's own poll at TX time.
-    await _require_range_authorized("jam", user["email"])
-
-    # jam_mode routing (NOT a new authz path — every gate above already ran for
-    # both modes). Operator mode is band-fixed to the operator's own presets and
-    # rejects an arbitrary freq_mhz / the GNSS bands its flowgraph doesn't cover.
-    jam_mode = body.jam_mode
-    if jam_mode == "operator":
-        if body.sweep:
-            raise HTTPException(400, "Operator Jam mode is band-fixed and cannot sweep — the "
-                                     "operator's flowgraph transmits at one center. Use "
-                                     "jam_mode=meghdut for a swept barrage.")
-        if body.freq_mhz is not None:
-            raise HTTPException(400, "Operator Jam mode is band-fixed — omit `freq_mhz` and "
-                                     "select one of its supported bands (433|915|2g4|5g8).")
-        if body.band not in OPERATOR_JAM_BANDS:
-            raise HTTPException(400, "Operator Jam mode supports only bands 433|915|2g4|5g8 "
-                                     "(its per-band callers cover 435/915/2450/5800 MHz).")
-
-    # Swept-barrage requires an explicit band span; a single-center jam requires
-    # a resolvable center frequency.
-    if body.sweep:
-        if body.freq_start_mhz is None or body.freq_stop_mhz is None:
-            raise HTTPException(400, "Swept barrage requires `freq_start_mhz` and `freq_stop_mhz` "
-                                     "(e.g. 2400 and 2483.5 for the 2.4GHz ISM hop band).")
-        if body.freq_stop_mhz <= body.freq_start_mhz:
-            raise HTTPException(400, "`freq_stop_mhz` must be greater than `freq_start_mhz`.")
-        # FREQUENCY-SCOPE safety bounds (NOT a timing/effectiveness cap). Keep the
-        # sweep inside the HackRF tunable range and cap the span so a single
-        # request cannot blanket aviation/GNSS/cellular. See MAX_SWEEP_SPAN_MHZ.
-        if (body.freq_start_mhz < HACKRF_MIN_FREQ_MHZ
-                or body.freq_stop_mhz > HACKRF_MAX_FREQ_MHZ):
-            raise HTTPException(400, f"Sweep band must lie within the HackRF tunable range "
-                                     f"[{HACKRF_MIN_FREQ_MHZ:g}, {HACKRF_MAX_FREQ_MHZ:g}] MHz.")
-        if (body.freq_stop_mhz - body.freq_start_mhz) > MAX_SWEEP_SPAN_MHZ:
-            raise HTTPException(400, f"Sweep span must not exceed {MAX_SWEEP_SPAN_MHZ:g} MHz "
-                                     f"(frequency-scope safety bound — covers any single drone "
-                                     f"band; not a timing limit). Requested span "
-                                     f"{body.freq_stop_mhz - body.freq_start_mhz:g} MHz.")
-        if body.step_mhz <= 0:
-            raise HTTPException(400, "`step_mhz` must be > 0.")
-        if body.dwell_ms <= 0:
-            raise HTTPException(400, "`dwell_ms` must be > 0.")
-        freq_mhz = None
-    else:
-        freq_mhz = body.freq_mhz if body.freq_mhz is not None else JAM_BAND_PRESETS_MHZ.get(body.band)
-        if not freq_mhz:
-            raise HTTPException(400, "Provide either `band` (433|915|2g4|bt_2g4|5g8|gps_l1|galileo_e1|beidou_b1|"
-                                      "glonass_l1), an explicit `freq_mhz`, or a `sweep` band span.")
-
-    # NO artificial cap (commander directive): a continuous jam carries
-    # duration_s=None (runs until the operator stops it — always stoppable via
-    # Stand Down / EMERGENCY ABORT / tx_halt); otherwise the operator-set
-    # bounded window is honored verbatim.
-    continuous = bool(body.continuous) or float(body.duration_s) <= 0.0
-    duration_s = None if continuous else float(body.duration_s)
-    # Human-readable duration for logs/records (JSON-safe: None -> "continuous").
-    duration_desc = "continuous" if duration_s is None else f"{duration_s}s"
-
-    request_id = str(uuid.uuid4())
-
-    if body.band in JAM_GNSS_BANDS and freq_mhz is not None:
-        # Logging only — NOT an additional gate. The extra GNSS-denial-radius
-        # warning is surfaced to the operator in the SAME SafetyGate confirm
-        # flow (frontend/src/pages/Jamming.jsx), before arm_token/
-        # jam_confirm_token were ever minted for this request.
-        logger.warning(
-            "GNSS-target jam request %s: band=%s freq=%.3fMHz — GNSS denial has a "
-            "proportionally larger effective radius than comms jamming at the same "
-            "TX power (GPS-band receive levels are ~-130dBm).", request_id, body.band, freq_mhz,
-        )
-    # Common jam parameters, shared by the pending record + the WS broadcast so
-    # the bridge sees exactly what is logged/tracked. continuous / sweep drive
-    # the field bridge (hackrf_jam.transmit_burst continuous / transmit_sweep).
-    jam_fields = {
-        "band": body.band,
-        "freq_mhz": freq_mhz,
-        "bandwidth_khz": body.bandwidth_khz,
-        "duration_s": duration_s,          # None => continuous (JSON null)
-        "continuous": continuous,
-        "sweep": body.sweep,
-        "freq_start_mhz": body.freq_start_mhz,
-        "freq_stop_mhz": body.freq_stop_mhz,
-        "step_mhz": body.step_mhz,
-        "dwell_ms": body.dwell_ms,
-        "tx_gain": body.tx_gain,
-        "jam_mode": jam_mode,  # surfaced in GET /jam/status so the UI shows which jammer fired
-    }
-    _pending_jam[request_id] = {
-        "ts": datetime.now(timezone.utc),
-        "status": "AWAITING_ACK",
-        **jam_fields,
-        "actor": user["email"],
-    }
-
-    await ws_manager.broadcast_json({
-        "type": "jam_request",
-        "request_id": request_id,
-        **jam_fields,
-        # Routes the request to the correct bridge: jam_bridge.py (meghdut)
-        # vs operator_jam_bridge.py (operator). Each ignores the other's mode
-        # so the two bridges never double-fire on this shared WS channel.
-        # Forwarded AFTER being consumed above — its presence here is the
-        # bridge's evidence a real UI confirmation happened, not a live
-        # credential the bridge itself validates against the backend.
-        "jam_confirm_token": body.jam_confirm_token,
-        "actor": user["email"],
-    })
-
-    span_desc = (f"SWEEP {body.freq_start_mhz}-{body.freq_stop_mhz} MHz"
-                 if body.sweep else f"{freq_mhz} MHz")
-    await log_event(
-        "JAM",
-        f"Requested RF jam [{jam_mode.upper()}]: {span_desc}, {body.bandwidth_khz}kHz BW, "
-        f"{duration_desc}, gain={body.tx_gain} — awaiting bridge TX confirmation (request {request_id})",
-        # jam_mode is audited distinctly (OPERATOR vs MEGHDUT) so the mission
-        # log unambiguously records WHICH jammer radiated each burst.
-        meta={"request_id": request_id, "freq_mhz": freq_mhz, "duration_s": duration_s,
-              "continuous": continuous, "sweep": body.sweep, "jam_mode": jam_mode.upper()},
-        actor=user["email"],
-    )
-    await ws_manager.broadcast_json({"type": "jam_status", "request_id": request_id, "status": "AWAITING_ACK"})
-
-    # ---- Honest "no jam TX bridge subscribed" signal (false-green hardening) --
-    # Same rationale as /payloads/deploy: the AWAITING_ACK -> jam_ack ->
-    # JAM_ACTIVE/JAM_COMPLETE (or lazy TX_TIMEOUT) state machine already prevents
-    # a silent false success, and this neither gates the request nor changes the
-    # status/HTTP code. It only lets the console warn AT FIRE TIME that no
-    # cema-jam-bridge is subscribed to actually radiate — instead of the request
-    # looking "in flight" until the timeout. has_tx_consumer('jam') is true only
-    # when a real jam bridge advertised itself (not merely when a browser is on
-    # the same WS).
-    tx_bridge_subscribed = ws_manager.has_tx_consumer("jam")
-    if not tx_bridge_subscribed:
-        await log_event(
-            "JAM",
-            f"WARNING: NO jam TX bridge subscribed — jam request {request_id} will not "
-            f"radiate and will TX_TIMEOUT. Start cema-jam-bridge on the transmit host "
-            f"before engaging.",
-            meta={"request_id": request_id, "tx_bridge_subscribed": False},
-            actor="SYSTEM",
-        )
-
-    return {
-        "request_id": request_id,
-        "status": "AWAITING_ACK",
-        "freq_mhz": freq_mhz,
-        "bandwidth_khz": body.bandwidth_khz,
-        "duration_s": duration_s,       # null => continuous (runs until stopped)
-        "continuous": continuous,
-        "sweep": body.sweep,
-        "freq_start_mhz": body.freq_start_mhz,
-        "freq_stop_mhz": body.freq_stop_mhz,
-        "tx_gain": body.tx_gain,
-        "jam_mode": jam_mode,  # which jammer fired: "meghdut" | "operator"
-        # Additive, informational (never changes status/HTTP code): False means
-        # "nothing will radiate — no jam bridge subscribed". Console warns on it.
-        "tx_bridge_subscribed": tx_bridge_subscribed,
-    }
+    return await _execute_engagement("jam", body, user)
 
 
 @api.get("/jam/status")
@@ -7354,179 +8768,7 @@ async def deploy_mavlink_sdr_inject(body: MavlinkSdrInjectBody,
     None of these replaces any other — removing any one is a regression.
     """
     _check_tx_not_halted()
-    _consume_arm_token(body.arm_token, effect="mavlink_sdr_inject",
-                       target_detection_id=body.target_detection_id)  # F3: effect+target bound
-    _consume_mavlink_sdr_inject_confirm_token(body.mavlink_sdr_inject_confirm_token)
-
-    detection = await db.detections.find_one({"id": body.target_detection_id})
-    if not detection:
-        raise HTTPException(404, "Target detection not found")
-
-    is_friendly = (
-        detection.get("iff_verified")
-        or detection.get("threat_level") == "FRIENDLY (IFF verified)"
-    )
-    # Friendly-fire interlock: a non-friendly must be an authorized target; a
-    # CONFIRMED-FRIENDLY is exempt from this routine check because its ONLY
-    # licence is the single-use commander friendly-fire ack enforced (consumed +
-    # loudly audited) in _enforce_fire_time_iff just below — so a friendly with
-    # no ack still cannot fire. Identical posture to /payloads/deploy.
-    if not is_friendly and not detection.get("authorized_target"):
-        raise HTTPException(
-            403,
-            "Target not authorized — friendly-fire interlock: "
-            "POST /api/detections/{id}/authorize-target first.",
-        )
-    # Fire-time IFF re-check (fratricide interlock). For a CONFIRMED-FRIENDLY
-    # this is the SOLE authorization gate and requires the single-use,
-    # target-bound commander friendly-fire ack from this request (consumed here).
-    await _enforce_fire_time_iff(detection, user, context="SDR MAVLink inject",
-                                 friendly_fire_ack=body.iff_friendly_fire_ack)
-
-    target_sys = detection.get("system_id", 1)
-    target_comp = detection.get("component_id", 1)
-    # A target_system of 0 in a MAVLink command is a BROADCAST to every craft in
-    # range — it defeats the target-bound arm-token + IFF interlocks above.
-    # Refuse before building/sending any frame (mirrors /payloads/deploy F-4).
-    if target_sys in (0, None):
-        raise HTTPException(
-            422,
-            "Refusing targeted SDR inject: target detection has system_id 0/None, which in "
-            "MAVLink broadcasts the command to ALL craft in range and defeats the "
-            "target-bound gates. Re-detect the craft with a concrete system id.",
-        )
-
-    # HONESTY GATE: SDR MAVLink injection is inapplicable to an encrypted/FHSS
-    # link (there is no unauthenticated MAVLink to inject into), and an
-    # unknown/empty link fails closed unless the operator attests it is legacy
-    # MAVLink. Same single-source-of-truth classifier the paired takeover uses.
-    proto = detection.get("protocol")
-    if not _codec_link_is_overridable(proto, legacy_attested=body.target_link_legacy_mavlink):
-        cls = classify_override_link(proto)
-        if cls == "encrypted":
-            reason = (
-                f"target link '{proto}' is encrypted/frequency-hopping. SDR MAVLink "
-                "injection cannot inject into it (no unauthenticated MAVLink; a "
-                "fixed-frequency burst does not follow an FHSS hop pattern) — the defeat "
-                "for such a link is JAMMING, not injection. Refusing to transmit uselessly."
-            )
-        else:  # unknown / empty, and no legacy attestation
-            reason = (
-                f"target link protocol '{proto}' is unknown/unrecognized and the operator "
-                "did not attest it is legacy MAVLink (target_link_legacy_mavlink=true). For "
-                "an SDR MAVLink injection an unknown link type fails closed — refusing to "
-                "transmit."
-            )
-        await log_event(
-            "MAVLINK_SDR_INJECT",
-            f"SDR MAVLink inject NOT APPLICABLE against {detection.get('callsign','?')} "
-            f"— {reason} No RF transmitted.",
-            meta={"target_detection_id": body.target_detection_id, "protocol": proto,
-                  "classification": cls, "legacy_attested": body.target_link_legacy_mavlink,
-                  "command": body.command, "not_applicable": True},
-            actor=user["email"],
-        )
-        raise HTTPException(422, f"SDR MAVLink inject not applicable: {reason}")
-
-    # Backend-side range-authorization gate (effect=mavlink_sdr_inject). This is
-    # a SEPARATE lease from effect=mavlink / effect=jam — arming those does NOT
-    # arm this (same principle as gnss_spoof). Two-sided gate: this 409 plus the
-    # field bridge's own live poll as defense in depth.
-    await _require_range_authorized("mavlink_sdr_inject", user["email"])
-
-    # Build the byte-accurate frame for the audit record (the field bridge
-    # rebuilds identical bytes via sdr_mavlink_inject.py before modulating).
-    builder = MAVLINK_SDR_INJECT_COMMAND_BUILDERS[body.command]
-    frame = builder(target_sys, target_comp, 0)
-
-    request_id = str(uuid.uuid4())
-    _pending_mavlink_inject[request_id] = {
-        "ts": datetime.now(timezone.utc),
-        "status": "AWAITING_ACK",
-        "command": body.command,
-        "target_detection_id": body.target_detection_id,
-        "target_system": target_sys,
-        "center_freq_mhz": body.center_freq_mhz,
-        "air_rate_bps": body.air_rate_bps,
-        "repeat": body.repeat,
-        "continuous": body.continuous,
-        "tx_gain": body.tx_gain,
-        "actor": user["email"],
-    }
-
-    await log_event(
-        "MAVLINK_SDR_INJECT",
-        f"Requested SDR MAVLink inject [{body.command.upper()}] over the air at "
-        f"{body.center_freq_mhz} MHz (air rate {body.air_rate_bps:.0f} bps, "
-        f"repeat={body.repeat}, gain={body.tx_gain}) against "
-        f"{detection.get('callsign','?')} (sys {target_sys}) — GFSK modulation of a "
-        f"byte-accurate {body.command} COMMAND_LONG onto baseband IQ, no pairing. "
-        f"Awaiting bridge TX confirmation (request {request_id})",
-        # Audited DISTINCTLY (kind MAVLINK_SDR_INJECT) with the command type in meta.
-        meta={"request_id": request_id, "command": body.command,
-              "target_detection_id": body.target_detection_id, "target_system": target_sys,
-              "center_freq_mhz": body.center_freq_mhz, "air_rate_bps": body.air_rate_bps,
-              "deviation_hz": body.deviation_hz, "bt": body.bt, "bit_order": body.bit_order,
-              "preamble_hex": body.preamble_hex.upper(), "sync_word_hex": body.sync_word_hex.upper(),
-              "fec": body.fec, "repeat": body.repeat, "tx_gain": body.tx_gain,
-              "frame_hex": frame.hex().upper(), "decoded": describe_packet(frame)},
-        actor=user["email"],
-    )
-
-    await ws_manager.broadcast_json({
-        "type": "mavlink_inject_request",
-        "request_id": request_id,
-        "command": body.command,
-        "target_system": target_sys,
-        "target_component": target_comp,
-        "center_freq_mhz": body.center_freq_mhz,
-        "air_rate_bps": body.air_rate_bps,
-        "deviation_hz": body.deviation_hz,
-        "bt": body.bt,
-        "bit_order": body.bit_order,
-        "preamble_hex": body.preamble_hex,
-        "sync_word_hex": body.sync_word_hex,
-        "fec": body.fec,
-        "repeat": body.repeat,
-        "continuous": body.continuous,
-        "tx_gain": body.tx_gain,
-        # Forwarded AFTER being consumed above — same convention as the
-        # jam_request/gnss_spoof_request confirm-token forwarding. Its presence
-        # is the bridge's evidence a real UI confirmation happened, not a live
-        # credential the bridge validates against the backend.
-        "mavlink_sdr_inject_confirm_token": body.mavlink_sdr_inject_confirm_token,
-        "actor": user["email"],
-    })
-    await ws_manager.broadcast_json({"type": "mavlink_inject_status", "request_id": request_id,
-                                     "status": "AWAITING_ACK"})
-
-    # Honest "no TX bridge subscribed" signal (false-green hardening) — the
-    # AWAITING_ACK -> mavlink_inject_ack -> ACTIVE/COMPLETE (or lazy TX_TIMEOUT)
-    # machinery already prevents a silent false success; this neither gates nor
-    # changes the status/HTTP code. It only lets the console warn AT FIRE TIME
-    # that no sdr-mavlink bridge is subscribed to actually radiate.
-    tx_bridge_subscribed = ws_manager.has_tx_consumer("mavlink_sdr_inject")
-    if not tx_bridge_subscribed:
-        await log_event(
-            "MAVLINK_SDR_INJECT",
-            f"WARNING: NO SDR-MAVLink-inject TX bridge subscribed — request {request_id} "
-            f"will not radiate and will TX_TIMEOUT. Start cema-sdr-mavlink-bridge on the "
-            f"transmit host (bring TX online) before engaging.",
-            meta={"request_id": request_id, "tx_bridge_subscribed": False},
-            actor="SYSTEM",
-        )
-
-    return {
-        "request_id": request_id,
-        "status": "AWAITING_ACK",
-        "command": body.command,
-        "target_system": target_sys,
-        "center_freq_mhz": body.center_freq_mhz,
-        "air_rate_bps": body.air_rate_bps,
-        "repeat": body.repeat,
-        "tx_gain": body.tx_gain,
-        "tx_bridge_subscribed": tx_bridge_subscribed,
-    }
+    return await _execute_engagement("mavlink_sdr_inject", body, user)
 
 
 @api.get("/mavlink-sdr-inject/status")
@@ -7700,191 +8942,7 @@ async def deploy_wifi_defeat(body: WifiDefeatBody,
          fail-closed) before any frame is forwarded (FRATRICIDE-CRITICAL).
     """
     _check_tx_not_halted()
-
-    mode = body.mode
-    effect = _wifi_defeat_effect_for_mode(mode)  # wifi_deauth | arsdk_inject
-
-    _consume_arm_token(body.arm_token, effect=effect,
-                       target_detection_id=body.target_detection_id)  # F3: effect+target bound
-    _consume_wifi_defeat_confirm_token(body.wifi_defeat_confirm_token)
-
-    detection = await db.detections.find_one({"id": body.target_detection_id})
-    if not detection:
-        raise HTTPException(404, "Target detection not found")
-
-    is_friendly = (
-        detection.get("iff_verified")
-        or detection.get("threat_level") == "FRIENDLY (IFF verified)"
-    )
-    # Friendly-fire interlock: a non-friendly must be an authorized target; a
-    # CONFIRMED-FRIENDLY is exempt from this routine check because its ONLY licence
-    # is the single-use commander friendly-fire ack enforced in
-    # _enforce_fire_time_iff just below — a friendly with no ack still cannot fire.
-    # Identical posture to /payloads/deploy and /payloads/mavlink-sdr-inject.
-    if not is_friendly and not detection.get("authorized_target"):
-        raise HTTPException(
-            403,
-            "Target not authorized — friendly-fire interlock: "
-            "POST /api/detections/{id}/authorize-target first.",
-        )
-    # Fire-time IFF re-check (fratricide interlock). For a CONFIRMED-FRIENDLY this
-    # is the SOLE authorization gate and requires the single-use, target-bound
-    # commander friendly-fire ack from this request (consumed here). NEVER deauth a
-    # friendly/registered AP without it.
-    await _enforce_fire_time_iff(detection, user, context=f"Wi-Fi defeat [{mode}]",
-                                 friendly_fire_ack=body.iff_friendly_fire_ack)
-
-    # Backend-side range-authorization gate (effect=wifi_deauth / arsdk_inject).
-    # SEPARATE lease from every other effect. Two-sided gate: this 409 plus the
-    # field bridge's own live poll (Gate A) as defense in depth.
-    await _require_range_authorized(effect, user["email"])
-
-    # HONESTY GATES (fratricide + no-overclaim). Based on the detection's REAL
-    # fields; fail closed where the needed signal is absent for the inject modes.
-    if mode == "deauth":
-        if _wifi_target_has_pmf(detection):
-            reason = (
-                "target softAP advertises 802.11w / PMF (Protected Management Frames). "
-                "An 802.11 deauth against a PMF-protected AP is a NO-OP — the management "
-                "frames are cryptographically protected. Refusing to transmit a useless "
-                "deauth and claim an effect."
-            )
-            await log_event(
-                "WIFI_DEFEAT",
-                f"Wi-Fi deauth NOT APPLICABLE against {detection.get('callsign','?')} "
-                f"— {reason} No RF transmitted.",
-                meta={"target_detection_id": body.target_detection_id, "mode": mode,
-                      "pmf": True, "not_applicable": True},
-                actor=user["email"],
-            )
-            raise HTTPException(422, f"Wi-Fi deauth not applicable: {reason}")
-    else:
-        family = "arsdk" if mode in ("arsdk_land", "arsdk_emergency") else "tello"
-        ok, reason = _wifi_inject_target_identity(detection, family)
-        if not ok:
-            await log_event(
-                "WIFI_DEFEAT",
-                f"Wi-Fi {family} inject NOT APPLICABLE against {detection.get('callsign','?')} "
-                f"— {reason} No RF transmitted.",
-                meta={"target_detection_id": body.target_detection_id, "mode": mode,
-                      "family": family, "encrypted": bool(detection.get("encrypted")),
-                      "control_link_family": detection.get("control_link_family"),
-                      "not_applicable": True},
-                actor=user["email"],
-            )
-            raise HTTPException(422, f"Wi-Fi {family} inject not applicable: {reason}")
-
-    # softAP BSSID scope resolution (FRATRICIDE-CRITICAL). The wifi_drone candidate
-    # carries the softAP BSSID/channel; resolve from the detection's real fields.
-    # A broadcast/absent BSSID is refused fail-closed BEFORE any forward — the
-    # bridge + primitive also refuse it, but this endpoint must never be the thing
-    # that forwards a band-wide deauth.
-    target_bssid = (detection.get("bssid") or detection.get("softap_bssid")
-                    or detection.get("target_bssid"))
-    if _wifi_bssid_missing_or_broadcast(target_bssid):
-        await log_event(
-            "WIFI_DEFEAT",
-            f"Wi-Fi defeat REFUSED against {detection.get('callsign','?')} — target "
-            f"detection has no concrete softAP BSSID (or a broadcast BSSID {target_bssid!r}). "
-            f"A targeted deauth/inject requires a specific AP BSSID; a broadcast/absent BSSID "
-            f"would deauth every AP on the channel (fratricide) and defeats the target-bound "
-            f"gates. No RF transmitted.",
-            meta={"target_detection_id": body.target_detection_id, "mode": mode,
-                  "target_bssid": target_bssid, "refused": True},
-            actor=user["email"],
-        )
-        raise HTTPException(
-            422,
-            "Refusing Wi-Fi defeat: target detection has no concrete softAP BSSID (or a "
-            "broadcast BSSID), which would deauth every AP on the channel (fratricide) and "
-            "defeats the target-bound gates. Re-detect the drone softAP with a concrete BSSID.",
-        )
-    target_bssid = target_bssid.strip().upper()
-    # softAP host (UDP inject target) + channel, from the detection's real fields.
-    softap = detection.get("softap") or detection.get("softap_ip")
-    channel = detection.get("channel")
-    # deauth is CONTINUOUS by default (count None/<=0 -> until abort/lease-expiry);
-    # a positive count is a bounded burst. Only meaningful for deauth.
-    is_continuous = (mode == "deauth" and not body.count)
-
-    request_id = str(uuid.uuid4())
-    _pending_wifi_defeat[request_id] = {
-        "ts": datetime.now(timezone.utc),
-        "status": "AWAITING_ACK",
-        "mode": mode,
-        "effect": effect,
-        "target_detection_id": body.target_detection_id,
-        "target_bssid": target_bssid,
-        "softap": softap,
-        "channel": channel,
-        "count": body.count,
-        "continuous": is_continuous,
-        "actor": user["email"],
-    }
-
-    await log_event(
-        "WIFI_DEFEAT",
-        f"Requested Wi-Fi defeat [{mode.upper()}] (effect={effect}) against "
-        f"{detection.get('callsign','?')} softAP {target_bssid}"
-        f"{f' ch {channel}' if channel is not None else ''} — "
-        + ("802.11 deauth link-drop (forces the drone's OWN link-loss failsafe; NOT command "
-           "takeover, defeated by PMF/MAC-rand)" if mode == "deauth" else
-           "unauthenticated ARSDK/Tello UDP land/emergency to the OPEN softAP (unencrypted "
-           "Parrot/Tello only; NOT takeover of an arbitrary drone)")
-        + f". Awaiting bridge TX confirmation (request {request_id})",
-        # Audited DISTINCTLY (kind WIFI_DEFEAT) with the mode in meta.
-        meta={"request_id": request_id, "mode": mode, "effect": effect,
-              "target_detection_id": body.target_detection_id, "target_bssid": target_bssid,
-              "softap": softap, "channel": channel, "count": body.count,
-              "continuous": is_continuous},
-        actor=user["email"],
-    )
-
-    await ws_manager.broadcast_json({
-        "type": "wifi_defeat_request",
-        "request_id": request_id,
-        "mode": mode,
-        "target_bssid": target_bssid,
-        "softap": softap,
-        "client_mac": body.client_mac,
-        "channel": channel,
-        "count": body.count,
-        # Forwarded AFTER being consumed above — same convention as the
-        # jam_request / mavlink_inject_request confirm-token forwarding. Its
-        # presence is the bridge's evidence a real UI confirmation happened, not a
-        # live credential the bridge validates against the backend.
-        "wifi_defeat_confirm_token": body.wifi_defeat_confirm_token,
-        "actor": user["email"],
-    })
-    await ws_manager.broadcast_json({"type": "wifi_defeat_status", "request_id": request_id,
-                                     "status": "AWAITING_ACK"})
-
-    # Honest "no TX bridge subscribed" signal (false-green hardening). The
-    # wifi-defeat bridge advertises a SINGLE consumer role "wifi_defeat" for BOTH
-    # effects (see its bridge_hello). This neither gates nor changes the HTTP code;
-    # it only lets the console warn AT FIRE TIME that no wifi-defeat bridge is
-    # subscribed to actually radiate.
-    tx_bridge_subscribed = ws_manager.has_tx_consumer("wifi_defeat")
-    if not tx_bridge_subscribed:
-        await log_event(
-            "WIFI_DEFEAT",
-            f"WARNING: NO wifi-defeat TX bridge subscribed — request {request_id} will not "
-            f"radiate and will TX_TIMEOUT. Start cema-wifi-defeat-bridge on the transmit host "
-            f"(bring TX online, WIFI_TX_IFACE pinned) before engaging.",
-            meta={"request_id": request_id, "tx_bridge_subscribed": False},
-            actor="SYSTEM",
-        )
-
-    return {
-        "request_id": request_id,
-        "status": "AWAITING_ACK",
-        "mode": mode,
-        "effect": effect,
-        "target_bssid": target_bssid,
-        "channel": channel,
-        "continuous": is_continuous,
-        "tx_bridge_subscribed": tx_bridge_subscribed,
-    }
+    return await _execute_engagement(_wifi_defeat_effect_for_mode(body.mode), body, user)
 
 
 @api.get("/wifi-defeat/status")
@@ -8000,6 +9058,524 @@ async def set_range_authorization(body: RangeAuthorizationBody, request: Request
     status = _range_auth_status(body.effect)
     await ws_manager.broadcast_json({"type": "range_authorization", **status})
     return status
+
+
+# =====================================================================
+# Routes: WEAPONS-HOT posture + ONE-TAP ENGAGE (Phase 1 — TIGHT only)
+# =====================================================================
+# The posture is the STANDING authorization POST /api/engage draws on; it is an
+# ADDITIONAL required condition, never a replacement for any gate. /api/engage
+# COMPOSES the shared, fully-gated `_execute_engagement` primitive (it does NOT
+# reimplement a parallel fire path): it server-mints single-use, effect+target-
+# bound arm + effect-specific confirm tokens and hands them to the primitive,
+# whose UNCHANGED gate chain (IFF fratricide with friendly_fire_ack=None,
+# range-auth lease, per-target scope, honest AWAITING_ACK/tx_ack dispatch) then
+# runs and consumes them EXACTLY ONCE. There is NO friendly-fire auto-mint path
+# here — the ROE floor refuses a friendly/neutral/unclassified target outright.
+class WeaponsPostureBody(BaseModel):
+    # state=HOLD is the low-friction disarm (no step-up, like range-auth disable).
+    # state=TIGHT is the deliberate arm (full load-bearing gate set below). FREE
+    # is a deferred, separately-gated phase (P3) and is not accepted here.
+    state: str = Field(pattern="^(HOLD|TIGHT)$")
+    # AO = a commander-defined geofence zone id (db.zones). Required to arm.
+    ao: Optional[str] = None
+    # Subset of ENGAGE_COMPOSABLE_EFFECTS the one-tap path may select. Required
+    # non-empty to arm; each is armed as a real range-auth lease via the existing
+    # /range-authorization path.
+    permitted_effects: List[str] = Field(default_factory=list)
+    # Step-up re-auth (required to arm) — verified against the stored hash, so a
+    # stolen JWT alone cannot arm. Not needed to disarm (state=HOLD).
+    password: Optional[str] = None
+    # Deliberate confirm phrase — must EXACTLY equal "WEAPONS <STATE> <AO>".
+    confirm_phrase: Optional[str] = None
+    # AO-level SafetyGate checklist — every WEAPONS_POSTURE_SAFETY_CHECKLIST key
+    # must be acknowledged (truthy). Stored once in the posture's safety_ack.
+    safety_ack: Optional[Dict[str, Any]] = None
+    # Deliberate commander assertion that the IFF / no-strike registry is loaded.
+    # Required True to arm any non-HOLD posture.
+    iff_registry_loaded: bool = False
+
+
+class EngageBody(BaseModel):
+    # WHICH target — the one thing that genuinely needs a human. Hostility, AO
+    # containment, effect selection and every interlock are enforced server-side.
+    target_detection_id: str
+    # The per-target DELIBERATE human intent (the press-and-hold / tap-then-confirm
+    # gesture on the console). Load-bearing: absent/falsey -> refused, never fired.
+    engage_confirm: bool = False
+    # Optional: pick a FEASIBLE failover effector (a recommender effector name as
+    # it appears in the recommendation's recommended_effector/failover_order) in
+    # place of the top recommendation. An infeasible / not-currently-clearable
+    # override is surfaced, never fired.
+    effect_override: Optional[str] = None
+
+
+def _issue_engage_confirm_token(effect: str) -> str:
+    """Mint the MATCHING effect-specific confirm token for a one-tap engage.
+    Each effect maps to exactly its OWN non-interchangeable confirm-token type
+    (cross-effect is impossible — the wrong type is a hard reject inside
+    `_execute_engagement`). gnss/other never reach here (excluded before mint)."""
+    if effect == "jam":
+        return _issue_jam_confirm_token()["jam_confirm_token"]
+    if effect == "mavlink_sdr_inject":
+        return _issue_mavlink_sdr_inject_confirm_token()["mavlink_sdr_inject_confirm_token"]
+    if effect in ("wifi_deauth", "arsdk_inject"):
+        return _issue_wifi_defeat_confirm_token()["wifi_defeat_confirm_token"]
+    raise HTTPException(500, f"_issue_engage_confirm_token: no one-tap confirm token for {effect!r}")
+
+
+def _engage_freq_mhz_from_detection(det: Dict[str, Any]) -> Optional[float]:
+    """The target's control-link centre in MHz from its real center_freq_ghz, or
+    None. A transmit PARAMETER (what to radiate), never an authorization input."""
+    cf = det.get("center_freq_ghz")
+    try:
+        if cf is not None:
+            mhz = float(cf) * 1000.0
+            if mhz > 0:
+                return mhz
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _engage_wifi_mode(det: Dict[str, Any], effect: str) -> str:
+    """Least-escalatory Wi-Fi-defeat mode for the selected effect. deauth for a
+    link-drop; a LAND command (tello_land vs arsdk_land by identified airframe)
+    for the ARSDK/Tello inject. If the airframe is misidentified the primitive's
+    own identity honesty gate refuses it (422) — this never bypasses that gate."""
+    if effect == "wifi_deauth":
+        return "deauth"
+    blob = " ".join(str(det.get(k, "")) for k in (
+        "make", "model", "family", "control_link_family", "ssid", "callsign", "protocol")).lower()
+    return "tello_land" if "tello" in blob else "arsdk_land"
+
+
+def _engage_effect_params(effect: str, det: Dict[str, Any]) -> Dict[str, Any]:
+    """Resolve the effect-specific transmit parameters BEFORE minting tokens (so a
+    parameter we cannot honestly resolve surfaces without leaving live tokens).
+    These are WHAT-to-transmit params only; every gate lives in the primitive."""
+    if effect == "jam":
+        freq = _engage_freq_mhz_from_detection(det)
+        if freq is None:
+            raise HTTPException(409, detail={
+                "error": "Cannot determine the target's control-link frequency to jam "
+                         "(no center_freq_ghz on the detection). Nothing fired.",
+                "target_detection_id": det.get("id")})
+        return {"freq_mhz": freq}
+    if effect == "mavlink_sdr_inject":
+        params: Dict[str, Any] = {"command": "force_land"}  # least-escalatory
+        freq = _engage_freq_mhz_from_detection(det)
+        if freq is not None and 0 < freq < 7250:
+            params["center_freq_mhz"] = freq
+        return params
+    if effect in ("wifi_deauth", "arsdk_inject"):
+        return {"mode": _engage_wifi_mode(det, effect)}
+    raise HTTPException(500, f"_engage_effect_params: unknown effect {effect!r}")
+
+
+def _build_engage_body(effect: str, target: str, arm_token: str,
+                       confirm_token: str, params: Dict[str, Any]):
+    """Assemble the SAME Pydantic request model the manual /payloads/* path uses,
+    carrying the server-minted tokens, so `_execute_engagement` runs its identical
+    per-effect gate chain and consumes the tokens exactly once."""
+    if effect == "jam":
+        return JamRequestBody(freq_mhz=params["freq_mhz"], arm_token=arm_token,
+                              jam_confirm_token=confirm_token)
+    if effect == "mavlink_sdr_inject":
+        return MavlinkSdrInjectBody(target_detection_id=target, arm_token=arm_token,
+                                    mavlink_sdr_inject_confirm_token=confirm_token, **params)
+    if effect in ("wifi_deauth", "arsdk_inject"):
+        return WifiDefeatBody(target_detection_id=target, arm_token=arm_token,
+                              wifi_defeat_confirm_token=confirm_token, mode=params["mode"])
+    raise HTTPException(500, f"_build_engage_body: unknown effect {effect!r}")
+
+
+@api.get("/weapons-posture")
+async def get_weapons_posture(user: Dict = Depends(require_commander)):
+    """Read the current WEAPONS posture (commander-only — it reveals the standing
+    fire authorization). Runs the lazy TTL expiry first so a stale non-HOLD state
+    is never observed past its TTL."""
+    await _expire_weapons_posture()
+    return _weapons_posture_status()
+
+
+@api.post("/weapons-posture")
+async def set_weapons_posture(body: WeaponsPostureBody, request: Request,
+                              user: Dict = Depends(require_commander)):
+    """Arm (TIGHT) or disarm (HOLD) the WEAPONS-HOT posture.
+
+    HOLD  = low-friction disarm (no step-up, like range-auth disable).
+    TIGHT = the deliberate arm, requiring the FULL load-bearing set: commander +
+            password step-up + confirm phrase "WEAPONS TIGHT <AO>" + the AO
+            SafetyGate checklist acked once + iff_registry_loaded==True + a valid
+            AO zone, and it ARMS the matching per-effect range-auth leases via the
+            EXISTING /range-authorization path (range-auth stays the real gate).
+    FREE is a deferred, separately-gated phase (P3) and is refused here.
+    """
+    await _expire_weapons_posture()
+
+    # ---- HOLD == disarm (low-friction) ----
+    if body.state == "HOLD":
+        await _drop_weapons_posture_to_hold("commander disarm", user["email"],
+                                            kind="WEAPONS_POSTURE_DISARM")
+        return _weapons_posture_status()
+
+    if body.state not in WEAPONS_POSTURE_ARMABLE_STATES:
+        raise HTTPException(
+            400, "state must be HOLD (disarm) or TIGHT — FREE (zone auto-engage) is a "
+                 "deferred, separately-gated phase and cannot be armed here.")
+
+    # ---- Arming a non-HOLD posture: the FULL load-bearing gate set ----
+    ao = (body.ao or "").strip()
+    if not ao:
+        raise HTTPException(400, "ao (area-of-operations geofence zone id) is required to arm.")
+
+    permitted = [e.strip() for e in (body.permitted_effects or []) if e and e.strip()]
+    if not permitted:
+        raise HTTPException(
+            400, f"permitted_effects must be a non-empty subset of {ENGAGE_COMPOSABLE_EFFECTS}.")
+    bad = [e for e in permitted if e not in ENGAGE_COMPOSABLE_EFFECTS]
+    if bad:
+        raise HTTPException(
+            400, f"permitted_effects {bad} are not one-tap-composable — allowed: "
+                 f"{ENGAGE_COMPOSABLE_EFFECTS}. GNSS-deny is never one-tap; use "
+                 "POST /api/payloads/gnss-spoof (deliberate attestation flow).")
+
+    if not body.iff_registry_loaded:
+        raise HTTPException(
+            400, "iff_registry_loaded must be True to arm a non-HOLD posture — the IFF / "
+                 "no-strike registry must be loaded so the fratricide interlock has data.")
+
+    ack = body.safety_ack or {}
+    missing_ack = [k for k in WEAPONS_POSTURE_SAFETY_CHECKLIST if not ack.get(k)]
+    if missing_ack:
+        raise HTTPException(
+            400, f"AO SafetyGate checklist incomplete — unacknowledged item(s): {missing_ack}. "
+                 f"All of {list(WEAPONS_POSTURE_SAFETY_CHECKLIST)} must be acknowledged once.")
+
+    zone = await db.zones.find_one({"id": ao}, {"_id": 0})
+    if not zone:
+        raise HTTPException(
+            404, f"AO zone '{ao}' not found — create/select a valid geofence zone first.")
+
+    expected_phrase = f"WEAPONS {body.state} {ao}"
+    throttle_key = user["email"]
+    source_ip = request.client.host if request.client else None
+
+    # Step-up re-auth (mirrors set_range_authorization): throttle -> password
+    # re-verify -> confirm phrase. A stolen JWT alone is not sufficient here.
+    if _range_auth_locked_out(throttle_key):
+        await log_event(
+            "WEAPONS_POSTURE_ARM_FAILED",
+            f"WEAPONS posture arm for AO={ao} REFUSED: too many recent failed attempts "
+            f"(locked out {RANGE_AUTH_LOCKOUT_WINDOW_S}s)",
+            meta={"ao": ao, "reason": "locked_out", "source_ip": source_ip},
+            actor=user["email"],
+        )
+        raise HTTPException(429, "Too many failed authorization attempts — try again shortly.")
+
+    full_user = await db.users.find_one({"id": user["id"]})
+    if not body.password or not full_user or not verify_password(body.password, full_user["password_hash"]):
+        _record_range_auth_failure(throttle_key)
+        await log_event(
+            "WEAPONS_POSTURE_ARM_FAILED",
+            f"WEAPONS posture arm for AO={ao} REFUSED: bad password (step-up re-verify failed)",
+            meta={"ao": ao, "reason": "bad_password", "source_ip": source_ip},
+            actor=user["email"],
+        )
+        raise HTTPException(401, "Password re-verification failed.")
+
+    if body.confirm_phrase != expected_phrase:
+        _record_range_auth_failure(throttle_key)
+        await log_event(
+            "WEAPONS_POSTURE_ARM_FAILED",
+            f"WEAPONS posture arm for AO={ao} REFUSED: confirm phrase mismatch",
+            meta={"ao": ao, "reason": "bad_confirm_phrase", "source_ip": source_ip},
+            actor=user["email"],
+        )
+        raise HTTPException(400, f'Confirmation phrase must exactly match "{expected_phrase}".')
+
+    # Independent, honest (non-false-green) read of the loaded friendly/no-strike
+    # registry size — recorded in the audit + safety_ack. The per-target IFF
+    # interlock hard-blocks a friendly regardless of this count; the count proves
+    # the commander's iff_registry_loaded assertion is not a bare checkbox.
+    try:
+        iff_registry_count = await db.iff_friendlies.count_documents({})
+    except Exception:
+        iff_registry_count = None
+
+    # ARM the matching per-effect range-auth leases via the EXISTING gated path.
+    # This is NOT a bypass: set_range_authorization re-verifies the SAME password
+    # per lease and range-auth remains the real fire-time gate; the commander's
+    # deliberate "WEAPONS TIGHT <AO>" subsumes range-auth's own confirm phrase.
+    #
+    # Run the lazy range-auth expiry FIRST so a stale-but-still-flagged-enabled
+    # lease reads honestly here — then record ONLY the leases this posture-arm
+    # actually turns ON (a lease the commander already armed independently is left
+    # out, so the HOLD cascade in _drop_weapons_posture_to_hold never disables it).
+    await _expire_range_authorization()
+    leases_armed_by_posture = []
+    for eff in permitted:
+        was_enabled = _range_authorization[eff]["enabled"]
+        await set_range_authorization(
+            RangeAuthorizationBody(effect=eff, enabled=True, password=body.password,
+                                   confirm_phrase=RANGE_AUTH_CONFIRM_PHRASE),
+            request, user,
+        )
+        if not was_enabled:
+            leases_armed_by_posture.append(eff)
+
+    now = datetime.now(timezone.utc)
+    _weapons_posture.update({
+        "state": body.state,
+        "ao": ao,
+        "permitted_effects": permitted,
+        "expires_at": now + timedelta(seconds=WEAPONS_POSTURE_TTL_S),
+        "armed_by": user["email"],
+        "armed_at": now,
+        "safety_ack": {
+            "checklist": list(WEAPONS_POSTURE_SAFETY_CHECKLIST),
+            "acked_by": user["email"],
+            "acked_at": now.isoformat(),
+            "iff_registry_count": iff_registry_count,
+        },
+        "iff_registry_loaded": True,
+        "leases_armed_by_posture": leases_armed_by_posture,
+    })
+    await log_event(
+        "WEAPONS_POSTURE_ARMED",
+        f"WEAPONS {body.state} ARMED over AO={ao} for effects={permitted} "
+        f"(expires in {WEAPONS_POSTURE_TTL_S}s). One-tap POST /api/engage is now LIVE for "
+        f"classified-hostile targets inside the AO. IFF/no-strike registry entries="
+        f"{iff_registry_count}. Every per-shot interlock still runs unchanged.",
+        meta={"state": body.state, "ao": ao, "permitted_effects": permitted,
+              "expires_at": _weapons_posture["expires_at"].isoformat(),
+              "iff_registry_count": iff_registry_count, "source_ip": source_ip,
+              "safety_ack_checklist": list(WEAPONS_POSTURE_SAFETY_CHECKLIST)},
+        actor=user["email"],
+    )
+    await ws_manager.broadcast_json({"type": "weapons_posture", **_weapons_posture_status()})
+    return _weapons_posture_status()
+
+
+@api.post("/weapons-posture/disarm")
+async def disarm_weapons_posture(user: Dict = Depends(require_commander)):
+    """Explicit one-call disarm — drops the posture to HOLD (loudly audited).
+    Equivalent to POST /api/weapons-posture with state=HOLD."""
+    await _drop_weapons_posture_to_hold("commander disarm", user["email"],
+                                        kind="WEAPONS_POSTURE_DISARM")
+    return _weapons_posture_status()
+
+
+@api.post("/engage")
+async def one_tap_engage(body: EngageBody, user: Dict = Depends(require_commander)):
+    """ONE confirmed tap, per target — with a per-target in-flight guard (GAP 1).
+
+    At most one engagement may be in flight per target_detection_id at a time: a
+    double-tap from a laggy UI (or two operators on the same track) that arrives
+    while the first engage is still running is refused here with a clean 409
+    BEFORE any token is minted or dispatched, so "one tap = one shot" holds even
+    under concurrency. The check-and-add is atomic (no await between the membership
+    test and the add), and the id is released on EVERY exit path — success and
+    every refusal/exception alike — via the finally, so the guard cannot leak and
+    a target can always be engaged again once the prior call has returned. All
+    gate enforcement lives in `_one_tap_engage_impl` (unchanged)."""
+    target = body.target_detection_id
+    if target in _engage_in_flight:
+        raise HTTPException(
+            409, "An engagement is already in progress for this target — one tap = one shot. "
+                 "The concurrent request was refused; no second engagement was started.")
+    _engage_in_flight.add(target)
+    try:
+        return await _one_tap_engage_impl(body, user)
+    finally:
+        _engage_in_flight.discard(target)
+
+
+async def _one_tap_engage_impl(body: EngageBody, user: Dict) -> Dict:
+    """ONE confirmed tap, per target. Runs the WHOLE existing gate chain
+    server-side, in this exact order, then COMPOSES `_execute_engagement`:
+
+      a. posture valid/non-expired/state!=HOLD; target position in AO; selected
+         effect in permitted_effects  (else 409, no fire)
+      b. _check_tx_not_halted()       (master kill)
+      c. ROE FLOOR (hard 403): friendly / not-classified-hostile -> REFUSE. NEVER
+         mints a friendly-fire ack (that stays the separate deliberate path).
+      d. effect auto-select via build_effector_recommendations (+ optional
+         FEASIBLE effect_override); NOT_FEASIBLE/UNKNOWN/none-clearable/
+         not-permitted -> surface the verdict, no fire.
+      e. deliberate engage_confirm required (else 422).
+      f. server mint arm token bound {effect,target}.
+      g. server mint the MATCHING effect-specific confirm token.
+      h. _execute_engagement(effect, synthesized-body, user) — its UNCHANGED gate
+         chain (IFF _enforce_fire_time_iff with friendly_fire_ack=None,
+         _require_range_authorized, per-target scope, dispatch) runs and consumes
+         the freshly-minted tokens EXACTLY ONCE.
+    """
+    target = body.target_detection_id
+
+    # ---- a. Posture valid, non-expired, non-HOLD ----
+    await _expire_weapons_posture()
+    posture = _weapons_posture
+    if posture["state"] == "HOLD":
+        raise HTTPException(
+            409, "WEAPONS posture is HOLD — one-tap engage is refused. A commander must arm a "
+                 "TIGHT posture (POST /api/weapons-posture) first.")
+    ao = posture["ao"]
+    permitted = list(posture["permitted_effects"])
+
+    # ---- b. TX not halted (master kill) ----
+    _check_tx_not_halted()
+
+    # ---- c. Load detection + ROE FLOOR ----
+    detection = await db.detections.find_one({"id": target})
+    if not detection:
+        raise HTTPException(404, "Target detection not found")
+    if _detection_is_confirmed_friendly(detection):
+        await log_event(
+            "ENGAGE_REFUSED",
+            f"ONE-TAP ENGAGE REFUSED (ROE floor): {detection.get('callsign','?')} ({target}) is a "
+            f"CONFIRMED-FRIENDLY (IFF-verified) contact. /api/engage never fires on a friendly and "
+            f"mints NO friendly-fire ack.",
+            meta={"target_detection_id": target, "reason": "roe_floor_friendly"},
+            actor=user["email"],
+        )
+        raise HTTPException(
+            403, "ROE FLOOR — one-tap engage refused: target is CONFIRMED-FRIENDLY (IFF-verified). "
+                 "/api/engage never fires on a friendly and mints no friendly-fire ack; a deliberate "
+                 "friendly engagement is a separate commander action "
+                 "(POST /api/detections/{id}/friendly-fire-ack + the manual deploy path).")
+    if not _detection_is_classified_hostile(detection):
+        await log_event(
+            "ENGAGE_REFUSED",
+            f"ONE-TAP ENGAGE REFUSED (ROE floor): {detection.get('callsign','?')} ({target}) is not "
+            f"classified hostile (threat_level={detection.get('threat_level')!r}).",
+            meta={"target_detection_id": target, "reason": "roe_floor_not_hostile",
+                  "threat_level": detection.get("threat_level")},
+            actor=user["email"],
+        )
+        raise HTTPException(
+            403, "ROE FLOOR — one-tap engage refused: target is not classified hostile "
+                 f"(threat_level={detection.get('threat_level')!r}). Neutral / civilian / unknown / "
+                 "unclassified contacts are never a valid one-tap target.")
+
+    # ---- a (cont). Target live position must be inside the authorized AO ----
+    pos = _detection_live_position(detection)
+    if pos is None:
+        raise HTTPException(
+            409, "Target has no live position — cannot confirm it is inside the authorized AO. "
+                 "One-tap engage refused (fail-closed).")
+    zone = await db.zones.find_one({"id": ao}, {"_id": 0})
+    if not zone:
+        raise HTTPException(
+            409, f"AO zone '{ao}' for the current posture no longer exists — refusing.")
+    if not geo_zone.point_in_zone(pos, zone):
+        raise HTTPException(
+            409, f"Target is OUTSIDE the authorized AO ('{ao}') — one-tap engage refused.")
+
+    # ---- d. Effect auto-select via the read-only recommender ----
+    recs = await _compute_effector_recommendations()
+    rec = next((r for r in recs.get("recommendations", []) if r.get("detection_id") == target), None)
+    if rec is None:
+        raise HTTPException(409, detail={
+            "error": "No effector recommendation for this target — it is not an engageable "
+                     "(CONFIRMED, ACTIVE, non-friendly) contact per the current picture. Nothing fired.",
+            "target_detection_id": target,
+            "excluded": next((e for e in recs.get("excluded", []) if e.get("detection_id") == target), None),
+        })
+
+    if body.effect_override:
+        feasible_names = set()
+        if rec.get("recommended_effector"):
+            feasible_names.add(rec["recommended_effector"])
+        feasible_names |= {f["effector"] for f in rec.get("failover_order", []) if f.get("feasible")}
+        if body.effect_override not in feasible_names:
+            raise HTTPException(409, detail={
+                "error": f"effect_override '{body.effect_override}' is not a FEASIBLE option for this "
+                         "target — refusing to fire an infeasible effector.",
+                "feasibility": rec.get("feasibility"),
+                "recommended_effector": rec.get("recommended_effector"),
+                "failover_order": rec.get("failover_order")})
+        fo = next((f for f in rec.get("failover_order", []) if f["effector"] == body.effect_override), None)
+        if fo is not None and not fo.get("available"):
+            raise HTTPException(409, detail={
+                "error": f"effect_override '{body.effect_override}' is feasible but not currently "
+                         "clearable (bridge down / range-auth lease off). Nothing fired.",
+                "reason": fo.get("reason")})
+        selected_effector = body.effect_override
+    else:
+        selected_effector = rec.get("recommended_effector")
+
+    if not selected_effector:
+        raise HTTPException(409, detail={
+            "error": "No feasible + currently-clearable effector for this target — nothing fired.",
+            "recommended_rationale": rec.get("recommended_rationale"),
+            "feasibility": rec.get("feasibility"),
+            "failover_order": rec.get("failover_order")})
+
+    selected_effect = _EFFECTOR_TO_ENGAGE_EFFECT.get(selected_effector)
+    if selected_effect not in ENGAGE_COMPOSABLE_EFFECTS:
+        raise HTTPException(409, detail={
+            "error": f"Selected effector '{selected_effector}' is not available as a one-tap effect "
+                     "(e.g. GNSS-deny requires the deliberate POST /api/payloads/gnss-spoof attestation "
+                     "flow). Nothing fired.",
+            "selected_effector": selected_effector})
+    if selected_effect not in permitted:
+        raise HTTPException(409, detail={
+            "error": f"Selected effect '{selected_effect}' is not permitted by the current WEAPONS "
+                     f"posture (permitted_effects={permitted}). Nothing fired.",
+            "selected_effector": selected_effector})
+
+    # Resolve WHAT to transmit BEFORE minting any token (surface unresolved
+    # parameters without leaving live tokens dangling).
+    synth_params = _engage_effect_params(selected_effect, detection)
+
+    # ---- e. Deliberate per-target human intent (load-bearing) ----
+    if not body.engage_confirm:
+        raise HTTPException(
+            422, "engage_confirm required — one-tap engage needs a deliberate per-target "
+                 "confirmation gesture; refusing to fire without it.")
+
+    # ---- f. mint arm token bound {effect,target} ; g. mint MATCHING confirm token
+    # The tokens are minted server-side, exist only in server memory, and are
+    # BURNED exactly once by `_execute_engagement` below (its atomic single-use
+    # pop, unchanged). They are non-interchangeable and effect-bound; the
+    # TARGET binding mirrors each effect's OWN consume in the primitive — jam is
+    # an area effect and its arm token is target-less (consumed with no target),
+    # while the target-bound effects (mavlink_sdr_inject / wifi_*) bind the target
+    # so a mismatch is a 403 exactly as on the legacy /payloads/* path.
+    arm_target = None if selected_effect == "jam" else target
+    arm_token = _issue_arm_token(selected_effect, arm_target)["arm_token"]
+    confirm_token = _issue_engage_confirm_token(selected_effect)
+    synth_body = _build_engage_body(selected_effect, target, arm_token, confirm_token, synth_params)
+
+    await log_event(
+        "ENGAGE",
+        f"ONE-TAP ENGAGE authorized: effector={selected_effector} (effect={selected_effect}) vs "
+        f"{detection.get('callsign','?')} ({target}) inside AO={ao} under WEAPONS {posture['state']}. "
+        f"Server-minted single-use arm+confirm tokens bound to this effect+target; the full "
+        f"_execute_engagement gate chain (IFF friendly_fire_ack=None / range-auth / per-target scope / "
+        f"honest dispatch) runs next and consumes them once.",
+        meta={"target_detection_id": target, "effector": selected_effector,
+              "effect": selected_effect, "ao": ao, "posture_state": posture["state"],
+              "effect_override": body.effect_override, "threat_level": detection.get("threat_level")},
+        actor=user["email"],
+    )
+
+    # ---- h. Compose the SHARED primitive — every existing gate runs UNCHANGED.
+    # friendly_fire_ack is NEVER supplied (the synthesized body has none), so
+    # `_enforce_fire_time_iff` cannot be satisfied for a friendly — the ROE floor
+    # above already refused one, and this is the machine-speed backstop.
+    result = await _execute_engagement(selected_effect, synth_body, user)
+    return {
+        "engaged": True,
+        "effect": selected_effect,
+        "effector": selected_effector,
+        "target_detection_id": target,
+        "ao": ao,
+        "posture_state": posture["state"],
+        **result,
+    }
 
 
 # =====================================================================
@@ -8321,6 +9897,10 @@ async def emergency_abort(user: Dict = Depends(get_current_user)):
     # cooperative WebSocket notice with no server-side enforcement).
     global _tx_halted
     _tx_halted = True
+    # One-touch kill also drops the WEAPONS-HOT posture to HOLD — no standing
+    # one-tap fire authorization survives an abort (build contract §"Emergency
+    # stop stays one-touch"). Loudly audited inside the helper.
+    await _drop_weapons_posture_to_hold("emergency abort", user["email"], kind="ABORT")
     await ws_manager.broadcast_json({
         "type": "abort",
         "ts": datetime.now(timezone.utc).isoformat(),

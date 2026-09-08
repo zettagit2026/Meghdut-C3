@@ -169,6 +169,92 @@ SWEEP_BAND_5G8 = (5725.0, 5875.0)
 # tx_gain; this is the ceiling the UI/CLI expose.
 MAX_TX_VGA_GAIN = 47
 
+# ---------------------------------------------------------------------------
+# JAM POWER PROFILES (anti-fade, Phase 1 — software-only)
+# ---------------------------------------------------------------------------
+# Field observation (commander): a continuous barrage fades ~11 dB over tens of
+# seconds. Root cause is the HackRF's UNHEATSINKED on-board TX RF amp heat-
+# soaking while keyed at max IF VGA on a 100%-duty `-R` loop (`-a 1 -x 47`) —
+# a HARDWARE thermal limit; no software register makes a bare HackRF hold full
+# continuous power. A "profile" trades peak power for flatness (or drives an
+# external PA) by changing ONLY the amp-enable (`-a`) and IF VGA (`-x`) in the
+# hackrf_transfer command. A profile NEVER touches the center freq, sweep
+# span/dwell, sample rate, `-R`, device-pin, or any safety gate.
+#
+#   MAX (default):  `-a 1 -x <tx_gain, <=47>`  — EXACTLY today's behavior. On-
+#                   board amp ON at the operator-set VGA. Highest peak, but
+#                   FADES ~11 dB under sustained load. The backward-compatible
+#                   default when no profile is specified.
+#   FLAT:           `-a 0 -x FLAT_TX_VGA`       — on-board amp OFF + a reduced
+#                   fixed VGA. Lower peak, ZERO thermal fade (bare-radio, no
+#                   PA). Does NOT give full power — it trades peak for a steady,
+#                   non-fading output. Software-only, no sensor.
+#   EXTERNAL_PA:    `-a 0 -x EXTERNAL_PA_DRIVE_VGA` — on-board amp OFF + a fixed
+#                   modest exciter-drive VGA: the HackRF as a cool, stable
+#                   exciter for an external duty-rated PA. This is only the
+#                   DRIVE-LEVEL profile; there is no PA-enable actuator yet
+#                   (that is a later hardware phase).
+JAM_PROFILE_MAX = "max"
+JAM_PROFILE_FLAT = "flat"
+JAM_PROFILE_EXTERNAL_PA = "external_pa"
+_JAM_PROFILES = frozenset({JAM_PROFILE_MAX, JAM_PROFILE_FLAT, JAM_PROFILE_EXTERNAL_PA})
+# The safe, backward-compatible default: MAX == today's fully-gated behavior.
+DEFAULT_JAM_PROFILE = JAM_PROFILE_MAX
+
+# FLAT reduced fixed VGA — bench-tunable. Lower than MAX's ceiling so the amp-
+# off output is steady with no thermal droop. (Well under MAX_TX_VGA_GAIN=47.)
+FLAT_TX_VGA = 30
+# EXTERNAL_PA exciter-drive VGA — a modest, cool, stable drive level for an
+# external PA's input (kept low so the HackRF stays linear and cool as an
+# exciter; the external PA supplies the real power). Bench-tunable.
+EXTERNAL_PA_DRIVE_VGA = 20
+
+
+def _normalize_jam_profile(profile) -> str:
+    """Map a requested jam power profile onto one of the known profiles.
+
+    An unknown / None / blank / non-string profile falls back SAFE to MAX —
+    i.e. EXACTLY today's fully-gated behavior — rather than raising or silently
+    selecting a lower-power mode. This is the documented safe default: a
+    malformed profile can never quietly drop the operator into a different power
+    behavior; it simply transmits as it did before profiles existed."""
+    if not isinstance(profile, str):
+        return JAM_PROFILE_MAX
+    p = profile.strip().lower()
+    return p if p in _JAM_PROFILES else JAM_PROFILE_MAX
+
+
+def _tx_amp_vga_args(profile, tx_gain) -> list:
+    """The `-x <vga> -a <0|1>` command fragment for `profile`.
+
+    This is the SINGLE place the amp-enable/VGA is chosen for every transmit
+    primitive, so all paths (burst / iq_file / sweep / CLI) stay identical.
+    Every returned VGA is hard-clamped to the MAX_TX_VGA_GAIN=47 ceiling
+    (FLAT/EXTERNAL_PA are already lower and trivially satisfy it; MAX is clamped
+    defensively too — no profile may exceed 47).
+
+    MAX (and any unknown/unspecified profile) is BYTE-IDENTICAL to the historic
+    `-x <tx_gain> -a 1`: an in-range gain (0..47) is passed through verbatim;
+    the clamp only ever engages for a gain ABOVE the 47 hardware ceiling (which
+    the radio caps at regardless). FLAT/EXTERNAL_PA drop the on-board amp
+    (`-a 0`) and use their own fixed, lower VGA constant."""
+    p = _normalize_jam_profile(profile)
+    if p == JAM_PROFILE_FLAT:
+        vga = max(0, min(int(FLAT_TX_VGA), MAX_TX_VGA_GAIN))
+        return ["-x", str(vga), "-a", "0"]
+    if p == JAM_PROFILE_EXTERNAL_PA:
+        vga = max(0, min(int(EXTERNAL_PA_DRIVE_VGA), MAX_TX_VGA_GAIN))
+        return ["-x", str(vga), "-a", "0"]
+    # MAX / default: preserve the exact historic tokens for every in-range gain;
+    # clamp ONLY a gain above the hardware ceiling (defence-in-depth).
+    gain = tx_gain
+    try:
+        if int(tx_gain) > MAX_TX_VGA_GAIN:
+            gain = MAX_TX_VGA_GAIN
+    except (TypeError, ValueError):
+        pass
+    return ["-x", str(gain), "-a", "1"]
+
 
 def _is_continuous(duration_s) -> bool:
     """True when the caller asked for a continuous (operator-stopped) run rather
@@ -329,6 +415,7 @@ def transmit_iq_file(
     stop_event: Optional["threading.Event"] = None,
     on_started: Optional[Callable[["subprocess.Popen"], None]] = None,
     tx_halt_check: Optional[Callable[[], bool]] = None,
+    profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Shared subprocess-management / abort-mid-transmission mechanics,
     factored out of transmit_burst() (Task #103, see
@@ -371,8 +458,10 @@ def transmit_iq_file(
         "-t", iq_path,
         "-f", str(int(freq_mhz * 1_000_000)),
         "-s", str(SAMPLE_RATE_HZ),
-        "-x", str(tx_gain),
-        "-a", "1",
+        # Amp-enable + IF VGA per jam power profile (default MAX == `-x <tx_gain>
+        # -a 1`, byte-identical to before; FLAT/EXTERNAL_PA => `-a 0` + a fixed
+        # lower VGA). Changes ONLY -x/-a — see _tx_amp_vga_args.
+        *_tx_amp_vga_args(profile, tx_gain),
         *(["-R"] if continuous else []),  # loop the file until the operator stops it
         *_tx_device_args(),  # `-d <TX serial>` when a TX unit is pinned (see HACKRF_TX_SERIAL)
     ]
@@ -432,6 +521,7 @@ def transmit_burst(
     stop_event: Optional["threading.Event"] = None,
     on_started: Optional[Callable[["subprocess.Popen"], None]] = None,
     tx_halt_check: Optional[Callable[[], bool]] = None,
+    profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Non-interactive, mechanical HackRF TX primitive — the exact same
     hackrf_transfer invocation as main()'s interactive CLI path below, minus
@@ -547,8 +637,10 @@ def transmit_burst(
             "-t", f.name,
             "-f", str(int(freq_mhz * 1_000_000)),
             "-s", str(SAMPLE_RATE_HZ),
-            "-x", str(tx_gain),
-            "-a", "1",
+            # Amp-enable + IF VGA per jam power profile (default MAX == `-x
+            # <tx_gain> -a 1`, byte-identical to before; FLAT/EXTERNAL_PA =>
+            # `-a 0` + a fixed lower VGA). Changes ONLY -x/-a.
+            *_tx_amp_vga_args(profile, tx_gain),
             *(["-R"] if loop else []),  # loop the chunk (continuous / long burst)
             *_tx_device_args(),  # `-d <TX serial>` when a TX unit is pinned (see HACKRF_TX_SERIAL)
         ]
@@ -643,6 +735,7 @@ def transmit_sweep(
     on_started: Optional[Callable[["subprocess.Popen"], None]] = None,
     tx_halt_check: Optional[Callable[[], bool]] = None,
     dwell_runner: Optional[Callable[..., str]] = None,
+    profile: Optional[str] = None,
 ) -> Dict[str, Any]:
     """MEGHDUT swept-barrage jam: step the TX center frequency across
     [freq_start_mhz, freq_stop_mhz] (see sweep_centers_mhz), dwelling dwell_ms
@@ -703,8 +796,11 @@ def transmit_sweep(
             "-t", iq_path,
             "-f", str(int(center_mhz * 1_000_000)),
             "-s", str(SAMPLE_RATE_HZ),
-            "-x", str(tx_gain),
-            "-a", "1",
+            # Amp-enable + IF VGA per jam power profile (default MAX == `-x
+            # <tx_gain> -a 1`, byte-identical to before; FLAT/EXTERNAL_PA =>
+            # `-a 0` + a fixed lower VGA). Changes ONLY -x/-a; the center hop,
+            # dwell and span are untouched.
+            *_tx_amp_vga_args(profile, tx_gain),
             *_tx_device_args(),
         ]
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
@@ -764,6 +860,16 @@ def main() -> None:
     ap.add_argument("--max-gain", action="store_true",
                      help=f"Shortcut: set TX VGA gain to the HackRF maximum ({MAX_TX_VGA_GAIN}) "
                           f"for maximum radiated power.")
+    ap.add_argument("--profile", choices=sorted(_JAM_PROFILES), default=DEFAULT_JAM_PROFILE,
+                     help=f"Jam power profile (default {DEFAULT_JAM_PROFILE}). "
+                          f"'{JAM_PROFILE_MAX}' = on-board amp ON at --tx-gain (highest peak, "
+                          f"but FADES ~11 dB under sustained load). "
+                          f"'{JAM_PROFILE_FLAT}' = amp OFF + reduced fixed VGA ({FLAT_TX_VGA}): "
+                          f"lower peak, ZERO thermal fade (bare-radio, no PA). "
+                          f"'{JAM_PROFILE_EXTERNAL_PA}' = amp OFF + fixed exciter drive "
+                          f"({EXTERNAL_PA_DRIVE_VGA}): a cool, stable exciter for an external "
+                          f"duty-rated PA (drive level only; no PA-enable actuator yet). "
+                          f"Only --profile max uses --tx-gain; flat/external_pa use their fixed VGA.")
     ap.add_argument("--continuous", action="store_true",
                      help="Transmit continuously until YOU press Ctrl+C (no auto-stop timer). "
                           "Still requires the one-time TRANSMIT confirmation before starting; "
@@ -809,8 +915,10 @@ def main() -> None:
             print("ERROR: --sweep needs --freq-start-mhz and --freq-stop-mhz "
                   "(e.g. 2400 2483.5 for the 2.4GHz ISM band).", file=sys.stderr)
             sys.exit(1)
+        gain_desc = (f"gain {args.tx_gain}" if args.profile == JAM_PROFILE_MAX
+                     else f"profile {args.profile} (amp OFF, fixed VGA)")
         span_desc = (f"SWEEP {start}->{stop} MHz, step {args.step_mhz}MHz, dwell {args.dwell_ms}ms, "
-                     f"~{args.bandwidth_khz}kHz BW, gain {args.tx_gain}")
+                     f"~{args.bandwidth_khz}kHz BW, {gain_desc}")
         mode_desc = "CONTINUOUS (until Ctrl+C)" if continuous else f"{args.duration_s}s"
         print(f"Preparing swept barrage [{mode_desc}]: {span_desc}.")
         confirm = input(f"About to TRANSMIT a swept barrage across {start}-{stop} MHz "
@@ -826,7 +934,7 @@ def main() -> None:
                 start, stop, args.bandwidth_khz, args.tx_gain,
                 step_mhz=args.step_mhz, dwell_ms=args.dwell_ms,
                 duration_s=(None if continuous else args.duration_s),
-                stop_event=stop_event,
+                stop_event=stop_event, profile=args.profile,
             )
         except KeyboardInterrupt:
             stop_event.set()
@@ -852,8 +960,10 @@ def main() -> None:
     # bounded run, build the requested duration and play it once.
     chunk = CONTINUOUS_CHUNK_S if continuous else duration
     mode = "CONTINUOUS (until you press Ctrl+C)" if continuous else f"{duration}s burst"
+    gain_desc = (f"TX gain {args.tx_gain}" if args.profile == JAM_PROFILE_MAX
+                 else f"profile {args.profile} (amp OFF, fixed VGA — lower peak, no fade)")
     print(f"Preparing {mode} @ {args.freq_mhz} MHz, "
-          f"~{args.bandwidth_khz}kHz bandwidth, TX gain {args.tx_gain}.")
+          f"~{args.bandwidth_khz}kHz bandwidth, {gain_desc}.")
     iq_bytes = build_noise_iq(chunk, args.bandwidth_khz)
 
     with tempfile.NamedTemporaryFile(suffix=".iq") as f:
@@ -871,8 +981,11 @@ def main() -> None:
             "-t", f.name,
             "-f", str(int(args.freq_mhz * 1_000_000)),
             "-s", str(SAMPLE_RATE_HZ),
-            "-x", str(args.tx_gain),
-            "-a", "1",
+            # Amp-enable + IF VGA per jam power profile (default MAX == `-x
+            # <tx_gain> -a 1`, byte-identical to before; FLAT/EXTERNAL_PA =>
+            # `-a 0` + a fixed lower VGA). Changes ONLY -x/-a — the single
+            # center (-f) and gapless -R below are untouched.
+            *_tx_amp_vga_args(args.profile, args.tx_gain),
             # CONTINUOUS = GAPLESS: loop the noise chunk seamlessly on the radio
             # itself (hackrf_transfer -R) as ONE long-lived process. The previous
             # loop-and-relaunch (a fresh subprocess.run per chunk, no -R) left an

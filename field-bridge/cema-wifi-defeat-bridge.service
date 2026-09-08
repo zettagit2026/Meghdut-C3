@@ -49,6 +49,56 @@ Type=simple
 User=biswajit
 WorkingDirectory=/CEMA/joydipdemo/field-bridge
 
+# =====================================================================
+# LEAST-PRIVILEGE OS GRANT — the ONLY thing that lets this UNPRIVILEGED
+# (User=biswajit) bridge key its PINNED injection NIC. Nothing more.
+# =====================================================================
+# Root cause this fixes (captured live on the field host): running as an
+# unprivileged user, wifi_nic_mode.ensure_monitor()'s first step
+# `ip link set <WIFI_TX_IFACE> down` returned "RTNETLINK: Operation not
+# permitted" (no CAP_NET_ADMIN), so the monitor-mode switch fail-closed and
+# ZERO frames were ever sent. We grant EXACTLY the two capabilities the two
+# transmit primitives need — and no others — WITHOUT running as root.
+#
+#   CAP_NET_ADMIN — reconfigure the NIC: `ip link set <iface> down/up`,
+#     `iw dev <iface> set type monitor|managed`, `iw ... set channel`,
+#     `iw ... connect`, `dhclient`. wifi_nic_mode.py runs these as child
+#     processes (argv-list subprocess, never a shell). AmbientCapabilities
+#     PROPAGATES into exec'd children (ip/iw/dhclient carry no file-caps, so
+#     on execve their permitted set = the ambient set), which is why the child
+#     `ip`/`iw` invocations inherit CAP_NET_ADMIN and the EPERM disappears.
+#   CAP_NET_RAW — inject raw 802.11: send_deauth() uses scapy sendp(), which
+#     opens an AF_PACKET/SOCK_RAW socket IN THIS Python process. Ambient caps
+#     are placed in the process's own effective set too, so the raw send is
+#     permitted. (The ARSDK/Tello path uses an ordinary AF_INET UDP socket and
+#     needs neither cap; it rides in on the managed-mode NIC switch above.)
+#
+# CapabilityBoundingSet bounds the process to EXACTLY these two — every other
+# capability (CAP_SYS_ADMIN, CAP_NET_BIND_SERVICE, CAP_DAC_OVERRIDE, ...) is
+# dropped from the bounding set, so a compromised bridge cannot raise anything
+# beyond NIC-config + raw-frame TX. AmbientCapabilities must be a subset of the
+# bounding set (it is).
+#
+# NoNewPrivileges=yes is COMPATIBLE with — and complementary to —
+# AmbientCapabilities: ambient caps are already-held privileges that survive
+# execve by design (the kernel feature ambient caps were created for), so they
+# still reach ip/iw/scapy under NNP. What NNP additionally buys us is that the
+# bridge (or any child) can NEVER escalate via a setuid/file-capability binary
+# beyond this bounded set. (The folklore "NNP breaks capabilities" is about
+# setcap FILE capabilities on a binary — NOT ambient caps; we use ambient caps,
+# so NNP is safe here.) systemd auto-adds SecureBits=keep-caps so the caps are
+# retained across the drop to User=biswajit.
+#
+# SCOPE NOTE: these caps are an OS-level grant of the ABILITY to reconfigure a
+# NIC and send raw frames; they do NOT choose WHICH NIC. The choice stays pinned
+# at the app layer — wifi_nic_mode._pin_guard() and
+# wifi_defeat_primitives._wifi_tx_pinning_error() both fail-closed refuse (run
+# NO command) any iface that is not the pinned WIFI_TX_IFACE, so even with these
+# caps the bridge structurally cannot touch the RX/detection NIC (NIC1/Kismet).
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+NoNewPrivileges=yes
+
 # This bridge drives field-bridge/wifi_defeat_primitives.py (real 802.11 / UDP
 # TX) under the SAME governed spine as cema-jam-bridge.service. See
 # field-bridge/wifi_defeat_bridge.py + wifi_defeat_primitives.py + wifi_arsdk_encode.py.

@@ -110,3 +110,43 @@ export function getOriginalModelAnnotation(d) {
     title: "Original RSSI-heuristic guess, superseded by ML reclassification",
   };
 }
+
+// Render-time helper (P2 of no-strike-registry.md): is this contact a PROTECTED
+// civilian / friendly / neutral no-strike match? The backend stamps
+// `no_strike.matched` (+ threat_level NON_THREAT for civilian/neutral, or
+// "FRIENDLY (registry)" for a registered own-force) on a match that is NOT a
+// protocol-confirmed decode. A protected contact is excluded from the priority
+// board and shown in its own collapsed lane instead -- it is deliberately kept
+// visible, never deleted.
+//
+// A `no_strike_conflict` contact (a DECODED drone that ALSO matches a no-strike
+// entry) is NOT protected -- it stays on the priority board behind an
+// "Adjudicate" badge, never hidden -- so it must not be caught here.
+export function isProtectedContact(d) {
+  if (!d) return false;
+  if (d.no_strike_conflict) return false;
+  if (d.no_strike && d.no_strike.matched) return true;
+  if (d.threat_level === "NON_THREAT") return true;
+  if (d.threat_level === "FRIENDLY (registry)") return true;
+  return false;
+}
+
+// Render-time helper (P2 of no-strike-registry.md §3): does this contact clear
+// >=1 confidence-corroboration tier, so it carries real drone identity/threat
+// weight on the board? Prefers the backend `target_grade` stamp when present;
+// otherwise mirrors backend is_target_grade() (T1 protocol decode, T2 real DF
+// bearing, T3 non-civilian wifi drone-OUI softAP, T4 multi-sensor fusion) so an
+// older record with no stamp still resolves consistently.
+export function isTargetGrade(d) {
+  if (!d) return false;
+  if (typeof d.target_grade === "boolean") return d.target_grade;
+  if (d.protocol_confirmed || d.confidence_type === "protocol_verified") return true;
+  if (d.bearing_available && !d.bearing_estimated) return true;
+  if (d.confidence_type === "multidomain_fused") return true;
+  const ns = d.no_strike || {};
+  const civilian =
+    ns.matched &&
+    (ns.category === "CIVILIAN_INFRASTRUCTURE" || ns.category === "NEUTRAL");
+  if (!civilian && d.match_protocol === "wifi" && d.make_candidate) return true;
+  return false;
+}

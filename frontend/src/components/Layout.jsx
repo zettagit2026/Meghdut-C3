@@ -15,14 +15,21 @@ import { api } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
 import {
   Radar, Crosshair, ScrollText, LogOut, Terminal, Shield, Zap, History, MapPin, BookOpen,
-  Satellite, RadioTower, Layers, Gauge, Wifi,
+  Satellite, RadioTower, Layers, Wifi, Rss,
 } from "lucide-react";
 
 // Grouped IA (FIGHT / PLAN / IDENTIFY / REVIEW). FIGHT stays always-visible —
-// the direct weapons (RF Jam / GNSS Deny / MAVLink Takeover) are never collapsed
-// behind DECIDE. Merged-away surfaces (Signals/MavlinkConsole/Payloads/Protocol
-// & Threat Library/SDR inject) are off-nav; their content lives in DECIDE, the
-// merged Library, and the merged Takeover pages.
+// the direct weapons (RF Jam / GNSS Deny / MAVLink Takeover) are always
+// reachable directly, never behind a hub page. Merged-away surfaces
+// (Signals/MavlinkConsole/Payloads/Protocol & Threat Library/SDR inject) are
+// off-nav; their content lives in the merged Library and Takeover pages.
+// DECIDE (operator-facing effector-recommendation hub, /decision) is removed
+// from the nav for the time being per operator directive — the recommendation
+// engine (backend/effector_selection.py) keeps running silently behind the
+// one-tap /api/engage flow. To re-add DECIDE: restore this nav item (route
+// "/decision", label "DECIDE", icon Gauge) and the <Route path="decision">
+// in App.js — the page component (pages/DecisionSupport.jsx) is preserved
+// unrouted for exactly this.
 const NAV_GROUPS = [
   {
     key: "fight",
@@ -31,7 +38,6 @@ const NAV_GROUPS = [
       { to: "/dashboard", label: "COMMAND CENTER",   icon: Radar,     testid: "nav-dashboard" },
       { to: "/map",       label: "TACTICAL MAP",     icon: MapPin,    testid: "nav-map" },
       { to: "/killchain", label: "KILL CHAIN",       icon: Crosshair, testid: "nav-killchain" },
-      { to: "/decision",  label: "DECIDE",           icon: Gauge,     testid: "nav-decision" },
       { to: "/jamming",   label: "RF JAM",           icon: Zap,       testid: "nav-jamming" },
       { to: "/gnss-spoof",label: "GNSS DENY",        icon: Satellite, testid: "nav-gnss-spoof" },
       { to: "/takeover",  label: "MAVLINK TAKEOVER", icon: RadioTower,testid: "nav-takeover" },
@@ -51,6 +57,10 @@ const NAV_GROUPS = [
     label: "IDENTIFY",
     items: [
       { to: "/library",   label: "THREAT & PROTOCOL LIBRARY", icon: BookOpen, testid: "nav-library" },
+      // RF situational awareness — a READ-ONLY window onto the ambient Wi-Fi
+      // AP picture (Kismet). Deliberately NOT under FIGHT: APs here are never
+      // engageable; this is a visibility surface, not a weapon.
+      { to: "/wifi-environment", label: "WI-FI ENVIRONMENT", icon: Rss, testid: "nav-wifi-environment" },
     ],
   },
   {

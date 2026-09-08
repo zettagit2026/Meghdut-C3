@@ -90,17 +90,18 @@ def test_transmit_burst_releases_lock_after_missing_binary_failure(isolated_lock
 
 def test_transmit_burst_signature_stable_plus_tx_halt_check():
     """The original positional params are unchanged (task #152 only wired in the
-    shared lock). The kill-switch hardening (FIX 2) appends ONE optional keyword,
-    tx_halt_check, so the single-center continuous burst polls tx_halt directly
-    like transmit_sweep / transmit_iq_file / the operator paths — an additive,
-    backward-compatible change (default None => prior behavior)."""
+    shared lock). The kill-switch hardening (FIX 2) appended one optional keyword,
+    tx_halt_check; the anti-fade Phase-1 change appends ANOTHER optional keyword,
+    profile (default None => MAX => today's `-a 1 -x <tx_gain>`). Both are
+    additive, backward-compatible keyword params — no positional caller breaks."""
     sig = inspect.signature(hackrf_jam.transmit_burst)
     assert list(sig.parameters.keys()) == [
         "freq_mhz", "bandwidth_khz", "duration_s", "tx_gain", "stop_event", "on_started",
-        "tx_halt_check",
+        "tx_halt_check", "profile",
     ]
-    # The new param is optional (keyword, default None) — no caller is broken.
+    # The appended params are optional (keyword, default None) — no caller broken.
     assert sig.parameters["tx_halt_check"].default is None
+    assert sig.parameters["profile"].default is None
 
 
 def test_transmit_burst_imports_shared_device_lock():

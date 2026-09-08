@@ -52,6 +52,56 @@ def test_autel_ssid_candidate():
     assert body["make_candidate"] == "Autel"
 
 
+# --- DJI FLOW video-feed softAP (self-named off its own BSSID) ----------------
+def test_flow_ssid_field_unit_is_a_candidate():
+    # The real fielded unit: SSID "FLOW_261916" broadcast on BSSID
+    # B4:C2:E0:26:19:16 (the SSID suffix == the BSSID's last 3 octets).
+    dev = _wifi_device("B4:C2:E0:26:19:16", ssid="FLOW_261916", channel="6")
+    body = b.scan_device(dev)
+    assert body is not None
+    # HONEST: a CANDIDATE by SSID convention, never a confirmed DJI ID.
+    assert body["make_candidate"] == "DJI (FLOW video softAP, candidate)"
+    assert "ssid" in body["match_basis"]
+    assert body["ssid"] == "FLOW_261916"
+    assert "serial" not in body
+    assert body["caveats"]  # spoofable/candidate caveats attached
+
+
+def test_flow_generic_six_hex_convention_matches():
+    # The rule is the general FLOW_<6-hex> convention, not the one unit's number.
+    body = b.scan_device(_wifi_device("00:11:22:33:44:55", ssid="FLOW_ABCDEF"))
+    assert body is not None
+    assert body["make_candidate"] == "DJI (FLOW video softAP, candidate)"
+
+
+def test_flow_engageable_carries_bssid_and_channel():
+    # CRITICAL: a classified FLOW_* contact must carry the softAP BSSID under the
+    # exact key the governed Wi-Fi-defeat endpoint reads as the deauth target
+    # (backend: detection.get("bssid")) plus the channel -- otherwise the endpoint
+    # fail-closes (a broadcast/absent BSSID = fratricide) and it is not engageable.
+    dev = _wifi_device("B4:C2:E0:26:19:16", ssid="FLOW_261916", channel="6HT20")
+    body = b.scan_device(dev)
+    assert body is not None
+    assert body["bssid"] == "B4:C2:E0:26:19:16"      # softAP's own MAC = its BSSID
+    assert body["source_mac"] == "B4:C2:E0:26:19:16"
+    assert body["channel"] == 6                       # parsed leading int from "6HT20"
+    # BSSID must be concrete (not broadcast/absent) so the endpoint does not refuse.
+    assert body["bssid"] not in (None, "", "FF:FF:FF:FF:FF:FF")
+
+
+def test_flow_false_positive_guard():
+    # Tight, anchored, fixed-length pattern: near-miss SSIDs must NOT classify, so
+    # ordinary "FLOW"-named Wi-Fi does not flood the board with false drone contacts.
+    for ssid in ("FLOW_hotspot",   # suffix not 6 hex
+                 "FLOWERSHOP",      # no underscore
+                 "FLOW_2619",       # too short (4 hex)
+                 "FLOW_2619160",    # too long (7 chars)
+                 "FLOW_26191G",     # 'G' is not hex
+                 "MYFLOW_261916"):  # not anchored at start
+        dev = _wifi_device("3C:5A:B4:11:22:33", ssid=ssid, manuf="Netgear")
+        assert b.scan_device(dev) is None, f"{ssid!r} must NOT classify as a drone"
+
+
 # --- OUI matching (reuses kismet_bridge.DRONE_MANUFACTURER_OUIS) --------------
 def test_dji_oui_match_without_droney_ssid():
     # A DJI-OUI MAC with a non-drone SSID still flags on OUI alone.

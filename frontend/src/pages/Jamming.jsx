@@ -83,6 +83,19 @@ const JAM_MODES = [
           "Band-fixed to 433 / 915 / 2.4 / 5.8 GHz." },
 ];
 
+// Jam POWER profiles (anti-fade). HONEST labels — no overclaim. Only MAX
+// consumes tx_gain; FLAT/EXTERNAL_PA use a fixed internal VGA (amp off), so
+// the gain slider is hidden under those (see gain control below). Values
+// mirror field-bridge/hackrf_jam.py JAM_PROFILE_* (max|flat|external_pa).
+const JAM_PROFILES = [
+  { value: "max", label: "MAX (highest power)",
+    hint: "Highest power — fades on continuous TX (thermal droop). Uses TX gain." },
+  { value: "flat", label: "FLAT (steady, zero-fade)",
+    hint: "Steady, zero-fade — lower power (amp off, fixed internal VGA)." },
+  { value: "external_pa", label: "EXTERNAL PA (exciter drive)",
+    hint: "Cool exciter drive for an external PA (fixed internal VGA)." },
+];
+
 // Poll-and-render, same pattern as KillChain.jsx / Payloads.jsx — no
 // bespoke WS consumer needed on the frontend.
 const STATUS_STYLE = {
@@ -106,6 +119,10 @@ export default function Jamming() {
   const [freqStopMhz, setFreqStopMhz] = useState(SWEEP_PRESETS[0].stop);
   const [bandwidthKhz, setBandwidthKhz] = useState(500);
   const [txGain, setTxGain] = useState(20);
+  // Jam POWER profile (anti-fade). "max" = highest power (fades on continuous TX);
+  // "flat" = steady zero-fade (amp off, lower power); "external_pa" = cool exciter
+  // drive for an external PA. Only MAX consumes tx_gain (see gain-slider gating).
+  const [profile, setProfile] = useState("max");
   const [gateOpen, setGateOpen] = useState(false);
   const [sessions, setSessions] = useState([]);
   const [submitting, setSubmitting] = useState(false);
@@ -194,8 +211,11 @@ export default function Jamming() {
         sweep,
         ...(sweep ? { freq_start_mhz: Number(freqStartMhz), freq_stop_mhz: Number(freqStopMhz) } : {}),
         bandwidth_khz: bandwidthKhz,
+        // tx_gain is only consumed by the MAX profile; FLAT/EXTERNAL_PA use a
+        // fixed internal VGA, so it is sent but ignored server-side under those.
         tx_gain: txGain,
         jam_mode: jamMode,
+        profile,
         arm_token: arm.arm_token,
         jam_confirm_token: confirm.jam_confirm_token,
       });
@@ -320,6 +340,26 @@ export default function Jamming() {
             </span>
           </label>
 
+          {/* JAM POWER PROFILE (MEGHDUT built-in jam only — the operator's own
+              jammer has a fixed waveform and ignores this). HONEST labels; the
+              gain slider below is hidden under FLAT/EXTERNAL_PA (fixed VGA). */}
+          {!isOperatorMode && (
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Power Profile</span>
+              <select
+                data-testid="jam-profile-select"
+                value={profile}
+                onChange={(e) => setProfile(e.target.value)}
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+              >
+                {JAM_PROFILES.map((p) => <option key={p.value} value={p.value}>{p.label}</option>)}
+              </select>
+              <span className="mt-1 block font-mono text-[10px] text-slate-500 leading-relaxed">
+                {JAM_PROFILES.find((p) => p.value === profile)?.hint}
+              </span>
+            </label>
+          )}
+
           {/* SWEPT BARRAGE (MEGHDUT only): step the center across a hop band so
               a frequency-hopping control link is hit on every hop. */}
           {!isOperatorMode && (
@@ -443,25 +483,40 @@ export default function Jamming() {
             />
           </label>
 
-          <label className="block">
-            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
-              TX Gain (0-47 dB — HackRF TX VGA hardware ceiling)
-            </span>
-            <input
-              data-testid="jam-gain-input"
-              type="number" min={0} max={47}
-              value={txGain}
-              onChange={(e) => setTxGain(Math.max(0, Math.min(47, Number(e.target.value))))}
-              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
-            />
-            <span className="mt-1 block font-mono text-[10px] text-slate-500 leading-relaxed">
-              {isOperatorMode
-                ? "Operator-adjustable — driven onto the operator jammer's osmosdr sink " +
-                  "(overrides its baked-in gain). 47 dB is the HackRF TX VGA hardware maximum, " +
-                  "not an artificial limit."
-                : "47 dB is the HackRF TX VGA hardware maximum (no artificial cap)."}
-            </span>
-          </label>
+          {/* TX GAIN — only the MAX profile consumes it; FLAT/EXTERNAL_PA use a
+              fixed internal VGA (amp off), so the slider is hidden under those to
+              avoid misleading the operator into thinking gain has any effect.
+              Operator mode always shows it (its jammer is gain-adjustable). */}
+          {(isOperatorMode || profile === "max") ? (
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
+                TX Gain (0-47 dB — HackRF TX VGA hardware ceiling)
+              </span>
+              <input
+                data-testid="jam-gain-input"
+                type="number" min={0} max={47}
+                value={txGain}
+                onChange={(e) => setTxGain(Math.max(0, Math.min(47, Number(e.target.value))))}
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+              />
+              <span className="mt-1 block font-mono text-[10px] text-slate-500 leading-relaxed">
+                {isOperatorMode
+                  ? "Operator-adjustable — driven onto the operator jammer's osmosdr sink " +
+                    "(overrides its baked-in gain). 47 dB is the HackRF TX VGA hardware maximum, " +
+                    "not an artificial limit."
+                  : "47 dB is the HackRF TX VGA hardware maximum (no artificial cap)."}
+              </span>
+            </label>
+          ) : (
+            <div
+              data-testid="jam-gain-fixed-note"
+              className="font-mono text-[10px] text-slate-500 leading-relaxed"
+            >
+              TX Gain is fixed under the{" "}
+              <span className="uppercase">{profile.replace("_", " ")}</span>{" "}
+              profile (internal VGA is set by the profile, amp off) — no gain control applies.
+            </div>
+          )}
 
           {isOperatorMode && (
             <div

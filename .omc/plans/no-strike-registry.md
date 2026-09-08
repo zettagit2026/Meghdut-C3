@@ -1,0 +1,45 @@
+# NO-STRIKE / FRIENDLY REGISTRY + CLASSIFICATION-CONFIDENCE GATE — build contract (MEGHDUT C3)
+
+Design 2026-09-07 (architect). The civilian-protection SAFETY FLOOR: (a) hard-protects civilian/friendly/neutral infra from ever being engaged, (b) stops the HackRF ML lane surfacing civilian APs (BSNL/Apple/RLTech) as "DJI Mini candidate / DRONE 76%" priority targets, (c) is the invisible civilian catch behind one-tap / "designate suspected UAS" / WEAPONS FREE. Detection/IFF-critical: each phase gets security-review + verifier.
+
+## Root cause (in code)
+`_HOSTILE_THREAT_LEVELS` includes `LOW` (server.py:1065) → `_detection_is_classified_hostile` (:1196) returns True for a `LOW` civilian-attributed contact. `Dashboard.jsx:546` sorts ALL active detections by threat weight with NO no-strike/confidence filter. RF-energy blip → `model="DJI Mini (candidate)"`/heuristic_binary/MEDIUM → Wi-Fi fusion re-attributes civilian OUI → LOW, but stays on the board + engageable. No data structure says "this SSID/BSSID/OUI is civilian, never engage."
+
+## 1. No-strike registry
+`db.no_strike_registry`, one doc/entry, commander-managed, hot-loaded (COPY the SOP version-stamped cache: `_bump_no_strike_version` + `_no_strike_entries()` mirror `_sop_reload_config_if_stale` server.py:3484). Disable-not-delete (audited). Pure matcher `backend/no_strike.py` (leaf, imports nothing from TX spine, like sop_engine/geo_zone).
+- **match**: `{ssid_exact, ssid_prefix, bssid(48-bit), oui(24-bit), vendor_regex}`; precedence most-specific-first: bssid → ssid_exact → ssid_prefix → oui → vendor_regex; returns `{matched, entry_id, category, hard, label, basis}`.
+- **categories**: `CIVILIAN_INFRASTRUCTURE` (hard:true, NO override, HARD 403) · `FRIENDLY_OWN_FORCE` (overridable only by the EXISTING single-use friendly-fire ack) · `NEUTRAL` (blocked from one-tap/FREE; manual deploy needs explicit commander confirm+reason).
+- **MAC-randomization limit** (document in UI + model): an OUI/BSSID entry protects a STABLE infra AP, not a roaming randomized-MAC client. An OUI-only match on a randomized MAC may SUPPRESS from priority but is flagged "possible civilian, unverified" — never silently trusted.
+- **CRUD**: `POST/PUT/DELETE /api/no-strike` under `require_commander` (template = zone CRUD server.py:2885), each bumps version + hash-chained `NO_STRIKE_CREATE/UPDATE/DISABLE` audit.
+- **Seed** (idempotent migration, upsert by natural key): CIVILIAN ISP prefixes (BSNL/Airtel/Jio/RLTech/ACT/Hathway/Excitel) + consumer OUIs (Apple/Samsung/Xiaomi/Intel/TP-Link/D-Link); FRIENDLY own SSIDs (Zetta*/zcpl*). **GOVERNING: the repo-committed seed uses TEST-Org N / synthetic OUIs, NEVER real org names** ([[feedback-test-data-no-real-org-names]]); real neighbours added ON-SITE by the operator via the survey "Add to no-strike" affordance (pre-fills bssid/ssid/oui/manuf, commander picks category, one gated write).
+
+## 2. Consult points
+**A. Classification/ingest (labeling honesty + suppress from priority):** in `detection_ingest` (:6642) + `_upsert_wifi_drone_detection` (:5474), AFTER the display/fusion overrides, BEFORE insert. Enrich identity from ssid/bssid/oui/manuf PLUS the fusion's `wifi_fusion.matched_mac_oui/manuf` (the RF-energy contact carries no OUI of its own — the civilian OUI is only known via the Kismet cross-ref). On a CIVILIAN/NEUTRAL match AND not protocol-confirmed → stamp `threat_level="NON_THREAT"` (NEW sentinel, OUTSIDE `_HOSTILE_THREAT_LEVELS`), `no_strike={matched,category,entry_id,label,basis}`, display "Protected — <label>" (keep `match_model`/`match_protocol` byte-identical for re-confirm merging). Excluded from priority board (NON_THREAT sorts below LOW). FRIENDLY match defers to existing IFF relabel where a beacon exists.
+- Frontend `Dashboard.jsx:546`: PRIORITY TARGETS excludes `d.no_strike?.matched` / `NON_THREAT`; new collapsed "Protected / Civilian (N)" + "Low-confidence RF" lanes. `detectionConfidence.js` gets `isProtectedContact`/`isTargetGrade`.
+
+**B. Fire-time HARD block (cannot be overridden):** NEW `_enforce_fire_time_no_strike(detection, user, *, context)` sibling to `_enforce_fire_time_iff` (:926), called in EVERY `_execute_engagement` transmit path (:7128/:7660/:7820) BEFORE the IFF interlock → covers manual `/payloads/*`, one-tap `/api/engage`, and future FREE in one place. CIVILIAN/NEUTRAL match → **HARD 403, no ack, no override token exists**, loud `NO_STRIKE_FIRE_REFUSED` audit. FRIENDLY_OWN_FORCE-without-beacon → same posture as IFF (friendly-fire ack only).
+- **ROE-floor fix (do regardless):** `_detection_is_classified_hostile` (:1196) also returns False when `no_strike?.matched` or `threat_level=="NON_THREAT"` → closes the `LOW∈hostile` gap at the one-tap ROE floor (:8926) BEFORE token mint. Defense-in-depth: ROE floor (early) + fire-time no-strike (instant).
+- Weapons-posture arm: repoint the `safety_ack` "no-strike registry" count (:8776) at `db.no_strike_registry`; keep `iff_registry_loaded` arming precondition.
+
+**CIVILIAN hard floor ≠ friendly-fire ack.** The ff-ack (:502) is a deliberate path to fire on a genuine OWN-FORCE friendly under ROE. The civilian floor has NO ack token at all — there is NO code path from any commander token to firing on a CIVILIAN_INFRASTRUCTURE contact. That is the floor invariant.
+
+## 3. Classification-confidence gate (labeling honesty)
+`is_target_grade(det)` — a contact carries drone identity/threat weight on the board ONLY if it clears ≥1 corroboration tier: **T1** protocol decode (`protocol_confirmed`/`protocol_verified`, DroneID/MAVLink/OcuSync/CRSF CRC) · **T2** real DF bearing (`bearing_available && !bearing_estimated`) · **T3** Wi-Fi drone-OUI softAP (whose vendor is NOT a no-strike civilian) · **T4** multi-sensor (`multidomain_fused`). Clears none → NOT target-grade → demote to "Unidentified RF / possible civilian" at its REAL confidence, `threat_level` capped LOW, excluded from priority sort. The "76%" ML number is badged "ML class probability (not drone-likelihood; model has no reject class)", never a bare confidence next to a drone name (the 3-class ML hallucinates drone >99% on noise, server.py:5920). Runs in the same pass as consult A.
+
+## 4. Enables the downstream (invisible civilian catch)
+(a) one-tap: the auto no-strike/IFF check sits behind the ENGAGE tap, zero extra steps → civilian 403 + loud audit, nothing fires. (b) "Designate suspected UAS" from the survey routes through consult A — a civilian AP can't be designated (offers "Add to no-strike" / "Report suspected spoof" instead); only a confidence-bar-clearing identity (typ. T3) produces a target-grade contact. (c) WEAPONS FREE (deferred) auto-engages ONLY: no-strike-clear ∧ target-grade ∧ hostile ∧ in-AO ∧ posture-permits; and `_enforce_fire_time_no_strike` is the last-line guarantee even if the supervisor filter has a bug.
+
+## 5. Honesty invariants + the conflict case
+- No fabricated confidence; low-confidence guess labeled as such; ML prob badged as class-prob.
+- **Registry never silently hides a real drone**: demotion fires ONLY for non-protocol-confirmed. A no-strike match that ALSO carries a decoded drone signature = CONFLICT → NOT auto-suppressed, NOT auto-engageable → stamped `no_strike_conflict`, raised to a HIGH-severity, un-dismissable human-adjudication queue (new `NO_STRIKE_CONFLICT` alert over the existing WS/alert channel), shown with both facts. Fire-time still HARD-BLOCKS a CIVILIAN conflict (civilian-protection wins the automated decision) until a commander adjudicates/reclassifies. Residual risk (accepted): an adversary spoofing a civilian SSID onto a drone forces an adjudication delay — cheaper than an automated civilian strike. Do NOT invert to auto-engage-on-conflict.
+- **Adversary-comms override (§2.3): deliberately NOT built.** If ever required = a separate `NO_STRIKE_CIVILIAN_OVERRIDE` token (commander + password step-up + typed justification, single-use, target-bound, separate token type, off-by-default, top-severity audit). The floor's whole point is civilian infra cannot be struck; an override is a loaded gun at that guarantee. Ship only behind an explicit documented doctrinal decision.
+
+## 6. Phasing (each: security-review + independent verifier)
+- **P1** registry model + `no_strike.py` pure matcher + CRUD + hot-load + audit. (No fire-path change — safe foundation.)
+- **P2** confidence demotion + NON_THREAT suppression + Dashboard protected/low-confidence lanes + ML-prob badge. (Board honesty; removes the label lie.)
+- **P3** fire-time `_enforce_fire_time_no_strike` (hard floor) + ROE NON_THREAT fix + posture count rewire + conflict adjudication. (Makes the block real; MUST NOT ship before P2.)
+- **P4** seed (TEST-Org only in repo) + on-site add flow.
+Neither ships before P1 hot-load verified; P3 not before P2.
+
+## The floor invariant (never violate)
+Civilian infrastructure CANNOT be struck (no override token exists) AND a genuine hostile is NEVER silently suppressed (conflict → loud human adjudication, civilian-wins the automated default). One shared pure matcher `no_strike.py` keeps the classification-demote and the fire-time-block in sync.

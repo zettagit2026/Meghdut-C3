@@ -12,12 +12,14 @@ remoteid_kismet_bridge.py / parrot_arsdk_ingest_bridge.py already poll -- no
 new radio) and flags a Wi-Fi device as a DRONE CANDIDATE when either:
 
   * its broadcast SSID matches a known drone softAP pattern
-    (^TELLO-, ^ANAFI-, ^Autel..., or the generic ^DIRECT- Wi-Fi Direct softAP), or
+    (^TELLO-, ^ANAFI-, ^Autel..., ^FLOW_<6-hex> DJI-FLOW video softAP, or the
+    generic ^DIRECT- Wi-Fi Direct softAP), or
   * its MAC's OUI (first 3 octets) is a known drone-manufacturer prefix
     (kismet_bridge.DRONE_MANUFACTURER_OUIS -- DJI/Parrot/Autel), or
   * Kismet's own manufacturer string names a drone vendor.
 
 On a match it POSTs /api/wifi-drone/ingest {ssid, oui, manuf, make_candidate,
+bssid (the softAP's own MAC = its BSSID, the Wi-Fi-defeat deauth target key),
 channel, signal} and, each cycle the Kismet feed is up, a
 /api/protocols/heartbeat for the `wifi_drone` protocol.
 
@@ -86,6 +88,16 @@ DRONE_SSID_PATTERNS: List[Tuple["re.Pattern[str]", str]] = [
     (re.compile(r"^TELLO-", re.IGNORECASE), "DJI/Ryze Tello"),
     (re.compile(r"^ANAFI-", re.IGNORECASE), "Parrot Anafi"),
     (re.compile(r"^Autel", re.IGNORECASE), "Autel"),
+    # DJI mini/nano-class "FLOW" video-feed softAP. These self-name off their own
+    # MAC: the SSID suffix is the last three octets of the softAP BSSID (e.g.
+    # SSID "FLOW_261916" on BSSID B4:C2:E0:26:19:16). Anchored + FIXED-LENGTH
+    # (exactly 6 hex, ^...$) to keep false positives LOW -- a bare "FLOW_hotspot"
+    # or "FLOWERSHOP" does NOT match. HONEST: this is an SSID-convention
+    # CANDIDATE only. The FLOW OUI seen in the field (B4:C2:E0 = Bouffalo Lab, a
+    # general Wi-Fi SoC vendor, NOT a DJI-registered OUI) is deliberately NOT
+    # added to the OUI table -- a SoC-vendor block is high-false-positive, so
+    # this rests on the SSID convention + operator ground-truth alone.
+    (re.compile(r"^FLOW_[0-9A-Fa-f]{6}$"), "DJI (FLOW video softAP, candidate)"),
 ]
 # Generic Wi-Fi Direct softAP. HONEST: used by a huge range of NON-drone
 # devices too (printers, Chromecast, Miracast, phone hotspots), so on its own
@@ -202,6 +214,14 @@ def match_wifi_drone(ssids: List[str], mac: Optional[str],
         "make_candidate": make_candidate,
         "match_basis": "+".join(basis_parts) if basis_parts else None,
         "source_mac": mac,
+        # ENGAGEABILITY: the softAP's own MAC IS its BSSID. Carry it under the
+        # EXACT key the governed Wi-Fi-defeat endpoint reads as the deauth target
+        # (backend server.py: detection.get("bssid") or "softap_bssid" or
+        # "target_bssid"; frontend WifiDefeat.jsx checks the same). Without a
+        # concrete BSSID the endpoint fail-closes (a broadcast/absent BSSID would
+        # deauth every AP on the channel = fratricide). This is a CANDIDATE softAP
+        # BSSID from a SPOOFABLE SSID/MAC -- the endpoint's own gates still apply.
+        "bssid": mac.upper() if mac else None,
         "source": "WIFI_DRONE_KISMET",
         "caveats": wifi_drone_caveats(),
     }

@@ -83,6 +83,25 @@ services:
       # does NOT auto-inject top-level .env values into the container (see the
       # SENSOR_LAT deploy-incident note above).
       DETECTION_WIFI_FUSION_ENABLED: "${DETECTION_WIFI_FUSION_ENABLED:-true}"
+      # Wi-Fi Environment (RF situational-awareness) panel -- READ ONLY.
+      # GET /api/wifi-environment proxies a running Kismet server's REST API
+      # server-side (the apikey NEVER reaches the browser) to show the ambient
+      # AP picture. Purely a visibility layer: creates no detections, never
+      # engages/targets anything. Optional -- if KISMET_URL is unset the
+      # endpoint reports "not configured" honestly and returns an empty list.
+      # Must be listed here explicitly -- Compose does NOT auto-inject top-level
+      # .env values into the container (see the SENSOR_LAT deploy-incident note
+      # above). Point KISMET_URL at the SAME Kismet server the field-bridge
+      # kismet_bridge already uses (field-bridge/.env KISMET_URL/KISMET_APIKEY).
+      KISMET_URL: "${KISMET_URL:-}"
+      KISMET_APIKEY: "${KISMET_APIKEY:-}"
+    # Wi-Fi Environment panel needs to reach the HOST's Kismet REST API from
+    # inside this bridged container. Kismet binds 127.0.0.1:2501 on the host,
+    # which is the container's own loopback, not the host's -- so KISMET_URL is
+    # pointed at host.docker.internal, resolved to the host via host-gateway.
+    # READ-ONLY GET traffic only; nothing here transmits, arms, or engages.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       # Container->host privilege bridge for the GUI TX-bridge SiK handoff
       # (POST /api/tx/online|standdown). The cema-tx-helper root daemon on the

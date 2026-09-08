@@ -297,6 +297,12 @@ class JamBridge:
         tx_halt_check = make_tx_halt_check(
             lambda: self.tx_halted,
             RangeAuthLease(lambda: self.is_range_authorized("jam")))
+        # Jam power profile (anti-fade): default None => MAX == today's `-a 1 -x
+        # <tx_gain>` (byte-identical). FLAT/EXTERNAL_PA change ONLY the amp-
+        # enable/VGA inside the SAME gated primitive — never the freq, span,
+        # dwell, -R, device-pin or any gate. Backend does not stamp this yet, so
+        # absence transmits exactly as before (see hackrf_jam._tx_amp_vga_args).
+        profile = params.get("profile")
         if params.get("sweep"):
             return transmit_sweep(
                 params["freq_start_mhz"], params["freq_stop_mhz"],
@@ -304,7 +310,7 @@ class JamBridge:
                 step_mhz=params["step_mhz"], dwell_ms=params["dwell_ms"],
                 duration_s=params["duration_s"],
                 stop_event=stop_event, on_started=on_started,
-                tx_halt_check=tx_halt_check)
+                tx_halt_check=tx_halt_check, profile=profile)
         return transmit_burst(
             params["freq_mhz"], params["bandwidth_khz"], params["duration_s"],
             params["tx_gain"], stop_event=stop_event, on_started=on_started,
@@ -313,7 +319,7 @@ class JamBridge:
             # sweep branch above and transmit_iq_file / operator paths) —
             # stop_event, tx_halt AND lease-expiry are all independent stop
             # triggers on ALL continuous paths.
-            tx_halt_check=tx_halt_check)
+            tx_halt_check=tx_halt_check, profile=profile)
 
     # ---- WS handling ---------------------------------------------------
     def _handle_jam_request(self, ws, data: dict) -> None:
@@ -387,6 +393,13 @@ class JamBridge:
             step_mhz = float(data.get("step_mhz", SWEEP_DEFAULT_STEP_MHZ))
             dwell_ms = float(data.get("dwell_ms", SWEEP_DEFAULT_DWELL_MS))
             freq_mhz = data.get("freq_mhz") or BAND_PRESETS_MHZ.get(band)
+            # Jam power profile (anti-fade). Optional; the backend does not stamp
+            # it yet, so absence => None => MAX (byte-identical to today) in the
+            # transmit primitives. It only ever changes the amp-enable/VGA, never
+            # a gate — hackrf_jam._normalize_jam_profile maps an unknown value
+            # back to MAX (safe default), so a malformed profile can't drop the
+            # operator into an unexpected power mode.
+            profile = data.get("profile")
         except (TypeError, ValueError) as e:
             self._send_jam_ack(ws, request_id, "failed", ok=False, error=f"invalid jam parameters: {e}")
             return
@@ -432,6 +445,7 @@ class JamBridge:
             "freq_stop_mhz": freq_stop_mhz,
             "step_mhz": step_mhz,
             "dwell_ms": dwell_ms,
+            "profile": profile,
             "request_id": request_id,
             "actor": actor,
         }
