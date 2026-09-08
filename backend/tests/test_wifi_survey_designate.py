@@ -42,6 +42,10 @@ import server as srv
 COMMANDER = {"email": "cmd@unused.local", "role": "commander"}
 OPERATOR = {"email": "op@unused.local", "role": "operator"}
 
+# A real, actively-typed justification (>=20 chars, not trivial) — required to
+# commander-override the drone gate for a NON-DRONE AP (F2 friction).
+GOOD_JUST = "Visual confirmation of a rogue relay operating from this office AP."
+
 # A DJI drone-OUI softAP row as it appears in the Wi-Fi survey (OUI 60:60:1F is
 # in kismet_survey.DRONE_MANUFACTURER_OUIS).
 DJI_BSSID = "60:60:1F:AA:BB:CC"
@@ -283,3 +287,116 @@ async def test_non_pmf_row_does_not_falsely_signal_pmf(monkeypatch):
     # Unknown PMF is honestly treated as PMF-not-indicated (deauth allowed as a
     # best-effort link-drop) — never fabricated as PMF-present.
     assert srv._wifi_target_has_pmf(doc) is False
+
+
+# ---------------------------------------------------------------------
+# COMMANDER NO-STRIKE OVERRIDE (designate side) — the two-tier split:
+#   * a NEUTRAL no-strike match is now DESIGNATABLE (fire still needs the
+#     fire-time override token); only CIVILIAN_INFRASTRUCTURE is hard-refused;
+#   * a non-drone-tagged row is designatable under commander_override, forced to
+#     the honest non-drone candidate tier; commander_override NEVER bypasses the
+#     CIVILIAN hard floor.
+# ---------------------------------------------------------------------
+async def test_neutral_no_strike_match_is_designatable(monkeypatch):
+    neutral_entry = {
+        "id": "neu-1", "category": "NEUTRAL", "label": "Neutral AP",
+        "enabled": True, "match": {"oui": DJI_OUI},   # matches the drone-OUI candidate
+    }
+    db, events = _setup(monkeypatch, no_strike_entries=[neutral_entry])
+    # A drone-OUI row that matches a NEUTRAL entry is NO LONGER refused at
+    # designate — it becomes a governed contact (fire is gated later by the
+    # fire-time no-strike override token).
+    res = await srv.designate_wifi_survey_uas(_body(), user=COMMANDER)
+    assert res["bssid"] == DJI_BSSID
+    assert len(db.detections.docs) == 1
+    assert any(e["kind"] == "WIFI_SURVEY_DESIGNATE" for e in events)
+
+
+async def test_commander_override_designates_non_drone_row_honestly(monkeypatch):
+    db, events = _setup(monkeypatch)
+    # A NON-drone AP (no drone OUI/SSID) is normally refused 422; a commander may
+    # override, but it is forced to the honest non-drone candidate tier.
+    res = await srv.designate_wifi_survey_uas(
+        _body(bssid="AA:BB:CC:DD:EE:01", oui="AA:BB:CC", ssid="MyOfficeWiFi",
+              vendor="Cisco", commander_override=True, justification=GOOD_JUST),
+        user=COMMANDER,
+    )
+    assert res["bssid"] == "AA:BB:CC:DD:EE:01"
+    doc = db.detections.docs[0]
+    assert "non-drone" in doc["make_candidate"].lower()
+    assert doc["match_basis"] == "commander-override"
+    desig = [e for e in events if e["kind"] == "WIFI_SURVEY_DESIGNATE"]
+    assert desig and desig[0]["meta"]["commander_override"] is True
+
+
+async def test_non_drone_row_without_override_still_422(monkeypatch):
+    db, _events = _setup(monkeypatch)
+    with pytest.raises(srv.HTTPException) as ei:
+        await srv.designate_wifi_survey_uas(
+            _body(bssid="AA:BB:CC:DD:EE:01", oui="AA:BB:CC", ssid="MyOfficeWiFi",
+                  vendor="Cisco", commander_override=False),
+            user=COMMANDER,
+        )
+    assert ei.value.status_code == 422
+    assert db.detections.docs == []
+
+
+async def test_commander_override_never_bypasses_civilian_hard_floor(monkeypatch):
+    civilian_entry = {
+        "id": "civ-1", "category": "CIVILIAN_INFRASTRUCTURE", "label": "Civilian AP",
+        "enabled": True, "match": {"oui": "AA:BB:CC"},
+    }
+    db, _events = _setup(monkeypatch, no_strike_entries=[civilian_entry])
+    # Even with commander_override AND a valid justification, a
+    # CIVILIAN_INFRASTRUCTURE match is hard-refused (the civilian floor is unchanged).
+    with pytest.raises(srv.HTTPException) as ei:
+        await srv.designate_wifi_survey_uas(
+            _body(bssid="AA:BB:CC:DD:EE:01", oui="AA:BB:CC", ssid="MyOfficeWiFi",
+                  vendor="Cisco", commander_override=True, justification=GOOD_JUST),
+            user=COMMANDER,
+        )
+    assert ei.value.status_code == 403
+    assert "CIVILIAN_INFRASTRUCTURE" in ei.value.detail
+    assert db.detections.docs == []
+
+
+# ---------------------------------------------------------------------
+# FIX 3 — F2 FRICTION: a commander-override designation of a NON-DRONE AP
+# REQUIRES a real justification, forces the honest possibly-civilian caveat, and
+# emits a distinct top-severity WIFI_SURVEY_COMMANDER_OVERRIDE_DESIGNATE audit.
+# ---------------------------------------------------------------------
+async def test_commander_override_designate_requires_justification_and_audits(monkeypatch):
+    db, events = _setup(monkeypatch)
+    # (1) No justification -> 400, nothing created.
+    with pytest.raises(srv.HTTPException) as ei:
+        await srv.designate_wifi_survey_uas(
+            _body(bssid="AA:BB:CC:DD:EE:02", oui="AA:BB:CC", ssid="MyOfficeWiFi",
+                  vendor="Cisco", commander_override=True),
+            user=COMMANDER,
+        )
+    assert ei.value.status_code == 400
+    assert db.detections.docs == []
+    # (2) A trivial placeholder justification -> still 400.
+    with pytest.raises(srv.HTTPException) as ei:
+        await srv.designate_wifi_survey_uas(
+            _body(bssid="AA:BB:CC:DD:EE:02", oui="AA:BB:CC", ssid="MyOfficeWiFi",
+                  vendor="Cisco", commander_override=True, justification="n/a"),
+            user=COMMANDER,
+        )
+    assert ei.value.status_code == 400
+    assert db.detections.docs == []
+    # (3) A real justification -> created, honest possibly-civilian caveat, distinct audit.
+    res = await srv.designate_wifi_survey_uas(
+        _body(bssid="AA:BB:CC:DD:EE:02", oui="AA:BB:CC", ssid="MyOfficeWiFi",
+              vendor="Cisco", commander_override=True, justification=GOOD_JUST),
+        user=COMMANDER,
+    )
+    assert res["bssid"] == "AA:BB:CC:DD:EE:02"
+    doc = db.detections.docs[0]
+    caveats = " ".join(doc.get("caveats") or []).lower()
+    assert "possibly civilian" in caveats and "non-drone" in caveats
+    ovr = [e for e in events if e["kind"] == "WIFI_SURVEY_COMMANDER_OVERRIDE_DESIGNATE"]
+    assert ovr, "a commander-override non-drone designate must emit WIFI_SURVEY_COMMANDER_OVERRIDE_DESIGNATE"
+    assert ovr[0]["meta"]["justification"] == GOOD_JUST
+    assert ovr[0]["meta"]["bssid"] == "AA:BB:CC:DD:EE:02"
+    # A drone-tagged designation still needs NO justification (unchanged).

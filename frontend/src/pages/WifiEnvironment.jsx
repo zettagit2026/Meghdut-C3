@@ -6,6 +6,7 @@ import { useAuth } from "@/context/AuthContext";
 import { Rss, ShieldAlert, ShieldPlus, ShieldCheck, Search, ArrowUp, ArrowDown, X, Crosshair } from "lucide-react";
 import {
   filterAps, sortAps, isPossibleUas, canDesignateUas, encryptionLabel, pmfLabel, lastSeenLabel, macOui,
+  hasConcreteBssid,
 } from "@/lib/wifiEnvironment";
 
 // WI-FI ENVIRONMENT — RF situational awareness.
@@ -369,6 +370,9 @@ export default function WifiEnvironment() {
       vendor: ap.vendor,
       pmf_required: ap.pmf_required,
       pmf_supported: ap.pmf_supported,
+      // COMMANDER OVERRIDE: only set for a non-drone-tagged row the commander
+      // deliberately designated (the backend forces the honest non-drone label).
+      commander_override: ap.__commanderOverride === true,
     });
     toast.success("DESIGNATED — SUSPECTED UAS", {
       description: `${ap.ssid || ap.bssid} → Wi-Fi defeat (candidate, not identification)`,
@@ -521,6 +525,18 @@ export default function WifiEnvironment() {
               {rows.map((ap, i) => {
                 const uas = isPossibleUas(ap);
                 const protectedAp = isApProtected(ap);
+                // COMMANDER NO-STRIKE OVERRIDE (row gate): a CIVILIAN_INFRASTRUCTURE
+                // match is a HARD FLOOR — no engage/override control, just a badge
+                // (reclassify the registry entry first). A NEUTRAL/FRIENDLY (or
+                // unmatched) row is engageable for a commander: a drone-OUI/SSID row
+                // via the normal designate, a non-drone row via commander_override
+                // (honest non-drone candidate; fire still needs the fire-time
+                // no-strike override token).
+                const matchedEntry = enabledNoStrikeEntries.find((e) => entryMatchesAp(e, ap)) || null;
+                const civilianProtected = matchedEntry?.category === "CIVILIAN_INFRASTRUCTURE";
+                const droneDesignable = canDesignateUas(ap, { isCommander, isProtected: false });
+                const overrideDesignable =
+                  isCommander && !civilianProtected && !droneDesignable && hasConcreteBssid(ap.bssid);
                 return (
                   <tr key={ap.bssid || i} className="tactical-border-b" data-testid={`wifi-env-row-${ap.bssid}`}>
                     <td className="px-3 py-2" style={{ color: "var(--text-primary)" }}>
@@ -578,7 +594,16 @@ export default function WifiEnvironment() {
                       )}
                     </td>
                     <td className="px-3 py-2">
-                      {canDesignateUas(ap, { isCommander, isProtected: protectedAp }) ? (
+                      {civilianProtected ? (
+                        <span
+                          data-testid={`wifi-env-protected-badge-${ap.bssid}`}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 tactical-border text-[9px] font-bold uppercase tracking-widest whitespace-nowrap"
+                          title="CIVILIAN_INFRASTRUCTURE no-strike match — hard floor. No override exists: reclassify the registry entry (commander declassify) before this can ever be engaged."
+                          style={{ color: "var(--accent-success)", borderColor: "var(--accent-success)" }}
+                        >
+                          <ShieldCheck size={10} strokeWidth={2} /> Protected — reclassify to engage
+                        </span>
+                      ) : droneDesignable ? (
                         <button
                           type="button"
                           data-testid={`wifi-env-designate-${ap.bssid}`}
@@ -588,6 +613,17 @@ export default function WifiEnvironment() {
                           style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}
                         >
                           <Crosshair size={10} strokeWidth={2} /> Engage as suspected UAS
+                        </button>
+                      ) : overrideDesignable ? (
+                        <button
+                          type="button"
+                          data-testid={`wifi-env-designate-override-${ap.bssid}`}
+                          onClick={() => setDesignatingAp({ ...ap, __commanderOverride: true })}
+                          title="COMMANDER OVERRIDE: this AP is not drone-OUI/SSID tagged. Designate it as a candidate (NOT an identification) and route to the governed per-BSSID Wi-Fi-defeat flow. Fire still requires the SafetyGate and, for a NEUTRAL/FRIENDLY match, a fire-time no-strike override token."
+                          className="inline-flex items-center gap-1 px-2 py-0.5 tactical-border text-[9px] font-bold uppercase tracking-widest whitespace-nowrap hover-surface transition-colors"
+                          style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
+                        >
+                          <Crosshair size={10} strokeWidth={2} /> Engage (commander override)
                         </button>
                       ) : (
                         <span className="text-slate-600">—</span>

@@ -303,14 +303,18 @@ def test_manual_deploy_civilian_hard_blocked_403(monkeypatch):
     assert any(e["kind"] == "NO_STRIKE_FIRE_REFUSED" for e in events)
 
 
-# ---- NEUTRAL match is likewise blocked from auto/manual fire ----
-def test_manual_wifi_neutral_hard_blocked_403(monkeypatch):
+# ---- NEUTRAL match is TIER B (OVERRIDABLE): with NO override token it is a 403
+#      (NO_STRIKE_OVERRIDE_REFUSED). The COMMANDER-OVERRIDE two-tier split moved
+#      NEUTRAL from the hard floor to overridable — the WITH-a-valid-token allow
+#      path lives in test_no_strike_override.py. ----
+def test_manual_wifi_neutral_blocked_without_override_403(monkeypatch):
     neu = _civ_wifi(ssid="TESTNEU-AP01")
     events, broadcasts = _stub(monkeypatch, detection=neu, entries=[NEUTRAL_ENTRY])
     with pytest.raises(srv.HTTPException) as ei:
         asyncio.run(srv.deploy_wifi_defeat(_wifi_body(), user=USER))
     assert ei.value.status_code == 403
-    ref = [e for e in events if e["kind"] == "NO_STRIKE_FIRE_REFUSED"]
+    assert "neutral" in ei.value.detail.lower()
+    ref = [e for e in events if e["kind"] == "NO_STRIKE_OVERRIDE_REFUSED"]
     assert ref and ref[0]["meta"]["category"] == "NEUTRAL"
     assert not _forwarded(broadcasts, "wifi_defeat_request")
 
@@ -353,16 +357,21 @@ def test_friendly_fire_ack_does_not_bypass_civilian_floor(monkeypatch):
 
 
 def test_no_civilian_fire_through_source_has_no_override_branch():
-    """Static guarantee: the fire-time function's CIVILIAN/NEUTRAL branch raises
-    with NO ack/override consult in scope — there is literally no code path from a
-    token to firing on a civilian. Assert the source shape (belt-and-braces to the
-    behavioural test above)."""
+    """Static guarantee: the fire-time function's TIER A (CIVILIAN_INFRASTRUCTURE
+    HARD FLOOR) branch raises with NO ack/override consult in scope — there is
+    literally no code path from any token to firing on a civilian-infrastructure
+    contact. The COMMANDER-OVERRIDE two-tier split keeps this invariant: the
+    override lives ONLY in TIER B (NEUTRAL) and the FRIENDLY branch, both AFTER the
+    hard floor. Assert the source shape of the TIER A region specifically."""
     import inspect
     src = inspect.getsource(srv._enforce_fire_time_no_strike)
-    civ_branch = src.split("block_category = next", 1)[1].split(
-        "FRIENDLY_OWN_FORCE", 1)[0]
-    assert "_consume_iff_ff_ack" not in civ_branch
-    assert "friendly_fire_ack" not in civ_branch
+    # The TIER A hard-floor region runs from its marker to the TIER B marker.
+    assert "# ---- TIER A" in src and "# ---- TIER B" in src
+    tier_a = src.split("# ---- TIER A", 1)[1].split("# ---- TIER B", 1)[0]
+    assert "_consume_iff_ff_ack" not in tier_a
+    assert "_consume_no_strike_override" not in tier_a
+    assert "friendly_fire_ack" not in tier_a
+    assert "no_strike_override" not in tier_a
 
 
 # ===========================================================================

@@ -78,6 +78,48 @@ export function canDesignateUas(ap, { isCommander, isProtected } = {}) {
   return hasConcreteBssid(ap.bssid);
 }
 
+// Return the first ENABLED no-strike entry that matches this AP (by BSSID or
+// OUI), or null. Mirrors WifiEnvironment.jsx's entryMatchesAp but lives here so
+// the row-action gate is unit-testable. Disabled entries (enabled === false) are
+// skipped. Client-side display convenience ONLY — the backend is the source of
+// truth for any real consult/fire decision.
+export function matchedNoStrikeEntry(ap, entries) {
+  if (!ap || !Array.isArray(entries)) return null;
+  const bssid = (ap.bssid || "").toUpperCase();
+  const oui = macOui(ap.bssid);
+  for (const entry of entries) {
+    if (!entry || entry.enabled === false) continue;
+    const m = entry.match || {};
+    if (m.bssid && bssid && String(m.bssid).toUpperCase() === bssid) return entry;
+    if (m.oui && oui && String(m.oui).toUpperCase() === oui) return entry;
+  }
+  return null;
+}
+
+// COMMANDER NO-STRIKE OVERRIDE — the Wi-Fi survey row's Designate/Engage gate.
+// Returns one of:
+//   "protected"       -> a CIVILIAN_INFRASTRUCTURE match: the HARD FLOOR. NO
+//                        engage/override control — reclassify the registry entry
+//                        first (commander declassify). This is the buttonless badge.
+//   "engage"          -> a drone-OUI/SSID-tagged, non-civilian row: normal designate.
+//   "engage-override" -> a commander + non-civilian row that is NOT drone-tagged:
+//                        designate with commander_override (honest non-drone
+//                        candidate). Fire still needs the fire-time no-strike
+//                        override token for a NEUTRAL/FRIENDLY match.
+//   "none"            -> nothing actionable (non-commander, or a broadcast/absent
+//                        BSSID).
+// The CIVILIAN hard floor is the ONLY thing that removes the engage control; a
+// NEUTRAL/FRIENDLY match is engageable (the override token is the fire-time gate,
+// not a designate-time block). Kept in lock-step with canDesignateUas.
+export function noStrikeRowAction(ap, entries, isCommander) {
+  const matched = matchedNoStrikeEntry(ap, entries);
+  if (matched && matched.category === "CIVILIAN_INFRASTRUCTURE") return "protected";
+  if (!isCommander) return "none";
+  if (!hasConcreteBssid(ap && ap.bssid)) return "none";
+  if (canDesignateUas(ap, { isCommander, isProtected: false })) return "engage";
+  return "engage-override";
+}
+
 // Human-readable encryption label. Kismet's crypt_string is already printable
 // (e.g. "WPA2-PSK-AES", "Open"); we only normalise the empty/unknown case.
 export function encryptionLabel(ap) {

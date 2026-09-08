@@ -13,6 +13,7 @@ const path = require("path");
 const {
   isPossibleUas, droneOuiVendor, ssidLooksLikeDrone, filterAps, sortAps,
   encryptionLabel, pmfLabel, lastSeenLabel, canDesignateUas, hasConcreteBssid,
+  matchedNoStrikeEntry, noStrikeRowAction,
 } = require("./wifiEnvironment");
 
 // A small fixture in the exact survey shape the backend returns.
@@ -105,6 +106,55 @@ describe("designate gating predicate (canDesignateUas)", () => {
   test("ABSENT without a concrete (non-broadcast) BSSID", () => {
     expect(canDesignateUas({ possible_uas: true, bssid: "" }, { isCommander: true })).toBe(false);
     expect(canDesignateUas({ possible_uas: true, bssid: "FF:FF:FF:FF:FF:FF" }, { isCommander: true })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// COMMANDER NO-STRIKE OVERRIDE — the Wi-Fi survey row action gate. Only a
+// CIVILIAN_INFRASTRUCTURE match removes the engage control (hard floor, badge
+// only); NEUTRAL / FRIENDLY / unmatched rows are engageable for a commander.
+// ---------------------------------------------------------------------------
+describe("no-strike row action gate (noStrikeRowAction)", () => {
+  const droneRow = FIXTURE[2]; // DJI OUI 60:60:1F, possible_uas true
+  const officeRow = FIXTURE[0]; // OfficeNet — not a possible UAS, OUI AC:DE:48
+  const CIV = { category: "CIVILIAN_INFRASTRUCTURE", enabled: true, match: { oui: "60:60:1F" } };
+  const NEU = { category: "NEUTRAL", enabled: true, match: { oui: "60:60:1F" } };
+  const FRD = { category: "FRIENDLY_OWN_FORCE", enabled: true, match: { oui: "AC:DE:48" } };
+
+  test("matchedNoStrikeEntry matches by OUI and skips disabled entries", () => {
+    expect(matchedNoStrikeEntry(droneRow, [NEU])).toBe(NEU);
+    expect(matchedNoStrikeEntry(droneRow, [{ ...NEU, enabled: false }])).toBeNull();
+    expect(matchedNoStrikeEntry(officeRow, [NEU])).toBeNull();
+  });
+
+  test("CIVILIAN_INFRASTRUCTURE match -> 'protected' (hard floor, no engage/override)", () => {
+    expect(noStrikeRowAction(droneRow, [CIV], true)).toBe("protected");
+    // ...even though it is a drone-tagged row, the civilian hard floor wins.
+  });
+
+  test("NEUTRAL drone-tagged match -> 'engage' (designatable; override is a fire-time gate)", () => {
+    expect(noStrikeRowAction(droneRow, [NEU], true)).toBe("engage");
+  });
+
+  test("drone-tagged non-matched row -> 'engage'", () => {
+    expect(noStrikeRowAction(droneRow, [], true)).toBe("engage");
+  });
+
+  test("non-drone FRIENDLY match (commander) -> 'engage-override'", () => {
+    expect(noStrikeRowAction(officeRow, [FRD], true)).toBe("engage-override");
+  });
+
+  test("non-drone unmatched row (commander) -> 'engage-override'", () => {
+    expect(noStrikeRowAction(officeRow, [], true)).toBe("engage-override");
+  });
+
+  test("non-commander -> 'none' for a non-civilian row", () => {
+    expect(noStrikeRowAction(droneRow, [NEU], false)).toBe("none");
+  });
+
+  test("broadcast/absent BSSID -> 'none'", () => {
+    expect(noStrikeRowAction({ bssid: "FF:FF:FF:FF:FF:FF" }, [], true)).toBe("none");
+    expect(noStrikeRowAction({ bssid: "" }, [], true)).toBe("none");
   });
 });
 

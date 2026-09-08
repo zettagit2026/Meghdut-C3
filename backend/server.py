@@ -529,6 +529,77 @@ def _consume_iff_ff_ack(token: Optional[str],
     return rec
 
 
+# ---- Commander NO-STRIKE OVERRIDE token (DELIBERATELY a separate type) --------
+# The ONLY thing that can license firing on a target that matches an OVERRIDABLE
+# no-strike entry (FRIENDLY_OWN_FORCE or NEUTRAL — see
+# _NO_STRIKE_OVERRIDABLE_CATEGORIES). Modeled on the friendly-fire ack above
+# (short-TTL, single-use, target-bound, atomic pop) but a SEPARATE token type so
+# an over-a-no-strike-floor engagement can never be authorized by a token minted
+# for anything else, and — CRITICAL — it is bound at mint time to the matched
+# CATEGORY so a token can never validate against a CIVILIAN_INFRASTRUCTURE match
+# (the civilian hard floor has no override; _consume rejects any category outside
+# _NO_STRIKE_OVERRIDABLE_CATEGORIES). It is additionally bound to the exact target
+# detection id, the derived softAP BSSID (per-BSSID only, never client-supplied),
+# and the effect, so it can never be replayed onto a different target/effect. It
+# must be minted by a COMMANDER (require_commander) and is LOUDLY audited at both
+# mint time (NO_STRIKE_OVERRIDE_MINTED) and fire time (NO_STRIKE_CIVILIAN_OVERRIDE).
+# It is NOT a bypass of the arm-token / range-lease / tx-halt / IFF spine — those
+# all still apply; this is an EXTRA gate layered on top for an overridable match.
+NO_STRIKE_OVERRIDE_TTL_S = 60
+# token -> {"expiry", "target_detection_id", "bssid", "effect", "category",
+#           "justification", "minted_by"}
+_no_strike_overrides: Dict[str, Dict[str, Any]] = {}
+
+
+def _issue_no_strike_override(target_detection_id: str, bssid: Optional[str],
+                             effect: str, category: str, justification: str,
+                             minted_by: str) -> Dict[str, Any]:
+    token = str(uuid.uuid4())
+    _no_strike_overrides[token] = {
+        "expiry": datetime.now(timezone.utc) + timedelta(seconds=NO_STRIKE_OVERRIDE_TTL_S),
+        "target_detection_id": target_detection_id,
+        "bssid": bssid,
+        "effect": effect,
+        "category": category,
+        "justification": justification,
+        "minted_by": minted_by,
+    }
+    return {"token": token, "expires_in_s": NO_STRIKE_OVERRIDE_TTL_S,
+            "target_detection_id": target_detection_id, "effect": effect,
+            "category": category}
+
+
+def _consume_no_strike_override(token: Optional[str], target_detection_id: str,
+                               effect: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Atomic single-use burn of a commander-minted no-strike override, verifying
+    it is bound to THIS target AND THIS effect, carries a concrete BSSID, and —
+    the load-bearing invariant — matched an OVERRIDABLE category. Returns the
+    burned record on success, or None when the token is missing / expired / bound
+    to a different target or effect / has no BSSID / matched a NON-overridable
+    (i.e. CIVILIAN_INFRASTRUCTURE) category. A civilian override can NEVER validate
+    here: even if a token somehow carried CIVILIAN_INFRASTRUCTURE it is rejected.
+
+    ATOMICITY: the lookup-and-pop is a single synchronous dict.pop with NO `await`
+    between the read and the removal — this is what makes the override genuinely
+    single-use and immune to a double-spend race. A binding/category mismatch STILL
+    burns the token (the pop already happened) — a mismatch is a security-relevant
+    event, not a retryable one — mirroring _consume_iff_ff_ack / _consume_arm_token."""
+    if not token:
+        return None
+    rec = _no_strike_overrides.pop(token, None)  # atomic single-use burn — no await around this
+    if not rec or datetime.now(timezone.utc) > rec["expiry"]:
+        return None
+    if rec.get("target_detection_id") != target_detection_id:
+        return None
+    if rec.get("effect") != effect:
+        return None
+    if not _nonempty_str(rec.get("bssid")):
+        return None
+    if rec.get("category") not in _NO_STRIKE_OVERRIDABLE_CATEGORIES:
+        return None
+    return rec
+
+
 # ---- Jam-confirm token (SEPARATE from arm_token — the digital equivalent
 # of physically typing 'TRANSMIT' at hackrf_jam.py's interactive prompt) ----
 # RF jamming (/payloads/jam) needs its own, distinct, single-use token — NOT
@@ -1014,48 +1085,99 @@ def _detection_identity(detection: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-async def _enforce_fire_time_no_strike(detection: Dict[str, Any], user: Dict[str, Any],
-                                       *, context: str,
-                                       friendly_fire_ack: Optional[str] = None) -> None:
-    """P3 (no-strike-registry.md §2B) — the FIRE-TIME CIVILIAN HARD BLOCK: the
-    actual civilian-protection floor behind every shot. Called in EVERY
-    `_execute_engagement` transmit path (and the manual /payloads/deploy path)
-    BEFORE `_enforce_fire_time_iff`, so the civilian floor is evaluated FIRST and
-    its 403 is unconditional.
+def _matches_any_civilian(identity: Any, entries: Any) -> bool:
+    """CIVILIAN-WINS-OVER-SPECIFICITY — the load-bearing predicate behind the
+    fire-time hard floor and the override-mint refusal.
 
-    THE FLOOR INVARIANT (never violated): a target that matches a
-    CIVILIAN_INFRASTRUCTURE or NEUTRAL no-strike entry CANNOT be struck. There is
-    NO ack, NO override token, and NO code path from any commander token to firing
-    on a civilian contact — the friendly-fire ack (a deliberate path to engage an
-    own-force FRIENDLY under ROE) does NOT satisfy this and is never consulted for
-    a civilian/neutral match.
+    `no_strike.match()` returns only the SINGLE most-specific hit (bssid beats
+    ssid beats oui beats vendor_regex). That means a more-specific NEUTRAL/FRIENDLY
+    entry — or a drone deliberately spoofing a civilian BSSID — can SHADOW an
+    enabled CIVILIAN_INFRASTRUCTURE entry out of the aggregate verdict, which the
+    now-overridable NEUTRAL tier would then turn into a silent civilian-strike path.
+    This evaluates the civilian floor ONE ENTRY AT A TIME so a civilian match can
+    never be shadowed: True iff `identity` matches ANY enabled
+    CIVILIAN_INFRASTRUCTURE entry on its own. Callers MUST pass only ENABLED
+    entries (the hot-load cache / `_no_strike_entries()` is already enabled-only).
+    Pure, read-only, never raises."""
+    if not isinstance(identity, dict) or not isinstance(entries, (list, tuple)):
+        return False
+    return any(
+        no_strike.match(identity, [e]).get("category") == "CIVILIAN_INFRASTRUCTURE"
+        for e in entries
+        if isinstance(e, dict) and e.get("category") == "CIVILIAN_INFRASTRUCTURE"
+    )
+
+
+def _first_matching_civilian_entry(identity: Any, entries: Any) -> Optional[Dict[str, Any]]:
+    """The first enabled CIVILIAN_INFRASTRUCTURE entry that matches `identity` on
+    its own (per-entry, unshadowed) — used ONLY to name the actual civilian entry
+    in a refusal message/audit when the aggregate hit was a shadowing non-civilian
+    entry. Never raises."""
+    if not isinstance(identity, dict) or not isinstance(entries, (list, tuple)):
+        return None
+    for e in entries:
+        if (isinstance(e, dict) and e.get("category") == "CIVILIAN_INFRASTRUCTURE"
+                and no_strike.match(identity, [e]).get("matched")):
+            return e
+    return None
+
+
+async def _enforce_fire_time_no_strike(detection: Dict[str, Any], user: Dict[str, Any],
+                                       *, context: str, effect: Optional[str] = None,
+                                       friendly_fire_ack: Optional[str] = None,
+                                       no_strike_override: Optional[str] = None) -> None:
+    """P3 (no-strike-registry.md §2B) — the FIRE-TIME NO-STRIKE FLOOR: the actual
+    civilian-protection floor behind every shot. Called in EVERY
+    `_execute_engagement` transmit path (and the manual /payloads/deploy path)
+    BEFORE `_enforce_fire_time_iff`, so the floor is evaluated FIRST.
+
+    TWO-TIER FLOOR (COMMANDER NO-STRIKE OVERRIDE):
+
+      * TIER A — HARD FLOOR (CIVILIAN_INFRASTRUCTURE, see
+        `_NO_STRIKE_HARD_FLOOR_CATEGORIES`): UNCONDITIONAL 403. There is NO ack,
+        NO override token, and NO code path from any commander token to firing on
+        a civilian-infrastructure contact — no token is even consulted in this
+        branch. Striking a civilian entity requires FIRST reclassifying its
+        registry entry out of CIVILIAN_INFRASTRUCTURE (a separate, password +
+        justification, loudly-audited act — see update_no_strike): two deliberate,
+        audited acts, neither casual nor silent. THE FLOOR INVARIANT is unchanged
+        for civilian infrastructure.
+
+      * TIER B — OVERRIDABLE (NEUTRAL, and FRIENDLY_OWN_FORCE below; see
+        `_NO_STRIKE_OVERRIDABLE_CATEGORIES`): blocked UNLESS this request carries a
+        valid single-use, target+effect+category-bound commander override token
+        (`_consume_no_strike_override`). A NEUTRAL match with no/invalid token is a
+        403 (NO_STRIKE_OVERRIDE_REFUSED); a valid token allows the shot and is
+        LOUDLY audited (NO_STRIKE_CIVILIAN_OVERRIDE). The override is bound to the
+        matched CATEGORY, so a civilian token can never validate here.
 
     The verdict is RE-COMPUTED at the instant of transmission against the LIVE,
     hot-loaded registry (`no_strike.match(_detection_identity(detection),
     _no_strike_entries())`) and ALSO honours the stored P2 stamps
-    (`no_strike`/`no_strike_conflict`) as defence-in-depth — civilian-protection
-    wins, so a civilian/neutral verdict from EITHER source blocks. Adjudicating a
-    contact off the floor is therefore a deliberate commander act on the REGISTRY
-    (disable/reclassify the entry, which the next detection tick re-stamps); there
-    is no fire-through path here.
+    (`no_strike`/`no_strike_conflict`) as defence-in-depth — protection wins, so a
+    matching verdict from EITHER source drives the tier.
 
-    CONFLICT case: a contact that matches a civilian entry AND carries a decoded
+    CONFLICT case: a contact that matches a HARD-FLOOR entry AND carries a decoded
     drone signature (`no_strike_conflict`) is STILL hard-blocked here — the block
     message names the conflict so a human can adjudicate by resolving the registry
     entry. This never inverts to auto-engage-on-conflict.
 
-    FRIENDLY_OWN_FORCE: same posture as the IFF interlock (blocked, overridable
-    ONLY by the existing single-use friendly-fire ack). This function does NOT
-    duplicate the IFF machinery: for a beacon-verified friendly it DEFERS (no-op)
-    and lets `_enforce_fire_time_iff` own the block and burn the ack; it adds
-    coverage ONLY for a registry-declared friendly with NO IFF beacon (which the
-    IFF interlock would otherwise let through)."""
+    FRIENDLY_OWN_FORCE: an OVERRIDABLE category. Same posture as the IFF interlock
+    (blocked, overridable ONLY by a deliberate single-use commander token). This
+    function does NOT duplicate the IFF machinery: for a beacon-verified friendly
+    it DEFERS (no-op) and lets `_enforce_fire_time_iff` own the block and burn the
+    ack; it adds coverage ONLY for a registry-declared friendly with NO IFF beacon
+    (which the IFF interlock would otherwise let through), accepting EITHER the
+    no-strike override token OR the existing single-use friendly-fire ack — never
+    both (no double burn)."""
     if not isinstance(detection, dict):
         return
     det_id = detection.get("id")
 
     # LIVE re-match against the hot-loaded registry (authoritative instant check).
-    ns = no_strike.match(_detection_identity(detection), await _no_strike_entries())
+    identity = _detection_identity(detection)
+    entries = await _no_strike_entries()
+    ns = no_strike.match(identity, entries)
     live_category = ns.get("category") if ns.get("matched") else None
 
     # Stored P2 stamps (defence-in-depth; civilian-protection wins).
@@ -1066,22 +1188,46 @@ async def _enforce_fire_time_no_strike(detection: Dict[str, Any], user: Dict[str
     stored_conflict = stored_conflict if isinstance(stored_conflict, dict) else {}
     conflict_category = stored_conflict.get("category") if stored_conflict else None
 
-    # ---- CIVILIAN / NEUTRAL: HARD 403 floor. No ack, no override token exists. ----
+    # CIVILIAN-WINS-OVER-SPECIFICITY (evaluated PER-ENTRY, unshadowed): a
+    # more-specific NEUTRAL/FRIENDLY entry — or a drone spoofing a civilian BSSID —
+    # can shadow an enabled CIVILIAN_INFRASTRUCTURE entry out of the SINGLE aggregate
+    # `ns` hit, so the aggregate alone is not enough to hold the floor. This
+    # per-entry sweep holds the hard floor regardless of what `ns` returned; it is
+    # defence-in-depth ALONGSIDE the stored/conflict stamps below (protection wins
+    # from ANY source).
+    per_entry_civilian = _matches_any_civilian(identity, entries)
+
+    # ---- TIER A — HARD FLOOR (CIVILIAN_INFRASTRUCTURE): UNCONDITIONAL 403. ----
+    # No ack, NO override token, NO token consulted in this branch. There is
+    # literally no code path from any commander token to firing on a civilian-
+    # infrastructure contact (see the source-shape test in test_no_strike_fire_block).
     block_category = next(
         (c for c in (live_category, stored_category, conflict_category)
-         if c in _NO_STRIKE_CIVILIAN_CATEGORIES), None)
+         if c in _NO_STRIKE_HARD_FLOOR_CATEGORIES), None)
+    if block_category is None and per_entry_civilian:
+        # The aggregate hit was a shadowing non-civilian entry, but the identity
+        # matches a civilian entry on its own: still the hard floor.
+        block_category = "CIVILIAN_INFRASTRUCTURE"
     if block_category is not None:
-        label = ns.get("label") or stored_ns.get("label")
+        # Prefer the ACTUAL civilian entry for the label/basis so the refusal names
+        # the civilian entry even when a non-civilian entry shadowed the aggregate.
+        civ_entry = _first_matching_civilian_entry(identity, entries)
+        if civ_entry is not None:
+            label = civ_entry.get("label")
+            entry_id = civ_entry.get("id")
+            basis = no_strike.match(identity, [civ_entry]).get("basis")
+        else:
+            label = ns.get("label") or stored_ns.get("label")
+            entry_id = (ns.get("entry_id") or stored_ns.get("entry_id")
+                        or stored_conflict.get("registry_entry_id"))
+            basis = ns.get("basis") if ns.get("matched") else "stored_stamp"
         label_txt = label if _nonempty_str(label) else "unnamed entry"
-        entry_id = (ns.get("entry_id") or stored_ns.get("entry_id")
-                    or stored_conflict.get("registry_entry_id"))
-        basis = ns.get("basis") if ns.get("matched") else "stored_stamp"
         # CONFLICT = the civilian contact ALSO carries a real drone signature
         # (a stored no_strike_conflict stamp, or a live civilian match on an
         # otherwise target-grade contact). Named in the message for adjudication;
         # the block is unconditional either way.
         is_conflict = bool(stored_conflict) or (
-            live_category in _NO_STRIKE_CIVILIAN_CATEGORIES and is_target_grade(detection))
+            live_category in _NO_STRIKE_HARD_FLOOR_CATEGORIES and is_target_grade(detection))
         drone_basis = (stored_conflict.get("drone_basis")
                        or (_corroboration_basis(detection) if is_conflict else None))
         msg = (
@@ -1111,7 +1257,55 @@ async def _enforce_fire_time_no_strike(detection: Dict[str, Any], user: Dict[str
         )
         raise HTTPException(403, msg)
 
-    # ---- FRIENDLY_OWN_FORCE: same posture as IFF; do NOT duplicate IFF. ----
+    # ---- TIER B — NEUTRAL (OVERRIDABLE): blocked UNLESS a valid commander -------
+    # no-strike override token is presented for THIS target + effect + category.
+    # A NEUTRAL contact never reaches here on the one-tap /api/engage path (the ROE
+    # floor `_detection_is_classified_hostile` refuses a no_strike.matched contact
+    # before any token is minted); this is the deliberate manual-deploy path.
+    neutral_category = next(
+        (c for c in (live_category, stored_category, conflict_category)
+         if c == "NEUTRAL"), None)
+    if neutral_category is not None:
+        label = ns.get("label") or stored_ns.get("label")
+        label_txt = label if _nonempty_str(label) else "unnamed entry"
+        entry_id = (ns.get("entry_id") or stored_ns.get("entry_id")
+                    or stored_conflict.get("registry_entry_id"))
+        override_rec = _consume_no_strike_override(no_strike_override, det_id, effect)
+        if override_rec is None or override_rec.get("category") != "NEUTRAL":
+            await log_event(
+                "NO_STRIKE_OVERRIDE_REFUSED",
+                f"NO-STRIKE NEUTRAL: {context} against {detection.get('callsign', '?')} "
+                f"({det_id}) REFUSED — target matches a protected NEUTRAL no-strike registry "
+                f"entry ({label_txt}) and this deploy carried no valid single-use commander "
+                f"no-strike override token for THIS target+effect+category.",
+                meta={"detection_id": det_id, "callsign": detection.get("callsign"),
+                      "context": context, "category": "NEUTRAL", "entry_id": entry_id,
+                      "effect": effect},
+                actor=user["email"],
+            )
+            raise HTTPException(
+                403,
+                "NO-STRIKE FLOOR — fire refused: target matches a protected NEUTRAL registry "
+                f"entry ({label_txt}). Firing on a NEUTRAL contact requires an explicit, "
+                "single-use, per-engagement commander no-strike override minted for THIS target "
+                "(POST /api/detections/{id}/no-strike-override). There is no standing override, "
+                "and no override exists for CIVILIAN_INFRASTRUCTURE.",
+            )
+        await log_event(
+            "NO_STRIKE_CIVILIAN_OVERRIDE",
+            f"COMMANDER OVERRODE the NEUTRAL no-strike floor — {detection.get('callsign', '?')} "
+            f"({det_id}) via single-use no-strike override token ({context}, effect={effect}).",
+            meta={"detection_id": det_id, "callsign": detection.get("callsign"),
+                  "context": context, "category": "NEUTRAL", "entry_id": entry_id,
+                  "effect": effect, "bssid": override_rec.get("bssid"),
+                  "override_minted_by": override_rec.get("minted_by"),
+                  "justification": override_rec.get("justification"),
+                  "engaged_by": user["email"]},
+            actor=user["email"],
+        )
+        return
+
+    # ---- FRIENDLY_OWN_FORCE (OVERRIDABLE): same posture as IFF; do NOT duplicate IFF. ----
     if live_category == "FRIENDLY_OWN_FORCE" or stored_category == "FRIENDLY_OWN_FORCE":
         # A beacon-verified friendly is owned by the IFF interlock, which runs
         # next and consumes the single-use ack exactly once. Defer (no-op) here so
@@ -1120,8 +1314,28 @@ async def _enforce_fire_time_no_strike(detection: Dict[str, Any], user: Dict[str
             return
         # A registry-declared friendly with NO IFF beacon: `_enforce_fire_time_iff`
         # would let it through (its is_friendly predicate is False), so add exactly
-        # that coverage — blocked unless THIS request carries a valid single-use,
-        # target-bound commander friendly-fire ack (the SAME token type IFF uses).
+        # that coverage — blocked unless THIS request carries a valid single-use
+        # commander token. Accept EITHER the no-strike override token (tried FIRST)
+        # OR the existing friendly-fire ack — NEVER both: a valid override returns
+        # before the ack is ever consulted, so at most one token is burned.
+        override_rec = _consume_no_strike_override(no_strike_override, det_id, effect)
+        if override_rec is not None and override_rec.get("category") == "FRIENDLY_OWN_FORCE":
+            await log_event(
+                "NO_STRIKE_FRIENDLY_FIRE_OVERRIDE",
+                f"COMMANDER ENGAGED A REGISTRY-FRIENDLY (no IFF beacon) — "
+                f"{detection.get('callsign', '?')} ({det_id}) via single-use no-strike override "
+                f"token ({context}, effect={effect}).",
+                meta={"detection_id": det_id, "callsign": detection.get("callsign"),
+                      "context": context, "category": "FRIENDLY_OWN_FORCE",
+                      "via": "no_strike_override", "effect": effect,
+                      "override_minted_by": override_rec.get("minted_by"),
+                      "justification": override_rec.get("justification"),
+                      "engaged_by": user["email"]},
+                actor=user["email"],
+            )
+            return
+        # No override token (or not a friendly one): fall back to the existing
+        # single-use, target-bound friendly-fire ack (the SAME token type IFF uses).
         # Consumed here; IFF then no-ops for it, so there is no double burn.
         ack_rec = _consume_iff_ff_ack(friendly_fire_ack, det_id)
         if ack_rec is None:
@@ -2144,6 +2358,13 @@ class DeployPayloadBody(BaseModel):
     # IFF-verified FRIENDLY. Never a bypass of the arm-token/range-lease/tx-halt
     # spine; an EXTRA gate on top. See _enforce_fire_time_iff.
     iff_friendly_fire_ack: Optional[str] = None
+    # DELIBERATE no-strike override: a single-use, commander-minted, target+effect+
+    # category-bound token (see POST /api/detections/{id}/no-strike-override).
+    # Consumed exactly once, ONLY when the target matches an OVERRIDABLE no-strike
+    # entry (NEUTRAL / FRIENDLY_OWN_FORCE). NEVER licenses a CIVILIAN_INFRASTRUCTURE
+    # match (the hard floor has no override) and NEVER bypasses the spine. See
+    # _enforce_fire_time_no_strike.
+    no_strike_override: Optional[str] = None
 
 
 class AuthorizeTargetBody(BaseModel):
@@ -2335,6 +2556,11 @@ class MavlinkSdrInjectBody(BaseModel):
     # ONLY when the target is currently IFF-verified FRIENDLY. Never a bypass of
     # the spine; an EXTRA gate. See _enforce_fire_time_iff.
     iff_friendly_fire_ack: Optional[str] = None
+    # DELIBERATE no-strike override — single-use, commander-minted, target+effect+
+    # category-bound (see POST /api/detections/{id}/no-strike-override). Consumed
+    # once, ONLY for an OVERRIDABLE (NEUTRAL / FRIENDLY_OWN_FORCE) match; NEVER for
+    # CIVILIAN_INFRASTRUCTURE. See _enforce_fire_time_no_strike.
+    no_strike_override: Optional[str] = None
 
 
 # ---- Active Wi-Fi defeat (Parrot/Tello) — 802.11 deauth link-drop OR
@@ -2385,6 +2611,12 @@ class WifiDefeatBody(BaseModel):
     # the spine; an EXTRA gate. See _enforce_fire_time_iff. A registered/friendly
     # AP is NEVER deauthed without this.
     iff_friendly_fire_ack: Optional[str] = None
+    # DELIBERATE no-strike override — single-use, commander-minted, target+effect+
+    # category-bound (see POST /api/detections/{id}/no-strike-override). Consumed
+    # once, ONLY for an OVERRIDABLE (NEUTRAL / FRIENDLY_OWN_FORCE) match; NEVER for
+    # CIVILIAN_INFRASTRUCTURE. A NEUTRAL softAP is NEVER deauthed without it. See
+    # _enforce_fire_time_no_strike.
+    no_strike_override: Optional[str] = None
 
 
 # ---- GNSS L1 civil-signal spoofing ("soft-kill") — Task #103. See
@@ -3227,6 +3459,26 @@ class NoStrikeUpdateBody(BaseModel):
     hard: Optional[bool] = None
     enabled: Optional[bool] = None
     notes: Optional[str] = Field(None, max_length=2000)
+    # Required (CONDITIONALLY) whenever this edit WEAKENS or REMOVES the civilian
+    # hard floor of an ENABLED CIVILIAN_INFRASTRUCTURE entry — a category change OUT
+    # of CIVILIAN_INFRASTRUCTURE, a DISABLE (enabled -> false), OR a MATCH-BLOCK edit
+    # (which could narrow coverage). Each lifts the floor for an entity, so each
+    # demands the SAME step-up ceremony (password + real justification, loudly
+    # audited). Ignored for every other edit and for non-civilian entries. See
+    # update_no_strike / _verify_civilian_protection_ceremony.
+    password: Optional[str] = None
+    justification: Optional[str] = None
+
+
+class NoStrikeDeleteBody(BaseModel):
+    # DELETE disables an entry (never a hard delete). When the target is an ENABLED
+    # CIVILIAN_INFRASTRUCTURE entry, disabling it removes the civilian hard floor, so
+    # it requires the SAME step-up ceremony as a declassify (password + real
+    # justification). Both fields are optional at the schema level and CONDITIONALLY
+    # required only for a civilian entry — a non-civilian disable stays ungated as
+    # before. See delete_no_strike / _verify_civilian_protection_ceremony.
+    password: Optional[str] = None
+    justification: Optional[str] = None
 
 
 def _validate_no_strike_match(match_block: Any) -> None:
@@ -3247,6 +3499,105 @@ def _no_strike_hard_default(category: str, hard: Optional[bool]) -> bool:
     if hard is not None:
         return bool(hard)
     return category == "CIVILIAN_INFRASTRUCTURE"
+
+
+def _civilian_protection_removal(existing: Dict[str, Any], *,
+                                 new_category: Optional[str] = None,
+                                 new_enabled: Optional[bool] = None,
+                                 new_match: Optional[Dict[str, Any]] = None,
+                                 deleting: bool = False) -> Optional[str]:
+    """HOLISTIC trigger detector: return a short old->new TRANSITION description
+    iff this mutation WEAKENS or REMOVES the civilian hard floor of an ENABLED
+    CIVILIAN_INFRASTRUCTURE registry entry, else None. The single property behind
+    FIX-2 — a civilian floor can be lifted ONLY by the declassify ceremony,
+    whichever registry operation lifts it:
+
+      (a) category change OUT of CIVILIAN_INFRASTRUCTURE;
+      (b) DISABLE (enabled true -> false), including a DELETE (which disables);
+      (c) MATCH-BLOCK edit that actually changes the match (could narrow coverage).
+
+    An entry that is already disabled (already unprotected) or is not
+    CIVILIAN_INFRASTRUCTURE never triggers — a non-civilian edit/delete stays
+    ungated exactly as before. Pure, never raises."""
+    if not isinstance(existing, dict):
+        return None
+    if existing.get("category") != "CIVILIAN_INFRASTRUCTURE":
+        return None
+    if not existing.get("enabled", True):
+        return None
+    reasons: List[str] = []
+    if new_category is not None and new_category != "CIVILIAN_INFRASTRUCTURE":
+        reasons.append(f"category CIVILIAN_INFRASTRUCTURE -> {new_category}")
+    if deleting or new_enabled is False:
+        reasons.append("enabled -> false (disabled)")
+    if (new_match is not None
+            and isinstance(existing.get("match"), dict)
+            and new_match != existing.get("match")):
+        reasons.append("match block edited (coverage may be narrowed)")
+    elif new_match is not None and not isinstance(existing.get("match"), dict):
+        reasons.append("match block edited (coverage may be narrowed)")
+    return "; ".join(reasons) if reasons else None
+
+
+async def _verify_civilian_protection_ceremony(*, entry_id: str,
+                                               request: Optional[Request],
+                                               user: Dict[str, Any],
+                                               password: Optional[str],
+                                               justification: Optional[str],
+                                               action: str) -> None:
+    """The ONE shared declassify ceremony invoked by every registry transition that
+    lifts a civilian hard floor (category-out / disable / delete / match-edit) so the
+    three paths can NEVER drift apart. Same step-up the category-declassify has always
+    required: throttled password re-verification (a stolen JWT alone is never enough)
+    + a real, actively-typed justification. Raises 429 (locked out) / 401 (bad
+    password) / 400 (trivial justification). Emits NO success audit — the caller
+    performs the write, then calls _audit_civilian_declassified with the precise
+    transition. Touches NO TX-spine state."""
+    source_ip = request.client.host if (request and request.client) else None
+    throttle_key = user["email"]
+    if _range_auth_locked_out(throttle_key):
+        raise HTTPException(429, "Too many failed attempts — try again shortly.")
+    full_user = await db.users.find_one({"id": user["id"]})
+    if not password or not full_user or not verify_password(password, full_user["password_hash"]):
+        _record_range_auth_failure(throttle_key)
+        await log_event(
+            "NO_STRIKE_CIVILIAN_DECLASSIFY_FAILED",
+            f"CIVILIAN protection-removal ({action}) of no-strike entry {entry_id} REFUSED: "
+            f"bad password",
+            meta={"entry_id": entry_id, "reason": "bad_password", "action": action,
+                  "source_ip": source_ip},
+            actor=user["email"],
+        )
+        raise HTTPException(401, "Password re-verification failed.")
+    if not _looks_like_real_attestation(justification):
+        raise HTTPException(
+            400,
+            f"Removing the civilian hard floor from a CIVILIAN_INFRASTRUCTURE no-strike entry "
+            f"(via {action}) requires a specific, actively-typed justification (at least "
+            f"{MIN_FRIENDLY_ASSET_ATTESTATION_LEN} characters, not a trivial placeholder).",
+        )
+
+
+async def _audit_civilian_declassified(*, entry_id: str, existing: Dict[str, Any],
+                                       transition: str, justification: Optional[str],
+                                       actor: str, action: str,
+                                       new_category: Optional[str] = None) -> None:
+    """The ONE shared top-severity NO_STRIKE_CIVILIAN_DECLASSIFIED audit for every
+    civilian-floor removal, carrying the old->new transition + justification. Firing
+    on the entity STILL requires a fresh single-use no-strike override afterwards."""
+    await log_event(
+        "NO_STRIKE_CIVILIAN_DECLASSIFIED",
+        f"COMMANDER removed the civilian hard floor from CIVILIAN_INFRASTRUCTURE no-strike "
+        f"entry {entry_id} ({existing.get('label') or 'unnamed'}) via {action}: {transition}. "
+        f"This lifts the civilian hard floor for this entity; firing still requires a fresh "
+        f"single-use no-strike override. Justification: {justification}",
+        meta={"entry_id": entry_id, "label": existing.get("label"),
+              "action": action, "transition": transition,
+              "old_category": existing.get("category"),
+              "new_category": new_category,
+              "justification": justification, "declassified_by": actor},
+        actor=actor,
+    )
 
 
 # Version-stamped hot-apply cache -- COPY of the SOP pattern (_sop_config_version
@@ -3318,6 +3669,25 @@ async def _no_strike_entries() -> List[Dict[str, Any]]:
 _NON_THREAT_LEVEL = "NON_THREAT"
 
 _NO_STRIKE_CIVILIAN_CATEGORIES = ("CIVILIAN_INFRASTRUCTURE", "NEUTRAL")
+
+# ---- COMMANDER NO-STRIKE OVERRIDE — the two-tier civilian-protection split ----
+# `_NO_STRIKE_CIVILIAN_CATEGORIES` above is DELIBERATELY LEFT UNCHANGED: it still
+# drives P2 board-demotion / is_target_grade / the one-tap ROE-floor suppression
+# for BOTH civilian classes (a NEUTRAL contact is still demoted off the priority
+# board and is still never a valid one-tap target). The two tuples below split
+# the FIRE-TIME floor ONLY:
+#   * HARD FLOOR (never overridable, no token exists, always 403 at fire time):
+#     CIVILIAN_INFRASTRUCTURE. Striking a civilian entity requires FIRST
+#     reclassifying its registry entry out of CIVILIAN_INFRASTRUCTURE (a
+#     separate, password+justification, loudly-audited act — see update_no_strike)
+#     — there is no fire-through path from any token.
+#   * OVERRIDABLE (fire allowed ONLY with a deliberate, single-use, target+effect+
+#     category-bound commander override token — see _issue/_consume_no_strike_override):
+#     FRIENDLY_OWN_FORCE and NEUTRAL. This weakens the fire-time floor for these
+#     two categories ONLY, under a heavily-gated commander token; the civilian
+#     hard floor is untouched.
+_NO_STRIKE_HARD_FLOOR_CATEGORIES = ("CIVILIAN_INFRASTRUCTURE",)
+_NO_STRIKE_OVERRIDABLE_CATEGORIES = ("FRIENDLY_OWN_FORCE", "NEUTRAL")
 
 # Honest badge for the ML "%" on a not-target-grade contact: the 3-class model
 # has no reject class, so a bare "76%" next to a drone name is a lie. This says
@@ -3580,14 +3950,38 @@ async def create_no_strike(body: NoStrikeBody,
 
 
 @api.put("/no-strike/{entry_id}")
-async def update_no_strike(entry_id: str, body: NoStrikeUpdateBody,
+async def update_no_strike(entry_id: str, body: NoStrikeUpdateBody, request: Request = None,
                            user: Dict = Depends(require_commander)):
     """Edit a no-strike registry entry (commander only), hot-applied on the next
     consult. A provided match block is re-validated (bad shape/regex => 422).
-    Bumps the hot-load version and audits the edit. Touches NO TX-spine state."""
+    Bumps the hot-load version and audits the edit. Touches NO TX-spine state.
+
+    CIVILIAN PROTECTION-REMOVAL HARDENING (holistic — closes the shadow/strip
+    class): ANY edit that WEAKENS or REMOVES the civilian hard floor of an ENABLED
+    CIVILIAN_INFRASTRUCTURE entry unlocks a target for the fire-time NEUTRAL/FRIENDLY
+    override, so ALL such edits — a category change OUT of CIVILIAN_INFRASTRUCTURE,
+    a DISABLE (enabled -> false), OR a MATCH-BLOCK edit (which could narrow coverage)
+    — go through the SAME deliberate, audited ceremony via
+    _verify_civilian_protection_ceremony (password step-up + a real justification)
+    and emit the SAME top-severity NO_STRIKE_CIVILIAN_DECLASSIFIED audit. Every
+    OTHER no-strike edit, and every edit of a non-civilian entry, is unchanged."""
     existing = await db.no_strike_registry.find_one({"id": entry_id}, {"_id": 0})
     if existing is None:
         raise HTTPException(404, "No-strike entry not found")
+
+    # Does this edit WEAKEN/REMOVE the civilian hard floor of an ENABLED civilian
+    # entry (category-out / disable / match-edit)? If so, require the shared step-up
+    # ceremony BEFORE any write. `_civilian_protection_removal` returns the precise
+    # old->new transition (or None when nothing civilian-protecting is being lifted).
+    new_match_dict = body.match.dict() if body.match is not None else None
+    civilian_transition = _civilian_protection_removal(
+        existing, new_category=body.category, new_enabled=body.enabled,
+        new_match=new_match_dict)
+    if civilian_transition is not None:
+        await _verify_civilian_protection_ceremony(
+            entry_id=entry_id, request=request, user=user,
+            password=body.password, justification=body.justification, action="edit")
+
     updates: Dict[str, Any] = {}
     for field in ("category", "label", "enabled", "notes"):
         value = getattr(body, field)
@@ -3612,6 +4006,13 @@ async def update_no_strike(entry_id: str, body: NoStrikeUpdateBody,
     updates["updated_at"] = now
     await db.no_strike_registry.update_one({"id": entry_id}, {"$set": updates})
     _bump_no_strike_version()
+    if civilian_transition is not None:
+        # DISTINCT top-severity audit: a civilian entity's hard floor has been
+        # lifted, unlocking it for the fire-time NEUTRAL/FRIENDLY override.
+        await _audit_civilian_declassified(
+            entry_id=entry_id, existing=existing, transition=civilian_transition,
+            justification=body.justification, actor=actor, action="edit",
+            new_category=body.category)
     await log_event(
         "NO_STRIKE_UPDATE",
         f"No-strike entry updated: {entry_id}",
@@ -3623,15 +4024,31 @@ async def update_no_strike(entry_id: str, body: NoStrikeUpdateBody,
 
 
 @api.delete("/no-strike/{entry_id}")
-async def delete_no_strike(entry_id: str,
+async def delete_no_strike(entry_id: str, body: NoStrikeDeleteBody = None,
+                           request: Request = None,
                            user: Dict = Depends(require_commander)):
     """DISABLE a no-strike registry entry (commander only) -- NEVER a hard
     delete. Sets enabled:false so the protection drops out of the hot-load cache
     on the next consult but the entry (and its removal) remain auditable and
-    re-enablable. Bumps the version and writes a NO_STRIKE_DISABLE audit."""
+    re-enablable. Bumps the version and writes a NO_STRIKE_DISABLE audit.
+
+    CIVILIAN PROTECTION-REMOVAL HARDENING (holistic): disabling an ENABLED
+    CIVILIAN_INFRASTRUCTURE entry removes its civilian hard floor exactly like a
+    declassify does, so it goes through the SAME shared ceremony
+    (_verify_civilian_protection_ceremony: password step-up + a real justification)
+    and emits the SAME top-severity NO_STRIKE_CIVILIAN_DECLASSIFIED audit. Disabling
+    a non-civilian (or already-disabled) entry stays ungated exactly as before."""
     existing = await db.no_strike_registry.find_one({"id": entry_id}, {"_id": 0})
     if existing is None:
         raise HTTPException(404, "No-strike entry not found")
+    body = body or NoStrikeDeleteBody()
+    # Disabling an ENABLED civilian entry lifts its hard floor -> require the shared
+    # ceremony (the transition is a disable). Non-civilian disables trigger nothing.
+    civilian_transition = _civilian_protection_removal(existing, deleting=True)
+    if civilian_transition is not None:
+        await _verify_civilian_protection_ceremony(
+            entry_id=entry_id, request=request, user=user,
+            password=body.password, justification=body.justification, action="disable")
     actor = user["email"]
     now = datetime.now(timezone.utc).isoformat()
     await db.no_strike_registry.update_one(
@@ -3639,6 +4056,10 @@ async def delete_no_strike(entry_id: str,
         {"$set": {"enabled": False, "updated_by": actor, "updated_at": now}},
     )
     _bump_no_strike_version()
+    if civilian_transition is not None:
+        await _audit_civilian_declassified(
+            entry_id=entry_id, existing=existing, transition=civilian_transition,
+            justification=body.justification, actor=actor, action="disable")
     await log_event(
         "NO_STRIKE_DISABLE",
         f"No-strike entry disabled: {entry_id}",
@@ -4643,6 +5064,17 @@ class WifiSurveyDesignateBody(BaseModel):
     vendor: Optional[str] = None
     pmf_required: Optional[bool] = None
     pmf_supported: Optional[bool] = None
+    # COMMANDER NO-STRIKE OVERRIDE (designate side): when True, a deliberate
+    # commander may designate a row whose drone-OUI/SSID candidate gate FAILS
+    # (a non-drone-tagged AP). It is ALLOWED but forced to the honest non-drone
+    # candidate tier (never an identification), and it NEVER relaxes the per-BSSID
+    # / no-broadcast guard (a) or the CIVILIAN_INFRASTRUCTURE hard-floor refuse (c);
+    # a NEUTRAL/FRIENDLY still needs the fire-time no-strike override token to fire.
+    commander_override: bool = False
+    # REQUIRED only when commander_override promotes a NON-DRONE AP (F2 friction):
+    # a real, actively-typed justification (_looks_like_real_attestation, >=20 chars).
+    # Ignored for a normal drone-OUI/SSID designation. See designate_wifi_survey_uas.
+    justification: Optional[str] = None
 
 
 @api.post("/wifi-environment/designate")
@@ -4672,43 +5104,80 @@ async def designate_wifi_survey_uas(body: WifiSurveyDesignateBody,
     # flag. Only a drone-OUI or drone-SSID AP may be designated.
     oui_vendor = kismet_survey.match_drone_oui(body.oui or body.bssid)
     ssid_is_drone = kismet_survey.match_drone_ssid(body.ssid)
-    if not (oui_vendor or ssid_is_drone):
-        raise HTTPException(
-            422,
-            "not a UAS candidate — only a drone-OUI/SSID AP may be designated",
-        )
+    commander_override_used = False
     if oui_vendor and ssid_is_drone:
         match_basis = "ssid+oui"
     elif oui_vendor:
         match_basis = "oui"
-    else:
+    elif ssid_is_drone:
         match_basis = "ssid"
-    reason = (f"OUI {kismet_survey.mac_oui(body.bssid)} -> {oui_vendor}"
-              if oui_vendor else "SSID pattern")
+    elif body.commander_override:
+        # The drone-OUI/SSID candidate gate FAILED, but a COMMANDER deliberately
+        # overrides it. ALLOWED — but forced to the honest non-drone candidate tier
+        # below (never an identification). This relaxes ONLY the candidate gate; the
+        # per-BSSID/no-broadcast guard (a) and the CIVILIAN_INFRASTRUCTURE hard-floor
+        # refuse (c) still apply, and fire still needs the SafetyGate + (for a
+        # NEUTRAL/FRIENDLY match) the fire-time no-strike override token.
+        #
+        # F2 FRICTION: promoting a NON-DRONE AP (which is POSSIBLY CIVILIAN) is a
+        # deliberate, audited act — require a real, actively-typed justification
+        # (>=20 chars, not a trivial placeholder), exactly like the no-strike
+        # override / declassify ceremonies. A drone-tagged designation above needs
+        # no justification (unchanged).
+        if not _looks_like_real_attestation(body.justification):
+            raise HTTPException(
+                400,
+                "A specific, actively-typed justification is required to commander-override the "
+                "drone gate and designate a NON-DRONE AP (POSSIBLY CIVILIAN) as a candidate "
+                f"(at least {MIN_FRIENDLY_ASSET_ATTESTATION_LEN} characters, not a trivial "
+                "placeholder).",
+            )
+        commander_override_used = True
+        match_basis = "commander-override"
+    else:
+        raise HTTPException(
+            422,
+            "not a UAS candidate — only a drone-OUI/SSID AP may be designated",
+        )
+    if commander_override_used:
+        reason = "commander-designated, non-drone"
+    else:
+        reason = (f"OUI {kismet_survey.mac_oui(body.bssid)} -> {oui_vendor}"
+                  if oui_vendor else "SSID pattern")
 
-    # (c) No-strike CIVILIAN/NEUTRAL hard refuse (belt-and-braces beyond the
-    # fire-time _enforce_fire_time_no_strike). A civilian/protected AP that a
-    # spoofed drone SSID/OUI mislabels can NEVER become a governed contact.
+    # (c) No-strike HARD-FLOOR (CIVILIAN_INFRASTRUCTURE) refuse (belt-and-braces
+    # beyond the fire-time _enforce_fire_time_no_strike). A civilian-infrastructure
+    # AP can NEVER become a targetable contact — commander_override does NOT relax
+    # this. A NEUTRAL/FRIENDLY match is DESIGNATABLE (fire still needs the fire-time
+    # no-strike override token), so it is deliberately NOT refused here.
     ns = no_strike.match(
         _detection_identity({"ssid": body.ssid, "bssid": body.bssid,
                              "oui": body.oui, "manuf": body.vendor}),
         await _no_strike_entries(),
     )
-    if ns.get("matched") and ns.get("category") in _NO_STRIKE_CIVILIAN_CATEGORIES:
+    if ns.get("matched") and ns.get("category") in _NO_STRIKE_HARD_FLOOR_CATEGORIES:
         raise HTTPException(
             403,
             "Refusing to designate: this AP matches a "
             f"{ns.get('category')} no-strike (civilian-protection) entry "
             f"{('— ' + ns.get('label')) if ns.get('label') else ''}. A "
-            "civilian/protected AP can never be promoted to a targetable contact.",
+            "civilian-infrastructure AP can never be promoted to a targetable contact "
+            "(reclassify the registry entry first).",
         )
 
     # (d) Synthesize the governed ingest + upsert (creates a contact only).
+    designate_caveats = ["Manually designated from Wi-Fi survey; SSID/OUI spoofable — "
+                         "candidate, not identification"]
+    if commander_override_used:
+        designate_caveats.append(
+            "commander-override designation of a NON-DRONE AP — unverified, POSSIBLY CIVILIAN; "
+            "SSID/OUI spoofable — candidate, not identification.")
     synth = WifiDroneIngestBody(
         ssid=body.ssid,
         oui=body.oui,
         manuf=body.vendor,
-        make_candidate=f"Wi-Fi UAS candidate ({reason})",
+        make_candidate=("commander-designated, non-drone — candidate, not identification"
+                        if commander_override_used else f"Wi-Fi UAS candidate ({reason})"),
         match_basis=match_basis,
         channel=body.channel,
         bssid=body.bssid,
@@ -4717,12 +5186,28 @@ async def designate_wifi_survey_uas(body: WifiSurveyDesignateBody,
         # _wifi_target_has_pmf is truthful for a PMF-required AP downstream.
         pmf_required=body.pmf_required,
         pmf_supported=body.pmf_supported,
-        caveats=["Manually designated from Wi-Fi survey; SSID/OUI spoofable — "
-                 "candidate, not identification"],
+        caveats=designate_caveats,
     )
     detection_id = await _upsert_wifi_drone_detection(synth, body.bssid, user)
 
-    # (f) Distinct audit event.
+    # (f) F2 FRICTION: a commander-override designation of a NON-DRONE (possibly
+    # civilian) AP is loudly, distinctly audited on top of the routine designate
+    # audit — the deliberate promotion of an unverified/possibly-civilian AP is
+    # never silent in the hash-chained trail.
+    if commander_override_used:
+        await log_event(
+            "WIFI_SURVEY_COMMANDER_OVERRIDE_DESIGNATE",
+            f"COMMANDER OVERRODE the drone gate to designate a NON-DRONE AP (POSSIBLY CIVILIAN) "
+            f"bssid={body.bssid} ssid={body.ssid or 'n/a'} as a candidate contact {detection_id} "
+            f"— unverified, SSID/OUI spoofable, candidate NOT identification. "
+            f"Justification: {body.justification}",
+            meta={"detection_id": detection_id, "bssid": body.bssid,
+                  "ssid": body.ssid, "justification": body.justification,
+                  "source": "WIFI_SURVEY_MANUAL", "actor": user["email"]},
+            actor=user["email"],
+        )
+
+    # (g) Distinct audit event.
     await log_event(
         "WIFI_SURVEY_DESIGNATE",
         f"COMMANDER designated Wi-Fi survey AP bssid={body.bssid} ssid="
@@ -4730,7 +5215,8 @@ async def designate_wifi_survey_uas(body: WifiSurveyDesignateBody,
         f"contact {detection_id} created (SSID/OUI spoofable — candidate, not "
         f"identification; no arm/transmit/fire performed here).",
         meta={"detection_id": detection_id, "bssid": body.bssid,
-              "match_basis": match_basis, "source": "WIFI_SURVEY_MANUAL"},
+              "match_basis": match_basis, "source": "WIFI_SURVEY_MANUAL",
+              "commander_override": commander_override_used},
         actor=user["email"],
     )
     return {"detection_id": detection_id, "bssid": body.bssid}
@@ -5352,6 +5838,149 @@ async def mint_friendly_fire_ack(det_id: str, user: Dict = Depends(require_comma
         actor=user["email"],
     )
     return out
+
+
+class NoStrikeOverrideBody(BaseModel):
+    # Commander password re-verify (step-up: a stolen JWT alone is never enough
+    # to mint an override, mirroring set_range_authorization §2.1/2.2).
+    password: str
+    # A REQUIRED, actively-typed justification (floored by
+    # _looks_like_real_attestation / MIN_FRIENDLY_ASSET_ATTESTATION_LEN — same
+    # "reject a trivially fabricated placeholder" posture as the friendly-asset
+    # attestation). Recorded on the token and in both audit events.
+    justification: str
+    # The effect this override licenses (bound into the token; the fire-time
+    # consume rejects a token spent on a different effect). Must be a known
+    # transmit effect (ARM_TOKEN_EFFECTS).
+    effect: str
+
+
+@api.post("/detections/{det_id}/no-strike-override")
+async def mint_no_strike_override(det_id: str, body: NoStrikeOverrideBody,
+                                  request: Request,
+                                  user: Dict = Depends(require_commander)):
+    """Mint a SINGLE-USE, short-TTL (NO_STRIKE_OVERRIDE_TTL_S), target+effect+
+    category-bound COMMANDER no-strike override for a target that matches an
+    OVERRIDABLE (NEUTRAL / FRIENDLY_OWN_FORCE) no-strike registry entry. This is
+    the ONLY thing that can license a subsequent deploy to engage such a contact.
+
+    HARD FLOOR IS UNTOUCHED: a CIVILIAN_INFRASTRUCTURE match is REFUSED here (403)
+    — no override exists for civilian infrastructure; the commander must first
+    reclassify the registry entry out of CIVILIAN_INFRASTRUCTURE (a separate,
+    password + justification, loudly-audited act). The BSSID the token is bound to
+    is DERIVED from the detection, NEVER client-supplied (per-BSSID only).
+
+    Order of gates (mirrors set_range_authorization's step-up posture):
+      1. throttle + password re-verify (reuse the range-auth lockout/throttle);
+      2. a real (non-trivial) justification (else 400);
+      3. load the detection, re-match the LIVE registry;
+      4. a CIVILIAN_INFRASTRUCTURE match -> 403 REFUSE TO MINT;
+      5. not matched / not an overridable category -> 422;
+      6. effect must be a known transmit effect (ARM_TOKEN_EFFECTS);
+      7. mint the token bound to {det_id, bssid, effect, category};
+      8. LOUD top-severity NO_STRIKE_OVERRIDE_MINTED audit.
+    It is NOT a bypass of the arm-token / range-lease / tx-halt / IFF spine — all
+    of those still apply at deploy; this is an EXTRA gate layered on top."""
+    source_ip = request.client.host if request.client else None
+    throttle_key = user["email"]
+
+    # 1. Throttle + password step-up (reuse the range-auth lockout machinery).
+    if _range_auth_locked_out(throttle_key):
+        await log_event(
+            "NO_STRIKE_OVERRIDE_MINT_FAILED",
+            f"No-strike override mint for {det_id} REFUSED: too many recent failed "
+            f"attempts (locked out {RANGE_AUTH_LOCKOUT_WINDOW_S}s)",
+            meta={"detection_id": det_id, "reason": "locked_out", "source_ip": source_ip},
+            actor=user["email"],
+        )
+        raise HTTPException(429, "Too many failed override attempts — try again shortly.")
+    full_user = await db.users.find_one({"id": user["id"]})
+    if not body.password or not full_user or not verify_password(body.password, full_user["password_hash"]):
+        _record_range_auth_failure(throttle_key)
+        await log_event(
+            "NO_STRIKE_OVERRIDE_MINT_FAILED",
+            f"No-strike override mint for {det_id} REFUSED: bad password",
+            meta={"detection_id": det_id, "reason": "bad_password", "source_ip": source_ip},
+            actor=user["email"],
+        )
+        raise HTTPException(401, "Password re-verification failed.")
+
+    # 2. A real, actively-typed justification (never a trivial placeholder).
+    if not _looks_like_real_attestation(body.justification):
+        raise HTTPException(
+            400,
+            "A specific, actively-typed justification is required to mint a no-strike "
+            f"override (at least {MIN_FRIENDLY_ASSET_ATTESTATION_LEN} characters, not a "
+            "trivial placeholder).",
+        )
+
+    # 3. Load the detection + re-match the LIVE registry.
+    doc = await db.detections.find_one({"id": det_id})
+    if not doc:
+        raise HTTPException(404, "Detection not found")
+    identity = _detection_identity(doc)
+    entries = await _no_strike_entries()
+    ns = no_strike.match(identity, entries)
+    category = ns.get("category") if ns.get("matched") else None
+
+    # 4. CIVILIAN_INFRASTRUCTURE — REFUSE TO MINT (the hard floor has no override).
+    # Evaluated PER-ENTRY (_matches_any_civilian) as well as on the aggregate hit:
+    # a more-specific NEUTRAL/FRIENDLY entry (or a drone spoofing a civilian BSSID)
+    # could otherwise shadow a civilian entry out of the aggregate `ns` verdict and
+    # trick the mint into issuing a NEUTRAL token that the fire-time floor honours.
+    # Naming the ACTUAL civilian entry keeps the audit/refusal honest.
+    civ_entry = _first_matching_civilian_entry(identity, entries)
+    if category in _NO_STRIKE_HARD_FLOOR_CATEGORIES or civ_entry is not None:
+        civ_label = (civ_entry.get("label") if civ_entry else None) or ns.get("label") or "unnamed"
+        civ_entry_id = (civ_entry.get("id") if civ_entry else None) or ns.get("entry_id")
+        await log_event(
+            "NO_STRIKE_OVERRIDE_MINT_FAILED",
+            f"No-strike override mint for {doc.get('callsign', '?')} ({det_id}) REFUSED — target "
+            f"matches a CIVILIAN_INFRASTRUCTURE no-strike entry ({civ_label}). "
+            f"There is NO override for civilian infrastructure; reclassify the registry entry first.",
+            meta={"detection_id": det_id, "callsign": doc.get("callsign"),
+                  "category": "CIVILIAN_INFRASTRUCTURE", "entry_id": civ_entry_id,
+                  "source_ip": source_ip},
+            actor=user["email"],
+        )
+        raise HTTPException(
+            403,
+            "REFUSE TO MINT — this target matches a CIVILIAN_INFRASTRUCTURE no-strike entry: "
+            "civilian infrastructure — reclassify the registry entry first; no override exists.",
+        )
+
+    # 5. Not matched, or matched a non-overridable category -> nothing to override.
+    if category not in _NO_STRIKE_OVERRIDABLE_CATEGORIES:
+        raise HTTPException(
+            422,
+            "This target does not match an OVERRIDABLE (NEUTRAL / FRIENDLY_OWN_FORCE) no-strike "
+            "entry — there is nothing to override. Engage a non-matching target via the routine "
+            "authorize-target + arm-token path.",
+        )
+
+    # 6. The effect must be a known transmit effect.
+    if body.effect not in ARM_TOKEN_EFFECTS:
+        raise HTTPException(400, f"effect must be one of {ARM_TOKEN_EFFECTS}")
+
+    # 7. Mint the token, bound to this exact target + the DERIVED bssid + effect +
+    #    matched category (bssid is never client-supplied — per-BSSID only).
+    bssid = _detection_identity(doc).get("bssid")
+    out = _issue_no_strike_override(det_id, bssid, body.effect, category,
+                                    body.justification, user["email"])
+
+    # 8. LOUD top-severity audit at mint time (un-missable even if never spent).
+    await log_event(
+        "NO_STRIKE_OVERRIDE_MINTED",
+        f"COMMANDER MINTED a single-use no-strike override for {category} contact "
+        f"{doc.get('callsign', '?')} ({det_id}) — bssid={bssid or 'n/a'}, effect={body.effect}, "
+        f"valid {NO_STRIKE_OVERRIDE_TTL_S}s, one engagement only. Justification: {body.justification}",
+        meta={"detection_id": det_id, "callsign": doc.get("callsign"), "category": category,
+              "entry_id": ns.get("entry_id"), "bssid": bssid, "effect": body.effect,
+              "justification": body.justification, "minted_by": user["email"],
+              "source_ip": source_ip},
+        actor=user["email"],
+    )
+    return {"token": out["token"], "expires_in_s": out["expires_in_s"]}
 
 
 class AttachIqCaptureBody(BaseModel):
@@ -7956,7 +8585,9 @@ async def deploy_payload(body: DeployPayloadBody,
         # beacon defers to the friendly-fire ack exactly as IFF does. Additive —
         # it never changes the IFF behaviour below for a non-matching contact.
         await _enforce_fire_time_no_strike(detection, user, context="payload deploy",
-                                           friendly_fire_ack=body.iff_friendly_fire_ack)
+                                           effect="deploy",
+                                           friendly_fire_ack=body.iff_friendly_fire_ack,
+                                           no_strike_override=body.no_strike_override)
         # F2 (2026-08): fire-time IFF re-check at the instant of transmission.
         # For a CONFIRMED-FRIENDLY target this is the SOLE authorization gate and
         # requires the single-use, target-bound commander friendly-fire ack from
@@ -8496,7 +9127,9 @@ async def _execute_engagement(effect: str, body, user: Dict) -> Dict:
         # for a CIVILIAN/NEUTRAL match). Additive; a non-matching hostile falls
         # straight through to the unchanged IFF re-check below.
         await _enforce_fire_time_no_strike(detection, user, context="SDR MAVLink inject",
-                                           friendly_fire_ack=body.iff_friendly_fire_ack)
+                                           effect=effect,
+                                           friendly_fire_ack=body.iff_friendly_fire_ack,
+                                           no_strike_override=body.no_strike_override)
         # Fire-time IFF re-check (fratricide interlock). For a CONFIRMED-FRIENDLY
         # this is the SOLE authorization gate and requires the single-use,
         # target-bound commander friendly-fire ack from this request (consumed here).
@@ -8680,7 +9313,9 @@ async def _execute_engagement(effect: str, body, user: Dict) -> Dict:
         # softAP that a candidate mis-labels) matched by the no-strike registry is
         # hard-refused (403, no override token) before any deauth/inject frame.
         await _enforce_fire_time_no_strike(detection, user, context=f"Wi-Fi defeat [{mode}]",
-                                           friendly_fire_ack=body.iff_friendly_fire_ack)
+                                           effect=effect,
+                                           friendly_fire_ack=body.iff_friendly_fire_ack,
+                                           no_strike_override=body.no_strike_override)
         # Fire-time IFF re-check (fratricide interlock). For a CONFIRMED-FRIENDLY this
         # is the SOLE authorization gate and requires the single-use, target-bound
         # commander friendly-fire ack from this request (consumed here). NEVER deauth a

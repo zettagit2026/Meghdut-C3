@@ -53,8 +53,8 @@ import pytest
 import no_strike
 import server as srv
 
-COMMANDER = {"email": "cmdr@unused.local", "role": "commander"}
-OPERATOR = {"email": "op@unused.local", "role": "operator"}
+COMMANDER = {"email": "cmdr@unused.local", "role": "commander", "id": "u-cmdr"}
+OPERATOR = {"email": "op@unused.local", "role": "operator", "id": "u-op"}
 
 
 # ==========================================================================
@@ -254,9 +254,22 @@ class _FakeCollection:
         return None
 
 
+class _FakeUsers:
+    async def find_one(self, flt=None, projection=None):
+        return {"id": COMMANDER["id"], "email": COMMANDER["email"],
+                "password_hash": "hash-unused"}
+
+
 class _FakeDB:
     def __init__(self):
         self.no_strike_registry = _FakeCollection()
+        self.users = _FakeUsers()
+
+
+class _Req:
+    class _C:
+        host = "10.0.0.9"
+    client = _C()
 
 
 @pytest.fixture
@@ -499,14 +512,83 @@ def test_update_category_to_civilian_restores_hard_default(fake_env):
 
 
 # --------------------------------------------------------------------------
+# CIVILIAN DECLASSIFICATION HARDENING — moving an entry OUT of
+# CIVILIAN_INFRASTRUCTURE requires password step-up + a real justification and
+# emits a distinct top-severity NO_STRIKE_CIVILIAN_DECLASSIFIED audit. Every
+# OTHER edit is unchanged (covered by the tests above, which pass no password).
+# --------------------------------------------------------------------------
+def _make_civilian(fake_env):
+    return asyncio.run(srv.create_no_strike(
+        srv.NoStrikeBody(category="CIVILIAN_INFRASTRUCTURE",
+                         match=srv.NoStrikeMatch(ssid_prefix="TESTCIV-"),
+                         label="TEST-Org civilian AP"),
+        user=COMMANDER))
+
+
+def test_declassify_requires_password_stepup(monkeypatch, fake_env):
+    created = _make_civilian(fake_env)
+    monkeypatch.setattr(srv, "verify_password", lambda pw, h: False)  # wrong password
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.update_no_strike(
+            created["id"],
+            srv.NoStrikeUpdateBody(category="NEUTRAL", password="wrong",
+                                   justification="Reassessed as a neutral relay after survey."),
+            request=_Req(), user=COMMANDER))
+    assert ei.value.status_code == 401
+
+
+def test_declassify_requires_real_justification(monkeypatch, fake_env):
+    created = _make_civilian(fake_env)
+    monkeypatch.setattr(srv, "verify_password", lambda pw, h: True)
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.update_no_strike(
+            created["id"],
+            srv.NoStrikeUpdateBody(category="NEUTRAL", password="ok", justification="n/a"),
+            request=_Req(), user=COMMANDER))
+    assert ei.value.status_code == 400
+
+
+def test_declassify_success_emits_declassified_audit(monkeypatch, fake_env):
+    _db, events = fake_env
+    created = _make_civilian(fake_env)
+    monkeypatch.setattr(srv, "verify_password", lambda pw, h: True)
+    updated = asyncio.run(srv.update_no_strike(
+        created["id"],
+        srv.NoStrikeUpdateBody(
+            category="NEUTRAL", password="ok",
+            justification="Reassessed as a neutral relay after positive survey ID."),
+        request=_Req(), user=COMMANDER))
+    assert updated["category"] == "NEUTRAL"
+    decl = [e for e in events if e["kind"] == "NO_STRIKE_CIVILIAN_DECLASSIFIED"]
+    assert decl, "declassifying a civilian entry must emit NO_STRIKE_CIVILIAN_DECLASSIFIED"
+    assert decl[0]["meta"]["old_category"] == "CIVILIAN_INFRASTRUCTURE"
+    assert decl[0]["meta"]["new_category"] == "NEUTRAL"
+    assert "justification" in decl[0]["meta"]
+
+
+def test_non_declassify_edit_needs_no_password(fake_env):
+    # A label edit on a civilian entry (category unchanged) is NOT a declassify —
+    # it needs no password/justification (regression: hardening is scoped).
+    created = _make_civilian(fake_env)
+    updated = asyncio.run(srv.update_no_strike(
+        created["id"], srv.NoStrikeUpdateBody(label="TEST-Org civilian AP v2"),
+        request=_Req(), user=COMMANDER))
+    assert updated["label"] == "TEST-Org civilian AP v2"
+    assert updated["category"] == "CIVILIAN_INFRASTRUCTURE"
+
+
+# --------------------------------------------------------------------------
 # DELETE /no-strike/{id} — DISABLES, never removes
 # --------------------------------------------------------------------------
 def test_delete_disables_not_removes(fake_env):
+    # A NON-civilian (NEUTRAL) disable stays ungated — proves the disable-not-remove
+    # property without tripping the new civilian ceremony (see the ceremony tests
+    # below for the civilian path).
     db, events = fake_env
     created = asyncio.run(srv.create_no_strike(
-        srv.NoStrikeBody(category="CIVILIAN_INFRASTRUCTURE",
-                         match=srv.NoStrikeMatch(ssid_prefix="BSNL"),
-                         label="bsnl"),
+        srv.NoStrikeBody(category="NEUTRAL",
+                         match=srv.NoStrikeMatch(ssid_prefix="NeutralNet"),
+                         label="neutral"),
         user=COMMANDER))
     res = asyncio.run(srv.delete_no_strike(created["id"], user=COMMANDER))
     assert res["disabled"] is True
@@ -523,3 +605,99 @@ def test_delete_missing_404(fake_env):
     with pytest.raises(srv.HTTPException) as ei:
         asyncio.run(srv.delete_no_strike("no-such-id", user=COMMANDER))
     assert ei.value.status_code == 404
+
+
+# --------------------------------------------------------------------------
+# FIX 2 — CIVILIAN PROTECTION-REMOVAL is HOLISTICALLY gated: category-out (above),
+# DISABLE/DELETE, and MATCH-BLOCK edit of an ENABLED civilian entry all require the
+# SAME step-up ceremony (password + real justification) and emit
+# NO_STRIKE_CIVILIAN_DECLASSIFIED. Non-civilian edits/deletes stay ungated.
+# --------------------------------------------------------------------------
+_CIV_JUST = "Reassessed after positive survey ID; this AP is a hostile relay, not civilian infra."
+
+
+def test_disable_civilian_entry_requires_ceremony(monkeypatch, fake_env):
+    db, events = fake_env
+    srv._range_auth_failures.clear()
+    created = _make_civilian(fake_env)
+    # (1) No password -> 401, entry stays ENABLED (floor intact).
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.delete_no_strike(
+            created["id"], body=srv.NoStrikeDeleteBody(justification=_CIV_JUST),
+            request=_Req(), user=COMMANDER))
+    assert ei.value.status_code == 401
+    assert db.no_strike_registry.docs[0]["enabled"] is True
+    # (2) Good password, trivial justification -> 400, still enabled.
+    monkeypatch.setattr(srv, "verify_password", lambda pw, h: True)
+    srv._range_auth_failures.clear()
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.delete_no_strike(
+            created["id"], body=srv.NoStrikeDeleteBody(password="ok", justification="n/a"),
+            request=_Req(), user=COMMANDER))
+    assert ei.value.status_code == 400
+    assert db.no_strike_registry.docs[0]["enabled"] is True
+    # (3) Good password + real justification -> disabled + declassified audit.
+    res = asyncio.run(srv.delete_no_strike(
+        created["id"], body=srv.NoStrikeDeleteBody(password="ok", justification=_CIV_JUST),
+        request=_Req(), user=COMMANDER))
+    assert res["disabled"] is True
+    assert db.no_strike_registry.docs[0]["enabled"] is False
+    decl = [e for e in events if e["kind"] == "NO_STRIKE_CIVILIAN_DECLASSIFIED"]
+    assert decl, "disabling a civilian entry must emit NO_STRIKE_CIVILIAN_DECLASSIFIED"
+    assert decl[0]["meta"]["action"] == "disable"
+    assert "disabled" in decl[0]["meta"]["transition"]
+
+
+def test_match_edit_of_civilian_entry_requires_ceremony(monkeypatch, fake_env):
+    db, events = fake_env
+    srv._range_auth_failures.clear()
+    created = _make_civilian(fake_env)
+    new_match = srv.NoStrikeMatch(ssid_prefix="TESTCIV-NARROWER-")
+    # (1) No password -> 401, match unchanged.
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.update_no_strike(
+            created["id"],
+            srv.NoStrikeUpdateBody(match=new_match, justification=_CIV_JUST),
+            request=_Req(), user=COMMANDER))
+    assert ei.value.status_code == 401
+    assert db.no_strike_registry.docs[0]["match"]["ssid_prefix"] == "TESTCIV-"
+    # (2) Good password, trivial justification -> 400.
+    monkeypatch.setattr(srv, "verify_password", lambda pw, h: True)
+    srv._range_auth_failures.clear()
+    with pytest.raises(srv.HTTPException) as ei:
+        asyncio.run(srv.update_no_strike(
+            created["id"],
+            srv.NoStrikeUpdateBody(match=new_match, password="ok", justification="n/a"),
+            request=_Req(), user=COMMANDER))
+    assert ei.value.status_code == 400
+    # (3) Good password + real justification -> match edited + declassified audit.
+    updated = asyncio.run(srv.update_no_strike(
+        created["id"],
+        srv.NoStrikeUpdateBody(match=new_match, password="ok", justification=_CIV_JUST),
+        request=_Req(), user=COMMANDER))
+    assert updated["match"]["ssid_prefix"] == "TESTCIV-NARROWER-"
+    decl = [e for e in events if e["kind"] == "NO_STRIKE_CIVILIAN_DECLASSIFIED"]
+    assert decl, "a match-block edit of a civilian entry must emit NO_STRIKE_CIVILIAN_DECLASSIFIED"
+    assert decl[0]["meta"]["action"] == "edit"
+    assert "match block edited" in decl[0]["meta"]["transition"]
+
+
+def test_noncivilian_disable_and_edit_still_ungated(fake_env):
+    # SCOPE REGRESSION: a NEUTRAL entry's disable AND match-edit take NO password/
+    # justification — the hardening is scoped to CIVILIAN_INFRASTRUCTURE only.
+    db, events = fake_env
+    created = asyncio.run(srv.create_no_strike(
+        srv.NoStrikeBody(category="NEUTRAL",
+                         match=srv.NoStrikeMatch(ssid_prefix="Cafe"),
+                         label="cafe"),
+        user=COMMANDER))
+    # match-edit, ungated
+    updated = asyncio.run(srv.update_no_strike(
+        created["id"], srv.NoStrikeUpdateBody(match=srv.NoStrikeMatch(ssid_prefix="Cafe2")),
+        request=_Req(), user=COMMANDER))
+    assert updated["match"]["ssid_prefix"] == "Cafe2"
+    # disable, ungated
+    res = asyncio.run(srv.delete_no_strike(created["id"], request=_Req(), user=COMMANDER))
+    assert res["disabled"] is True
+    # NO declassify ceremony audit was emitted for the non-civilian entry.
+    assert not any(e["kind"] == "NO_STRIKE_CIVILIAN_DECLASSIFIED" for e in events)

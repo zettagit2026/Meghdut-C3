@@ -11,6 +11,10 @@ import SafetyGate from "@/components/SafetyGate";
 import RangeAuthorizationControl from "@/components/RangeAuthorizationControl";
 import EmergencyAbort from "@/components/EmergencyAbort";
 import { useAuth } from "@/context/AuthContext";
+import {
+  noStrikeOverrideNeeded, noStrikeOverrideCategory, noStrikeOverrideJustificationValid,
+  MIN_NO_STRIKE_OVERRIDE_JUSTIFICATION_LEN,
+} from "@/lib/noStrikeOverride";
 
 // =============================================================================
 // WI-FI DEFEAT (Parrot/Tello) — Phase P5 governed frontend effector surface.
@@ -137,6 +141,13 @@ export default function WifiDefeat() {
   const [authorizing, setAuthorizing] = useState(false);
   const [sessions, setSessions] = useState([]);
   const [submitting, setSubmitting] = useState(false);
+  // COMMANDER NO-STRIKE OVERRIDE modal (for a NEUTRAL / FRIENDLY_OWN_FORCE
+  // no_strike-stamped contact). Password + REQUIRED typed justification.
+  const [overrideOpen, setOverrideOpen] = useState(false);
+  const [overridePassword, setOverridePassword] = useState("");
+  const [overrideJustification, setOverrideJustification] = useState("");
+  const [overrideSubmitting, setOverrideSubmitting] = useState(false);
+  const [overrideErr, setOverrideErr] = useState(null);
   const [lastSuccessAt, setLastSuccessAt] = useState(null);
   const [consecutiveFailures, setConsecutiveFailures] = useState(0);
   const [now, setNow] = useState(() => Date.now());
@@ -220,8 +231,22 @@ export default function WifiDefeat() {
     setGateOpen(true);
   };
 
-  const fireWifiDefeat = async () => {
+  const fireWifiDefeat = async (noStrikeOverride = null) => {
     if (!target) { toast.error("No target selected"); return; }
+    // COMMANDER NO-STRIKE OVERRIDE: if the contact carries a NEUTRAL /
+    // FRIENDLY_OWN_FORCE no_strike stamp, the fire-time floor blocks the deploy
+    // unless a single-use override token is presented. Open the deliberate
+    // override modal (password + REQUIRED typed justification) FIRST; on confirm it
+    // mints the token and re-enters this function with it. (A CIVILIAN stamp is the
+    // HARD FLOOR — noStrikeOverrideNeeded returns false for it, so this never
+    // offers an override for civilian infrastructure.)
+    if (noStrikeOverrideNeeded(selectedDet) && !noStrikeOverride) {
+      setOverridePassword("");
+      setOverrideJustification("");
+      setOverrideErr(null);
+      setOverrideOpen(true);
+      return;
+    }
     setSubmitting(true);
     try {
       // Step 1: arm token bound to this effect (wifi_deauth | arsdk_inject) AND
@@ -250,6 +275,10 @@ export default function WifiDefeat() {
         arm_token: arm.arm_token,
         wifi_defeat_confirm_token: confirm.wifi_defeat_confirm_token,
         ...(iffAck ? { iff_friendly_fire_ack: iffAck } : {}),
+        // COMMANDER NO-STRIKE OVERRIDE — carried EXACTLY as iff_friendly_fire_ack
+        // is, consumed once by the backend fire-time floor for a NEUTRAL/FRIENDLY
+        // match. Never present for a CIVILIAN_INFRASTRUCTURE contact.
+        ...(noStrikeOverride ? { no_strike_override: noStrikeOverride } : {}),
       });
       if (data.tx_bridge_subscribed === false) {
         if (!handleEngageBlock({ response: data }, { isCommander, onFixed: loadStatus })) {
@@ -277,6 +306,36 @@ export default function WifiDefeat() {
       toast.error("Wi-Fi defeat request failed", { description: formatApiError(e) });
     } finally {
       setSubmitting(false);
+    }
+  };
+
+  // Mint the single-use commander no-strike override token (password step-up +
+  // REQUIRED typed justification), then re-enter fireWifiDefeat carrying it.
+  const submitNoStrikeOverride = async (e) => {
+    if (e && e.preventDefault) e.preventDefault();
+    if (!target) return;
+    if (!noStrikeOverrideJustificationValid(overrideJustification)) {
+      setOverrideErr(
+        `Justification must be at least ${MIN_NO_STRIKE_OVERRIDE_JUSTIFICATION_LEN} characters.`);
+      return;
+    }
+    setOverrideSubmitting(true);
+    setOverrideErr(null);
+    try {
+      const { data } = await api.post(`/detections/${target}/no-strike-override`, {
+        password: overridePassword,
+        justification: overrideJustification.trim(),
+        effect,
+      });
+      setOverrideOpen(false);
+      setOverridePassword("");
+      setOverrideJustification("");
+      // Carry the freshly-minted token straight into the deploy (as iff ack is).
+      await fireWifiDefeat(data.token);
+    } catch (err) {
+      setOverrideErr(formatApiError(err));
+    } finally {
+      setOverrideSubmitting(false);
     }
   };
 
@@ -600,6 +659,89 @@ export default function WifiDefeat() {
           fireWifiDefeat();
         }}
       />
+
+      {overrideOpen && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center p-4"
+          style={{ background: "rgba(0,0,0,0.72)" }}
+          data-testid="no-strike-override-modal"
+        >
+          <form
+            onSubmit={submitNoStrikeOverride}
+            className="w-full max-w-lg tactical-border p-5 space-y-4"
+            style={{ background: "var(--bg-surface)", borderColor: "var(--accent-critical)" }}
+          >
+            <div className="flex items-center gap-2">
+              <ShieldAlert size={18} strokeWidth={1.75} style={{ color: "var(--accent-critical)" }} />
+              <h3 className="font-heading font-black text-lg uppercase tracking-tight">
+                No-strike override
+              </h3>
+            </div>
+            <p className="font-mono text-[11px] leading-relaxed" style={{ color: "var(--text-muted)" }}>
+              This contact matches a protected{" "}
+              <span className="font-bold" style={{ color: "var(--accent-critical)" }}>
+                {noStrikeOverrideCategory(selectedDet) || "NO-STRIKE"}
+              </span>{" "}
+              no-strike registry entry
+              {selectedDet?.no_strike?.label ? ` (${selectedDet.no_strike.label})` : ""}. Engaging it is
+              a deliberate commander override of the no-strike floor. There is NO override for
+              CIVILIAN_INFRASTRUCTURE — that is a hard floor that must be reclassified first.
+            </p>
+            <p className="font-mono text-[10px] leading-relaxed" style={{ color: "var(--text-muted)" }}>
+              Effect: <span className="font-bold" style={{ color: "var(--text-primary)" }}>{meta.label}</span>.
+              Per-BSSID deauth is a link disruptor, not a kill — effect is loss-of-link.
+            </p>
+            <label className="block font-mono text-[10px] uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>
+              Commander password (step-up)
+              <input
+                type="password"
+                data-testid="no-strike-override-password"
+                value={overridePassword}
+                onChange={(e) => setOverridePassword(e.target.value)}
+                autoComplete="off"
+                className="mt-1 w-full px-3 py-2 tactical-border bg-transparent font-mono text-sm"
+                style={{ color: "var(--text-primary)" }}
+              />
+            </label>
+            <label className="block font-mono text-[10px] uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>
+              Justification (required, min {MIN_NO_STRIKE_OVERRIDE_JUSTIFICATION_LEN} chars)
+              <textarea
+                data-testid="no-strike-override-justification"
+                value={overrideJustification}
+                onChange={(e) => setOverrideJustification(e.target.value)}
+                rows={3}
+                placeholder="Why this NEUTRAL/FRIENDLY contact must be engaged — recorded verbatim in the audit trail."
+                className="mt-1 w-full px-3 py-2 tactical-border bg-transparent font-mono text-sm"
+                style={{ color: "var(--text-primary)" }}
+              />
+            </label>
+            {overrideErr && (
+              <div className="font-mono text-[11px]" style={{ color: "var(--accent-critical)" }}>
+                {overrideErr}
+              </div>
+            )}
+            <div className="flex items-center justify-end gap-3 pt-1">
+              <button
+                type="button"
+                onClick={() => { setOverrideOpen(false); setOverrideErr(null); }}
+                className="px-3 py-1.5 tactical-border font-mono text-[11px] uppercase tracking-widest hover-surface"
+                style={{ color: "var(--text-muted)" }}
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                data-testid="no-strike-override-confirm"
+                disabled={overrideSubmitting || !noStrikeOverrideJustificationValid(overrideJustification) || !overridePassword}
+                className="px-3 py-1.5 tactical-border font-mono text-[11px] font-bold uppercase tracking-widest hover-surface disabled:opacity-30 disabled:cursor-not-allowed"
+                style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
+              >
+                {overrideSubmitting ? "Minting…" : "Override & fire"}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
     </div>
   );
 }
