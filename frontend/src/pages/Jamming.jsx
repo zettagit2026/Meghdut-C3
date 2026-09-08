@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import { useSearchParams } from "react-router-dom";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
 import { Radio, AlertTriangle, ShieldAlert, Infinity as InfinityIcon, Waves, Siren } from "lucide-react";
@@ -68,6 +69,52 @@ const SWEEP_PRESETS = [
 // backend's OPERATOR_JAM_BANDS and operator_jam_wrapper.py's OPERATOR_BANDS.
 const OPERATOR_BAND_VALUES = new Set(["433", "915", "2g4", "5g8"]);
 
+// CUSTOM CENTER FREQUENCY (MHz) — lets the operator jam an exact channel
+// (e.g. 2462 MHz = Wi-Fi channel 11) instead of picking a band preset. This
+// is the SAME governed arm -> /jam/confirm -> /payloads/jam flow and the SAME
+// backend field (JamRequestBody.freq_mhz, which already wins over `band` when
+// both are present — see backend/server.py) — nothing here adds a new
+// transmit path. HONEST LABEL: a channel-center barrage is AREA denial, not a
+// per-BSSID strike — it denies the ENTIRE channel to every device in RF
+// range on that frequency (the intended target AND its clients AND any other
+// co-channel device, civilian or own), governed by the range-authorization
+// lease above, not by BSSID. See the AREA-DENIAL caution + checklist item
+// below whenever a custom frequency is set.
+function hasCustomFreqMhz(value) {
+  return value !== "" && value != null && Number.isFinite(Number(value)) && Number(value) > 0;
+}
+
+// Pure, exported for tests: builds the exact /payloads/jam request body.
+// A set custom frequency takes precedence over `band` (mirrors the backend's
+// own freq_mhz-wins-over-band precedence) -- band is omitted whenever a
+// sweep or a custom frequency is in effect, same as the existing sweep
+// omission below.
+export function buildJamPayload({
+  sweep, band, customFreqMhz, durationS, continuous, freqStartMhz, freqStopMhz,
+  bandwidthKhz, txGain, jamMode, profile, armToken, jamConfirmToken,
+}) {
+  // Sweep always wins: if a stale custom frequency lingers in state from
+  // before the operator toggled sweep on, it must never sneak a freq_mhz
+  // into a sweep request alongside freq_start_mhz/freq_stop_mhz.
+  const hasCustom = !sweep && hasCustomFreqMhz(customFreqMhz);
+  return {
+    band: (sweep || hasCustom) ? undefined : band,
+    ...(hasCustom ? { freq_mhz: Number(customFreqMhz) } : {}),
+    duration_s: durationS,
+    continuous,
+    sweep,
+    ...(sweep ? { freq_start_mhz: Number(freqStartMhz), freq_stop_mhz: Number(freqStopMhz) } : {}),
+    bandwidth_khz: bandwidthKhz,
+    // tx_gain is only consumed by the MAX profile; FLAT/EXTERNAL_PA use a
+    // fixed internal VGA, so it is sent but ignored server-side under those.
+    tx_gain: txGain,
+    jam_mode: jamMode,
+    profile,
+    arm_token: armToken,
+    jam_confirm_token: jamConfirmToken,
+  };
+}
+
 // Two jammers, one governed spine. "meghdut" = the built-in HackRF barrage
 // jam; "operator" = the operator's OWN GNU Radio jammer, run pinned+bounded
 // through the identical arm/confirm/range-auth/tx-halt gates (see
@@ -110,6 +157,7 @@ const STATUS_STYLE = {
 export default function Jamming() {
   const { user } = useAuth();
   const isCommander = user?.role === "commander";
+  const [searchParams] = useSearchParams();
   const [jamMode, setJamMode] = useState("meghdut");
   const [band, setBand] = useState("915");
   const [durationS, setDurationS] = useState(DEFAULT_DURATION_S);
@@ -117,6 +165,13 @@ export default function Jamming() {
   const [sweep, setSweep] = useState(false);
   const [freqStartMhz, setFreqStartMhz] = useState(SWEEP_PRESETS[0].start);
   const [freqStopMhz, setFreqStopMhz] = useState(SWEEP_PRESETS[0].stop);
+  // CUSTOM CENTER FREQUENCY (MHz) — deep-linkable from WifiEnvironment.jsx's
+  // "Jam Channel (Area)" affordance via ?freq=<MHz> (e.g. /jamming?freq=2462).
+  // Prefilled once on mount; empty string means "no custom freq, use band".
+  const [customFreqMhz, setCustomFreqMhz] = useState(() => {
+    const freqParam = searchParams.get("freq");
+    return freqParam && Number(freqParam) > 0 ? freqParam : "";
+  });
   const [bandwidthKhz, setBandwidthKhz] = useState(500);
   const [txGain, setTxGain] = useState(20);
   // Jam POWER profile (anti-fade). "max" = highest power (fades on continuous TX);
@@ -172,22 +227,37 @@ export default function Jamming() {
     if (isOperatorMode && sweep) setSweep(false);
   }, [isOperatorMode, sweep]);
 
-  const isGnssTarget = !sweep && GNSS_BANDS.has(band);
+  // Operator Jam is band-fixed server-side (the backend 400s on freq_mhz for
+  // operator mode) — clear any custom frequency when switching into it.
+  useEffect(() => {
+    if (isOperatorMode && customFreqMhz) setCustomFreqMhz("");
+  }, [isOperatorMode, customFreqMhz]);
 
-  // Same JAM_CHECKS the SafetyGate has always used, PLUS one extra line when
-  // the operator has selected a GNSS target — still the ONE SafetyGate
-  // component/flow, just with an added checklist item for this specific
-  // target (no second confirmation mechanism).
-  const gateChecks = isGnssTarget
-    ? [
-        ...JAM_CHECKS,
-        "GNSS TARGET SELECTED: navigation-denial jamming reaches FAR beyond comms jamming " +
-          "at the same TX power — GPS-band signals arrive at only ~-130dBm at the receiver, " +
-          "so even modest transmit power can deny GNSS fixes well outside the intended " +
-          "footprint. Effective denial radius and any risk to non-participating " +
-          "receivers/aircraft/vehicles outside the range has been assessed.",
-      ]
-    : JAM_CHECKS;
+  const isGnssTarget = !sweep && GNSS_BANDS.has(band);
+  const hasCustomFreq = !sweep && !isOperatorMode && hasCustomFreqMhz(customFreqMhz);
+
+  // Same JAM_CHECKS the SafetyGate has always used, PLUS one extra line each
+  // when the operator has selected a GNSS target and/or a custom AREA-DENIAL
+  // frequency — still the ONE SafetyGate component/flow, just with added
+  // checklist items for the specific target (no second confirmation
+  // mechanism).
+  const gateChecks = [
+    ...JAM_CHECKS,
+    ...(isGnssTarget ? [
+      "GNSS TARGET SELECTED: navigation-denial jamming reaches FAR beyond comms jamming " +
+        "at the same TX power — GPS-band signals arrive at only ~-130dBm at the receiver, " +
+        "so even modest transmit power can deny GNSS fixes well outside the intended " +
+        "footprint. Effective denial radius and any risk to non-participating " +
+        "receivers/aircraft/vehicles outside the range has been assessed.",
+    ] : []),
+    ...(hasCustomFreq ? [
+      `AREA DENIAL — CUSTOM FREQUENCY ${customFreqMhz} MHz: this is a channel-wide barrage, ` +
+        "NOT a per-BSSID / targeted strike — it denies the ENTIRE CHANNEL to ALL devices in RF " +
+        "range, including co-channel civilian and own networks, along with the intended " +
+        "target. Range authorization confirmed to cover area denial of this channel/frequency " +
+        "(governed by the range-authorization lease, NOT by BSSID).",
+    ] : []),
+  ];
 
   const fireJam = async () => {
     setSubmitting(true);
@@ -203,22 +273,14 @@ export default function Jamming() {
       // this", the digital equivalent of typing 'TRANSMIT' at a terminal.
       const { data: confirm } = await api.post("/jam/confirm");
       // Step 3: the actual jam request, carrying both tokens. continuous / sweep
-      // drive the field bridge; there is no artificial duration cap.
-      const { data } = await api.post("/payloads/jam", {
-        band: sweep ? undefined : band,
-        duration_s: durationS,
-        continuous,
-        sweep,
-        ...(sweep ? { freq_start_mhz: Number(freqStartMhz), freq_stop_mhz: Number(freqStopMhz) } : {}),
-        bandwidth_khz: bandwidthKhz,
-        // tx_gain is only consumed by the MAX profile; FLAT/EXTERNAL_PA use a
-        // fixed internal VGA, so it is sent but ignored server-side under those.
-        tx_gain: txGain,
-        jam_mode: jamMode,
-        profile,
-        arm_token: arm.arm_token,
-        jam_confirm_token: confirm.jam_confirm_token,
-      });
+      // drive the field bridge; there is no artificial duration cap. A set
+      // custom frequency (AREA DENIAL of an exact channel) takes precedence
+      // over the band preset — see buildJamPayload.
+      const { data } = await api.post("/payloads/jam", buildJamPayload({
+        sweep, band, customFreqMhz, durationS, continuous, freqStartMhz, freqStopMhz,
+        bandwidthKhz, txGain, jamMode, profile,
+        armToken: arm.arm_token, jamConfirmToken: confirm.jam_confirm_token,
+      }));
       const modeLabel = jamMode === "operator" ? "OPERATOR JAM" : "MEGHDUT BARRAGE";
       if (data.tx_bridge_subscribed === false) {
         // Honest false-green guard: request accepted (HTTP 200, AWAITING_ACK)
@@ -317,6 +379,28 @@ export default function Jamming() {
             proportionally much larger and harder to contain to the intended target/range. Confirm
             the STEAG range clearance and spectrum authorization specifically cover GNSS L1 denial
             before arming.
+          </div>
+        </div>
+      )}
+
+      {hasCustomFreq && (
+        <div
+          data-testid="jam-area-denial-caution"
+          className="tactical-border p-4 flex items-start gap-3"
+          style={{ background: "var(--surface-critical)" }}
+        >
+          <AlertTriangle size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
+          <div className="font-mono text-xs text-slate-300">
+            <span className="font-bold" style={{ color: "var(--accent-critical)" }}>
+              AREA DENIAL — CUSTOM FREQUENCY, NOT A TARGETED STRIKE:
+            </span>{" "}
+            Jamming an exact center frequency ({customFreqMhz} MHz) denies THIS ENTIRE CHANNEL to
+            ALL devices in range, including co-channel civilian and own networks — it is a
+            channel-wide barrage, not a per-AP / per-BSSID engagement, and it cannot be scoped to
+            one device. It hits the target AP, its clients, AND any other radio sharing that
+            channel within RF range. This is governed by the range-authorization lease above, NOT
+            by BSSID — confirm the range clearance covers area denial of this channel before
+            arming.
           </div>
         </div>
       )}
@@ -429,10 +513,38 @@ export default function Jamming() {
                 data-testid="jam-band-select"
                 value={band}
                 onChange={(e) => setBand(e.target.value)}
-                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+                disabled={hasCustomFreq}
+                className={`mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info ${hasCustomFreq ? "opacity-30 cursor-not-allowed" : ""}`}
               >
                 {bandOptions.map((b) => <option key={b.value} value={b.value}>{b.label}</option>)}
               </select>
+            </label>
+          )}
+
+          {/* CUSTOM CENTER FREQUENCY (MHz) — jam an exact channel instead of a
+              band preset (e.g. 2462 MHz = Wi-Fi channel 11). Not available in
+              Operator mode (band-fixed server-side) or Swept mode (its own
+              start/stop range applies instead). Overrides the Band select
+              above when set — see buildJamPayload's freq_mhz-wins precedence. */}
+          {!sweep && !isOperatorMode && (
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
+                Custom Center Frequency (MHz) — overrides Band, AREA DENIAL
+              </span>
+              <input
+                data-testid="jam-custom-freq-input"
+                type="number" min={1} step={0.5}
+                value={customFreqMhz}
+                onChange={(e) => setCustomFreqMhz(e.target.value)}
+                placeholder="e.g. 2462 (Wi-Fi channel 11)"
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none focus-accent-info"
+              />
+              <span className="mt-1 block font-mono text-[10px] text-slate-500 leading-relaxed">
+                Jam an exact center frequency — e.g. a specific Wi-Fi channel (2462 MHz = channel
+                11) — instead of a band preset. AREA DENIAL: this denies the ENTIRE channel to ALL
+                devices in RF range, not one AP; it is NOT a per-BSSID / targeted strike. Leave
+                blank to use the Band preset above.
+              </span>
             </label>
           )}
 
@@ -609,8 +721,8 @@ export default function Jamming() {
 
       <SafetyGate
         open={gateOpen}
-        payloadName={`${isOperatorMode ? "OPERATOR JAM" : sweep ? "MEGHDUT SWEPT BARRAGE" : "MEGHDUT RF BARRAGE JAM"} `
-          + `(${sweep ? `${freqStartMhz}–${freqStopMhz} MHz sweep` : (BANDS.find((b) => b.value === band)?.label || band)}`
+        payloadName={`${isOperatorMode ? "OPERATOR JAM" : sweep ? "MEGHDUT SWEPT BARRAGE" : hasCustomFreq ? "MEGHDUT AREA-DENIAL JAM (CUSTOM FREQ)" : "MEGHDUT RF BARRAGE JAM"} `
+          + `(${sweep ? `${freqStartMhz}–${freqStopMhz} MHz sweep` : hasCustomFreq ? `${customFreqMhz} MHz — AREA DENIAL, whole channel` : (BANDS.find((b) => b.value === band)?.label || band)}`
           + `${continuous ? ", CONTINUOUS until Stand Down" : ""})`}
         severity="CRITICAL"
         checks={gateChecks}

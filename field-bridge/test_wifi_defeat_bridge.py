@@ -108,10 +108,10 @@ def _stub_primitives(monkeypatch):
         cap["calls"].append("restore_safe")
         return {"ok": True, "error": None, "mode": "safe", "iface": iface, "ran": []}
 
-    def fake_send_deauth(iface, target_bssid, client_mac, channel, count,
+    def fake_send_deauth(iface, target_bssid, client_macs, channel, count,
                          stop_event=None, tx_halt_check=None, frame_sender=None):
         cap["deauth"] = {"iface": iface, "target_bssid": target_bssid,
-                         "client_mac": client_mac, "channel": channel,
+                         "client_macs": client_macs, "channel": channel,
                          "count": count, "tx_halt_check": tx_halt_check}
         cap["calls"].append("send_deauth")
         return {"ok": True, "error": None, "stopped_early": False, "frames_sent": 1}
@@ -361,9 +361,26 @@ def test_deauth_dispatches_to_send_deauth_with_bssid_channel_count(monkeypatch):
     assert cap["deauth"]["target_bssid"] == "AA:BB:CC:DD:EE:FF"
     assert cap["deauth"]["channel"] == 6
     assert cap["deauth"]["count"] == 10
-    assert cap["deauth"]["client_mac"] == "11:22:33:44:55:66"
+    # The bridge folds the single back-compat client_mac into the STA list it
+    # forwards to the primitive (which no longer has a broadcast fallback).
+    assert cap["deauth"]["client_macs"] == ["11:22:33:44:55:66"]
     assert cap["deauth"]["iface"] == "wlan1"
     assert callable(cap["deauth"]["tx_halt_check"])
+
+
+def test_deauth_forwards_explicit_client_macs_list(monkeypatch):
+    """An explicit client_macs list in the request is threaded verbatim to the
+    primitive (the per-STA unicast targets) — no broadcast fallback."""
+    b = _bridge()
+    monkeypatch.setattr(b, "is_range_authorized", lambda effect: True)
+    cap = _stub_primitives(monkeypatch)
+    ws = FakeWS()
+    stas = ["11:22:33:44:55:66", "AA:BB:CC:00:11:22"]
+    req = _valid_request(mode="deauth", client_macs=stas)
+    del req["client_mac"]  # only the list supplied
+    b._handle_defeat_request(ws, req)
+    _wait_for_phase(ws, "complete")
+    assert cap["deauth"]["client_macs"] == stas
 
 
 def test_deauth_continuous_when_count_omitted(monkeypatch):
@@ -710,7 +727,7 @@ def test_abort_triggers_teardown(monkeypatch):
 
     aborted = threading.Event()
 
-    def blocking_deauth(iface, target_bssid, client_mac, channel, count,
+    def blocking_deauth(iface, target_bssid, client_macs, channel, count,
                         stop_event=None, tx_halt_check=None, frame_sender=None):
         cap["deauth"] = {"iface": iface, "target_bssid": target_bssid}
         cap["calls"].append("send_deauth")

@@ -378,6 +378,69 @@ def test_deauth_allowed_when_pmf_absent(monkeypatch):
 
 
 # ---------------------------------------------------------------------
+# Per-STA target resolution + forwarding (unicast deauth; NO broadcast)
+# ---------------------------------------------------------------------
+_STAS = ["11:22:33:44:55:66", "AA:BB:CC:00:11:22"]
+
+
+def _wifi_defeat_req(broadcasts):
+    reqs = [b for b in broadcasts if b.get("type") == "wifi_defeat_request"]
+    assert reqs, "expected a wifi_defeat_request broadcast"
+    return reqs[0]
+
+
+def test_deauth_resolves_stores_and_forwards_detection_sta_list(monkeypatch):
+    """The fire path resolves the target detection's associated_client_macs, STORES
+    them in the pending record + audit meta, and FORWARDS them to the bridge — the
+    per-STA unicast deauth targets."""
+    det = {**_PARROT_TARGET, "associated_client_macs": _STAS}
+    events, broadcasts = _stub_spine(monkeypatch, detection=det)
+    resp = asyncio.run(srv.deploy_wifi_defeat(_body(mode="deauth"), user=USER))
+    assert resp["status"] == "AWAITING_ACK"
+    req = _wifi_defeat_req(broadcasts)
+    assert req["client_macs"] == _STAS                       # forwarded to bridge
+    assert srv._pending_wifi_defeat[req["request_id"]]["client_macs"] == _STAS  # stored
+    reqmeta = [e for e in events if e["meta"].get("request_id") == req["request_id"]
+               and "client_macs" in e["meta"]]
+    assert reqmeta and reqmeta[0]["meta"]["client_macs"] == _STAS  # audit meta
+
+
+def test_explicit_body_client_macs_overrides_detection(monkeypatch):
+    det = {**_PARROT_TARGET, "associated_client_macs": ["FF:EE:DD:CC:BB:AA"]}
+    events, broadcasts = _stub_spine(monkeypatch, detection=det)
+    asyncio.run(srv.deploy_wifi_defeat(_body(mode="deauth", client_macs=_STAS), user=USER))
+    assert _wifi_defeat_req(broadcasts)["client_macs"] == _STAS
+
+
+def test_empty_sta_list_is_carried_honestly_never_broadcast(monkeypatch):
+    """A target with no associated_client_macs resolves to [] and is forwarded as
+    [] — the backend NEVER synthesizes an FF:FF:FF:FF:FF:FF broadcast client (the
+    bridge/primitive refuse the empty list downstream)."""
+    events, broadcasts = _stub_spine(monkeypatch, detection=_PARROT_TARGET)
+    asyncio.run(srv.deploy_wifi_defeat(_body(mode="deauth"), user=USER))
+    req = _wifi_defeat_req(broadcasts)
+    assert req["client_macs"] == []
+    assert "FF:FF:FF:FF:FF:FF" not in (req.get("client_macs") or [])
+
+
+def test_client_macs_oversized_list_rejected_by_schema():
+    """Defense-in-depth bound (mirrors field-bridge's MAX_DEAUTH_STA_TARGETS=64
+    truncation): WifiDefeatBody.client_macs REFUSES a >64-entry list at the API,
+    never reaching the TX-side cap."""
+    import pydantic
+    too_many = [f"11:22:33:44:55:{i:02X}" for i in range(65)]
+    with pytest.raises(pydantic.ValidationError):
+        _body(mode="deauth", client_macs=too_many)
+
+
+def test_client_macs_at_bound_is_accepted():
+    """Exactly 64 entries is still within bound — not refused."""
+    exactly_64 = [f"11:22:33:44:55:{i:02X}" for i in range(64)]
+    body = _body(mode="deauth", client_macs=exactly_64)
+    assert body.client_macs == exactly_64
+
+
+# ---------------------------------------------------------------------
 # HONESTY gate: inject against an encrypted / non-Parrot-Tello target -> 422
 # ---------------------------------------------------------------------
 def test_arsdk_inject_against_encrypted_target_refused_422(monkeypatch):

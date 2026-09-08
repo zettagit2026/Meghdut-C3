@@ -2618,10 +2618,17 @@ class WifiDefeatBody(BaseModel):
     # finite request cannot be turned into an unbounded on-air run by param abuse
     # (continuous=None is the intended uncapped path, stoppable at the bridge).
     count: Optional[int] = Field(None, ge=1, le=100_000)
-    # OPTIONAL: a specific client MAC to deauth (defaults to the broadcast client
-    # at the bridge — band-safe because the addr2/addr3 BSSID is still the pinned
-    # target AP; only the target_bssid broadcast guard is fratricide-relevant).
+    # OPTIONAL: a specific client MAC to deauth (back-compat single-STA form).
     client_mac: Optional[str] = None
+    # OPTIONAL: the explicit list of associated-client STA MACs to deauth, per
+    # BSSID. When omitted, the fire path resolves the target detection's own
+    # surveyed associated_client_macs. FORENSICS: a broadcast-addressed deauth is
+    # ignored by modern clients, so the deauth targets these STAs by UNICAST. An
+    # empty resolved list is REFUSED downstream (honesty gate) — NEVER turned into
+    # a broadcast FF:FF:FF:FF:FF:FF target. Bounded (defense-in-depth mirror of
+    # field-bridge's MAX_DEAUTH_STA_TARGETS truncation): an oversized list is
+    # rejected here at the API rather than relying only on the TX-side cap.
+    client_macs: Optional[List[str]] = Field(default=None, max_length=64)
     # Full arming spine tokens (all REQUIRED, every time):
     arm_token: Optional[str] = None            # bound to effect=wifi_deauth|arsdk_inject + this target (F3)
     wifi_defeat_confirm_token: Optional[str] = None  # proof of the SafetyGate two-step confirm
@@ -6721,6 +6728,15 @@ class WifiDroneIngestBody(BaseModel):
     # optional-PMF AP can still be deauthed against a non-PMF client).
     pmf_required: Optional[bool] = None
     pmf_supported: Optional[bool] = None
+    # Associated-client STA MACs read off the softAP's dot11 associated_client_map
+    # (RX-only survey enrich). The governed Wi-Fi-defeat deauth targets these
+    # specific client STAs by UNICAST -- a modern (PMF-capable) client ignores a
+    # broadcast-addressed deauth, so a broadcast deauth "transmits fine" yet has no
+    # effect. Empty when none observed. Refreshed like signal/channel on re-ingest;
+    # NEVER a fire-time gate and NEVER synthesized into a broadcast target.
+    # Bounded (defense-in-depth mirror of field-bridge's MAX_DEAUTH_STA_TARGETS
+    # truncation): an oversized list is rejected here at the API.
+    associated_client_macs: List[str] = Field(default=[], max_length=64)
 
 
 class FpvAnalogIngestBody(BaseModel):
@@ -6977,6 +6993,13 @@ async def _upsert_wifi_drone_detection(body: "WifiDroneIngestBody", bssid: str,
         }
         if center_freq_ghz is not None:
             updates["center_freq_ghz"] = center_freq_ghz
+        # Refresh the associated-client STA list like signal/channel (liveness),
+        # ONLY when this ingest actually carried one -- an empty list on a beacon
+        # that simply did not enumerate clients must not wipe a good STA list. This
+        # is a liveness refresh, NOT a fire-time gate; threat/IFF/no-strike below
+        # stay untouched.
+        if body.associated_client_macs:
+            updates["associated_client_macs"] = body.associated_client_macs
         # Deliberately NOT overwritten on merge: threat_level, authorized_target,
         # iff_* -- so an IFF re-classification or an operator authorization/downgrade
         # is sticky and a stream of beacons can't silently reset a fire-time gate.
@@ -7003,6 +7026,10 @@ async def _upsert_wifi_drone_detection(body: "WifiDroneIngestBody", bssid: str,
         "match_basis": body.match_basis,
         "signal_dbm": body.signal_dbm,
         "rssi_dbm": rssi,
+        # Associated-client STA MACs (per-STA unicast deauth targets); [] when the
+        # survey observed none. NOT a targeting/threat claim; the fire-time gates
+        # are unchanged.
+        "associated_client_macs": body.associated_client_macs,
         # We do NOT know the softAP's encryption/PMF posture from an SSID/OUI
         # fingerprint; default encrypted False (honest unknown). This does NOT
         # enable a false inject: _wifi_inject_target_identity still fails closed
@@ -9436,6 +9463,19 @@ async def _execute_engagement(effect: str, body, user: Dict) -> Dict:
         # a positive count is a bounded burst. Only meaningful for deauth.
         is_continuous = (mode == "deauth" and not body.count)
 
+        # Per-STA (unicast) deauth targets. FORENSICS: a broadcast-addressed deauth
+        # transmits fine but is IGNORED by modern (PMF-capable) clients, so the
+        # deauth must name the AP's OWN associated client STAs. Resolve the explicit
+        # request list, else the single client_mac (back-compat), else the target
+        # detection's surveyed associated_client_macs. NEVER a broadcast: an empty
+        # list is carried honestly and the bridge/primitive REFUSE it (there is no
+        # FF:FF:FF:FF:FF:FF fallback anywhere on the fire path).
+        target_client_macs = (
+            body.client_macs
+            or ([body.client_mac] if body.client_mac else None)
+            or detection.get("associated_client_macs")
+            or [])
+
         request_id = str(uuid.uuid4())
         _pending_wifi_defeat[request_id] = {
             "ts": datetime.now(timezone.utc),
@@ -9448,6 +9488,10 @@ async def _execute_engagement(effect: str, body, user: Dict) -> Dict:
             "channel": channel,
             "count": body.count,
             "continuous": is_continuous,
+            # STA targets stored so the forensic record shows exactly which client
+            # MACs were sent to the bridge (closes the "meta has no client target"
+            # gap). Empty list => the bridge/primitive will refuse (no broadcast).
+            "client_macs": target_client_macs,
             "actor": user["email"],
         }
 
@@ -9465,7 +9509,10 @@ async def _execute_engagement(effect: str, body, user: Dict) -> Dict:
             meta={"request_id": request_id, "mode": mode, "effect": effect,
                   "target_detection_id": body.target_detection_id, "target_bssid": target_bssid,
                   "softap": softap, "channel": channel, "count": body.count,
-                  "continuous": is_continuous},
+                  "continuous": is_continuous,
+                  # Forensic: the exact per-STA client MACs forwarded to the bridge
+                  # (closes the prior "meta records no client target" gap).
+                  "client_macs": target_client_macs},
             actor=user["email"],
         )
 
@@ -9476,6 +9523,9 @@ async def _execute_engagement(effect: str, body, user: Dict) -> Dict:
             "target_bssid": target_bssid,
             "softap": softap,
             "client_mac": body.client_mac,
+            # The resolved per-STA unicast target list the bridge deauths (empty =>
+            # bridge/primitive refuse; NEVER a broadcast).
+            "client_macs": target_client_macs,
             "channel": channel,
             "count": body.count,
             # Forwarded AFTER being consumed above — same convention as the
@@ -10176,7 +10226,13 @@ def _engage_effect_params(effect: str, det: Dict[str, Any]) -> Dict[str, Any]:
             params["center_freq_mhz"] = freq
         return params
     if effect in ("wifi_deauth", "arsdk_inject"):
-        return {"mode": _engage_wifi_mode(det, effect)}
+        # Mirror _execute_engagement's STA resolution at one-tap param-resolution
+        # time: the per-STA (unicast) deauth targets come from the detection's own
+        # surveyed associated_client_macs (the operator supplies no client field on
+        # the one-tap path). Empty list => the fire path refuses honestly downstream
+        # (no broadcast). This is a WHAT-to-transmit param, never an authz input.
+        return {"mode": _engage_wifi_mode(det, effect),
+                "client_macs": det.get("associated_client_macs") or []}
     raise HTTPException(500, f"_engage_effect_params: unknown effect {effect!r}")
 
 
@@ -10193,7 +10249,8 @@ def _build_engage_body(effect: str, target: str, arm_token: str,
                                     mavlink_sdr_inject_confirm_token=confirm_token, **params)
     if effect in ("wifi_deauth", "arsdk_inject"):
         return WifiDefeatBody(target_detection_id=target, arm_token=arm_token,
-                              wifi_defeat_confirm_token=confirm_token, mode=params["mode"])
+                              wifi_defeat_confirm_token=confirm_token, mode=params["mode"],
+                              client_macs=params.get("client_macs"))
     raise HTTPException(500, f"_build_engage_body: unknown effect {effect!r}")
 
 

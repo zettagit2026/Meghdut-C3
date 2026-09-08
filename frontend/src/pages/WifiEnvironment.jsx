@@ -3,10 +3,11 @@ import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
-import { Rss, ShieldAlert, ShieldPlus, ShieldCheck, Search, ArrowUp, ArrowDown, X, Crosshair } from "lucide-react";
+import { Rss, ShieldAlert, ShieldPlus, ShieldCheck, Search, ArrowUp, ArrowDown, X, Crosshair, Radio } from "lucide-react";
 import {
   filterAps, sortAps, isPossibleUas, canDesignateUas, encryptionLabel, pmfLabel, lastSeenLabel, macOui,
   hasConcreteBssid, designateJustificationRequired, designateJustificationValid, DESIGNATE_JUSTIFICATION_MIN_LEN,
+  apChannelToMhz,
 } from "@/lib/wifiEnvironment";
 
 // WI-FI ENVIRONMENT — RF situational awareness.
@@ -329,6 +330,106 @@ function DesignateUasModal({ ap, justificationRequired, onConfirm, onClose }) {
   );
 }
 
+// Commander-only JAM CHANNEL (AREA) caution. This is a SEPARATE, distinct
+// affordance from the ENGAGE (per-BSSID deauth) controls above -- it never
+// deauths and it is NOT gated by the no-strike registry (a channel-wide
+// barrage cannot be scoped to spare one BSSID, so no-strike protection can't
+// meaningfully apply the way it does to a per-BSSID deauth). Confirming here
+// makes NO api call and TRANSMITS NOTHING -- it only client-side
+// navigate()s to the Jamming page with this channel's center frequency
+// prefilled; the actual arm/confirm/fire (and its own AREA-DENIAL caution +
+// SafetyGate checklist item) live entirely on that next screen.
+function JamChannelAreaModal({ ap, freqMhz, civilianProtected, onClose, onConfirm }) {
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center p-6"
+      style={{ background: "rgba(5, 8, 16, 0.9)", backdropFilter: "blur(4px)" }}
+      data-testid="wifi-env-jam-area-modal"
+    >
+      <div className="max-w-xl w-full tactical-border" style={{ background: "var(--bg-surface)" }}>
+        <div className="px-5 py-3 tactical-border-b flex items-center justify-between">
+          <span className="font-heading font-black text-lg uppercase tracking-tighter flex items-center gap-2">
+            <Radio size={16} strokeWidth={1.5} style={{ color: "var(--accent-critical)" }} />
+            Jam Channel — Area Denial
+          </span>
+          <button
+            type="button"
+            data-testid="wifi-env-jam-area-close"
+            onClick={onClose}
+            className="text-slate-400 hover:text-[var(--text-primary)]"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        <div className="p-4 space-y-4">
+          <div className="font-mono text-[10px] leading-relaxed text-slate-300 space-y-2">
+            <p>
+              <span className="font-bold" style={{ color: "var(--accent-critical)" }}>
+                AREA DENIAL — NOT a per-BSSID / targeted strike.
+              </span>{" "}
+              Jamming channel {ap.channel || "—"} ({freqMhz != null ? `${freqMhz} MHz` : "frequency unknown"}) denies
+              THIS ENTIRE CHANNEL to <span className="font-bold">ALL devices within RF range</span> — the target
+              AP ({ap.bssid}) AND its clients AND every other co-channel device, including{" "}
+              <span className="font-bold">civilian and your own networks</span>. This is a channel-wide barrage,
+              not a targeted deauth; it cannot be scoped to one device.
+            </p>
+            <p>
+              Governed by the RANGE AUTHORIZATION lease on the Jamming page, NOT by BSSID — it is not gated by
+              the no-strike registry the way per-BSSID engagement is, because area jam cannot exempt one AP from
+              a channel-wide barrage.
+            </p>
+            {civilianProtected && (
+              <p
+                data-testid="wifi-env-jam-area-civilian-warning"
+                style={{ color: "var(--accent-critical)" }}
+                className="font-bold"
+              >
+                WARNING — REGISTERED CIVILIAN INFRASTRUCTURE: this AP is on the no-strike registry as
+                CIVILIAN_INFRASTRUCTURE. Jamming its channel still denies THAT civilian network and its
+                neighbours too — the no-strike protection cannot exempt it from an area-wide channel jam.
+              </p>
+            )}
+            <p>
+              Confirming here only takes you to the Jamming page with this frequency prefilled — nothing is
+              armed or transmitted here. The arm/confirm/fire sequence and its SafetyGate live on that page.
+            </p>
+          </div>
+          <dl className="grid grid-cols-2 gap-2 font-mono text-[11px]">
+            <div>
+              <dt className="text-slate-500 uppercase tracking-widest text-[9px]">BSSID</dt>
+              <dd className="text-slate-300">{ap.bssid || "—"}</dd>
+            </div>
+            <div>
+              <dt className="text-slate-500 uppercase tracking-widest text-[9px]">Channel</dt>
+              <dd className="text-slate-300">{ap.channel || "—"}</dd>
+            </div>
+          </dl>
+          <div className="tactical-border-t pt-3 flex items-center justify-between">
+            <button
+              type="button"
+              data-testid="wifi-env-jam-area-cancel"
+              onClick={onClose}
+              className="px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest text-slate-400 hover-surface"
+            >
+              CANCEL
+            </button>
+            <button
+              type="button"
+              data-testid="wifi-env-jam-area-confirm"
+              onClick={onConfirm}
+              disabled={freqMhz == null}
+              className="px-4 py-2 tactical-border font-mono text-xs font-bold uppercase tracking-widest hover-surface scanline-btn disabled:opacity-50"
+              style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
+            >
+              PROCEED TO JAMMING (AREA DENIAL)
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function WifiEnvironment() {
   const { user } = useAuth();
   const isCommander = user?.role === "commander";
@@ -342,6 +443,7 @@ export default function WifiEnvironment() {
   const [noStrikeEntries, setNoStrikeEntries] = useState([]);
   const [addingAp, setAddingAp] = useState(null);
   const [designatingAp, setDesignatingAp] = useState(null);
+  const [jammingAp, setJammingAp] = useState(null);
 
   const cancelledRef = useRef(false);
   useEffect(() => () => { cancelledRef.current = true; }, []);
@@ -559,6 +661,9 @@ export default function WifiEnvironment() {
                 <th className="px-3 py-2 text-left uppercase tracking-widest text-[10px] whitespace-nowrap" style={{ color: "var(--text-muted)" }}>
                   ENGAGE
                 </th>
+                <th className="px-3 py-2 text-left uppercase tracking-widest text-[10px] whitespace-nowrap" style={{ color: "var(--text-muted)" }}>
+                  JAM CHANNEL (AREA)
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -577,6 +682,12 @@ export default function WifiEnvironment() {
                 const droneDesignable = canDesignateUas(ap, { isCommander, isProtected: false });
                 const overrideDesignable =
                   isCommander && !civilianProtected && !droneDesignable && hasConcreteBssid(ap.bssid);
+                // JAM CHANNEL (AREA): a SEPARATE, distinct affordance from the
+                // per-BSSID ENGAGE controls above -- never a deauth, and NOT
+                // gated by the no-strike registry (an area barrage can't spare
+                // one BSSID). Same commander role gate as ENGAGE; only needs a
+                // derivable center frequency.
+                const jamFreqMhz = apChannelToMhz(ap);
                 return (
                   <tr key={ap.bssid || i} className="tactical-border-b" data-testid={`wifi-env-row-${ap.bssid}`}>
                     <td className="px-3 py-2" style={{ color: "var(--text-primary)" }}>
@@ -669,12 +780,33 @@ export default function WifiEnvironment() {
                         <span className="text-slate-600">—</span>
                       )}
                     </td>
+                    <td className="px-3 py-2">
+                      {isCommander && jamFreqMhz != null ? (
+                        <button
+                          type="button"
+                          data-testid={`wifi-env-jam-area-${ap.bssid}`}
+                          onClick={() => setJammingAp(ap)}
+                          title={`AREA DENIAL: jam channel ${ap.channel || "—"} (${jamFreqMhz} MHz) entirely — denies ALL devices in RF range on this channel, not just this AP (never a per-BSSID deauth). Deep-links to the Jamming page; the arm/confirm/fire happens there.`}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 tactical-border text-[9px] font-bold uppercase tracking-widest whitespace-nowrap hover-surface transition-colors"
+                          style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
+                        >
+                          <Radio size={10} strokeWidth={2} /> Jam Channel (Area)
+                        </button>
+                      ) : (
+                        <span
+                          className="text-slate-600"
+                          title={!isCommander ? "Commander role required" : "No channel/frequency data for this row"}
+                        >
+                          —
+                        </span>
+                      )}
+                    </td>
                   </tr>
                 );
               })}
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={COLUMNS.length + 3} className="px-3 py-6 text-center text-slate-600">
+                  <td colSpan={COLUMNS.length + 4} className="px-3 py-6 text-center text-slate-600">
                     {query ? "No APs match the filter." : "No access points in range."}
                   </td>
                 </tr>
@@ -689,11 +821,15 @@ export default function WifiEnvironment() {
         Passive RX-only survey via Kismet (monitor-mode NIC). Vendor is Kismet's OUI-derived guess;
         SSID / OUI are spoofable, so a “possible UAS” tag is a candidate hint, never an identification.
         This panel transmits nothing itself. A commander may (a) add a row to the no-strike
-        civilian-protection registry (PROTECT), or (b) designate a possible-UAS row as a suspected-UAS
+        civilian-protection registry (PROTECT), (b) designate a possible-UAS row as a suspected-UAS
         contact that deep-links into the governed, per-BSSID Wi-Fi-defeat flow — where the SafetyGate
-        arm/confirm and every fire-time gate still apply. Designating creates a governed contact only;
-        it never arms, transmits, or fires, and only a drone-OUI/SSID, non-civilian, non-broadcast row
-        is eligible.
+        arm/confirm and every fire-time gate still apply, or (c) deep-link a row's channel into the
+        Jamming page (JAM CHANNEL (AREA)) — a channel-wide AREA-DENIAL barrage, NOT a per-BSSID strike,
+        that denies the whole channel to every device in RF range including civilian/own co-channel
+        traffic; it is not scoped by the no-strike registry, and the arm/confirm/fire (with its own
+        AREA-DENIAL caution) happens entirely on that next page. Designating creates a governed contact
+        only; it never arms, transmits, or fires, and only a drone-OUI/SSID, non-civilian, non-broadcast
+        row is eligible.
       </div>
 
       {addingAp && (
@@ -716,6 +852,22 @@ export default function WifiEnvironment() {
           )}
           onClose={() => setDesignatingAp(null)}
           onConfirm={(justification) => doDesignate(designatingAp, justification)}
+        />
+      )}
+
+      {jammingAp && (
+        <JamChannelAreaModal
+          ap={jammingAp}
+          freqMhz={apChannelToMhz(jammingAp)}
+          civilianProtected={enabledNoStrikeEntries.some(
+            (e) => entryMatchesAp(e, jammingAp) && e.category === "CIVILIAN_INFRASTRUCTURE"
+          )}
+          onClose={() => setJammingAp(null)}
+          onConfirm={() => {
+            const freqMhz = apChannelToMhz(jammingAp);
+            setJammingAp(null);
+            navigate(`/jamming?freq=${freqMhz}`);
+          }}
         />
       )}
     </div>

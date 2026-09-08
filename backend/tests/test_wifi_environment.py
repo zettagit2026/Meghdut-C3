@@ -55,6 +55,13 @@ def _wpa2_ap_device():
         "kismet.device.base.signal": {"kismet.common.signal.last_signal": -47},
         "dot11.device": {
             "dot11.device.num_associated_clients": 3,
+            # A map keyed by client MAC -> per-client record (values elided). The
+            # survey extracts the KEYS as the associated-client STA list.
+            "dot11.device.associated_client_map": {
+                "DE:AD:BE:EF:00:01": {"x": 1},
+                "de:ad:be:ef:00:02": {"x": 2},
+                "DE:AD:BE:EF:00:01": {"x": 3},  # dup key (last wins in the dict)
+            },
             "dot11.device.last_beaconed_ssid_record": {
                 "dot11.advertisedssid.ssid": "OfficeNet",
                 "dot11.advertisedssid.crypt_string": "WPA2-PSK-AES",
@@ -154,9 +161,25 @@ def test_parse_produces_survey_shape():
     assert row["possible_uas"] is False
     # Every documented survey key is present (stable shape for the frontend).
     for key in ("bssid", "ssid", "channel", "rssi_dbm", "vendor", "encryption",
-                "pmf_required", "pmf_supported", "client_count", "first_seen",
+                "pmf_required", "pmf_supported", "client_count",
+                "associated_client_macs", "first_seen",
                 "last_seen", "possible_uas"):
         assert key in row
+
+
+def test_parse_extracts_associated_client_macs_from_client_map():
+    """The associated-client STA MACs are the KEYS of associated_client_map,
+    upper-cased + de-duped (order-stable) — the per-STA unicast deauth targets."""
+    row = kismet_survey.parse_kismet_device(_wpa2_ap_device())
+    assert row["associated_client_macs"] == ["DE:AD:BE:EF:00:01", "DE:AD:BE:EF:00:02"]
+
+
+def test_parse_associated_client_macs_empty_when_absent():
+    """No associated_client_map (or a non-AP device) -> [] (never None/raise)."""
+    assert kismet_survey.parse_kismet_device(_dji_oui_device())["associated_client_macs"] == []
+    assert kismet_survey.parse_kismet_device(
+        {"kismet.device.base.macaddr": "F4:5C:89:00:00:01",
+         "kismet.device.base.phyname": "Bluetooth"})["associated_client_macs"] == []
 
 
 def test_parse_projected_field_view_shape_populates_all():

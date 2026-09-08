@@ -349,7 +349,14 @@ class WifiDefeatBridge:
             iface = os.environ.get("WIFI_TX_IFACE")
             target_bssid = data.get("target_bssid")
             softap = data.get("softap")
+            # Per-STA (unicast) deauth targets. Prefer the explicit client_macs
+            # list the backend forwards; fall back to a single client_mac (back-
+            # compat). NEVER synthesize a broadcast target here — an empty list is
+            # passed through and the primitive refuses it fail-closed.
             client_mac = data.get("client_mac")
+            client_macs = data.get("client_macs")
+            if not client_macs and client_mac:
+                client_macs = [client_mac]
             # SSID of the drone's OPEN softAP (e.g. TELLO-* / ANAFI-* / DIRECT-*).
             # Only used by the mode-arbiter for the managed-mode association
             # (arsdk/tello); ignored for deauth.
@@ -394,6 +401,7 @@ class WifiDefeatBridge:
             "target_bssid": target_bssid,
             "softap": softap,
             "client_mac": client_mac,
+            "client_macs": client_macs,
             "ssid": ssid,
             "channel": channel,
             "count": count,
@@ -506,11 +514,13 @@ class WifiDefeatBridge:
         iface = params["iface"]
 
         if mode == MODE_DEAUTH:
-            # LINK-DROP: spoofed deauth/disassoc against the ONE target softAP
-            # BSSID (the primitive refuses a broadcast/empty/malformed BSSID).
+            # LINK-DROP: spoofed BIDIRECTIONAL deauth/disassoc against the target
+            # softAP BSSID, aimed per-STA at its associated client MACs (the
+            # primitive refuses a broadcast/empty/malformed BSSID AND an empty STA
+            # list — there is no broadcast-client fallback).
             on_started()
             return send_deauth(
-                iface, params["target_bssid"], params["client_mac"],
+                iface, params["target_bssid"], params["client_macs"],
                 params["channel"], params["count"],
                 stop_event=stop_event, tx_halt_check=tx_halt_check)
 

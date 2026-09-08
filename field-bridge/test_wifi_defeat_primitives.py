@@ -40,6 +40,12 @@ TX_IFACE = "wlan1mon"
 PIN_ENV = "WIFI_TX_IFACE"
 ALLOW_ENV = "WIFI_ALLOW_UNPINNED_TX"
 GOOD_BSSID = "AA:BB:CC:11:22:33"
+# Associated-client STA MACs — the per-STA (unicast) deauth targets. A deauth now
+# REQUIRES a concrete STA list (no broadcast fallback), so valid-deauth tests must
+# supply one.
+GOOD_STA = "DE:AD:BE:EF:00:01"
+GOOD_STA2 = "DE:AD:BE:EF:00:02"
+GOOD_STAS = [GOOD_STA]
 
 
 @pytest.fixture
@@ -58,12 +64,13 @@ def unpinned_no_optout(monkeypatch):
 
 
 class _RecordingDeauthSender:
-    """Records every (iface, bssid, client, channel) burst it is asked to send."""
+    """Records every (iface, bssid, client_macs, channel) burst it is asked to
+    send. client_macs is the resolved unicast STA LIST (never a broadcast)."""
     def __init__(self):
         self.calls = []
 
-    def __call__(self, iface, target_bssid, client_mac, channel):
-        self.calls.append((iface, target_bssid, client_mac, channel))
+    def __call__(self, iface, target_bssid, client_macs, channel):
+        self.calls.append((iface, target_bssid, client_macs, channel))
 
 
 class _RecordingUdpSender:
@@ -72,6 +79,55 @@ class _RecordingUdpSender:
 
     def __call__(self, target, payload):
         self.calls.append((target, payload))
+
+
+# --- Fake scapy so the REAL _tx_deauth_frames can be exercised without scapy ---
+# scapy is intentionally absent in this test env (see the module docstring). To
+# assert the ACTUAL frame addressing the primitive builds (bidirectional per STA)
+# we inject a tiny fake `scapy.all` into sys.modules; the primitive's lazy
+# `from scapy.all import ...` then picks up these fakes. No frame is transmitted.
+class _FakeLayer:
+    def __init__(self, _name, **kw):
+        self._name = _name
+        self._kw = kw
+        self.layers = [self]
+
+    def __truediv__(self, other):
+        comp = _FakeLayer("__composite__")
+        comp.layers = self.layers + other.layers
+        return comp
+
+
+def _dot11_of(frame):
+    """Return the addr1/addr2/addr3 of the Dot11 layer in a composite fake frame."""
+    for layer in frame.layers:
+        if layer._name == "Dot11":
+            return layer._kw
+    raise AssertionError("no Dot11 layer in frame")
+
+
+def _install_fake_scapy(monkeypatch):
+    """Install a fake scapy.all and return a capture dict of sendp() calls."""
+    import types
+    sent = {"sendp": []}
+    mod = types.ModuleType("scapy.all")
+
+    def _mk(name):
+        return lambda **kw: _FakeLayer(name, **kw)
+
+    mod.RadioTap = _mk("RadioTap")
+    mod.Dot11 = _mk("Dot11")
+    mod.Dot11Deauth = _mk("Dot11Deauth")
+    mod.Dot11Disas = _mk("Dot11Disas")
+
+    def _sendp(frames, iface=None, verbose=None):
+        sent["sendp"].append({"frames": list(frames), "iface": iface})
+
+    mod.sendp = _sendp
+    scapy_pkg = types.ModuleType("scapy")
+    monkeypatch.setitem(sys.modules, "scapy", scapy_pkg)
+    monkeypatch.setitem(sys.modules, "scapy.all", mod)
+    return sent
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +168,7 @@ def test_optout_proceeds_with_warning(monkeypatch, capsys):
     monkeypatch.delenv(PIN_ENV, raising=False)
     monkeypatch.setenv(ALLOW_ENV, "1")
     sender = _RecordingDeauthSender()
-    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, None, 6, 1,
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, GOOD_STAS, 6, 1,
                              frame_sender=sender)
     assert result["ok"] is True
     assert result["frames_sent"] == 1
@@ -155,25 +211,140 @@ def test_send_deauth_refuses_bad_bssid(pinned, bad_bssid):
 # ---------------------------------------------------------------------------
 def test_valid_deauth_invokes_sender_with_bssid_and_channel(pinned):
     sender = _RecordingDeauthSender()
-    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, "DE:AD:BE:EF:00:01", 11, 4,
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, [GOOD_STA], 11, 4,
                              frame_sender=sender)
     assert result["ok"] is True
     assert result["stopped_early"] is False
     assert result["frames_sent"] == 4
     assert len(sender.calls) == 4
-    for iface, bssid, client, channel in sender.calls:
+    for iface, bssid, client_macs, channel in sender.calls:
         assert iface == TX_IFACE
         assert bssid == GOOD_BSSID
-        assert client == "DE:AD:BE:EF:00:01"
+        # The resolved STA LIST is forwarded to the sender (never a bare MAC and
+        # never a broadcast).
+        assert client_macs == [GOOD_STA]
         assert channel == 11
 
 
-def test_valid_deauth_defaults_client_to_bssid_scoped_broadcast(pinned):
-    """A None client defaults to this-BSSID broadcast — band-safe because the
-    BSSID (addr2/addr3) still pins the one softAP."""
+def test_empty_sta_list_refused_no_broadcast_fallback(pinned):
+    """HONESTY GATE / no-broadcast-fallback: an empty STA list is REFUSED, never
+    silently turned into an FF:FF:FF:FF:FF:FF broadcast client. Proves the old
+    broadcast default is GONE."""
+    for empty in (None, [], (), "", "   ", ["  "], ["not-a-mac"], ["FF:FF:FF:FF:FF:FF"]):
+        sender = _RecordingDeauthSender()
+        result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, empty, 6, 3,
+                                 frame_sender=sender)
+        assert result["ok"] is False, f"empty STA {empty!r} must refuse"
+        assert "no associated clients" in result["error"]
+        assert result["frames_sent"] == 0
+        assert sender.calls == [], "no frame may be sent when there is no STA"
+
+
+def test_deauth_normalizes_dedups_and_drops_broadcast_and_malformed(pinned):
+    """A mixed STA list is normalized: valid MACs upper-cased + de-duped (order
+    stable), a broadcast MAC and a malformed MAC dropped. The surviving unicast
+    list is what reaches the sender."""
     sender = _RecordingDeauthSender()
-    wdp.send_deauth(TX_IFACE, GOOD_BSSID, None, 6, 1, frame_sender=sender)
-    assert sender.calls[0][2] == "FF:FF:FF:FF:FF:FF"
+    result = wdp.send_deauth(
+        TX_IFACE, GOOD_BSSID,
+        ["de:ad:be:ef:00:01", "FF:FF:FF:FF:FF:FF", "DE:AD:BE:EF:00:01",
+         "garbage", GOOD_STA2],
+        6, 1, frame_sender=sender)
+    assert result["ok"] is True
+    assert sender.calls[0][2] == [GOOD_STA, GOOD_STA2]
+
+
+def test_deauth_drops_multicast_and_ig_bit_macs(pinned):
+    """R1: ANY MAC whose first octet has the I/G (least-significant) bit set is
+    dropped, not just the all-FF broadcast — e.g. the well-known IPv4-multicast
+    OUI 01:00:5E. A real associated client STA is always unicast."""
+    sender = _RecordingDeauthSender()
+    result = wdp.send_deauth(
+        TX_IFACE, GOOD_BSSID,
+        ["01:00:5E:00:00:01", "03:00:00:11:22:33", GOOD_STA],
+        6, 1, frame_sender=sender)
+    assert result["ok"] is True
+    assert sender.calls[0][2] == [GOOD_STA], "multicast/I-G-bit MACs must be dropped"
+
+
+def test_deauth_all_multicast_list_refused_no_send(pinned):
+    """An all-multicast/I-G-bit STA list has nothing surviving -> REFUSE, same as
+    an all-broadcast or all-malformed list; no sendp/TX call made."""
+    sender = _RecordingDeauthSender()
+    result = wdp.send_deauth(
+        TX_IFACE, GOOD_BSSID,
+        ["01:00:5E:00:00:01", "33:33:00:00:00:01"],
+        6, 3, frame_sender=sender)
+    assert result["ok"] is False
+    assert "no associated clients" in result["error"]
+    assert sender.calls == [], "all-multicast STA list must inject no frame"
+
+
+def test_deauth_canonicalizes_dash_form_mac_to_colon_upper(pinned):
+    """R3: a valid dash-separated MAC is canonicalized to colon-separated UPPER
+    form (not rejected, not forwarded with dashes) so scapy accepts it at TX."""
+    sender = _RecordingDeauthSender()
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, ["de-ad-be-ef-00-01"],
+                             6, 1, frame_sender=sender)
+    assert result["ok"] is True
+    assert sender.calls[0][2] == ["DE:AD:BE:EF:00:01"]
+
+
+def test_deauth_caps_oversized_sta_list_with_warning(pinned, capsys):
+    """R2: a STA list larger than MAX_DEAUTH_STA_TARGETS is truncated to the
+    first MAX_DEAUTH_STA_TARGETS (stable order), and a WARNING is logged — the
+    request is NOT refused, the surviving capped list is still transmitted."""
+    over = wdp.MAX_DEAUTH_STA_TARGETS + 10
+    stas = [f"DE:AD:BE:EF:{(i >> 8) & 0xFF:02X}:{i & 0xFF:02X}" for i in range(over)]
+    sender = _RecordingDeauthSender()
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, stas, 6, 1, frame_sender=sender)
+    assert result["ok"] is True
+    sent_targets = sender.calls[0][2]
+    assert len(sent_targets) == wdp.MAX_DEAUTH_STA_TARGETS
+    # stable order: the first MAX_DEAUTH_STA_TARGETS survivors, unchanged order.
+    assert sent_targets == stas[: wdp.MAX_DEAUTH_STA_TARGETS]
+    err = capsys.readouterr().err
+    assert "WARNING" in err and "MAX_DEAUTH_STA_TARGETS" in err
+
+
+def test_deauth_cap_reflected_in_real_frame_count(monkeypatch):
+    """The cap is enforced BEFORE frames are built: with the real (fake-scapy)
+    _tx_deauth_frames, an oversized STA list yields exactly
+    MAX_DEAUTH_STA_TARGETS * 4 frames (2 directions x {deauth,disas}) per
+    burst, never one frame more."""
+    monkeypatch.setenv(PIN_ENV, TX_IFACE)
+    monkeypatch.delenv(ALLOW_ENV, raising=False)
+    sent = _install_fake_scapy(monkeypatch)
+    over = wdp.MAX_DEAUTH_STA_TARGETS + 5
+    stas = [f"DE:AD:BE:EF:{(i >> 8) & 0xFF:02X}:{i & 0xFF:02X}" for i in range(over)]
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, stas, 6, 1)
+    assert result["ok"] is True
+    assert len(sent["sendp"]) == 1
+    assert len(sent["sendp"][0]["frames"]) == wdp.MAX_DEAUTH_STA_TARGETS * 4
+
+
+def test_tx_deauth_frames_emits_both_directions_per_sta(monkeypatch):
+    """BIDIRECTIONAL per-STA: the REAL _tx_deauth_frames (scapy mocked) must emit,
+    for EACH STA, an AP->STA frame (addr1=STA,addr2=BSSID) AND a STA->AP frame
+    (addr1=BSSID,addr2=STA), with addr2/addr3 always pinned to the ONE BSSID."""
+    sent = _install_fake_scapy(monkeypatch)
+    stas = [GOOD_STA, GOOD_STA2]
+    wdp._tx_deauth_frames(TX_IFACE, GOOD_BSSID, stas, 6)
+    # One sendp() call carrying every frame for this burst.
+    assert len(sent["sendp"]) == 1
+    call = sent["sendp"][0]
+    assert call["iface"] == TX_IFACE
+    dot11s = [_dot11_of(f) for f in call["frames"]]
+    for sta in stas:
+        ap_to_sta = [d for d in dot11s if d["addr1"] == sta and d["addr2"] == GOOD_BSSID]
+        sta_to_ap = [d for d in dot11s if d["addr1"] == GOOD_BSSID and d["addr2"] == sta]
+        assert ap_to_sta, f"missing AP->STA frame for {sta}"
+        assert sta_to_ap, f"missing STA->AP frame for {sta}"
+        # addr3 (the BSS) is always the ONE target BSSID, never the band.
+        for d in ap_to_sta + sta_to_ap:
+            assert d["addr3"] == GOOD_BSSID
+    # NEVER a broadcast client address anywhere.
+    assert all(d["addr1"] != "FF:FF:FF:FF:FF:FF" for d in dot11s)
 
 
 # ---------------------------------------------------------------------------
@@ -181,7 +352,7 @@ def test_valid_deauth_defaults_client_to_bssid_scoped_broadcast(pinned):
 # ---------------------------------------------------------------------------
 def test_deauth_stops_immediately_when_halted_before_first_burst(pinned):
     sender = _RecordingDeauthSender()
-    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, None, 6, 100,
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, GOOD_STAS, 6, 100,
                              tx_halt_check=lambda: True, frame_sender=sender)
     assert result["ok"] is True
     assert result["stopped_early"] is True
@@ -199,7 +370,7 @@ def test_deauth_stops_mid_stream_on_halt(pinned):
     def sender(iface, bssid, client, channel):
         state["n"] += 1
 
-    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, None, 6, None,  # continuous
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, GOOD_STAS, 6, None,  # continuous
                              tx_halt_check=halt, frame_sender=sender)
     assert result["ok"] is True
     assert result["stopped_early"] is True
@@ -212,7 +383,7 @@ def test_deauth_stops_on_stop_event(pinned):
     ev = threading.Event()
     ev.set()
     sender = _RecordingDeauthSender()
-    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, None, 6, 50,
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, GOOD_STAS, 6, 50,
                              stop_event=ev, frame_sender=sender)
     assert result["ok"] is True
     assert result["stopped_early"] is True
@@ -224,7 +395,7 @@ def test_deauth_halt_probe_that_raises_fails_safe(pinned):
     def boom():
         raise RuntimeError("probe broke")
     sender = _RecordingDeauthSender()
-    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, None, 6, 100,
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, GOOD_STAS, 6, 100,
                              tx_halt_check=boom, frame_sender=sender)
     assert result["ok"] is True
     assert result["stopped_early"] is True
@@ -235,9 +406,9 @@ def test_deauth_halt_probe_that_raises_fails_safe(pinned):
 # 6) no-raise contract: a raising real-TX sender comes back as ok=False
 # ---------------------------------------------------------------------------
 def test_deauth_sender_exception_is_not_raised(pinned):
-    def boom(iface, bssid, client, channel):
+    def boom(iface, bssid, client_macs, channel):
         raise OSError("nic gone")
-    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, None, 6, 3, frame_sender=boom)
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, GOOD_STAS, 6, 3, frame_sender=boom)
     assert result["ok"] is False
     assert "failed" in result["error"].lower()
     assert result["stopped_early"] is False
@@ -345,7 +516,7 @@ def test_send_deauth_pinned_but_wrong_iface_refused(pinned):
 def test_send_deauth_pinned_matching_iface_proceeds(pinned):
     """iface == the pinned WIFI_TX_IFACE -> transmit proceeds normally."""
     sender = _RecordingDeauthSender()
-    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, None, 6, 2,
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, GOOD_STAS, 6, 2,
                              frame_sender=sender)
     assert result["ok"] is True
     assert result["frames_sent"] == 2
@@ -393,7 +564,7 @@ def test_dev_optout_allows_iface_mismatch_with_warning(monkeypatch, capsys):
     monkeypatch.delenv(PIN_ENV, raising=False)
     monkeypatch.setenv(ALLOW_ENV, "1")
     sender = _RecordingDeauthSender()
-    result = wdp.send_deauth(WRONG_IFACE, GOOD_BSSID, None, 6, 1,
+    result = wdp.send_deauth(WRONG_IFACE, GOOD_BSSID, GOOD_STAS, 6, 1,
                              frame_sender=sender)
     assert result["ok"] is True
     assert result["frames_sent"] == 1
@@ -439,7 +610,7 @@ def test_blank_pin_with_optout_still_proceeds(monkeypatch, capsys):
     monkeypatch.setenv(PIN_ENV, "  \t  ")
     monkeypatch.setenv(ALLOW_ENV, "1")
     sender = _RecordingDeauthSender()
-    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, None, 6, 1,
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, GOOD_STAS, 6, 1,
                              frame_sender=sender)
     assert result["ok"] is True
     err = capsys.readouterr().err
@@ -457,7 +628,7 @@ class _RaisingStopEvent:
 
 def test_deauth_stop_event_that_raises_fails_safe(pinned):
     sender = _RecordingDeauthSender()
-    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, None, 6, 100,
+    result = wdp.send_deauth(TX_IFACE, GOOD_BSSID, GOOD_STAS, 6, 100,
                              stop_event=_RaisingStopEvent(), frame_sender=sender)
     assert result["ok"] is True
     assert result["stopped_early"] is True

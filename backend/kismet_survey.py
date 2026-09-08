@@ -205,6 +205,25 @@ def _to_bool(val: Any) -> Optional[bool]:
     return None
 
 
+def _associated_client_macs(client_map: Any) -> List[str]:
+    """The associated-client STA MACs from a Kismet dot11 associated_client_map
+    (a map whose KEYS are the client MACs). Read-only projection: upper-cased,
+    de-duped, order-stable; empty list when the map is absent / empty / oddly-
+    shaped. Never raises."""
+    if not isinstance(client_map, dict):
+        return []
+    out: List[str] = []
+    seen = set()
+    for k in client_map.keys():
+        if not isinstance(k, str):
+            continue
+        mac = k.strip().upper()
+        if mac and mac not in seen:
+            seen.add(mac)
+            out.append(mac)
+    return out
+
+
 def parse_kismet_device(device: Dict[str, Any]) -> Dict[str, Any]:
     """Reshape ONE Kismet device-JSON object into the compact survey row the
     /api/wifi-environment endpoint returns. Pure -- no I/O, never raises on a
@@ -235,6 +254,12 @@ def parse_kismet_device(device: Dict[str, Any]) -> Dict[str, Any]:
     dot11 = device.get("dot11.device")
     client_count = _nested(device, "dot11.device",
                            "dot11.device.num_associated_clients")
+    # Associated-client STA MACs: the KEYS of dot11.device.associated_client_map
+    # (a map keyed by client MAC). Read-only survey enrich — the count above is a
+    # number, this is the actual STA list a per-STA (unicast) deauth targets.
+    client_map = _nested(device, "dot11.device",
+                         "dot11.device.associated_client_map")
+    associated_client_macs = _associated_client_macs(client_map)
     ssid_record = _nested(device, "dot11.device",
                           "dot11.device.last_beaconed_ssid_record")
 
@@ -276,6 +301,10 @@ def parse_kismet_device(device: Dict[str, Any]) -> Dict[str, Any]:
         "pmf_required": pmf_required,          # 802.11w
         "pmf_supported": pmf_supported,
         "client_count": int(client_count) if client_count is not None else None,
+        # Associated-client STA MACs (from associated_client_map keys); [] when
+        # none/absent. Read-only survey field — the per-STA unicast deauth target
+        # list; NEVER a targeting/threat claim on its own.
+        "associated_client_macs": associated_client_macs,
         "first_seen": int(first_time) if first_time else None,
         "last_seen": int(last_time) if last_time else None,
         # NON-ACTIONABLE visual hint only. Never used for targeting/engagement.

@@ -253,6 +253,53 @@ async def test_reingest_does_not_reset_engagement_authorization(monkeypatch):
 
 
 # ---------------------------------------------------------------------
+# Associated-client STA list is persisted + refreshed (per-STA deauth targets)
+# ---------------------------------------------------------------------
+async def test_ingest_persists_associated_client_macs(monkeypatch):
+    """The STA list the survey/bridge carried is persisted on the promoted contact
+    so the governed Wi-Fi-defeat deauth can target those client STAs by unicast."""
+    db, _events = _setup(monkeypatch)
+    stas = ["11:22:33:44:55:66", "AA:BB:CC:00:11:22"]
+    await srv.wifi_drone_ingest(_flow_body(associated_client_macs=stas), user=USER)
+    assert db.detections.docs[0]["associated_client_macs"] == stas
+
+
+def test_associated_client_macs_oversized_list_rejected_by_schema():
+    """Defense-in-depth bound (mirrors field-bridge's MAX_DEAUTH_STA_TARGETS=64
+    truncation): WifiDroneIngestBody.associated_client_macs REFUSES a >64-entry
+    list at the API, never reaching the TX-side cap."""
+    import pydantic
+    too_many = [f"11:22:33:44:55:{i:02X}" for i in range(65)]
+    with pytest.raises(pydantic.ValidationError):
+        _flow_body(associated_client_macs=too_many)
+
+
+def test_associated_client_macs_at_bound_is_accepted():
+    """Exactly 64 entries is still within bound — not refused."""
+    exactly_64 = [f"11:22:33:44:55:{i:02X}" for i in range(64)]
+    body = _flow_body(associated_client_macs=exactly_64)
+    assert body.associated_client_macs == exactly_64
+
+
+async def test_reingest_refreshes_sta_list_but_empty_does_not_wipe(monkeypatch):
+    """Re-ingest carrying a fresh STA list refreshes it (liveness, like signal);
+    a subsequent beacon that enumerated NO clients must NOT wipe a good list."""
+    db, _events = _setup(monkeypatch)
+    await srv.wifi_drone_ingest(
+        _flow_body(associated_client_macs=["11:22:33:44:55:66"]), user=USER)
+    # New STA appears -> refreshed.
+    await srv.wifi_drone_ingest(
+        _flow_body(associated_client_macs=["11:22:33:44:55:66", "AA:BB:CC:00:11:22"]),
+        user=USER)
+    assert db.detections.docs[0]["associated_client_macs"] == [
+        "11:22:33:44:55:66", "AA:BB:CC:00:11:22"]
+    # A beacon with no enumerated clients (default []) must not clobber the list.
+    await srv.wifi_drone_ingest(_flow_body(), user=USER)
+    assert db.detections.docs[0]["associated_client_macs"] == [
+        "11:22:33:44:55:66", "AA:BB:CC:00:11:22"]
+
+
+# ---------------------------------------------------------------------
 # A non-classified / generic / BSSID-less wifi ingest is NOT promoted
 # ---------------------------------------------------------------------
 async def test_generic_softap_does_not_create_targetable_contact(monkeypatch):

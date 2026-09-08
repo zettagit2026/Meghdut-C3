@@ -267,6 +267,30 @@ def _device_signal(device: Dict) -> Optional[float]:
     return float(v) if isinstance(v, (int, float)) else None
 
 
+def _device_associated_client_macs(device: Dict) -> List[str]:
+    """Upper-cased associated-client STA MACs from the softAP's dot11
+    associated_client_map (a map whose KEYS are the client MACs); [] when absent.
+    Read-only. Carried onto the ingest so the governed Wi-Fi-defeat deauth can
+    target these specific STAs by unicast (a modern client ignores a broadcast-
+    addressed deauth) — never a broadcast/blanket target."""
+    dot11 = device.get("dot11.device")
+    cmap = dot11.get("dot11.device.associated_client_map") if isinstance(dot11, dict) else None
+    if cmap is None:
+        cmap = device.get("dot11.device.associated_client_map")
+    if not isinstance(cmap, dict):
+        return []
+    out: List[str] = []
+    seen = set()
+    for k in cmap.keys():
+        if not isinstance(k, str):
+            continue
+        mac = k.strip().upper()
+        if mac and mac not in seen:
+            seen.add(mac)
+            out.append(mac)
+    return out
+
+
 def scan_device(device: Dict) -> Optional[Dict]:
     """Build a full /api/wifi-drone/ingest body for one device if it is a drone
     candidate, else None. Only IEEE802.11 (Wi-Fi) devices are considered."""
@@ -279,6 +303,7 @@ def scan_device(device: Dict) -> Optional[Dict]:
         return None
     match["channel"] = _device_channel(device)
     match["signal_dbm"] = _device_signal(device)
+    match["associated_client_macs"] = _device_associated_client_macs(device)
     return match
 
 

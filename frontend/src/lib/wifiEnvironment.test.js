@@ -15,6 +15,7 @@ const {
   encryptionLabel, pmfLabel, lastSeenLabel, canDesignateUas, hasConcreteBssid,
   matchedNoStrikeEntry, noStrikeRowAction,
   designateJustificationRequired, designateJustificationValid, DESIGNATE_JUSTIFICATION_MIN_LEN,
+  wifiChannelToMhz, apChannelToMhz,
 } = require("./wifiEnvironment");
 
 // A small fixture in the exact survey shape the backend returns.
@@ -219,12 +220,61 @@ describe("filter + sort (drives what the table renders)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// AREA-DENIAL "Jam Channel" deep-link helpers (WifiEnvironment.jsx's "JAM
+// CHANNEL (AREA)" affordance -> Jamming.jsx's custom-frequency input). A
+// Wi-Fi channel jam is PHYSICALLY area denial -- these helpers only compute
+// the center MHz to prefill; the honest AREA-DENIAL framing lives in the
+// page copy (scanned below) and on Jamming.jsx itself.
+// ---------------------------------------------------------------------------
+describe("wifiChannelToMhz / apChannelToMhz (AREA-DENIAL jam deep-link)", () => {
+  test("wifiChannelToMhz maps standard 2.4GHz channels", () => {
+    expect(wifiChannelToMhz(1)).toBe(2412);
+    expect(wifiChannelToMhz(11)).toBe(2462);
+    expect(wifiChannelToMhz(13)).toBe(2472);
+    expect(wifiChannelToMhz(14)).toBe(2484); // Japan-only special case
+  });
+
+  test("wifiChannelToMhz falls back to the 5GHz UNII table for higher channel numbers", () => {
+    expect(wifiChannelToMhz(36)).toBe(5180);
+    expect(wifiChannelToMhz(149)).toBe(5745);
+  });
+
+  test("wifiChannelToMhz is null for absent/invalid channel input", () => {
+    expect(wifiChannelToMhz(null)).toBeNull();
+    expect(wifiChannelToMhz("")).toBeNull();
+    expect(wifiChannelToMhz("not-a-channel")).toBeNull();
+    expect(wifiChannelToMhz(0)).toBeNull();
+  });
+
+  test("apChannelToMhz prefers Kismet's measured frequency_ghz over the channel table", () => {
+    // 2.462 GHz is channel 11's real center freq -- same answer either way here,
+    // but frequency_ghz is the one actually consulted first.
+    expect(apChannelToMhz({ channel: "11", frequency_ghz: 2.462 })).toBe(2462);
+    // A 5GHz reading the channel-11 table would get wrong if it were consulted.
+    expect(apChannelToMhz({ channel: "11", frequency_ghz: 5.18 })).toBe(5180);
+  });
+
+  test("apChannelToMhz falls back to the channel table when frequency_ghz is absent", () => {
+    expect(apChannelToMhz({ channel: "11" })).toBe(2462);
+    expect(apChannelToMhz({ channel: "36" })).toBe(5180);
+  });
+
+  test("apChannelToMhz is null when neither frequency_ghz nor a usable channel is present", () => {
+    expect(apChannelToMhz({})).toBeNull();
+    expect(apChannelToMhz(null)).toBeNull();
+    expect(apChannelToMhz({ channel: null, frequency_ghz: null })).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // GUARANTEE: the panel itself TRANSMITS NOTHING. It makes exactly two
 // commander-gated non-GET calls — PROTECT (POST /no-strike) and DESIGNATE
 // (POST /wifi-environment/designate). DESIGNATE only creates a governed contact
 // and DEEP-LINKS (a client-side navigate, never an api call) into the existing
-// /wifi-defeat SafetyGate flow where the deliberate arm/fire lives. The page
-// must never call a fire/transmit endpoint directly. Scan its source.
+// /wifi-defeat SafetyGate flow where the deliberate arm/fire lives. The
+// JAM CHANNEL (AREA) affordance is likewise a client-side navigate only, to
+// /jamming, never an api call. The page must never call a fire/transmit
+// endpoint directly. Scan its source.
 // ---------------------------------------------------------------------------
 describe("commander-override designate justification — flag-gated field-required predicate", () => {
   test("required ONLY for a commander-override designate AND only when the flag is on", () => {
@@ -329,5 +379,65 @@ describe("WifiEnvironment page: protect + designate, but transmits nothing itsel
     expect(pageSrc).toMatch(/navigate\(`\/wifi-defeat\?contact=/);
     // ...and /wifi-defeat is NEVER invoked as an api.<verb>("/wifi-defeat"...).
     expect(pageSrc).not.toMatch(/api\.[a-z]+\s*\(\s*["'`]\/wifi-defeat/i);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// JAM CHANNEL (AREA) — a SEPARATE, distinct affordance from the per-BSSID
+// ENGAGE controls: never a deauth, not gated by the no-strike registry (an
+// area barrage can't spare one BSSID), and honestly labeled AREA DENIAL of
+// the whole channel (never framed as a per-AP/targeted strike). Static scan
+// only — no api call is made by this affordance, only a client navigate.
+// ---------------------------------------------------------------------------
+describe("WifiEnvironment page: JAM CHANNEL (AREA) deep-link is honestly AREA-DENIAL, not per-BSSID", () => {
+  const pageSrc = fs.readFileSync(
+    path.join(__dirname, "..", "pages", "WifiEnvironment.jsx"), "utf8"
+  );
+  const low = pageSrc.toLowerCase();
+
+  test("deep-links to the Jamming page with the channel's center frequency, via a client navigate", () => {
+    expect(pageSrc).toMatch(/navigate\(`\/jamming\?freq=/);
+    // Never invoked as an api call.
+    expect(pageSrc).not.toMatch(/api\.[a-z]+\s*\(\s*["'`]\/jamming/i);
+  });
+
+  test("derives the frequency from the row via apChannelToMhz, imported from the lib module", () => {
+    expect(pageSrc).toMatch(/apChannelToMhz\s*[,}]/); // present in the named-import list
+    expect(pageSrc).toContain("apChannelToMhz(ap)");
+  });
+
+  test("the button/affordance is distinct from and does not replace the ENGAGE deauth controls", () => {
+    // The existing per-BSSID engage controls are untouched...
+    expect(pageSrc).toContain("Engage as suspected UAS");
+    expect(pageSrc).toContain("Engage (commander override)");
+    // ...and the new one has its own separate label, never framed as "take down"/deauth.
+    expect(low).toContain("jam channel");
+    expect(low).not.toMatch(/take\s*down\s*this\s*ap/);
+  });
+
+  test("copy honestly frames this as AREA DENIAL of the whole channel, never per-BSSID/targeted", () => {
+    expect(low).toContain("area denial");
+    expect(low).toContain("entire channel");
+    expect(low).toMatch(/all devices (within|in) rf range/);
+    expect(low).toContain("civilian");
+    expect(low).toMatch(/not a per-bssid|never a per-bssid|not.{0,20}targeted strike/);
+  });
+
+  test("the JAM affordance is gated on the commander role, same as ENGAGE", () => {
+    expect(pageSrc).toMatch(/isCommander\s*&&\s*jamFreqMhz\s*!=\s*null/);
+  });
+
+  test("the confirm caution warns when the AP is registered CIVILIAN_INFRASTRUCTURE (surfaced, not silently allowed)", () => {
+    expect(pageSrc).toContain("civilianProtected");
+    expect(pageSrc).toMatch(/civilianProtected\s*&&\s*\(/);
+    expect(low).toContain("registered civilian infrastructure");
+    expect(low).toContain("no-strike registry");
+  });
+
+  test("the JAM affordance is NOT gated by the no-strike/civilian match the way ENGAGE is", () => {
+    // civilianProtected only gates a warning here, never removes the button
+    // (unlike the ENGAGE column, which renders a badge-only "Protected" state
+    // instead of a button for a civilian match).
+    expect(pageSrc).toMatch(/isCommander && jamFreqMhz != null \? \(/);
   });
 });

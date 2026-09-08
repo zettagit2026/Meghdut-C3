@@ -220,6 +220,40 @@ export function designateJustificationValid(text) {
   return typeof text === "string" && text.trim().length >= DESIGNATE_JUSTIFICATION_MIN_LEN;
 }
 
+// AREA-DENIAL "Jam Channel" deep-link helpers. A Wi-Fi channel jam is a
+// PHYSICAL area-denial effect -- a barrage at a channel's center frequency
+// denies that ENTIRE channel to every device in RF range (the target AP,
+// its clients, and any other co-channel device, civilian or own), never a
+// single BSSID. These helpers only compute the center MHz to prefill on
+// Jamming.jsx; they carry no targeting/gating weight of their own.
+
+// Standard Wi-Fi channel -> 2.4GHz center-frequency (MHz) mapping (channels
+// 1-13 are linear 5MHz spacing from 2412 MHz; channel 14 is the Japan-only
+// special case at 2484 MHz). For channel numbers above the 2.4GHz range this
+// falls back to the standard 5MHz-per-channel-number UNII spacing from a
+// 5000 MHz base (covers the common 36-165 5GHz range). Used only as a
+// FALLBACK when a survey row has no measured `frequency_ghz` -- see
+// apChannelToMhz, which prefers the real Kismet measurement when present.
+export function wifiChannelToMhz(channel) {
+  const ch = Number(channel);
+  if (!Number.isFinite(ch) || ch < 1) return null;
+  if (ch === 14) return 2484;
+  if (ch <= 13) return 2412 + (ch - 1) * 5;
+  return 5000 + ch * 5;
+}
+
+// Best available AREA-DENIAL jam center-frequency (MHz) for a survey row.
+// Prefers Kismet's own measured `frequency_ghz` (a real reading, and correct
+// for 5GHz channels too); falls back to the standard channel->MHz table
+// (wifiChannelToMhz) when only `channel` is known. Returns null when neither
+// is available (the row is not jam-deep-link-eligible).
+export function apChannelToMhz(ap) {
+  if (!ap) return null;
+  const ghz = Number(ap.frequency_ghz);
+  if (Number.isFinite(ghz) && ghz > 0) return Math.round(ghz * 1000);
+  return wifiChannelToMhz(ap.channel);
+}
+
 // Seconds-since-last-seen -> compact relative label. `nowSec` injectable for
 // deterministic tests.
 export function lastSeenLabel(ap, nowSec) {
