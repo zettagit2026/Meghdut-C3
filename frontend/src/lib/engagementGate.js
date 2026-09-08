@@ -48,6 +48,7 @@ export function readTxSubsystem(health) {
     tx_halted: tx.tx_halted !== false, // default HALTED (fail-closed) if unknown
     sik_link_up: !!tx.sik_link_up,
     sik_owner: tx.sik_owner ?? null,
+    sik_link_mode: tx.sik_link_mode ?? null, // "tx" (rf-bridge owns+consumer up) | "rx" (recent sniffer RX) | null (down)
     tx_bridge_consumers: Array.isArray(tx.tx_bridge_consumers) ? tx.tx_bridge_consumers : [],
     range_auth: tx.range_auth || {},
     _present: !!health?.tx_subsystem,
@@ -83,11 +84,18 @@ export function deriveTxChips(health) {
     },
     {
       key: "sik-link",
-      label: tx.sik_link_up ? "SiK LINK UP" : "SiK LINK DOWN",
+      // Owner-aware, honest label. UP is only ever set from genuine liveness the
+      // backend proved (rf-bridge owns the SiK with a connected TX consumer, or a
+      // recent sniffer RX). Show WHICH mode so "UP" is never ambiguous.
+      label: tx.sik_link_up
+        ? (tx.sik_link_mode === "tx" ? "SiK LINK UP (TX)" : "SiK LINK UP (RX)")
+        : "SiK LINK DOWN",
       tone: tx.sik_link_up ? TONE.ok : TONE.warn,
       title: tx.sik_link_up
-        ? "SiK radio link is up (recent RX confirmed)."
-        : "No recent SiK RX — link may be down or idle.",
+        ? (tx.sik_link_mode === "tx"
+            ? "SiK radio link is up — owned by rf-bridge for transmit (a TX bridge consumer is connected)."
+            : "SiK radio link is up (recent RX confirmed by the passive sniffer).")
+        : "No recent SiK RX and no connected TX bridge — link may be down or idle.",
     },
     {
       key: "tx-radio",

@@ -1,6 +1,6 @@
 # MEGHDUT C3 — Master Task Sheet
 
-_Terse tracker. Pending = one-line plan. Done collapses to a Shipped line. Updated 2026-09-05._
+_Terse tracker. Pending = one-line plan. Done collapses to a Shipped line. Updated 2026-09-08._
 _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 needs-user (bench) · 📋 deferred/roadmap_
 
 ## Governing (always-on, never violate)
@@ -12,6 +12,13 @@ _Legend: 🔄 in progress · ⏸ queued · 🧱 blocked-on-hardware · 🧑 need
 ## GUI-only mandate (GOVERNING — operator NEVER runs a terminal)
 - ✅ **"TX Online / Enable Engagement" console control** — SHIPPED (see Shipped). Operator now needs zero terminal.
 - Audit every operator action for CLI leaks; each must be a console control.
+
+## TAKEDOWN — GUI-fireable (verified reality on .186)
+- ✅ **#1 JAM — GUI-fireable, VERIFIED on .186** (host-helper/AF_UNIX socket/930c-pin/`cema-jam-bridge` confirmed; real governed JAM fired under commander authority, chain-recorded).
+- ✅ **#2 GNSS-deny — GUI-fireable via jam-on-a-GNSS-band** (jam bridge on gps_l1/galileo_e1/beidou_b1/glonass_l1 — genuinely feasible today; GNSS *spoof* stays honest v1-placeholder deception, receiver-lock unproven).
+- ✅ **#3 MAVLink SDR-inject — bridge auto-starts on TX-online** (`Wants=`/`PartOf=` coupling to the TX-online unit; no whitelist change; unencrypted-MAVLink only).
+- ✅ **No-strike P3 civilian fire-floor — LIVE** (`c40b3c4`): ROE-floor positive predicate blocks any non-hostile/civilian one-tap target.
+- 🔄 **Residual = honesty/trust unit** (in review, not deployed): owner-aware SiK link status (no false-DOWN/UP), GNSS honesty text (real TX, fidelity-limited), recommender GNSS denial-vs-spoof labeling. Item C (denial/spoof effector split) DEFERRED — needs catalog/doctrine design, not a localized relabel.
 
 ## Operator-Jam (their code as a governed second mode)
 - ✅ **Operator Jam mode DEPLOYED dormant on .186 (`7d5d873`)** — operator's own CEMA_Jammer (GNU Radio, UNMODIFIED) as a governed 2nd jam mode; dedicated venv `/CEMA/operator-jam-venv`; GNU Radio + gr-osmosdr apt-installed; wrapper device-pin SELF-ENFORCING (fail-closed if the pin can't be proven applied, import-form-independent); enabled as a companion of cema-jam-bridge (comes up only on GUI TX-Online, PartOf propagates Stand-Down). Verified GO (spine intact, tx_halt→409, bounded/abort real, honest audit). Live A/B jam A/B on the analyser = commander bench step.

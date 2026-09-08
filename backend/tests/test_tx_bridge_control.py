@@ -210,6 +210,12 @@ async def test_tx_subsystem_bridges_online_owner_rf_bridge(monkeypatch):
     assert block["sik_owner"] == "rf-bridge"
     assert block["tx_halted"] is True
     assert set(block["range_auth"].keys()) == set(srv.RANGE_AUTH_EFFECTS)
+    # Owner-aware liveness (S1): a TX bridge owns the SiK AND a TX consumer is
+    # connected (tx_consumers has mavlink/jam) -> UP in TX mode, even though the
+    # passive sniffer emits ZERO SIK_RADIO RX (count=0) after the handoff. Proves
+    # the fix removed the false-DOWN on a healthy, TX-ready link.
+    assert block["sik_link_up"] is True
+    assert block["sik_link_mode"] == "tx"
 
 
 @pytest.mark.asyncio
@@ -223,10 +229,12 @@ async def test_tx_subsystem_sniffer_when_offline_but_recent_rx(monkeypatch):
     assert block["bridges_online"] is False
     assert block["sik_link_up"] is True
     assert block["sik_owner"] == "sniffer"
+    assert block["sik_link_mode"] == "rx"
 
 
 @pytest.mark.asyncio
 async def test_tx_subsystem_unknown_owner_when_idle(monkeypatch):
+    # S1 required case (2): no owner + no recent RX -> link_up False.
     monkeypatch.setattr(srv, "_expire_range_authorization", _AsyncCapture())
     monkeypatch.setattr(srv.ws_manager, "tx_consumers", lambda: [])
     monkeypatch.setattr(srv.db, "detections", _FakeColl(count=0))
@@ -235,6 +243,28 @@ async def test_tx_subsystem_unknown_owner_when_idle(monkeypatch):
     assert block["bridges_online"] is False
     assert block["sik_link_up"] is False
     assert block["sik_owner"] is None
+    assert block["sik_link_mode"] is None
+
+
+@pytest.mark.asyncio
+async def test_tx_subsystem_online_issued_but_no_tx_consumer_is_not_up(monkeypatch):
+    """S1 FAIL-SAFE case (3): an 'online' was issued but NO TX bridge consumer is
+    actually connected (only a non-TX client, e.g. a browser/telemetry role) and
+    there is no recent SIK_RADIO RX. The link MUST read DOWN -- liveness is tied
+    to the has-TX-consumer signal (an actually-connected mavlink/jam consumer),
+    which a merely-issued command cannot satisfy. Proves the fix introduces NO
+    false-UP (worse than the prior false-DOWN)."""
+    monkeypatch.setattr(srv, "_expire_range_authorization", _AsyncCapture())
+    # A connected client that is NOT a TX bridge (no 'mavlink'/'jam' role).
+    monkeypatch.setattr(srv.ws_manager, "tx_consumers", lambda: ["telemetry"])
+    monkeypatch.setattr(srv.db, "detections", _FakeColl(count=0))
+    monkeypatch.setattr(srv, "_tx_halted", False, raising=False)
+
+    block = await srv._tx_subsystem_status()
+    assert block["bridges_online"] is False
+    assert block["sik_link_up"] is False
+    assert block["sik_owner"] is None
+    assert block["sik_link_mode"] is None
 
 
 class _FakeColl:

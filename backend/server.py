@@ -9889,16 +9889,37 @@ async def _tx_subsystem_status() -> Dict[str, Any]:
     })
     tx_consumers = ws_manager.tx_consumers()
     bridges_online = any(c in ("mavlink", "jam") for c in tx_consumers)
-    sik_link_up = sik_recent > 0
+    # OWNER-AWARE, FAIL-SAFE SiK link liveness. The link reads UP only on GENUINE
+    # liveness evidence, under EITHER ownership mode:
+    #   * TX mode: a TX bridge (rf-bridge) is the connected consumer that owns the
+    #     serial radio to transmit. `bridges_online` IS the has-TX-consumer signal
+    #     (ws_manager.tx_consumers reflects an ACTUALLY-CONNECTED WS consumer that
+    #     advertised a mavlink/jam role) -- the SAME signal that already sets
+    #     sik_owner=="rf-bridge" below. Once /tx/online hands the SiK to rf-bridge,
+    #     the passive sniffer stops emitting SIK_RADIO RX, so RX-only liveness
+    #     would falsely read DOWN on a healthy TX-ready link; the connected TX
+    #     consumer is the honest liveness proof in that mode.
+    #   * RX mode: the passive sniffer PROVED the link with recent SIK_RADIO RX.
+    # FAIL-SAFE (load-bearing): NEVER report UP without one of these. A merely-
+    # issued "go online" command with NO connected consumer leaves bridges_online
+    # False AND sik_recent 0 -> DOWN. This deliberately admits no false-UP (worse
+    # than the prior false-DOWN): the has-TX-consumer signal cannot be satisfied
+    # by a command alone, only by a real connected consumer.
+    sik_rx_recent = sik_recent > 0
     if bridges_online:
         sik_owner = "rf-bridge"
-    elif sik_link_up:
+        sik_link_mode = "tx"
+    elif sik_rx_recent:
         sik_owner = "sniffer"
+        sik_link_mode = "rx"
     else:
         sik_owner = None
+        sik_link_mode = None
+    sik_link_up = sik_link_mode is not None
     return {
         "bridges_online": bridges_online,
         "sik_owner": sik_owner,
+        "sik_link_mode": sik_link_mode,
         "tx_halted": _tx_halted,
         "sik_link_up": sik_link_up,
         "tx_bridge_consumers": tx_consumers,

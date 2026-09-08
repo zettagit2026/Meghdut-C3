@@ -191,7 +191,10 @@ export default function GnssSpoof() {
         <div className="font-mono text-xs text-slate-300">
           <span className="font-bold" style={{ color: "var(--accent-critical)" }}>WARNING:</span>{" "}
           This transmits a REAL, structurally valid GPS L1 C/A signal carrying a FABRICATED position —
-          a deception effect, not a denial effect. Hard-capped at {MAX_DURATION_S}s per request (shorter than
+          a deception effect, not a denial effect. It is a v1 placeholder (placeholder ephemeris): the signal is
+          NOT validated to force a position fix on a real receiver and, on its own, very likely will NOT —
+          treat receiver-lock as unproven until tested on an authorized range against real hardware.
+          Hard-capped at {MAX_DURATION_S}s per request (shorter than
           jamming's cap — a single bad position report is enough to trigger the target's failsafe). Requires
           commander role, a fresh arm token, a gnss-spoof confirmation token (NOT interchangeable with the
           jam confirmation token) minted at the instant you complete the checklist below, a required

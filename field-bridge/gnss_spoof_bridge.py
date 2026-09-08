@@ -11,12 +11,19 @@ strings, different payload-preview content, and mixing them raises the risk
 of a future edit accidentally sharing a gate that must stay separate.
 
 =============================================================================
-STATUS: SAFETY-GATE PLUMBING COMPLETE, DSP STUBBED (Task A of a two-part
-split — see GNSS_SPOOF_ARCHITECTURE.md §7). DO NOT enable as a live systemd
-service until Task B's gnss_signal_synth.py is integrated — this bridge
-currently cannot transmit a real fabricated GPS signal; every gate below is
-real and tested, but the actual RF payload is a stub (see
-gnss_signal_synth.synthesize_iq_file's docstring).
+STATUS: SAFETY-GATE PLUMBING COMPLETE; DSP IMPLEMENTED, REAL RF TRANSMIT,
+FIDELITY-LIMITED, NOT FIELDED. The real signal synthesizer (Task B,
+gnss_signal_synth.py) IS integrated: this bridge DOES synthesize a real,
+on-frequency, structurally-valid L1 C/A signal and DOES perform a real RF
+transmit via hackrf_transfer — it is no longer a stub. BUT the signal is
+FIDELITY-LIMITED (a PLACEHOLDER ephemeris/almanac: structurally valid and
+parity-correct, but NOT a navigation-solution-consistent constellation). It
+has NOT been validated to force a position fix on a real receiver and, given
+those simplifications, very likely will NOT on its own — mirror
+gnss_signal_synth.py's "HONEST CLAIM BOUNDARY" (§ synthesize_iq_file docstring).
+There is NO systemd unit for this bridge and it is NOT fielded; every gate
+below is real and tested. Do NOT describe this as working "against any GPS"
+until it is tested on an authorized range against real hardware.
 =============================================================================
 
 =============================================================================
