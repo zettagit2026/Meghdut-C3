@@ -1,19 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import { api, formatApiError } from "@/lib/api";
-import { Rss, ShieldAlert, Search, ArrowUp, ArrowDown } from "lucide-react";
+import { useAuth } from "@/context/AuthContext";
+import { Rss, ShieldAlert, ShieldPlus, ShieldCheck, Search, ArrowUp, ArrowDown, X } from "lucide-react";
 import {
-  filterAps, sortAps, isPossibleUas, encryptionLabel, pmfLabel, lastSeenLabel,
+  filterAps, sortAps, isPossibleUas, encryptionLabel, pmfLabel, lastSeenLabel, macOui,
 } from "@/lib/wifiEnvironment";
 
 // WI-FI ENVIRONMENT — RF situational awareness.
 //
-// A strictly READ-ONLY window onto the ambient Wi-Fi picture from Kismet (via
-// the backend's GET /api/wifi-environment proxy). It lets the operator SEE
-// every AP/device in range. It is NOT a target list: there is deliberately NO
-// engage / arm / deauth / transmit affordance anywhere on this page, and it
-// never calls any mutating/transmitting endpoint (it only ever `api.get`s the
-// survey). A "possible UAS" tag is a non-actionable visual hint; real
-// engagement stays on the drone-contact target flow, never here.
+// A READ-ONLY window onto the ambient Wi-Fi picture from Kismet (via the
+// backend's GET /api/wifi-environment proxy). It lets the operator SEE every
+// AP/device in range. It is NOT a target list: there is deliberately NO
+// engage / arm / deauth / transmit affordance anywhere on this page. The one
+// exception is a PROTECT-only write: a commander may add a row to the
+// existing P1 no-strike civilian-protection registry (POST /api/no-strike,
+// the same commander-gated CRUD endpoint the no-strike-registry.md doc
+// describes) -- that is a defensive/protective action, never an engagement,
+// and it is the ONLY non-GET call this page ever makes. A "possible UAS" tag
+// is a non-actionable visual hint; real engagement stays on the drone-contact
+// target flow, never here.
 
 const COLUMNS = [
   { key: "ssid", label: "SSID", sortable: true },
@@ -26,12 +32,160 @@ const COLUMNS = [
   { key: "last_seen", label: "LAST SEEN", sortable: true },
 ];
 
+const NO_STRIKE_CATEGORIES = ["CIVILIAN_INFRASTRUCTURE", "FRIENDLY_OWN_FORCE", "NEUTRAL"];
+
+// Does an already-loaded no-strike registry entry match this AP row (by
+// BSSID or OUI)? Client-side, best-effort -- purely a display convenience so
+// a commander can see what is already protected; the backend remains the
+// source of truth for any real consult.
+function entryMatchesAp(entry, ap) {
+  const match = entry?.match || {};
+  const bssid = (ap?.bssid || "").toUpperCase();
+  const oui = macOui(ap?.bssid);
+  if (match.bssid && bssid && match.bssid.toUpperCase() === bssid) return true;
+  if (match.oui && oui && match.oui.toUpperCase() === oui) return true;
+  return false;
+}
+
+// Commander-only PROTECT action: pre-fills a no-strike registry entry from
+// one AP row and submits it via the existing P1 CRUD endpoint. This is
+// deliberately the ONLY mutating call this page makes -- there is no
+// engage, deauth, or arming affordance here or anywhere else on this page.
+function AddNoStrikeModal({ ap, onClose, onAdded }) {
+  const oui = macOui(ap.bssid);
+  const [category, setCategory] = useState("CIVILIAN_INFRASTRUCTURE");
+  const [label, setLabel] = useState(ap.vendor || ap.ssid || ap.bssid || "");
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function submit(e) {
+    e.preventDefault();
+    setSaving(true);
+    setErr(null);
+    try {
+      const match = {};
+      if (ap.bssid) match.bssid = ap.bssid;
+      if (ap.ssid) match.ssid_exact = ap.ssid;
+      if (oui) match.oui = oui;
+      const { data } = await api.post("/no-strike", { category, match, label: label.trim() });
+      toast.success("ADDED TO NO-STRIKE", { description: `${label.trim()} — ${category}` });
+      onAdded(data);
+    } catch (e2) {
+      setErr(formatApiError(e2));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center p-6"
+      style={{ background: "rgba(5, 8, 16, 0.9)", backdropFilter: "blur(4px)" }}
+      data-testid="wifi-env-no-strike-modal"
+    >
+      <form onSubmit={submit} className="max-w-xl w-full tactical-border" style={{ background: "var(--bg-surface)" }}>
+        <div className="px-5 py-3 tactical-border-b flex items-center justify-between">
+          <span className="font-heading font-black text-lg uppercase tracking-tighter flex items-center gap-2">
+            <ShieldPlus size={16} strokeWidth={1.5} style={{ color: "var(--accent-success)" }} />
+            Add To No-Strike
+          </span>
+          <button
+            type="button"
+            data-testid="wifi-env-no-strike-close"
+            onClick={onClose}
+            className="text-slate-400 hover:text-[var(--text-primary)]"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        <div className="p-4 space-y-4">
+          <div className="font-mono text-[10px] leading-relaxed text-slate-500">
+            A civilian-protection floor entry — this only ever PROTECTS a match, it can never engage or
+            authorise an effect. Read-only fields below come straight from the Wi-Fi survey row.
+          </div>
+          <dl className="grid grid-cols-2 gap-2 font-mono text-[11px]">
+            <div>
+              <dt className="text-slate-500 uppercase tracking-widest text-[9px]">BSSID</dt>
+              <dd className="text-slate-300">{ap.bssid || "—"}</dd>
+            </div>
+            <div>
+              <dt className="text-slate-500 uppercase tracking-widest text-[9px]">SSID</dt>
+              <dd className="text-slate-300">{ap.ssid || "(hidden)"}</dd>
+            </div>
+            <div>
+              <dt className="text-slate-500 uppercase tracking-widest text-[9px]">OUI</dt>
+              <dd className="text-slate-300">{oui || "—"}</dd>
+            </div>
+            <div>
+              <dt className="text-slate-500 uppercase tracking-widest text-[9px]">Vendor</dt>
+              <dd className="text-slate-300">{ap.vendor || "unknown"}</dd>
+            </div>
+          </dl>
+          <label className="block">
+            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Category</span>
+            <select
+              data-testid="wifi-env-no-strike-category"
+              value={category}
+              onChange={(e) => setCategory(e.target.value)}
+              className="mt-1 w-full tactical-border px-3 py-2 font-mono text-xs"
+              style={{ background: "var(--bg-surface)" }}
+            >
+              {NO_STRIKE_CATEGORIES.map((c) => (
+                <option key={c} value={c} style={{ background: "var(--bg-surface)" }}>{c}</option>
+              ))}
+            </select>
+          </label>
+          <label className="block">
+            <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">Label</span>
+            <input
+              data-testid="wifi-env-no-strike-label"
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none"
+              required
+            />
+          </label>
+          {err && (
+            <div className="font-mono text-[10px]" style={{ color: "var(--accent-critical)" }} data-testid="wifi-env-no-strike-error">
+              {err}
+            </div>
+          )}
+          <div className="tactical-border-t pt-3 flex items-center justify-between">
+            <button
+              type="button"
+              data-testid="wifi-env-no-strike-cancel"
+              onClick={onClose}
+              className="px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest text-slate-400 hover-surface"
+            >
+              CANCEL
+            </button>
+            <button
+              type="submit"
+              data-testid="wifi-env-no-strike-save"
+              disabled={saving || !label.trim()}
+              className="px-4 py-2 tactical-border font-mono text-xs font-bold uppercase tracking-widest hover-accent-info scanline-btn disabled:opacity-50"
+              style={{ color: "var(--accent-success)", borderColor: "var(--accent-success)" }}
+            >
+              {saving ? "SAVING…" : "ADD PROTECTION"}
+            </button>
+          </div>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 export default function WifiEnvironment() {
+  const { user } = useAuth();
+  const isCommander = user?.role === "commander";
+
   const [survey, setSurvey] = useState(null);
   const [query, setQuery] = useState("");
   const [sortKey, setSortKey] = useState("rssi_dbm");
   const [sortDir, setSortDir] = useState("desc");
   const [loadError, setLoadError] = useState(null);
+  const [noStrikeEntries, setNoStrikeEntries] = useState([]);
+  const [addingAp, setAddingAp] = useState(null);
 
   const cancelledRef = useRef(false);
   useEffect(() => () => { cancelledRef.current = true; }, []);
@@ -56,6 +210,19 @@ export default function WifiEnvironment() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // "Protected" badge (nicety): load the no-strike registry ONCE so already-
+  // protected rows can be tagged client-side. Commander-only endpoint -- a
+  // non-commander simply won't see the badge, which is fine (they also can't
+  // add one). Never retried/polled; a fresh add is merged in locally instead.
+  useEffect(() => {
+    if (!isCommander) return;
+    let cancelled = false;
+    api.get("/no-strike")
+      .then(({ data }) => { if (!cancelled) setNoStrikeEntries(data?.entries || []); })
+      .catch(() => { /* best-effort nicety only -- never surface an error for this */ });
+    return () => { cancelled = true; };
+  }, [isCommander]);
+
   const aps = useMemo(() => survey?.aps || [], [survey]);
   const rows = useMemo(
     () => sortAps(filterAps(aps, query), sortKey, sortDir),
@@ -64,6 +231,10 @@ export default function WifiEnvironment() {
   const possibleUasCount = useMemo(
     () => aps.filter((ap) => isPossibleUas(ap)).length, [aps]
   );
+  const enabledNoStrikeEntries = useMemo(
+    () => noStrikeEntries.filter((e) => e.enabled !== false), [noStrikeEntries]
+  );
+  const isApProtected = (ap) => enabledNoStrikeEntries.some((entry) => entryMatchesAp(entry, ap));
 
   const toggleSort = (key) => {
     if (key === sortKey) {
@@ -196,11 +367,15 @@ export default function WifiEnvironment() {
                 <th className="px-3 py-2 text-left uppercase tracking-widest text-[10px] whitespace-nowrap" style={{ color: "var(--text-muted)" }}>
                   TAG
                 </th>
+                <th className="px-3 py-2 text-left uppercase tracking-widest text-[10px] whitespace-nowrap" style={{ color: "var(--text-muted)" }}>
+                  PROTECT
+                </th>
               </tr>
             </thead>
             <tbody>
               {rows.map((ap, i) => {
                 const uas = isPossibleUas(ap);
+                const protectedAp = isApProtected(ap);
                 return (
                   <tr key={ap.bssid || i} className="tactical-border-b" data-testid={`wifi-env-row-${ap.bssid}`}>
                     <td className="px-3 py-2" style={{ color: "var(--text-primary)" }}>
@@ -231,12 +406,38 @@ export default function WifiEnvironment() {
                         <span className="text-slate-600">—</span>
                       )}
                     </td>
+                    <td className="px-3 py-2">
+                      {protectedAp ? (
+                        <span
+                          data-testid={`wifi-env-protected-${ap.bssid}`}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 tactical-border text-[9px] font-bold uppercase tracking-widest whitespace-nowrap"
+                          title="Already on the no-strike civilian-protection registry (matched by BSSID/OUI)."
+                          style={{ color: "var(--accent-success)", borderColor: "var(--accent-success)" }}
+                        >
+                          <ShieldCheck size={10} strokeWidth={2} /> Protected
+                        </span>
+                      ) : (
+                        <button
+                          type="button"
+                          data-testid={`wifi-env-add-no-strike-${ap.bssid}`}
+                          onClick={() => setAddingAp(ap)}
+                          disabled={!isCommander}
+                          title={isCommander
+                            ? "Add this AP to the no-strike civilian-protection registry (PROTECT only — never an engage/targeting action)."
+                            : "Commander role required"}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 tactical-border text-[9px] font-bold uppercase tracking-widest whitespace-nowrap hover-surface transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                          style={{ color: "var(--text-muted)" }}
+                        >
+                          <ShieldPlus size={10} strokeWidth={2} /> Add to no-strike
+                        </button>
+                      )}
+                    </td>
                   </tr>
                 );
               })}
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={COLUMNS.length + 1} className="px-3 py-6 text-center text-slate-600">
+                  <td colSpan={COLUMNS.length + 2} className="px-3 py-6 text-center text-slate-600">
                     {query ? "No APs match the filter." : "No access points in range."}
                   </td>
                 </tr>
@@ -250,8 +451,21 @@ export default function WifiEnvironment() {
       <div className="font-mono text-[10px] p-3 tactical-border" style={{ color: "var(--text-muted)" }}>
         Passive RX-only survey via Kismet (monitor-mode NIC). Vendor is Kismet's OUI-derived guess;
         SSID / OUI are spoofable, so a “possible UAS” tag is a candidate hint, never an identification.
-        This panel has no transmit, engage, deauth, or arm capability of any kind.
+        This panel has no transmit, engage, deauth, or arm capability of any kind. The only write this
+        page can issue is adding a row to the no-strike civilian-protection registry (PROTECT) —
+        commander-gated, and it can only ever protect a match, never target or engage one.
       </div>
+
+      {addingAp && (
+        <AddNoStrikeModal
+          ap={addingAp}
+          onClose={() => setAddingAp(null)}
+          onAdded={(entry) => {
+            setNoStrikeEntries((es) => [entry, ...es]);
+            setAddingAp(null);
+          }}
+        />
+      )}
     </div>
   );
 }

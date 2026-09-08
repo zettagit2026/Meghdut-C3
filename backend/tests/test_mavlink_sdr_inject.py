@@ -100,6 +100,13 @@ def _stub_spine(monkeypatch, *, detection=None, range_ok=True):
         return None
     monkeypatch.setattr(srv, "_require_range_authorized", _range)
 
+    # P3: the fire-time no-strike block reads the hot-loaded registry; stub it to
+    # an EMPTY registry so the REAL `_enforce_fire_time_no_strike` runs (no match
+    # -> no-op) without a Mongo hit, leaving these sdr-inject assertions intact.
+    async def _ns_entries():
+        return []
+    monkeypatch.setattr(srv, "_no_strike_entries", _ns_entries)
+
     async def _log(kind, message, meta=None, actor=None):
         events.append({"kind": kind, "message": message, "meta": meta or {}, "actor": actor})
         return {}

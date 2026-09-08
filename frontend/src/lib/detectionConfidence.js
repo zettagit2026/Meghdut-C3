@@ -150,3 +150,28 @@ export function isTargetGrade(d) {
   if (!civilian && d.match_protocol === "wifi" && d.make_candidate) return true;
   return false;
 }
+
+// Render-time-only helper: the honest framing for the ML "%" badge
+// (MlClassifierBadge.jsx). The underlying classifier (field-bridge/
+// ml_classify_bridge.py) is a closed-world 3-class model (drone / wifi_2_4 /
+// wifi_5) with NO idle/noise/reject class, so a bare "ML: DRONE (96%)" next
+// to a demoted/unidentified contact reads as a confirmed drone likelihood
+// when it is really just the model's forced top-class guess. A target-grade
+// contact (see isTargetGrade -- real protocol decode / DF bearing /
+// non-civilian wifi softAP / multidomain fusion) keeps the normal "ML:
+// <label> (<pct>%)" reading; every other contact (demoted, protected/
+// no-strike, or a bare unconfirmed emitter) must get this honest
+// class-probability framing instead. Prefers the backend's own P2 stamp
+// (server.py `_ML_CLASS_PROB_NOTE` -> `ml_probability_note`, set on the
+// "clears no corroboration tier" branch) when present; falls back to the
+// identical wording for a non-target-grade record the backend didn't stamp
+// (e.g. an older record, or the demoted-civilian/no-strike-protected branch,
+// which sets `target_grade: false` but not `ml_probability_note`).
+// Returns null when the contact is target-grade (no honesty override needed).
+const ML_CLASS_PROB_FALLBACK_NOTE = "ML class probability (no reject class)";
+
+export function getMlClassProbNote(d) {
+  if (!d) return null;
+  if (isTargetGrade(d)) return null;
+  return d.ml_probability_note || ML_CLASS_PROB_FALLBACK_NOTE;
+}

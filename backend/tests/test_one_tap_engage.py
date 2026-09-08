@@ -138,6 +138,13 @@ def _stub_engage_spine(monkeypatch, *, detection, rec=None, range_ok=True,
             raise srv.HTTPException(409, f"Range authorization for effect='{effect}' is OFF")
     monkeypatch.setattr(srv, "_require_range_authorized", _range)
 
+    # P3: the fire-time no-strike block reads the hot-loaded registry; stub it to
+    # an EMPTY registry so the REAL `_enforce_fire_time_no_strike` runs (no match
+    # -> no-op) without a Mongo hit, leaving these one-tap assertions intact.
+    async def _ns_entries():
+        return []
+    monkeypatch.setattr(srv, "_no_strike_entries", _ns_entries)
+
     async def _log(kind, message, meta=None, actor=None):
         events.append({"kind": kind, "meta": meta or {}, "actor": actor})
         return {}

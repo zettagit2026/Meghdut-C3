@@ -84,6 +84,10 @@ def _stub_spine(monkeypatch, detection=None):
         return None
     monkeypatch.setattr(srv, "_enforce_fire_time_iff", _iff)
 
+    async def _no_strike(detection, user, context=None, friendly_fire_ack=None):
+        return None
+    monkeypatch.setattr(srv, "_enforce_fire_time_no_strike", _no_strike)
+
     async def _log(kind, message, meta=None, actor=None):
         return {}
     monkeypatch.setattr(srv, "log_event", _log)

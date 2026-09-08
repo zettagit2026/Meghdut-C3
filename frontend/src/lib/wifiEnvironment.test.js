@@ -1,8 +1,12 @@
 // Tests for the WI-FI ENVIRONMENT panel logic + a static guarantee that the
-// page is READ-ONLY (no transmit/engage/deauth/arm call anywhere).
+// page is PROTECT-ONLY: no transmit/engage/deauth/arm call anywhere, and the
+// one write it is allowed to make is POST /api/no-strike (adding a row to the
+// existing P1 civilian-protection registry) -- a defensive action, never a
+// targeting one.
 //
 // Runs under bare jest (react-scripts) -- the pure helpers import nothing, and
-// the read-only guarantee is a static source scan (no RTL dependency needed).
+// the read-only/protect-only guarantee is a static source scan (no RTL
+// dependency needed).
 
 const fs = require("fs");
 const path = require("path");
@@ -129,7 +133,7 @@ describe("filter + sort (drives what the table renders)", () => {
 // READ-ONLY GUARANTEE: the page must expose NO transmit/engage/deauth/arm
 // affordance and must never call a mutating endpoint. Scan its source.
 // ---------------------------------------------------------------------------
-describe("WifiEnvironment page is strictly read-only", () => {
+describe("WifiEnvironment page is protect-only (no engage/arm/deauth/transmit)", () => {
   const pageSrc = fs.readFileSync(
     path.join(__dirname, "..", "pages", "WifiEnvironment.jsx"), "utf8"
   );
@@ -140,27 +144,42 @@ describe("WifiEnvironment page is strictly read-only", () => {
     expect(pageSrc.toLowerCase()).toContain("not engageable");
   });
 
-  test("reads ONLY the survey endpoint (api.get('/wifi-environment'))", () => {
+  test("reads the survey endpoint (api.get('/wifi-environment'))", () => {
     expect(pageSrc).toContain('api.get("/wifi-environment")');
   });
 
-  test("makes no mutating/transmitting HTTP call", () => {
-    // No POST/PUT/PATCH/DELETE of any kind.
-    expect(pageSrc).not.toMatch(/api\.(post|put|patch|delete)\s*\(/);
+  test("makes no PUT/PATCH/DELETE call of any kind", () => {
+    expect(pageSrc).not.toMatch(/api\.(put|patch|delete)\s*\(/);
   });
 
-  test("every api.* call is a GET (read-only)", () => {
-    const apiCalls = pageSrc.match(/api\.[a-z]+\s*\(/gi) || [];
-    expect(apiCalls.length).toBeGreaterThan(0);
-    for (const call of apiCalls) {
-      expect(call.replace(/\s+/g, "")).toBe("api.get(");
-    }
+  // The "Add to no-strike" commander action is a PROTECT action (P1
+  // no-strike civilian-protection registry CRUD, not a target/engage
+  // affordance) -- it is the one deliberate exception to the page otherwise
+  // being read-only, and it must be the ONLY non-GET call anywhere in the
+  // page. Every other api.* call must be a plain GET.
+  test("every api.* call is either a GET, or the single POST /no-strike protect action", () => {
+    const apiCallHeads = pageSrc.match(/api\.[a-z]+\s*\(/gi) || [];
+    expect(apiCallHeads.length).toBeGreaterThan(0);
+    const nonGet = apiCallHeads.filter(
+      (call) => call.replace(/\s+/g, "").toLowerCase() !== "api.get("
+    );
+    expect(nonGet).toHaveLength(1);
+    expect(nonGet[0].replace(/\s+/g, "").toLowerCase()).toBe("api.post(");
+  });
+
+  test("the one POST call targets exactly /no-strike (no other write endpoint)", () => {
+    expect(pageSrc).toContain('api.post("/no-strike",');
+  });
+
+  test("the POST is gated on the commander role client-side", () => {
+    expect(pageSrc).toMatch(/disabled=\{!isCommander/);
   });
 
   test("wires no engage/arm/jam/deauth endpoint path", () => {
     // Endpoint-path tokens (slash-prefixed) that would indicate a
     // transmit/engage call. Prose disclaimers that merely name these actions
     // in words (e.g. "no deauth capability") are intentionally not matched.
+    // "/no-strike" itself is a PROTECT-only registry path, not in this list.
     const forbiddenPaths = [
       "/engage", "/arm", "/jam", "/deploy", "/broadcast", "/wifi-defeat",
       "/tx/", "/emergency", "/detections/", "/payloads",

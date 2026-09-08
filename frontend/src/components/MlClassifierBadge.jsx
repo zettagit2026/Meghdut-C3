@@ -1,3 +1,5 @@
+import { getMlClassProbNote } from "@/lib/detectionConfidence";
+
 // Small secondary/supplementary chip surfacing the ML classify bridge's
 // output (see field-bridge/ml_classify_bridge.py). Deliberately styled as a
 // muted, secondary signal — NOT a primary verdict — because the underlying
@@ -30,6 +32,25 @@ export default function MlClassifierBadge({ detection }) {
     ? Math.round(detection.ml_confidence * 100)
     : null;
   const text = ML_LABEL_TEXT[label] || label;
+
+  // Honesty gate (no-strike-registry.md §5 / P2, detectionConfidence.js
+  // getMlClassProbNote): a demoted / protected / non-target-grade contact
+  // must NEVER show a bare "ML: drone (96%)" -- that reads as a confirmed
+  // drone likelihood when it is only the classifier's forced top-class
+  // guess. Only a target-grade contact (real protocol decode / DF bearing /
+  // non-civilian wifi softAP / multidomain fusion) keeps that plain reading.
+  const classProbNote = getMlClassProbNote(detection);
+  if (classProbNote) {
+    return (
+      <span
+        className="mt-1 inline-block w-fit px-1.5 py-0.5 tactical-border font-mono text-[11px] font-semibold uppercase tracking-wide"
+        style={{ color: "#94A8C7", borderColor: "#3D5273", background: "rgba(61,82,115,0.22)" }}
+        title={`Not target-grade — the classifier's top guess is "${text}", but this is a raw class probability, never a confirmed verdict. Closed-world 3-class model (drone / wifi 2.4 / wifi 5), no idle/noise/reject class -- known to hallucinate "drone" on ungated noise.`}
+      >
+        {classProbNote}{pct !== null ? `: ${pct}%` : ""}
+      </span>
+    );
+  }
 
   return (
     <span

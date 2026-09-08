@@ -993,6 +993,169 @@ async def _enforce_fire_time_iff(detection: Dict[str, Any], user: Dict[str, Any]
     )
 
 
+def _detection_identity(detection: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract the no-strike match identity (ssid/bssid/oui/manuf) from a
+    detection, pulling the Wi-Fi FUSION cross-ref attribution when a direct field
+    is absent -- an RF-energy contact carries no OUI of its own, so its civilian
+    OUI/manuf is known ONLY via the Kismet fusion result. This is the SAME
+    identity the P2 classification consult uses; sharing one extractor keeps the
+    board-time demote (P2) and the fire-time hard block (P3) reading exactly the
+    same fields, so the two civilian-protection decisions can never disagree on
+    what the contact is. Pure, never raises."""
+    if not isinstance(detection, dict):
+        return {"ssid": None, "bssid": None, "oui": None, "manuf": None}
+    fusion = detection.get("wifi_fusion")
+    fusion = fusion if isinstance(fusion, dict) else {}
+    return {
+        "ssid": detection.get("ssid") or fusion.get("matched_ssid"),
+        "bssid": detection.get("bssid"),
+        "oui": detection.get("oui") or fusion.get("matched_mac_oui"),
+        "manuf": detection.get("manuf") or fusion.get("matched_manuf"),
+    }
+
+
+async def _enforce_fire_time_no_strike(detection: Dict[str, Any], user: Dict[str, Any],
+                                       *, context: str,
+                                       friendly_fire_ack: Optional[str] = None) -> None:
+    """P3 (no-strike-registry.md §2B) — the FIRE-TIME CIVILIAN HARD BLOCK: the
+    actual civilian-protection floor behind every shot. Called in EVERY
+    `_execute_engagement` transmit path (and the manual /payloads/deploy path)
+    BEFORE `_enforce_fire_time_iff`, so the civilian floor is evaluated FIRST and
+    its 403 is unconditional.
+
+    THE FLOOR INVARIANT (never violated): a target that matches a
+    CIVILIAN_INFRASTRUCTURE or NEUTRAL no-strike entry CANNOT be struck. There is
+    NO ack, NO override token, and NO code path from any commander token to firing
+    on a civilian contact — the friendly-fire ack (a deliberate path to engage an
+    own-force FRIENDLY under ROE) does NOT satisfy this and is never consulted for
+    a civilian/neutral match.
+
+    The verdict is RE-COMPUTED at the instant of transmission against the LIVE,
+    hot-loaded registry (`no_strike.match(_detection_identity(detection),
+    _no_strike_entries())`) and ALSO honours the stored P2 stamps
+    (`no_strike`/`no_strike_conflict`) as defence-in-depth — civilian-protection
+    wins, so a civilian/neutral verdict from EITHER source blocks. Adjudicating a
+    contact off the floor is therefore a deliberate commander act on the REGISTRY
+    (disable/reclassify the entry, which the next detection tick re-stamps); there
+    is no fire-through path here.
+
+    CONFLICT case: a contact that matches a civilian entry AND carries a decoded
+    drone signature (`no_strike_conflict`) is STILL hard-blocked here — the block
+    message names the conflict so a human can adjudicate by resolving the registry
+    entry. This never inverts to auto-engage-on-conflict.
+
+    FRIENDLY_OWN_FORCE: same posture as the IFF interlock (blocked, overridable
+    ONLY by the existing single-use friendly-fire ack). This function does NOT
+    duplicate the IFF machinery: for a beacon-verified friendly it DEFERS (no-op)
+    and lets `_enforce_fire_time_iff` own the block and burn the ack; it adds
+    coverage ONLY for a registry-declared friendly with NO IFF beacon (which the
+    IFF interlock would otherwise let through)."""
+    if not isinstance(detection, dict):
+        return
+    det_id = detection.get("id")
+
+    # LIVE re-match against the hot-loaded registry (authoritative instant check).
+    ns = no_strike.match(_detection_identity(detection), await _no_strike_entries())
+    live_category = ns.get("category") if ns.get("matched") else None
+
+    # Stored P2 stamps (defence-in-depth; civilian-protection wins).
+    stored_ns = detection.get("no_strike")
+    stored_ns = stored_ns if isinstance(stored_ns, dict) else {}
+    stored_category = stored_ns.get("category") if stored_ns.get("matched") else None
+    stored_conflict = detection.get("no_strike_conflict")
+    stored_conflict = stored_conflict if isinstance(stored_conflict, dict) else {}
+    conflict_category = stored_conflict.get("category") if stored_conflict else None
+
+    # ---- CIVILIAN / NEUTRAL: HARD 403 floor. No ack, no override token exists. ----
+    block_category = next(
+        (c for c in (live_category, stored_category, conflict_category)
+         if c in _NO_STRIKE_CIVILIAN_CATEGORIES), None)
+    if block_category is not None:
+        label = ns.get("label") or stored_ns.get("label")
+        label_txt = label if _nonempty_str(label) else "unnamed entry"
+        entry_id = (ns.get("entry_id") or stored_ns.get("entry_id")
+                    or stored_conflict.get("registry_entry_id"))
+        basis = ns.get("basis") if ns.get("matched") else "stored_stamp"
+        # CONFLICT = the civilian contact ALSO carries a real drone signature
+        # (a stored no_strike_conflict stamp, or a live civilian match on an
+        # otherwise target-grade contact). Named in the message for adjudication;
+        # the block is unconditional either way.
+        is_conflict = bool(stored_conflict) or (
+            live_category in _NO_STRIKE_CIVILIAN_CATEGORIES and is_target_grade(detection))
+        drone_basis = (stored_conflict.get("drone_basis")
+                       or (_corroboration_basis(detection) if is_conflict else None))
+        msg = (
+            f"NO-STRIKE FLOOR — fire refused: target matches a protected "
+            f"{block_category} registry entry ({label_txt}). Hard civilian-protection "
+            f"floor; no override token exists."
+        )
+        if is_conflict:
+            msg += (
+                f" This contact ALSO carries a drone signature (NO-STRIKE CONFLICT, "
+                f"basis={drone_basis}) — civilian-protection wins the automated decision; a "
+                f"commander must adjudicate by resolving the registry entry. There is no "
+                f"fire-through path."
+            )
+        await log_event(
+            "NO_STRIKE_FIRE_REFUSED",
+            f"NO-STRIKE FLOOR: {context} against {detection.get('callsign', '?')} ({det_id}) "
+            f"REFUSED — target matches a protected {block_category} no-strike registry entry "
+            f"({label_txt}). Hard civilian-protection floor; there is NO override token."
+            + (f" CONFLICT: contact also carries a drone signature (basis={drone_basis}) — "
+               f"civilian-protection wins pending human adjudication." if is_conflict else ""),
+            meta={"detection_id": det_id, "callsign": detection.get("callsign"),
+                  "context": context, "category": block_category, "entry_id": entry_id,
+                  "basis": basis, "conflict": is_conflict, "drone_basis": drone_basis,
+                  "match_source": "live_registry" if ns.get("matched") else "stored_stamp"},
+            actor=user["email"],
+        )
+        raise HTTPException(403, msg)
+
+    # ---- FRIENDLY_OWN_FORCE: same posture as IFF; do NOT duplicate IFF. ----
+    if live_category == "FRIENDLY_OWN_FORCE" or stored_category == "FRIENDLY_OWN_FORCE":
+        # A beacon-verified friendly is owned by the IFF interlock, which runs
+        # next and consumes the single-use ack exactly once. Defer (no-op) here so
+        # the ack is never double-burned.
+        if _detection_is_confirmed_friendly(detection):
+            return
+        # A registry-declared friendly with NO IFF beacon: `_enforce_fire_time_iff`
+        # would let it through (its is_friendly predicate is False), so add exactly
+        # that coverage — blocked unless THIS request carries a valid single-use,
+        # target-bound commander friendly-fire ack (the SAME token type IFF uses).
+        # Consumed here; IFF then no-ops for it, so there is no double burn.
+        ack_rec = _consume_iff_ff_ack(friendly_fire_ack, det_id)
+        if ack_rec is None:
+            await log_event(
+                "NO_STRIKE_FIRE_REFUSED",
+                f"NO-STRIKE FRIENDLY: {context} against {detection.get('callsign', '?')} "
+                f"({det_id}) REFUSED — target matches a FRIENDLY_OWN_FORCE registry entry with "
+                f"no IFF beacon and this deploy carried no valid single-use commander "
+                f"friendly-fire ack for it.",
+                meta={"detection_id": det_id, "callsign": detection.get("callsign"),
+                      "context": context, "category": "FRIENDLY_OWN_FORCE",
+                      "entry_id": ns.get("entry_id") or stored_ns.get("entry_id")},
+                actor=user["email"],
+            )
+            raise HTTPException(
+                403,
+                "NO-STRIKE FRIENDLY — fire refused: target matches an own-force FRIENDLY "
+                "registry entry (no IFF beacon). Firing on a friendly requires an explicit, "
+                "single-use, per-engagement commander friendly-fire ack minted for THIS target "
+                "(POST /api/detections/{id}/friendly-fire-ack). There is no standing override.",
+            )
+        await log_event(
+            "NO_STRIKE_FRIENDLY_FIRE_OVERRIDE",
+            f"COMMANDER ENGAGED A REGISTRY-FRIENDLY (no IFF beacon) — "
+            f"{detection.get('callsign', '?')} ({det_id}) via single-use friendly-fire ack "
+            f"({context}).",
+            meta={"detection_id": det_id, "callsign": detection.get("callsign"),
+                  "context": context, "ack_minted_by": ack_rec.get("minted_by"),
+                  "engaged_by": user["email"]},
+            actor=user["email"],
+        )
+        return
+
+
 # ---- Authoritative transmit-halt (server-side, checked before any TX) ----
 # Set by /emergency/abort, cleared by /emergency/resume. /payloads/deploy and
 # /mavlink/broadcast both check this BEFORE building/sending any frame — the
@@ -1207,6 +1370,20 @@ def _detection_is_classified_hostile(det: Dict[str, Any]) -> bool:
     hostile weight. Neutral / civilian / UNKNOWN / unclassified all return
     False (fail-closed)."""
     if _detection_is_confirmed_friendly(det):
+        return False
+    # P3 ROE-floor no-strike fix (defence-in-depth AHEAD of the fire-time hard
+    # block): a contact the no-strike consult demoted — a civilian/neutral match
+    # (no_strike.matched) or the NON_THREAT sentinel — is NOT a valid one-tap
+    # target, so refuse it at the ROE floor BEFORE any token is minted. The
+    # fire-time `_enforce_fire_time_no_strike` is the redundant fire-instant
+    # backstop. (A no_strike_conflict keeps its hostile weight and is deliberately
+    # NOT demoted here — it passes the ROE floor as a corroborated hostile and is
+    # then hard-blocked at fire time, civilian-protection winning the automated
+    # decision.) NON_THREAT is intentionally NOT added to _HOSTILE_THREAT_LEVELS.
+    ns = det.get("no_strike")
+    if isinstance(ns, dict) and ns.get("matched"):
+        return False
+    if det.get("threat_level") == _NON_THREAT_LEVEL:
         return False
     return det.get("threat_level") in _HOSTILE_THREAT_LEVELS
 
@@ -3236,18 +3413,13 @@ def _no_strike_confidence_stamps(det: Dict[str, Any],
     if not isinstance(det, dict):
         return stamps
 
-    # Identity: the contact's own fields PLUS the Wi-Fi fusion cross-ref. An
-    # RF-energy contact carries no OUI of its own -- the civilian OUI/manuf is
-    # only known via the Kismet fusion result, so read it when the direct field
+    # Identity: the contact's own fields PLUS the Wi-Fi fusion cross-ref, via the
+    # SHARED `_detection_identity` extractor the P3 fire-time block also uses (so
+    # the board-time demote and the fire-time hard block read identical fields).
+    # An RF-energy contact carries no OUI of its own -- the civilian OUI/manuf is
+    # only known via the Kismet fusion result, so it is read when the direct field
     # is absent.
-    fusion = det.get("wifi_fusion") or {}
-    identity = {
-        "ssid": det.get("ssid") or (fusion.get("matched_ssid") if isinstance(fusion, dict) else None),
-        "bssid": det.get("bssid"),
-        "oui": det.get("oui") or (fusion.get("matched_mac_oui") if isinstance(fusion, dict) else None),
-        "manuf": det.get("manuf") or (fusion.get("matched_manuf") if isinstance(fusion, dict) else None),
-    }
-    ns = no_strike.match(identity, entries)
+    ns = no_strike.match(_detection_identity(det), entries)
 
     category = ns.get("category") if ns.get("matched") else None
 
@@ -7642,6 +7814,14 @@ async def deploy_payload(body: DeployPayloadBody,
                 "Target not authorized — friendly-fire interlock: "
                 "POST /api/detections/{id}/authorize-target first.",
             )
+        # P3 (no-strike-registry.md §2B): the FIRE-TIME CIVILIAN HARD BLOCK runs
+        # BEFORE the IFF interlock so the civilian-protection floor is evaluated
+        # FIRST and its 403 is unconditional. A CIVILIAN_INFRASTRUCTURE/NEUTRAL
+        # match hard-refuses with NO override token; a registry-friendly-without-
+        # beacon defers to the friendly-fire ack exactly as IFF does. Additive —
+        # it never changes the IFF behaviour below for a non-matching contact.
+        await _enforce_fire_time_no_strike(detection, user, context="payload deploy",
+                                           friendly_fire_ack=body.iff_friendly_fire_ack)
         # F2 (2026-08): fire-time IFF re-check at the instant of transmission.
         # For a CONFIRMED-FRIENDLY target this is the SOLE authorization gate and
         # requires the single-use, target-bound commander friendly-fire ack from
@@ -8176,6 +8356,12 @@ async def _execute_engagement(effect: str, body, user: Dict) -> Dict:
                 "Target not authorized — friendly-fire interlock: "
                 "POST /api/detections/{id}/authorize-target first.",
             )
+        # P3: FIRE-TIME CIVILIAN HARD BLOCK — evaluated BEFORE the IFF interlock so
+        # the civilian-protection floor is unconditional (403, no override token
+        # for a CIVILIAN/NEUTRAL match). Additive; a non-matching hostile falls
+        # straight through to the unchanged IFF re-check below.
+        await _enforce_fire_time_no_strike(detection, user, context="SDR MAVLink inject",
+                                           friendly_fire_ack=body.iff_friendly_fire_ack)
         # Fire-time IFF re-check (fratricide interlock). For a CONFIRMED-FRIENDLY
         # this is the SOLE authorization gate and requires the single-use,
         # target-bound commander friendly-fire ack from this request (consumed here).
@@ -8353,6 +8539,13 @@ async def _execute_engagement(effect: str, body, user: Dict) -> Dict:
                 "Target not authorized — friendly-fire interlock: "
                 "POST /api/detections/{id}/authorize-target first.",
             )
+        # P3: FIRE-TIME CIVILIAN HARD BLOCK — evaluated BEFORE the IFF interlock so
+        # the civilian-protection floor is unconditional. This is the invisible
+        # civilian catch behind a Wi-Fi defeat: a civilian AP (BSNL/Apple/RLTech
+        # softAP that a candidate mis-labels) matched by the no-strike registry is
+        # hard-refused (403, no override token) before any deauth/inject frame.
+        await _enforce_fire_time_no_strike(detection, user, context=f"Wi-Fi defeat [{mode}]",
+                                           friendly_fire_ack=body.iff_friendly_fire_ack)
         # Fire-time IFF re-check (fratricide interlock). For a CONFIRMED-FRIENDLY this
         # is the SOLE authorization gate and requires the single-use, target-bound
         # commander friendly-fire ack from this request (consumed here). NEVER deauth a
@@ -9295,14 +9488,18 @@ async def set_weapons_posture(body: WeaponsPostureBody, request: Request,
         )
         raise HTTPException(400, f'Confirmation phrase must exactly match "{expected_phrase}".')
 
-    # Independent, honest (non-false-green) read of the loaded friendly/no-strike
-    # registry size — recorded in the audit + safety_ack. The per-target IFF
-    # interlock hard-blocks a friendly regardless of this count; the count proves
-    # the commander's iff_registry_loaded assertion is not a bare checkbox.
+    # Independent, honest (non-false-green) read of the loaded NO-STRIKE registry
+    # size — recorded in the audit + safety_ack. This proves the commander's
+    # iff_registry_loaded assertion is not a bare checkbox for the arming
+    # precondition that actually backs the civilian-protection floor (the review
+    # noted this previously counted db.iff_friendlies — the IFF beacon store —
+    # not the no-strike registry the "no-strike registry loaded" arm claims). The
+    # per-target fire-time no-strike floor + IFF interlock hard-block regardless
+    # of this count; iff_registry_loaded remains a required arming precondition.
     try:
-        iff_registry_count = await db.iff_friendlies.count_documents({})
+        no_strike_registry_count = await db.no_strike_registry.count_documents({"enabled": True})
     except Exception:
-        iff_registry_count = None
+        no_strike_registry_count = None
 
     # ARM the matching per-effect range-auth leases via the EXISTING gated path.
     # This is NOT a bypass: set_range_authorization re-verifies the SAME password
@@ -9337,7 +9534,7 @@ async def set_weapons_posture(body: WeaponsPostureBody, request: Request,
             "checklist": list(WEAPONS_POSTURE_SAFETY_CHECKLIST),
             "acked_by": user["email"],
             "acked_at": now.isoformat(),
-            "iff_registry_count": iff_registry_count,
+            "no_strike_registry_count": no_strike_registry_count,
         },
         "iff_registry_loaded": True,
         "leases_armed_by_posture": leases_armed_by_posture,
@@ -9346,11 +9543,11 @@ async def set_weapons_posture(body: WeaponsPostureBody, request: Request,
         "WEAPONS_POSTURE_ARMED",
         f"WEAPONS {body.state} ARMED over AO={ao} for effects={permitted} "
         f"(expires in {WEAPONS_POSTURE_TTL_S}s). One-tap POST /api/engage is now LIVE for "
-        f"classified-hostile targets inside the AO. IFF/no-strike registry entries="
-        f"{iff_registry_count}. Every per-shot interlock still runs unchanged.",
+        f"classified-hostile targets inside the AO. No-strike registry entries="
+        f"{no_strike_registry_count}. Every per-shot interlock still runs unchanged.",
         meta={"state": body.state, "ao": ao, "permitted_effects": permitted,
               "expires_at": _weapons_posture["expires_at"].isoformat(),
-              "iff_registry_count": iff_registry_count, "source_ip": source_ip,
+              "no_strike_registry_count": no_strike_registry_count, "source_ip": source_ip,
               "safety_ack_checklist": list(WEAPONS_POSTURE_SAFETY_CHECKLIST)},
         actor=user["email"],
     )
