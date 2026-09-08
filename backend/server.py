@@ -4629,6 +4629,113 @@ async def get_wifi_environment(user: Dict = Depends(get_current_user)):
     return payload
 
 
+class WifiSurveyDesignateBody(BaseModel):
+    """One Wi-Fi survey row a COMMANDER has chosen to promote into a governed,
+    targetable db.detections contact. HONEST: SSID/OUI are SPOOFABLE, so this
+    only ever produces a suspected-UAS CANDIDATE, never an identification. The
+    endpoint creates a governed contact ONLY — it never arms, confirms,
+    transmits, or fires (the deliberate arm/confirm is the WifiDefeat SafetyGate
+    the frontend then deep-links into)."""
+    bssid: str                              # required, concrete non-broadcast softAP BSSID
+    ssid: Optional[str] = None
+    oui: Optional[str] = None
+    channel: Optional[int] = None
+    vendor: Optional[str] = None
+    pmf_required: Optional[bool] = None
+    pmf_supported: Optional[bool] = None
+
+
+@api.post("/wifi-environment/designate")
+async def designate_wifi_survey_uas(body: WifiSurveyDesignateBody,
+                                    user: Dict = Depends(require_commander)):
+    """COMMANDER-gated: promote ONE surveyed drone-OUI/SSID AP into a governed
+    db.detections contact (via the EXISTING _upsert_wifi_drone_detection) so it
+    becomes a real target the byte-unchanged /wifi-defeat SafetyGate flow can
+    resolve by id. It CREATES A GOVERNED CONTACT ONLY — it NEVER arms, confirms,
+    transmits, or fires, and NEVER clears tx_halted.
+
+    Every gate below is SERVER-SIDE (the client `possible_uas` hint is never
+    trusted): (a) fail-closed on absent/broadcast BSSID; (b) re-derive the
+    possible-UAS verdict from the drone-OUI/SSID matchers; (c) hard-refuse a
+    civilian/neutral no-strike match (belt-and-braces beyond the fire-time
+    floor); then synthesize the ingest body + upsert."""
+    # (a) Per-BSSID only — no broadcast/absent (same helper the fire path uses).
+    if _wifi_bssid_missing_or_broadcast(body.bssid):
+        raise HTTPException(
+            422,
+            "Refusing to designate: a concrete, non-broadcast softAP BSSID is "
+            "required (a broadcast/absent BSSID would target every AP on the "
+            "channel).",
+        )
+
+    # (b) Re-derive the possible-UAS verdict SERVER-SIDE — never trust a client
+    # flag. Only a drone-OUI or drone-SSID AP may be designated.
+    oui_vendor = kismet_survey.match_drone_oui(body.oui or body.bssid)
+    ssid_is_drone = kismet_survey.match_drone_ssid(body.ssid)
+    if not (oui_vendor or ssid_is_drone):
+        raise HTTPException(
+            422,
+            "not a UAS candidate — only a drone-OUI/SSID AP may be designated",
+        )
+    if oui_vendor and ssid_is_drone:
+        match_basis = "ssid+oui"
+    elif oui_vendor:
+        match_basis = "oui"
+    else:
+        match_basis = "ssid"
+    reason = (f"OUI {kismet_survey.mac_oui(body.bssid)} -> {oui_vendor}"
+              if oui_vendor else "SSID pattern")
+
+    # (c) No-strike CIVILIAN/NEUTRAL hard refuse (belt-and-braces beyond the
+    # fire-time _enforce_fire_time_no_strike). A civilian/protected AP that a
+    # spoofed drone SSID/OUI mislabels can NEVER become a governed contact.
+    ns = no_strike.match(
+        _detection_identity({"ssid": body.ssid, "bssid": body.bssid,
+                             "oui": body.oui, "manuf": body.vendor}),
+        await _no_strike_entries(),
+    )
+    if ns.get("matched") and ns.get("category") in _NO_STRIKE_CIVILIAN_CATEGORIES:
+        raise HTTPException(
+            403,
+            "Refusing to designate: this AP matches a "
+            f"{ns.get('category')} no-strike (civilian-protection) entry "
+            f"{('— ' + ns.get('label')) if ns.get('label') else ''}. A "
+            "civilian/protected AP can never be promoted to a targetable contact.",
+        )
+
+    # (d) Synthesize the governed ingest + upsert (creates a contact only).
+    synth = WifiDroneIngestBody(
+        ssid=body.ssid,
+        oui=body.oui,
+        manuf=body.vendor,
+        make_candidate=f"Wi-Fi UAS candidate ({reason})",
+        match_basis=match_basis,
+        channel=body.channel,
+        bssid=body.bssid,
+        source="WIFI_SURVEY_MANUAL",
+        # (e) PMF carry: persisted onto the contact's `pmf` field so
+        # _wifi_target_has_pmf is truthful for a PMF-required AP downstream.
+        pmf_required=body.pmf_required,
+        pmf_supported=body.pmf_supported,
+        caveats=["Manually designated from Wi-Fi survey; SSID/OUI spoofable — "
+                 "candidate, not identification"],
+    )
+    detection_id = await _upsert_wifi_drone_detection(synth, body.bssid, user)
+
+    # (f) Distinct audit event.
+    await log_event(
+        "WIFI_SURVEY_DESIGNATE",
+        f"COMMANDER designated Wi-Fi survey AP bssid={body.bssid} ssid="
+        f"{body.ssid or 'n/a'} as a SUSPECTED-UAS contact ({reason}) — governed "
+        f"contact {detection_id} created (SSID/OUI spoofable — candidate, not "
+        f"identification; no arm/transmit/fire performed here).",
+        meta={"detection_id": detection_id, "bssid": body.bssid,
+              "match_basis": match_basis, "source": "WIFI_SURVEY_MANUAL"},
+        actor=user["email"],
+    )
+    return {"detection_id": detection_id, "bssid": body.bssid}
+
+
 @api.get("/detections")
 async def list_detections(user: Dict = Depends(get_current_user)):
     # Stale-detection expiry now runs on a periodic background task (see
@@ -5936,6 +6043,15 @@ class WifiDroneIngestBody(BaseModel):
     softap_bssid: Optional[str] = None
     source: str = "WIFI_DRONE_KISMET"
     caveats: List[str] = []
+    # 802.11w / PMF posture carried from a real survey read (Kismet
+    # wpa_mfp_required/wpa_mfp_supported). Optional/honest-unknown by default.
+    # pmf_required maps to the detection `pmf` field _wifi_target_has_pmf reads,
+    # so a PMF-protected softAP promoted from the survey correctly fails the
+    # downstream deauth-applicability gate (a deauth vs a PMF AP is a NO-OP).
+    # pmf_supported is informational only (it does NOT force the gate — an
+    # optional-PMF AP can still be deauthed against a non-PMF client).
+    pmf_required: Optional[bool] = None
+    pmf_supported: Optional[bool] = None
 
 
 class FpvAnalogIngestBody(BaseModel):
@@ -6231,6 +6347,15 @@ async def _upsert_wifi_drone_detection(body: "WifiDroneIngestBody", bssid: str,
     })
     if center_freq_ghz is not None:
         det["center_freq_ghz"] = center_freq_ghz
+    # PMF carry (802.11w): when a real survey read supplied the softAP's PMF
+    # posture, persist it so _wifi_target_has_pmf reflects the truth at fire
+    # time. pmf_required -> the `pmf` field that gate reads (a PMF-required AP
+    # must fail the deauth-applicability gate); pmf_supported is informational.
+    # Absent (unknown) is left unset -> honestly treated as PMF-not-indicated.
+    if body.pmf_required is not None:
+        det["pmf"] = bool(body.pmf_required)
+    if body.pmf_supported is not None:
+        det["pmf_supported"] = bool(body.pmf_supported)
 
     # P2 no-strike CLASSIFICATION + confidence consult (no-strike-registry.md
     # §2A/§3): AFTER the display fields are set, BEFORE the insert. A classified

@@ -1,25 +1,31 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 import { api, formatApiError } from "@/lib/api";
 import { useAuth } from "@/context/AuthContext";
-import { Rss, ShieldAlert, ShieldPlus, ShieldCheck, Search, ArrowUp, ArrowDown, X } from "lucide-react";
+import { Rss, ShieldAlert, ShieldPlus, ShieldCheck, Search, ArrowUp, ArrowDown, X, Crosshair } from "lucide-react";
 import {
-  filterAps, sortAps, isPossibleUas, encryptionLabel, pmfLabel, lastSeenLabel, macOui,
+  filterAps, sortAps, isPossibleUas, canDesignateUas, encryptionLabel, pmfLabel, lastSeenLabel, macOui,
 } from "@/lib/wifiEnvironment";
 
 // WI-FI ENVIRONMENT — RF situational awareness.
 //
 // A READ-ONLY window onto the ambient Wi-Fi picture from Kismet (via the
 // backend's GET /api/wifi-environment proxy). It lets the operator SEE every
-// AP/device in range. It is NOT a target list: there is deliberately NO
-// engage / arm / deauth / transmit affordance anywhere on this page. The one
-// exception is a PROTECT-only write: a commander may add a row to the
-// existing P1 no-strike civilian-protection registry (POST /api/no-strike,
-// the same commander-gated CRUD endpoint the no-strike-registry.md doc
-// describes) -- that is a defensive/protective action, never an engagement,
-// and it is the ONLY non-GET call this page ever makes. A "possible UAS" tag
-// is a non-actionable visual hint; real engagement stays on the drone-contact
-// target flow, never here.
+// AP/device in range. It is NOT a blanket target list, and the panel itself
+// TRANSMITS NOTHING. It makes exactly two commander-gated, non-GET calls:
+//   (1) PROTECT — POST /api/no-strike adds a row to the P1 no-strike
+//       civilian-protection registry (a defensive action, never an engagement).
+//   (2) DESIGNATE — POST /api/wifi-environment/designate promotes ONE
+//       drone-OUI/SSID, non-civilian, non-broadcast row into a governed
+//       db.detections contact and then DEEP-LINKS into the existing,
+//       byte-unchanged /wifi-defeat SafetyGate flow. This is a fire-ADJACENT
+//       targeting affordance, NOT a fire control: it creates a governed contact
+//       and routes — the deliberate arm/confirm/fire happens on the WifiDefeat
+//       screen (its SafetyGate), never here. Commander-gated; the backend
+//       re-derives every gate server-side (the client hint is never trusted).
+// A "possible UAS" tag is an advisory candidate hint (SSID/OUI spoofable —
+// candidate, not identification); only such a row is designate-eligible.
 
 const COLUMNS = [
   { key: "ssid", label: "SSID", sortable: true },
@@ -175,9 +181,121 @@ function AddNoStrikeModal({ ap, onClose, onAdded }) {
   );
 }
 
+// Commander-only DESIGNATE handoff. This is a fire-ADJACENT targeting
+// affordance, NOT a fire control: confirming here promotes ONE possible-UAS
+// survey row into a governed contact and then DEEP-LINKS into the existing,
+// byte-unchanged /wifi-defeat SafetyGate flow. The actual arm/confirm/fire
+// happens on that next screen — never here. Deliberate (a confirm modal),
+// never a bare one-click deauth, with HONEST spoofable-candidate copy.
+function DesignateUasModal({ ap, onConfirm, onClose }) {
+  const oui = macOui(ap.bssid);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState(null);
+
+  async function submit(e) {
+    e.preventDefault();
+    setSaving(true);
+    setErr(null);
+    try {
+      await onConfirm();
+      // On success the parent navigates away; leave `saving` true so the
+      // button stays disabled through the unmount (no flicker).
+    } catch (e2) {
+      setErr(formatApiError(e2));
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-[60] flex items-center justify-center p-6"
+      style={{ background: "rgba(5, 8, 16, 0.9)", backdropFilter: "blur(4px)" }}
+      data-testid="wifi-env-designate-modal"
+    >
+      <form onSubmit={submit} className="max-w-xl w-full tactical-border" style={{ background: "var(--bg-surface)" }}>
+        <div className="px-5 py-3 tactical-border-b flex items-center justify-between">
+          <span className="font-heading font-black text-lg uppercase tracking-tighter flex items-center gap-2">
+            <Crosshair size={16} strokeWidth={1.5} style={{ color: "var(--accent-warning)" }} />
+            Engage As Suspected UAS
+          </span>
+          <button
+            type="button"
+            data-testid="wifi-env-designate-close"
+            onClick={onClose}
+            className="text-slate-400 hover:text-[var(--text-primary)]"
+          >
+            <X size={16} />
+          </button>
+        </div>
+        <div className="p-4 space-y-4">
+          <div className="font-mono text-[10px] leading-relaxed text-slate-400 space-y-2">
+            <p>
+              This designates a <span className="font-bold">SUSPECTED UAS</span>. The SSID and OUI are
+              <span className="font-bold"> spoofable</span> — this is a candidate,
+              <span className="font-bold"> NOT an identification</span>.
+            </p>
+            <p>
+              It will deauth <span className="font-bold">ONLY this one BSSID</span> ({ap.bssid}) — never a
+              broadcast or band-wide deauth.
+            </p>
+            <p>
+              Confirming here only creates a governed contact and routes you to the Wi-Fi-defeat screen. The
+              actual <span className="font-bold">arm and fire happen on that next screen</span> (its SafetyGate
+              is the deliberate confirm) — nothing is armed, transmitted, or fired here.
+            </p>
+          </div>
+          <dl className="grid grid-cols-2 gap-2 font-mono text-[11px]">
+            <div>
+              <dt className="text-slate-500 uppercase tracking-widest text-[9px]">BSSID</dt>
+              <dd className="text-slate-300">{ap.bssid || "—"}</dd>
+            </div>
+            <div>
+              <dt className="text-slate-500 uppercase tracking-widest text-[9px]">SSID</dt>
+              <dd className="text-slate-300">{ap.ssid || "(hidden)"}</dd>
+            </div>
+            <div>
+              <dt className="text-slate-500 uppercase tracking-widest text-[9px]">OUI</dt>
+              <dd className="text-slate-300">{oui || "—"}</dd>
+            </div>
+            <div>
+              <dt className="text-slate-500 uppercase tracking-widest text-[9px]">Vendor</dt>
+              <dd className="text-slate-300">{ap.vendor || "unknown"}</dd>
+            </div>
+          </dl>
+          {err && (
+            <div className="font-mono text-[10px]" style={{ color: "var(--accent-critical)" }} data-testid="wifi-env-designate-error">
+              {err}
+            </div>
+          )}
+          <div className="tactical-border-t pt-3 flex items-center justify-between">
+            <button
+              type="button"
+              data-testid="wifi-env-designate-cancel"
+              onClick={onClose}
+              className="px-4 py-2 tactical-border font-mono text-xs uppercase tracking-widest text-slate-400 hover-surface"
+            >
+              CANCEL
+            </button>
+            <button
+              type="submit"
+              data-testid="wifi-env-designate-confirm"
+              disabled={saving}
+              className="px-4 py-2 tactical-border font-mono text-xs font-bold uppercase tracking-widest hover-surface scanline-btn disabled:opacity-50"
+              style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}
+            >
+              {saving ? "DESIGNATING…" : "DESIGNATE & PROCEED"}
+            </button>
+          </div>
+        </div>
+      </form>
+    </div>
+  );
+}
+
 export default function WifiEnvironment() {
   const { user } = useAuth();
   const isCommander = user?.role === "commander";
+  const navigate = useNavigate();
 
   const [survey, setSurvey] = useState(null);
   const [query, setQuery] = useState("");
@@ -186,6 +304,7 @@ export default function WifiEnvironment() {
   const [loadError, setLoadError] = useState(null);
   const [noStrikeEntries, setNoStrikeEntries] = useState([]);
   const [addingAp, setAddingAp] = useState(null);
+  const [designatingAp, setDesignatingAp] = useState(null);
 
   const cancelledRef = useRef(false);
   useEffect(() => () => { cancelledRef.current = true; }, []);
@@ -235,6 +354,27 @@ export default function WifiEnvironment() {
     () => noStrikeEntries.filter((e) => e.enabled !== false), [noStrikeEntries]
   );
   const isApProtected = (ap) => enabledNoStrikeEntries.some((entry) => entryMatchesAp(entry, ap));
+
+  // Commander DESIGNATE: create the governed contact, then deep-link into the
+  // existing /wifi-defeat SafetyGate flow. This call ONLY creates the contact +
+  // routes — it does NOT arm or fire (WifiDefeat's SafetyGate is the deliberate
+  // confirm). The backend re-derives every gate server-side.
+  const doDesignate = async (ap) => {
+    const ch = ap.channel != null && ap.channel !== "" ? Number(ap.channel) : null;
+    const { data } = await api.post("/wifi-environment/designate", {
+      bssid: ap.bssid,
+      ssid: ap.ssid,
+      oui: ap.oui || macOui(ap.bssid),
+      channel: Number.isFinite(ch) ? ch : null,
+      vendor: ap.vendor,
+      pmf_required: ap.pmf_required,
+      pmf_supported: ap.pmf_supported,
+    });
+    toast.success("DESIGNATED — SUSPECTED UAS", {
+      description: `${ap.ssid || ap.bssid} → Wi-Fi defeat (candidate, not identification)`,
+    });
+    navigate(`/wifi-defeat?contact=${data.detection_id}`);
+  };
 
   const toggleSort = (key) => {
     if (key === sortKey) {
@@ -289,12 +429,14 @@ export default function WifiEnvironment() {
         <ShieldAlert size={18} strokeWidth={1.5} style={{ color: "var(--accent-warning)" }} className="mt-0.5 shrink-0" />
         <div className="font-mono text-[11px] leading-relaxed" style={{ color: "var(--text-primary)" }}>
           <span className="font-bold uppercase tracking-widest" style={{ color: "var(--accent-warning)" }}>
-            Situational awareness — not a target list.
+            Situational awareness — not a blanket target list.
           </span>{" "}
-          Access points shown here are <span className="font-bold">not engageable</span>. This is a passive,
-          read-only view of the ambient Wi-Fi picture from Kismet. Any “possible UAS” tag is an
-          advisory hint only — it does not select, arm, or authorise any effect. Engagement stays on
-          the drone-contact target flow (Kill Chain / Decide), never on this panel.
+          This is a passive, read-only view of the ambient Wi-Fi picture from Kismet. A “possible UAS”
+          tag is an advisory <span className="font-bold">candidate</span> hint — SSID/OUI are spoofable, so
+          it is a <span className="font-bold">candidate, not identification</span>. A commander MAY designate
+          a possible-UAS row as a suspected-UAS contact, which routes into the governed per-BSSID
+          Wi-Fi-defeat flow — the deliberate arm/confirm happens there (its SafetyGate), never on this
+          panel. No AP is armed, transmitted to, or fired on from here.
         </div>
       </div>
 
@@ -314,7 +456,7 @@ export default function WifiEnvironment() {
         <div className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
           {possibleUasCount > 0 && (
             <span style={{ color: "var(--accent-warning)" }}>
-              ⚑ {possibleUasCount} possible-UAS tagged (non-actionable)
+              ⚑ {possibleUasCount} possible-UAS tagged (advisory)
             </span>
           )}
         </div>
@@ -369,6 +511,9 @@ export default function WifiEnvironment() {
                 </th>
                 <th className="px-3 py-2 text-left uppercase tracking-widest text-[10px] whitespace-nowrap" style={{ color: "var(--text-muted)" }}>
                   PROTECT
+                </th>
+                <th className="px-3 py-2 text-left uppercase tracking-widest text-[10px] whitespace-nowrap" style={{ color: "var(--text-muted)" }}>
+                  ENGAGE
                 </th>
               </tr>
             </thead>
@@ -432,12 +577,28 @@ export default function WifiEnvironment() {
                         </button>
                       )}
                     </td>
+                    <td className="px-3 py-2">
+                      {canDesignateUas(ap, { isCommander, isProtected: protectedAp }) ? (
+                        <button
+                          type="button"
+                          data-testid={`wifi-env-designate-${ap.bssid}`}
+                          onClick={() => setDesignatingAp(ap)}
+                          title="Designate this possible-UAS AP as a SUSPECTED-UAS contact and route to the governed per-BSSID Wi-Fi-defeat flow (candidate, not identification; arm/fire happens on the next screen)."
+                          className="inline-flex items-center gap-1 px-2 py-0.5 tactical-border text-[9px] font-bold uppercase tracking-widest whitespace-nowrap hover-surface transition-colors"
+                          style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}
+                        >
+                          <Crosshair size={10} strokeWidth={2} /> Engage as suspected UAS
+                        </button>
+                      ) : (
+                        <span className="text-slate-600">—</span>
+                      )}
+                    </td>
                   </tr>
                 );
               })}
               {rows.length === 0 && (
                 <tr>
-                  <td colSpan={COLUMNS.length + 2} className="px-3 py-6 text-center text-slate-600">
+                  <td colSpan={COLUMNS.length + 3} className="px-3 py-6 text-center text-slate-600">
                     {query ? "No APs match the filter." : "No access points in range."}
                   </td>
                 </tr>
@@ -451,9 +612,12 @@ export default function WifiEnvironment() {
       <div className="font-mono text-[10px] p-3 tactical-border" style={{ color: "var(--text-muted)" }}>
         Passive RX-only survey via Kismet (monitor-mode NIC). Vendor is Kismet's OUI-derived guess;
         SSID / OUI are spoofable, so a “possible UAS” tag is a candidate hint, never an identification.
-        This panel has no transmit, engage, deauth, or arm capability of any kind. The only write this
-        page can issue is adding a row to the no-strike civilian-protection registry (PROTECT) —
-        commander-gated, and it can only ever protect a match, never target or engage one.
+        This panel transmits nothing itself. A commander may (a) add a row to the no-strike
+        civilian-protection registry (PROTECT), or (b) designate a possible-UAS row as a suspected-UAS
+        contact that deep-links into the governed, per-BSSID Wi-Fi-defeat flow — where the SafetyGate
+        arm/confirm and every fire-time gate still apply. Designating creates a governed contact only;
+        it never arms, transmits, or fires, and only a drone-OUI/SSID, non-civilian, non-broadcast row
+        is eligible.
       </div>
 
       {addingAp && (
@@ -464,6 +628,14 @@ export default function WifiEnvironment() {
             setNoStrikeEntries((es) => [entry, ...es]);
             setAddingAp(null);
           }}
+        />
+      )}
+
+      {designatingAp && (
+        <DesignateUasModal
+          ap={designatingAp}
+          onClose={() => setDesignatingAp(null)}
+          onConfirm={() => doDesignate(designatingAp)}
         />
       )}
     </div>

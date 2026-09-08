@@ -52,6 +52,32 @@ export function isPossibleUas(ap) {
   return droneOuiVendor(ap.bssid) !== null || ssidLooksLikeDrone(ap.ssid);
 }
 
+export const BROADCAST_BSSID = "FF:FF:FF:FF:FF:FF";
+
+// A concrete, non-broadcast softAP BSSID (mirrors the backend
+// _wifi_bssid_missing_or_broadcast fail-closed guard).
+export function hasConcreteBssid(bssid) {
+  if (!bssid || typeof bssid !== "string") return false;
+  const b = bssid.trim().toUpperCase();
+  return b !== "" && b !== BROADCAST_BSSID;
+}
+
+// Is this survey row DESIGNATE-eligible? A commander MAY promote it to a
+// suspected-UAS contact that routes to the governed per-BSSID Wi-Fi-defeat
+// flow ONLY when it is a possible-UAS row, NOT already civilian-protected, the
+// viewer is a commander, and it carries a concrete non-broadcast BSSID.
+// Civilian / no-drone-indicator / protected / non-commander rows are
+// NON-selectable (no engage control). This is a client-side convenience gate
+// ONLY — the backend /wifi-environment/designate re-derives every check and is
+// the source of truth (the client possible_uas flag is never trusted there).
+export function canDesignateUas(ap, { isCommander, isProtected } = {}) {
+  if (!ap) return false;
+  if (!isCommander) return false;
+  if (isProtected) return false;
+  if (!isPossibleUas(ap)) return false;
+  return hasConcreteBssid(ap.bssid);
+}
+
 // Human-readable encryption label. Kismet's crypt_string is already printable
 // (e.g. "WPA2-PSK-AES", "Open"); we only normalise the empty/unknown case.
 export function encryptionLabel(ap) {

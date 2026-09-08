@@ -12,7 +12,7 @@ const fs = require("fs");
 const path = require("path");
 const {
   isPossibleUas, droneOuiVendor, ssidLooksLikeDrone, filterAps, sortAps,
-  encryptionLabel, pmfLabel, lastSeenLabel,
+  encryptionLabel, pmfLabel, lastSeenLabel, canDesignateUas, hasConcreteBssid,
 } = require("./wifiEnvironment");
 
 // A small fixture in the exact survey shape the backend returns.
@@ -67,6 +67,44 @@ describe("labels", () => {
     expect(lastSeenLabel({ last_seen: 1000 }, 1030)).toBe("30s ago");
     expect(lastSeenLabel({ last_seen: 1000 }, 1000 + 120)).toBe("2m ago");
     expect(lastSeenLabel({}, 2000)).toBe("—");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DESIGNATE gating predicate: the "Engage as suspected UAS" control is PRESENT
+// only on a possible-UAS commander row with a concrete non-broadcast BSSID, and
+// ABSENT on civilian / no-drone-indicator / protected / non-commander rows.
+// ---------------------------------------------------------------------------
+describe("designate gating predicate (canDesignateUas)", () => {
+  const uasRow = FIXTURE[2]; // DJI OUI 60:60:1F, possible_uas true
+  const civilianRow = FIXTURE[0]; // OfficeNet — not a possible UAS
+
+  test("hasConcreteBssid rejects blank/absent/broadcast, accepts a real BSSID", () => {
+    expect(hasConcreteBssid("60:60:1F:AA:BB:CC")).toBe(true);
+    expect(hasConcreteBssid("")).toBe(false);
+    expect(hasConcreteBssid(null)).toBe(false);
+    expect(hasConcreteBssid("FF:FF:FF:FF:FF:FF")).toBe(false);
+  });
+
+  test("PRESENT only for a possible-UAS commander row with a concrete BSSID", () => {
+    expect(canDesignateUas(uasRow, { isCommander: true, isProtected: false })).toBe(true);
+  });
+
+  test("ABSENT for a non-commander", () => {
+    expect(canDesignateUas(uasRow, { isCommander: false, isProtected: false })).toBe(false);
+  });
+
+  test("ABSENT for a civilian-protected row", () => {
+    expect(canDesignateUas(uasRow, { isCommander: true, isProtected: true })).toBe(false);
+  });
+
+  test("ABSENT for a civilian / no-drone-indicator row", () => {
+    expect(canDesignateUas(civilianRow, { isCommander: true, isProtected: false })).toBe(false);
+  });
+
+  test("ABSENT without a concrete (non-broadcast) BSSID", () => {
+    expect(canDesignateUas({ possible_uas: true, bssid: "" }, { isCommander: true })).toBe(false);
+    expect(canDesignateUas({ possible_uas: true, bssid: "FF:FF:FF:FF:FF:FF" }, { isCommander: true })).toBe(false);
   });
 });
 
@@ -130,18 +168,30 @@ describe("filter + sort (drives what the table renders)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// READ-ONLY GUARANTEE: the page must expose NO transmit/engage/deauth/arm
-// affordance and must never call a mutating endpoint. Scan its source.
+// GUARANTEE: the panel itself TRANSMITS NOTHING. It makes exactly two
+// commander-gated non-GET calls — PROTECT (POST /no-strike) and DESIGNATE
+// (POST /wifi-environment/designate). DESIGNATE only creates a governed contact
+// and DEEP-LINKS (a client-side navigate, never an api call) into the existing
+// /wifi-defeat SafetyGate flow where the deliberate arm/fire lives. The page
+// must never call a fire/transmit endpoint directly. Scan its source.
 // ---------------------------------------------------------------------------
-describe("WifiEnvironment page is protect-only (no engage/arm/deauth/transmit)", () => {
+describe("WifiEnvironment page: protect + designate, but transmits nothing itself", () => {
   const pageSrc = fs.readFileSync(
     path.join(__dirname, "..", "pages", "WifiEnvironment.jsx"), "utf8"
   );
 
-  test("renders the situational-awareness / not-a-target-list label", () => {
-    expect(pageSrc.toLowerCase()).toContain("situational awareness");
-    expect(pageSrc.toLowerCase()).toContain("not a target list");
-    expect(pageSrc.toLowerCase()).toContain("not engageable");
+  // Every api.<verb>("<path>"...) call in the page: method + endpoint path.
+  const apiCalls = [...pageSrc.matchAll(
+    /api\.(get|post|put|patch|delete)\s*\(\s*["'`]([^"'`]+)["'`]/gi
+  )].map((m) => ({ method: m[1].toLowerCase(), path: m[2] }));
+
+  test("renders honest situational-awareness copy incl. the commander-designate caveat", () => {
+    const low = pageSrc.toLowerCase();
+    expect(low).toContain("situational awareness");
+    expect(low).toContain("not a blanket target list");
+    // Honest spoofable-candidate framing (no stale "not engageable" absolute).
+    expect(low).toContain("candidate, not identification");
+    expect(low).not.toContain("not engageable");
   });
 
   test("reads the survey endpoint (api.get('/wifi-environment'))", () => {
@@ -152,40 +202,44 @@ describe("WifiEnvironment page is protect-only (no engage/arm/deauth/transmit)",
     expect(pageSrc).not.toMatch(/api\.(put|patch|delete)\s*\(/);
   });
 
-  // The "Add to no-strike" commander action is a PROTECT action (P1
-  // no-strike civilian-protection registry CRUD, not a target/engage
-  // affordance) -- it is the one deliberate exception to the page otherwise
-  // being read-only, and it must be the ONLY non-GET call anywhere in the
-  // page. Every other api.* call must be a plain GET.
-  test("every api.* call is either a GET, or the single POST /no-strike protect action", () => {
-    const apiCallHeads = pageSrc.match(/api\.[a-z]+\s*\(/gi) || [];
-    expect(apiCallHeads.length).toBeGreaterThan(0);
-    const nonGet = apiCallHeads.filter(
-      (call) => call.replace(/\s+/g, "").toLowerCase() !== "api.get("
-    );
-    expect(nonGet).toHaveLength(1);
-    expect(nonGet[0].replace(/\s+/g, "").toLowerCase()).toBe("api.post(");
+  // Exactly two non-GET writes, both POST, both on the allowed endpoints:
+  // the PROTECT registry write and the DESIGNATE contact-promotion write.
+  test("every api.* call is a GET, or one of the two allowed POSTs (protect + designate)", () => {
+    expect(apiCalls.length).toBeGreaterThan(0);
+    const nonGet = apiCalls.filter((c) => c.method !== "get");
+    expect(nonGet.map((c) => `${c.method} ${c.path}`).sort()).toEqual([
+      "post /no-strike",
+      "post /wifi-environment/designate",
+    ]);
   });
 
-  test("the one POST call targets exactly /no-strike (no other write endpoint)", () => {
-    expect(pageSrc).toContain('api.post("/no-strike",');
+  test("the DESIGNATE call creates a governed contact only (POST /wifi-environment/designate)", () => {
+    expect(pageSrc).toContain('api.post("/wifi-environment/designate"');
   });
 
-  test("the POST is gated on the commander role client-side", () => {
+  test("both writes are gated on the commander role client-side", () => {
+    // PROTECT button disabled for non-commanders; DESIGNATE control only
+    // rendered when canDesignateUas(...) — which requires isCommander.
     expect(pageSrc).toMatch(/disabled=\{!isCommander/);
+    expect(pageSrc).toMatch(/canDesignateUas\(ap,\s*\{\s*isCommander/);
   });
 
-  test("wires no engage/arm/jam/deauth endpoint path", () => {
-    // Endpoint-path tokens (slash-prefixed) that would indicate a
-    // transmit/engage call. Prose disclaimers that merely name these actions
-    // in words (e.g. "no deauth capability") are intentionally not matched.
-    // "/no-strike" itself is a PROTECT-only registry path, not in this list.
-    const forbiddenPaths = [
+  test("the panel issues NO api.* call to any fire/transmit endpoint", () => {
+    const firePaths = [
       "/engage", "/arm", "/jam", "/deploy", "/broadcast", "/wifi-defeat",
       "/tx/", "/emergency", "/detections/", "/payloads",
     ];
-    for (const token of forbiddenPaths) {
-      expect(pageSrc).not.toContain(token);
+    for (const { path: p } of apiCalls) {
+      for (const f of firePaths) {
+        expect(p.startsWith(f)).toBe(false);
+      }
     }
+  });
+
+  test("routes to the governed wifi-defeat flow via a client navigate, never an api call", () => {
+    // The deep-link is a react-router navigate to the /wifi-defeat ROUTE...
+    expect(pageSrc).toMatch(/navigate\(`\/wifi-defeat\?contact=/);
+    // ...and /wifi-defeat is NEVER invoked as an api.<verb>("/wifi-defeat"...).
+    expect(pageSrc).not.toMatch(/api\.[a-z]+\s*\(\s*["'`]\/wifi-defeat/i);
   });
 });
