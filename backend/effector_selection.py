@@ -6,8 +6,9 @@ WHAT THIS IS (read this before touching anything here)
 Given the current contacts + the ranked engagement PLAN + a snapshot of effector
 availability, this module produces, per contact, a PROPOSED effector
 recommendation: an explainable threat score, an honest per-effector feasibility
-matrix (jam / GNSS-deny / MAVLink-takeover / Wi-Fi-deauth / ARSDK-Tello-inject),
-a recommended effector with a failover order, and a duplicate-engagement flag.
+matrix (jam / GNSS-deny-by-jam / GNSS-spoof / MAVLink-takeover / Wi-Fi-deauth /
+ARSDK-Tello-inject), a recommended effector with a failover order, and a
+duplicate-engagement flag.
 It is a sibling of `engagement_planner` and `sop_engine`: same PROPOSED-only,
 commander-cued posture.
 
@@ -41,8 +42,14 @@ Every feasibility verdict is grounded in real code, never invented capability:
     (`cyber_takeover_applicable`, `gnss_deny_applicable`, `jam_bands`).
 Encrypted/FHSS link -> takeover NOT_FEASIBLE (inject is a NO-OP). Unknown link
 -> takeover UNKNOWN (never a confident "viable"; needs link-type ID / operator
-attestation). GNSS-deny -> always the v1 placeholder verdict (receiver-lock
-unproven), NEVER a plain FEASIBLE. Jam -> universally applicable as an RF deny,
+attestation). GNSS denial splits into TWO honest effectors driven by the SAME
+`gnss_deny_applicable` signal: GNSS-deny-by-jam (an AREA jam on the platform's
+GNSS band, fired from the Jamming page with a GNSS band preset) is a REAL,
+fireable-today effect -> FEASIBLE_UNVERIFIED_RANGE when applicable (the same
+range-physics caveat jam carries), NEVER the v1 placeholder; GNSS-spoof
+(deception / receiver-lock) is the v1 placeholder -> always the placeholder
+verdict when applicable (unproven), NEVER a plain FEASIBLE. Jam -> universally
+applicable as an RF deny,
 but its *effectiveness* is power/proximity/band physics, not software-decidable,
 so it is FEASIBLE_UNVERIFIED_RANGE. **When the two takeover signals DISAGREE the
 conservative (fail-closed / NOT_FEASIBLE) verdict is taken and BOTH signals are
@@ -121,7 +128,13 @@ _FEASIBLE_VERDICTS = frozenset(
 
 # Effector names + the effector_availability snapshot key each reads.
 EFF_JAM = "jam"
-EFF_GNSS_DENY = "gnss_deny"
+# GNSS denial splits into two HONEST effectors driven by the same
+# `gnss_deny_applicable` signal: EFF_GNSS_DENY_JAM is an AREA jam on the
+# platform's GNSS band (real, fireable-today via the Jamming page's GNSS band
+# preset); EFF_GNSS_SPOOF is the GNSS deception/receiver-lock effect (v1
+# placeholder, unproven). Never interchange them.
+EFF_GNSS_SPOOF = "gnss_spoof"
+EFF_GNSS_DENY_JAM = "gnss_deny_jam"
 EFF_MAVLINK_TAKEOVER = "mavlink_takeover"
 # Active Wi-Fi defeat (Parrot/Tello) -- two SEPARATE effects, never interchange-
 # able: EFF_WIFI_DEAUTH is an 802.11 link-drop (NOT a takeover); EFF_ARSDK_INJECT
@@ -135,7 +148,11 @@ EFF_ARSDK_INJECT = "arsdk_inject"
 # emits for the wifi_defeat bridge consumer (server.py).
 _AVAILABILITY_KEY: Dict[str, str] = {
     EFF_JAM: "jam",
-    EFF_GNSS_DENY: "gnss_spoof",
+    # GNSS spoof reads its own honest slot; GNSS-deny-by-jam reads the SAME jam
+    # slot it actually fires through (jam bridge up + jam range-auth), so its
+    # clearability is evidence-backed by the jam transmit path.
+    EFF_GNSS_SPOOF: "gnss_spoof",
+    EFF_GNSS_DENY_JAM: "jam",
     EFF_MAVLINK_TAKEOVER: "mavlink_sdr_inject",
     EFF_WIFI_DEAUTH: "wifi_deauth",
     EFF_ARSDK_INJECT: "arsdk_inject",
@@ -148,9 +165,15 @@ EXECUTION_PATHS: Dict[str, str] = {
         "POST /api/payloads/jam (commander-gated: require_commander + "
         "TX-not-halted master kill + range authorization; the human fires)."
     ),
-    EFF_GNSS_DENY: (
+    EFF_GNSS_SPOOF: (
         "POST /api/payloads/gnss-spoof (commander-gated; v1 placeholder "
         "maturity -- receiver-lock unproven; the human fires)."
+    ),
+    EFF_GNSS_DENY_JAM: (
+        "POST /api/payloads/jam with a GNSS band preset "
+        "(gps_l1|galileo_e1|beidou_b1|glonass_l1) (commander-gated: "
+        "require_commander + TX-not-halted master kill + range authorization; "
+        "the human fires). AREA GNSS-denial -- no per-target scoping."
     ),
     EFF_MAVLINK_TAKEOVER: (
         "POST /api/payloads/mavlink-sdr-inject with target_detection_id=<this "
@@ -202,8 +225,12 @@ DOCTRINE_NOTE = (
     "injectable, so jam is the primary defeat with a GNSS-denial layer where "
     "applicable. Jam is a universal RF deny but its effectiveness is a "
     "power/proximity/band physics question, not software-decidable "
-    "(FEASIBLE_UNVERIFIED_RANGE). GNSS denial is a v1 placeholder "
-    "(FEASIBLE_PLACEHOLDER_V1), never a proven kill. Two Wi-Fi-specific "
+    "(FEASIBLE_UNVERIFIED_RANGE). GNSS denial is TWO honest effectors: "
+    "GNSS-deny-by-jam is a REAL AREA effect -- a jam on the platform's GNSS "
+    "band, invoked deliberately from the Jamming page with a GNSS band preset "
+    "(FEASIBLE_UNVERIFIED_RANGE, same range-physics caveat as jam, never a "
+    "per-target one-tap); GNSS-spoof (deception / receiver-lock) is the v1 "
+    "placeholder (FEASIBLE_PLACEHOLDER_V1), never a proven kill. Two Wi-Fi-specific "
     "additions: an identified unencrypted Parrot ARSDK3 / Ryze Tello softAP is "
     "best defeated by the surgical ARSDK/Tello UDP land-emergency inject "
     "(same surgical preference tier as MAVLink RC-override) when feasible AND "
@@ -434,20 +461,21 @@ def _feasibility(contact: Dict[str, Any],
         jam_rationale += f" Library jam_bands: {jam_bands}."
     jam = {"verdict": FEASIBLE_UNVERIFIED_RANGE, "rationale": jam_rationale}
 
-    # ---- GNSS-deny: FEASIBLE_PLACEHOLDER_V1 when applicable (v1 receiver-lock
-    # unproven -- NEVER a plain FEASIBLE); else UNKNOWN/NOT_FEASIBLE per what is
-    # decidable. --------------------------------------------------------------
+    # ---- GNSS SPOOF (deception / receiver-lock): FEASIBLE_PLACEHOLDER_V1 when
+    # applicable (v1 receiver-lock unproven -- NEVER a plain FEASIBLE); else
+    # UNKNOWN/NOT_FEASIBLE per what is decidable. This is the v1 placeholder. ---
     if gnss_applicable is True:
-        gnss = {
+        gnss_spoof = {
             "verdict": FEASIBLE_PLACEHOLDER_V1,
             "rationale": (
-                "countermeasures.gnss_deny_applicable=true, BUT the GNSS-denial "
-                "effector is a v1 placeholder (receiver-lock/effect unproven) -- "
-                "reported as a placeholder, never a proven kill."
+                "countermeasures.gnss_deny_applicable=true, BUT the GNSS-SPOOF "
+                "(deception / receiver-lock) effector is a v1 placeholder "
+                "(effect unproven) -- reported as a placeholder, never a proven "
+                "kill. For a REAL, fireable-today GNSS effect see gnss_deny_jam."
             ),
         }
     elif gnss_applicable is False:
-        gnss = {
+        gnss_spoof = {
             "verdict": NOT_FEASIBLE,
             "rationale": (
                 "countermeasures.gnss_deny_applicable=false -- GNSS denial has "
@@ -456,7 +484,44 @@ def _feasibility(contact: Dict[str, Any],
             ),
         }
     else:
-        gnss = {
+        gnss_spoof = {
+            "verdict": UNKNOWN,
+            "rationale": (
+                "gnss_deny_applicable is not decidable for this contact (no "
+                "matched library countermeasures) -- honest UNKNOWN, not an "
+                "assumed capability."
+            ),
+        }
+
+    # ---- GNSS-DENY-BY-JAM: AREA GNSS-band denial -- a jam on the platform's
+    # GNSS band, invoked from the Jamming page with a GNSS band preset. A REAL,
+    # fireable-today effect (jam machinery), so an applicable contact is
+    # FEASIBLE_UNVERIFIED_RANGE -- the SAME honest range-physics caveat jam
+    # carries -- NEVER the v1 placeholder verdict. Driven by the SAME
+    # gnss_deny_applicable signal as gnss_spoof. -------------------------------
+    if gnss_applicable is True:
+        gnss_deny_jam = {
+            "verdict": FEASIBLE_UNVERIFIED_RANGE,
+            "rationale": (
+                "countermeasures.gnss_deny_applicable=true -- AREA GNSS-band "
+                "denial (a jam on the platform's GNSS band, via the Jamming "
+                "page's GNSS band preset) is a real, fireable-today effect; its "
+                "effectiveness is a power/proximity/band-physics question, NOT "
+                "software-decidable, so range is UNVERIFIED. AREA effect -- no "
+                "per-target scoping, never a one-tap composable effect."
+            ),
+        }
+    elif gnss_applicable is False:
+        gnss_deny_jam = {
+            "verdict": NOT_FEASIBLE,
+            "rationale": (
+                "countermeasures.gnss_deny_applicable=false -- GNSS denial has "
+                "no expected effect on this platform (e.g. non-GNSS / manual "
+                "flight)."
+            ),
+        }
+    else:
+        gnss_deny_jam = {
             "verdict": UNKNOWN,
             "rationale": (
                 "gnss_deny_applicable is not decidable for this contact (no "
@@ -482,7 +547,8 @@ def _feasibility(contact: Dict[str, Any],
 
     return {
         "jam": jam,
-        "gnss_deny": gnss,
+        "gnss_deny_jam": gnss_deny_jam,
+        "gnss_spoof": gnss_spoof,
         "mavlink_takeover": mav,
         "wifi_deauth": wifi_deauth,
         "arsdk_inject": arsdk_inject,
@@ -687,14 +753,19 @@ def _doctrine_order(feasible: Dict[str, str]) -> List[str]:
       unidentified Wi-Fi) -> jam stays the universal primary defeat, with
       Wi-Fi deauth offered next (only when a Wi-Fi link was actually
       identified -- see _wifi_deauth_verdict) as a best-effort link-drop
-      supplement, then the GNSS-deny layer, then the surgical command
-      effectors last (they will not be FEASIBLE in this branch anyway)."""
+      supplement, then the GNSS-deny-by-jam AREA layer (an applicable
+      gnss_deny_jam is always FEASIBLE_UNVERIFIED_RANGE, so it is placed AFTER
+      jam -- jam wins as the auto recommendation and gnss_deny_jam only ever
+      surfaces in the failover_order, never as the auto recommended_effector),
+      then the surgical command effectors, with GNSS-spoof (the v1 placeholder)
+      last."""
     surgical = [e for e in (EFF_MAVLINK_TAKEOVER, EFF_ARSDK_INJECT) if e in feasible]
     if surgical:
-        preference = surgical + [EFF_JAM, EFF_WIFI_DEAUTH, EFF_GNSS_DENY]
+        preference = surgical + [EFF_JAM, EFF_WIFI_DEAUTH,
+                                 EFF_GNSS_DENY_JAM, EFF_GNSS_SPOOF]
     else:
-        preference = [EFF_JAM, EFF_WIFI_DEAUTH, EFF_GNSS_DENY,
-                      EFF_MAVLINK_TAKEOVER, EFF_ARSDK_INJECT]
+        preference = [EFF_JAM, EFF_WIFI_DEAUTH, EFF_GNSS_DENY_JAM,
+                      EFF_MAVLINK_TAKEOVER, EFF_ARSDK_INJECT, EFF_GNSS_SPOOF]
     return [e for e in preference if e in feasible]
 
 

@@ -11,10 +11,12 @@ adversarial review will scrutinise:
     tx-halt-clear / deploy symbol (static AST + source-scan assertions);
   * feasibility verdicts are HONEST: an unknown link never yields a confident
     takeover; an encrypted link is NOT_FEASIBLE for takeover and falls back to
-    jam; a legacy/unencrypted MAVLink link is FEASIBLE; GNSS-deny always carries
-    the v1 placeholder verdict, never plain FEASIBLE; and when the two takeover
-    signals DISAGREE the conservative NOT_FEASIBLE verdict is taken with BOTH
-    signals surfaced;
+    jam; a legacy/unencrypted MAVLink link is FEASIBLE; GNSS denial is two honest
+    effectors -- GNSS-deny-by-jam is the REAL AREA effect (FEASIBLE_UNVERIFIED_-
+    RANGE, never the placeholder) while GNSS-spoof carries the v1 placeholder
+    verdict (never plain FEASIBLE), both driven by the same gnss_deny_applicable
+    signal; and when the two takeover signals DISAGREE the conservative
+    NOT_FEASIBLE verdict is taken with BOTH signals surfaced;
   * position honesty: a position-less contact gets full protocol feasibility but
     a null proximity_factor; a positioned contact gets a proximity score;
   * failover/dedup: a halted TX marks every effector unavailable with a reason;
@@ -237,27 +239,103 @@ def test_legacy_unencrypted_mavlink_takeover_feasible():
     assert rec["recommended_effector"] == "mavlink_takeover"
 
 
-def test_gnss_deny_always_placeholder_never_plain_feasible():
+def test_gnss_spoof_always_placeholder_never_plain_feasible():
     # applicable=True must yield the v1 placeholder verdict, NOT plain FEASIBLE.
     out = build_effector_recommendations(
         [_legacy_mavlink_contact()], _empty_plan(), _availability(), set())
-    gnss = out["recommendations"][0]["feasibility"]["gnss_deny"]
+    gnss = out["recommendations"][0]["feasibility"]["gnss_spoof"]
     assert gnss["verdict"] == "FEASIBLE_PLACEHOLDER_V1"
     assert gnss["verdict"] != "FEASIBLE"
 
 
-def test_gnss_deny_not_applicable_is_not_feasible():
+def test_gnss_spoof_not_applicable_is_not_feasible():
     out = build_effector_recommendations(
         [_disagreement_contact()], _empty_plan(), _availability(), set())
-    gnss = out["recommendations"][0]["feasibility"]["gnss_deny"]
+    gnss = out["recommendations"][0]["feasibility"]["gnss_spoof"]
     assert gnss["verdict"] == "NOT_FEASIBLE"
 
 
-def test_gnss_deny_undecidable_is_unknown():
+def test_gnss_spoof_undecidable_is_unknown():
     out = build_effector_recommendations(
         [_unknown_link_contact()], _empty_plan(), _availability(), set())
-    gnss = out["recommendations"][0]["feasibility"]["gnss_deny"]
+    gnss = out["recommendations"][0]["feasibility"]["gnss_spoof"]
     assert gnss["verdict"] == "UNKNOWN"
+
+
+# --------------------------------------------------------------------------
+# GNSS DENY-BY-JAM (Item C): the REAL, fireable-today AREA GNSS-band denial --
+# an honest FEASIBLE_UNVERIFIED_RANGE (never the v1 placeholder), driven by the
+# SAME gnss_deny_applicable signal, clearability read from the shared jam slot.
+# --------------------------------------------------------------------------
+def test_gnss_deny_jam_applicable_is_feasible_unverified_range_never_placeholder():
+    # applicable=True -> the REAL area effect: FEASIBLE_UNVERIFIED_RANGE, and
+    # NEVER the v1 placeholder verdict nor a plain FEASIBLE (anti-false-feasible /
+    # anti-placeholder guard).
+    out = build_effector_recommendations(
+        [_legacy_mavlink_contact()], _empty_plan(), _availability(), set())
+    gnss = out["recommendations"][0]["feasibility"]["gnss_deny_jam"]
+    assert gnss["verdict"] == "FEASIBLE_UNVERIFIED_RANGE"
+    assert gnss["verdict"] != "FEASIBLE_PLACEHOLDER_V1"
+    assert gnss["verdict"] != "FEASIBLE"
+
+
+def test_gnss_deny_jam_not_applicable_is_not_feasible():
+    out = build_effector_recommendations(
+        [_disagreement_contact()], _empty_plan(), _availability(), set())
+    gnss = out["recommendations"][0]["feasibility"]["gnss_deny_jam"]
+    assert gnss["verdict"] == "NOT_FEASIBLE"
+
+
+def test_gnss_deny_jam_undecidable_is_unknown():
+    out = build_effector_recommendations(
+        [_unknown_link_contact()], _empty_plan(), _availability(), set())
+    gnss = out["recommendations"][0]["feasibility"]["gnss_deny_jam"]
+    assert gnss["verdict"] == "UNKNOWN"
+
+
+def test_gnss_deny_jam_clearability_reads_the_jam_slot():
+    """gnss_deny_jam fires through the jam machinery, so its clearability must
+    read the SAME jam availability slot -- jam bridge down => gnss_deny_jam is
+    surfaced-but-unavailable; jam clearable => available."""
+    # jam bridge DOWN -> gnss_deny_jam appears in failover_order as unavailable.
+    out_down = build_effector_recommendations(
+        [_legacy_mavlink_contact()], _empty_plan(),
+        _availability(jam=(False, True)), set())
+    fo_down = {f["effector"]: f
+               for f in out_down["recommendations"][0]["failover_order"]}
+    assert "gnss_deny_jam" in fo_down
+    assert fo_down["gnss_deny_jam"]["feasible"] is True
+    assert fo_down["gnss_deny_jam"]["available"] is False
+
+    # jam clearable -> gnss_deny_jam available in the failover order.
+    out_up = build_effector_recommendations(
+        [_legacy_mavlink_contact()], _empty_plan(), _availability(), set())
+    fo_up = {f["effector"]: f
+             for f in out_up["recommendations"][0]["failover_order"]}
+    assert "gnss_deny_jam" in fo_up
+    assert fo_up["gnss_deny_jam"]["available"] is True
+
+
+def test_both_gnss_keys_present_and_distinct_in_every_recommendation():
+    """Every recommendation must carry BOTH honest GNSS effectors as SEPARATE
+    feasibility keys -- the split is real, not an alias."""
+    contacts = [_legacy_mavlink_contact(), _encrypted_dji_contact(),
+                _unknown_link_contact(), _disagreement_contact()]
+    out = build_effector_recommendations(
+        contacts, _empty_plan(), _availability(), set())
+    assert out["recommendations"]
+    for rec in out["recommendations"]:
+        fes = rec["feasibility"]
+        assert "gnss_deny_jam" in fes
+        assert "gnss_spoof" in fes
+        # distinct objects, not the same dict aliased under two keys.
+        assert fes["gnss_deny_jam"] is not fes["gnss_spoof"]
+    # And the applicable case proves the verdicts genuinely differ (real AREA
+    # effect vs v1 placeholder), never collapsed to one.
+    legacy = next(r for r in out["recommendations"]
+                  if r["detection_id"] == "det-legacy")["feasibility"]
+    assert legacy["gnss_deny_jam"]["verdict"] == "FEASIBLE_UNVERIFIED_RANGE"
+    assert legacy["gnss_spoof"]["verdict"] == "FEASIBLE_PLACEHOLDER_V1"
 
 
 def test_jam_is_always_feasible_unverified_range():

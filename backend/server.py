@@ -1221,14 +1221,24 @@ WEAPONS_POSTURE_SAFETY_CHECKLIST = (
     "abort_authority_ready",
 )
 # Recommender effector name (effector_selection.EFF_*) -> range-auth/engage effect
-# key. gnss_deny maps to gnss_spoof, which is NOT in ENGAGE_COMPOSABLE_EFFECTS, so
-# a gnss recommendation is SURFACED (verdict + reason) and never fired one-tap.
+# key. The recommender surfaces TWO honest GNSS effectors, and NEITHER is one-tap
+# composable (both map to a value NOT in ENGAGE_COMPOSABLE_EFFECTS, so a GNSS
+# recommendation is SURFACED with its verdict + reason and never fired one-tap):
+#   * gnss_spoof   -> gnss_spoof   (the v1 deception placeholder; deliberate
+#                                   POST /api/payloads/gnss-spoof attestation flow)
+#   * gnss_deny_jam-> gnss_deny_jam (AREA GNSS-band denial; the deliberate
+#                                   Jamming-page POST /api/payloads/jam GNSS-band-
+#                                   preset flow -- an AREA effect, never per-target
+#                                   one-tap. It is intentionally NOT mapped to the
+#                                   composable `jam`: a one-tap `jam` would fire a
+#                                   CONTROL-band barrage mislabeled as GNSS denial.)
 _EFFECTOR_TO_ENGAGE_EFFECT = {
     "jam": "jam",
     "mavlink_takeover": "mavlink_sdr_inject",
     "wifi_deauth": "wifi_deauth",
     "arsdk_inject": "arsdk_inject",
-    "gnss_deny": "gnss_spoof",
+    "gnss_spoof": "gnss_spoof",
+    "gnss_deny_jam": "gnss_deny_jam",
 }
 # Threat levels that count as CLASSIFIED HOSTILE for the ROE floor. Anything else
 # (FRIENDLY / UNKNOWN / empty / neutral / civilian) is NEVER a valid one-tap
@@ -9713,9 +9723,11 @@ async def _one_tap_engage_impl(body: EngageBody, user: Dict) -> Dict:
     selected_effect = _EFFECTOR_TO_ENGAGE_EFFECT.get(selected_effector)
     if selected_effect not in ENGAGE_COMPOSABLE_EFFECTS:
         raise HTTPException(409, detail={
-            "error": f"Selected effector '{selected_effector}' is not available as a one-tap effect "
-                     "(e.g. GNSS-deny requires the deliberate POST /api/payloads/gnss-spoof attestation "
-                     "flow). Nothing fired.",
+            "error": f"Selected effector '{selected_effector}' is not available as a one-tap effect. "
+                     "GNSS denial is never one-tap: GNSS spoof/deception requires the deliberate "
+                     "POST /api/payloads/gnss-spoof attestation flow, and AREA GNSS-band denial "
+                     "requires the deliberate Jamming page (POST /api/payloads/jam) with a GNSS band "
+                     "preset (gps_l1|galileo_e1|beidou_b1|glonass_l1). Nothing fired.",
             "selected_effector": selected_effector})
     if selected_effect not in permitted:
         raise HTTPException(409, detail={

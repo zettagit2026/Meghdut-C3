@@ -491,9 +491,9 @@ def test_infeasible_override_surfaced_not_fired(monkeypatch):
 
 
 def test_gnss_recommendation_is_not_one_tap_composable(monkeypatch):
-    # gnss_deny maps to gnss_spoof which is NOT composable — surfaced, never fired.
+    # gnss_spoof (deception, v1 placeholder) is NOT composable — surfaced, never fired.
     events, broadcasts = _stub_engage_spine(
-        monkeypatch, detection=_JAM_TARGET, rec=_rec(effector="gnss_deny"))
+        monkeypatch, detection=_JAM_TARGET, rec=_rec(effector="gnss_spoof"))
     _arm_posture(effects=("jam",))
     with pytest.raises(srv.HTTPException) as ei:
         _engage(srv.EngageBody(target_detection_id="det-1", engage_confirm=True))

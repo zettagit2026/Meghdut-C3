@@ -155,7 +155,14 @@ def test_get_returns_proposed_recommendation_payload(fake_env):
     assert len(recs["recommendations"]) == 2
     # Every recommendation carries the PROPOSED-requires-human posture.
     assert all(r["status"] == PROPOSED for r in recs["recommendations"])
-    # The availability echo reflects the read-only snapshot (all clearable).
+    # Item C: the feasibility matrix carries BOTH honest GNSS effectors as
+    # SEPARATE keys on every recommendation (the split is real, not an alias) --
+    # gnss_deny_jam (real AREA denial-by-jam) and gnss_spoof (v1 placeholder).
+    for r in recs["recommendations"]:
+        assert "gnss_deny_jam" in r["feasibility"]
+        assert "gnss_spoof" in r["feasibility"]
+    # The availability echo reflects the read-only snapshot (all clearable), and
+    # the GNSS-spoof deception effector stays honestly stamped v1_placeholder.
     echo = recs["effector_availability_echo"]
     assert echo["tx_halted"] is False
     assert echo["jam"]["bridge_up"] is True
@@ -199,6 +206,114 @@ def test_tx_halted_snapshot_marks_effectors_unavailable(fake_env, monkeypatch):
     # With the master TX halt set, nothing is currently clearable.
     assert all(r["recommended_effector"] is None for r in recs["recommendations"])
     assert recs["summary"]["recommendations_with_clearable_effector"] == 0
+
+
+# ==========================================================================
+# Item C: GNSS-band AREA denial (gnss_deny_jam) is NEVER a one-tap effect.
+# A recommender-surfaced gnss_deny_jam that a commander tries to fire one-tap
+# via effect_override is REFUSED at the composable gate (409, nothing fired) --
+# it maps to a NON-composable engage effect, so the deliberate Jamming-page
+# GNSS-band-preset flow stays the only path. Locks that GNSS-band denial can
+# never become a per-target one-tap barrage.
+# ==========================================================================
+_ONE_TAP_AO_ZONE = {
+    "id": "AO-1", "name": "Test AO",
+    "polygon": {"type": "Polygon",
+                "coordinates": [[[-1, -1], [1, -1], [1, 1], [-1, 1], [-1, -1]]]},
+}
+# Hostile target inside the AO (position 0,0).
+_ONE_TAP_TARGET = {
+    "id": "det-1", "callsign": "HOSTILE-1", "threat_level": "HIGH",
+    "iff_verified": False, "drone_lat": 0.0, "drone_lon": 0.0,
+    "center_freq_ghz": 2.45,
+}
+
+
+class _OneTapColl:
+    def __init__(self, docs_by_id):
+        self._docs = docs_by_id
+
+    async def find_one(self, query, projection=None):
+        d = self._docs.get(query.get("id"))
+        return dict(d) if d else None
+
+    async def count_documents(self, query):
+        return 1
+
+
+class _OneTapDB:
+    def __init__(self):
+        self.detections = _OneTapColl({_ONE_TAP_TARGET["id"]: _ONE_TAP_TARGET})
+        self.zones = _OneTapColl({_ONE_TAP_AO_ZONE["id"]: _ONE_TAP_AO_ZONE})
+
+
+def _arm_tight_posture(effects=("jam",), ao="AO-1", ttl_s=1800):
+    now = srv.datetime.now(srv.timezone.utc)
+    srv._weapons_posture.update({
+        "state": "TIGHT", "ao": ao, "permitted_effects": list(effects),
+        "expires_at": now + srv.timedelta(seconds=ttl_s),
+        "armed_by": "cmdr", "armed_at": now,
+        "safety_ack": {"checklist": list(srv.WEAPONS_POSTURE_SAFETY_CHECKLIST)},
+        "iff_registry_loaded": True,
+    })
+
+
+def test_one_tap_gnss_deny_jam_override_is_refused_never_one_tap(monkeypatch):
+    """effect_override='gnss_deny_jam' -- a FEASIBLE + currently-clearable GNSS
+    AREA-denial the recommender surfaced -- is refused at the composable gate
+    (409, nothing fired), because gnss_deny_jam maps to a NON-composable engage
+    effect. GNSS-band denial is never a per-target one-tap."""
+    monkeypatch.setattr(srv, "_tx_halted", False)
+    monkeypatch.setattr(srv, "db", _OneTapDB())
+
+    async def _log(kind, message, meta=None, actor=None):
+        return {}
+    monkeypatch.setattr(srv, "log_event", _log)
+
+    # Recommender surfaces gnss_deny_jam as FEASIBLE and currently clearable so
+    # the override passes the feasibility + clearability checks and reaches the
+    # composable gate (the point under test).
+    async def _reco():
+        return {
+            "recommendations": [{
+                "detection_id": "det-1",
+                "callsign": "HOSTILE-1",
+                "recommended_effector": "jam",
+                "recommended_rationale": "jam is the clearable primary",
+                "feasibility": {
+                    "jam": {"verdict": "FEASIBLE_UNVERIFIED_RANGE"},
+                    "gnss_deny_jam": {"verdict": "FEASIBLE_UNVERIFIED_RANGE"},
+                    "gnss_spoof": {"verdict": "FEASIBLE_PLACEHOLDER_V1"},
+                },
+                "failover_order": [{
+                    "effector": "gnss_deny_jam", "feasible": True,
+                    "available": True, "reason": "clearable now (jam slot)",
+                }],
+            }],
+            "excluded": [],
+        }
+    monkeypatch.setattr(srv, "_compute_effector_recommendations", _reco)
+
+    try:
+        _arm_tight_posture(effects=("jam",))
+        with pytest.raises(srv.HTTPException) as ei:
+            asyncio.run(srv.one_tap_engage(
+                srv.EngageBody(target_detection_id="det-1", engage_confirm=True,
+                               effect_override="gnss_deny_jam"),
+                user=COMMANDER))
+        assert ei.value.status_code == 409
+        # The refusal is specifically the not-a-one-tap-effect gate, and it names
+        # gnss_deny_jam as the effector that cannot be fired one-tap.
+        detail = ei.value.detail
+        assert isinstance(detail, dict)
+        assert detail.get("selected_effector") == "gnss_deny_jam"
+        assert "one-tap effect" in detail.get("error", "")
+        # It is genuinely NON-composable in the mapping (defence-in-depth).
+        assert srv._EFFECTOR_TO_ENGAGE_EFFECT["gnss_deny_jam"] \
+            not in srv.ENGAGE_COMPOSABLE_EFFECTS
+    finally:
+        srv._reset_weapons_posture_fields()
+        srv._tx_halted = True
 
 
 # ==========================================================================
