@@ -10,6 +10,7 @@ const fs = require("fs");
 const path = require("path");
 const {
   noStrikeOverrideNeeded, noStrikeOverrideCategory, noStrikeOverrideJustificationValid,
+  noStrikeOverrideJustificationRequired,
   MIN_NO_STRIKE_OVERRIDE_JUSTIFICATION_LEN, OVERRIDABLE_NO_STRIKE_CATEGORIES,
 } = require("./noStrikeOverride");
 
@@ -54,6 +55,14 @@ describe("noStrikeOverrideJustificationValid — a real, long-enough justificati
   });
 });
 
+describe("noStrikeOverrideJustificationRequired — follows the backend flag", () => {
+  test("required only when the backend flag is on (default off = not required)", () => {
+    expect(noStrikeOverrideJustificationRequired(false)).toBe(false);
+    expect(noStrikeOverrideJustificationRequired(undefined)).toBe(false);
+    expect(noStrikeOverrideJustificationRequired(true)).toBe(true);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Static guarantee on WifiDefeat.jsx: the override modal mints via the override
 // endpoint, gates its confirm on a valid justification, and carries the token.
@@ -76,5 +85,16 @@ describe("WifiDefeat.jsx override modal wiring (static scan)", () => {
 
   test("opens the override modal only when noStrikeOverrideNeeded is true", () => {
     expect(src).toMatch(/noStrikeOverrideNeeded\(selectedDet\)/);
+  });
+
+  test("the justification field + its client-side check are gated on the backend flag", () => {
+    // The flag is read from the /wifi-defeat/status payload the page already polls.
+    expect(src).toContain("data.commander_override_justification_required === true");
+    // The justification field renders only when required...
+    expect(src).toMatch(/justificationRequired\s*&&\s*\(/);
+    // ...and the client-side justification enforcement runs only when required
+    // (the password step-up stays required regardless).
+    expect(src).toMatch(
+      /justificationRequired\s*&&\s*!noStrikeOverrideJustificationValid\(overrideJustification\)/);
   });
 });

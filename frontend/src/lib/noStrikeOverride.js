@@ -34,3 +34,14 @@ export function noStrikeOverrideJustificationValid(text) {
   if (typeof text !== "string") return false;
   return text.trim().length >= MIN_NO_STRIKE_OVERRIDE_JUSTIFICATION_LEN;
 }
+
+// Is a justification REQUIRED to mint the override? GATED on the backend
+// COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED flag, which WifiDefeat reads from
+// the /wifi-defeat/status payload as `commander_override_justification_required`
+// (DEFAULT FALSE per operator directive — not needed until near field
+// deployment). When off, the modal shows no justification field and the confirm
+// gates on the password alone; when on, the field is shown and required. The
+// password step-up and every backend gate are unchanged regardless of the flag.
+export function noStrikeOverrideJustificationRequired(flagOn) {
+  return flagOn === true;
+}

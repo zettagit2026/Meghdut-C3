@@ -361,11 +361,38 @@ async def test_commander_override_never_bypasses_civilian_hard_floor(monkeypatch
 
 
 # ---------------------------------------------------------------------
-# FIX 3 — F2 FRICTION: a commander-override designation of a NON-DRONE AP
-# REQUIRES a real justification, forces the honest possibly-civilian caveat, and
-# emits a distinct top-severity WIFI_SURVEY_COMMANDER_OVERRIDE_DESIGNATE audit.
+# F2 FRICTION (flag-gated): the commander-override justification requirement is
+# governed by COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED (DEFAULT FALSE per the
+# operator directive — not needed until near field deployment).
+#   * flag OFF (now): a commander-override designate of a NON-DRONE AP proceeds
+#     with NO justification, forces the honest possibly-civilian caveat, and
+#     STILL emits the distinct WIFI_SURVEY_COMMANDER_OVERRIDE_DESIGNATE audit
+#     (noting the justification was not required);
+#   * flag ON: a real justification is required (absent/trivial -> 400).
 # ---------------------------------------------------------------------
-async def test_commander_override_designate_requires_justification_and_audits(monkeypatch):
+async def test_commander_override_designate_no_justification_succeeds_when_flag_off(monkeypatch):
+    monkeypatch.setattr(srv, "COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED", False)
+    db, events = _setup(monkeypatch)
+    # No justification at all -> still created (flag off, pre-field).
+    res = await srv.designate_wifi_survey_uas(
+        _body(bssid="AA:BB:CC:DD:EE:03", oui="AA:BB:CC", ssid="MyOfficeWiFi",
+              vendor="Cisco", commander_override=True),
+        user=COMMANDER,
+    )
+    assert res["bssid"] == "AA:BB:CC:DD:EE:03"
+    assert len(db.detections.docs) == 1
+    doc = db.detections.docs[0]
+    caveats = " ".join(doc.get("caveats") or []).lower()
+    assert "possibly civilian" in caveats and "non-drone" in caveats
+    # The distinct override audit STILL fires — never silent — noting no justification required.
+    ovr = [e for e in events if e["kind"] == "WIFI_SURVEY_COMMANDER_OVERRIDE_DESIGNATE"]
+    assert ovr, "the override designate must be audited even when no justification is required"
+    assert ovr[0]["meta"]["justification"] == "not required (pre-field)"
+    assert ovr[0]["meta"]["bssid"] == "AA:BB:CC:DD:EE:03"
+
+
+async def test_commander_override_designate_requires_justification_when_flag_on(monkeypatch):
+    monkeypatch.setattr(srv, "COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED", True)
     db, events = _setup(monkeypatch)
     # (1) No justification -> 400, nothing created.
     with pytest.raises(srv.HTTPException) as ei:

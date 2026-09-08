@@ -683,6 +683,26 @@ def _looks_like_real_attestation(text: Optional[str]) -> bool:
     return True
 
 
+# COMMANDER-OVERRIDE JUSTIFICATION GATE — field-deployment friction toggle.
+# When True, BOTH commander-override justification gates below REQUIRE a real,
+# actively-typed justification (_looks_like_real_attestation):
+#   * designate_wifi_survey_uas's commander_override (NON-DRONE) branch, and
+#   * mint_no_strike_override.
+# DEFAULT FALSE per operator directive — the extra typed-justification friction
+# is not needed until near field deployment. Flip it on via the environment
+# (COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED=true) then restart the backend;
+# the frontend surfaces the flag (see the /wifi-environment survey payload and
+# /wifi-defeat/status) so the justification field appears with NO rebuild.
+# It NEVER relaxes any OTHER gate regardless of value: the commander step-up,
+# the per-BSSID / no-broadcast guard, the CIVILIAN_INFRASTRUCTURE hard-floor
+# refuse, single-use token binding, and the honest candidate caveats all stand.
+# Parsed exactly like the file's other boolean env flags (DETECTION_WIFI_FUSION_ENABLED).
+COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED = (
+    os.environ.get("COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED", "false").strip().lower()
+    in ("1", "true", "yes", "on")
+)
+
+
 def _issue_gnss_spoof_confirm_token(attestation: str) -> Dict[str, Any]:
     token = str(uuid.uuid4())
     _gnss_spoof_confirm_tokens[token] = datetime.now(timezone.utc) + timedelta(seconds=GNSS_SPOOF_CONFIRM_TTL_S)
@@ -4997,6 +5017,9 @@ async def get_wifi_environment(user: Dict = Depends(get_current_user)):
             "configured": False,
             "available": False,
             "status": "KISMET_URL not configured on the backend.",
+            # EXISTING channel WifiEnvironment already polls — surfaces the flag
+            # so the commander-override designate justification field is conditional.
+            "commander_override_justification_required": COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED,
             "source": "KISMET",
             "polled_at": _now_iso(),
             "ap_count": 0,
@@ -5024,6 +5047,7 @@ async def get_wifi_environment(user: Dict = Depends(get_current_user)):
             "configured": True,
             "available": False,
             "status": _sanitize_kismet_error(e),
+            "commander_override_justification_required": COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED,
             "source": "KISMET",
             "polled_at": _now_iso(),
             "ap_count": 0,
@@ -5038,6 +5062,7 @@ async def get_wifi_environment(user: Dict = Depends(get_current_user)):
         "configured": True,
         "available": True,
         "status": "ok",
+        "commander_override_justification_required": COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED,
         "source": "KISMET",
         "polled_at": _now_iso(),
         "ap_count": len(aps),
@@ -5119,12 +5144,17 @@ async def designate_wifi_survey_uas(body: WifiSurveyDesignateBody,
         # refuse (c) still apply, and fire still needs the SafetyGate + (for a
         # NEUTRAL/FRIENDLY match) the fire-time no-strike override token.
         #
-        # F2 FRICTION: promoting a NON-DRONE AP (which is POSSIBLY CIVILIAN) is a
-        # deliberate, audited act — require a real, actively-typed justification
-        # (>=20 chars, not a trivial placeholder), exactly like the no-strike
-        # override / declassify ceremonies. A drone-tagged designation above needs
-        # no justification (unchanged).
-        if not _looks_like_real_attestation(body.justification):
+        # F2 FRICTION (flag-gated): promoting a NON-DRONE AP (which is POSSIBLY
+        # CIVILIAN) is a deliberate, audited act. When
+        # COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED is True (near field
+        # deployment) it requires a real, actively-typed justification (>=20
+        # chars, not a trivial placeholder), exactly like the no-strike override
+        # / declassify ceremonies. DEFAULT FALSE per operator directive — the
+        # override then proceeds with an absent/empty justification (the audit
+        # still fires, noting "not required (pre-field)"). A drone-tagged
+        # designation above never needs a justification (unchanged). Every OTHER
+        # gate (commander, per-BSSID, CIVILIAN hard-floor) is untouched by the flag.
+        if COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED and not _looks_like_real_attestation(body.justification):
             raise HTTPException(
                 400,
                 "A specific, actively-typed justification is required to commander-override the "
@@ -5195,14 +5225,18 @@ async def designate_wifi_survey_uas(body: WifiSurveyDesignateBody,
     # audit — the deliberate promotion of an unverified/possibly-civilian AP is
     # never silent in the hash-chained trail.
     if commander_override_used:
+        # Record the justification if one was supplied; otherwise note that it
+        # was not required (the flag was off — pre-field). The override itself
+        # is ALWAYS audited regardless of the flag.
+        justification_note = body.justification if body.justification else "not required (pre-field)"
         await log_event(
             "WIFI_SURVEY_COMMANDER_OVERRIDE_DESIGNATE",
             f"COMMANDER OVERRODE the drone gate to designate a NON-DRONE AP (POSSIBLY CIVILIAN) "
             f"bssid={body.bssid} ssid={body.ssid or 'n/a'} as a candidate contact {detection_id} "
             f"— unverified, SSID/OUI spoofable, candidate NOT identification. "
-            f"Justification: {body.justification}",
+            f"Justification: {justification_note}",
             meta={"detection_id": detection_id, "bssid": body.bssid,
-                  "ssid": body.ssid, "justification": body.justification,
+                  "ssid": body.ssid, "justification": justification_note,
                   "source": "WIFI_SURVEY_MANUAL", "actor": user["email"]},
             actor=user["email"],
         )
@@ -5905,8 +5939,14 @@ async def mint_no_strike_override(det_id: str, body: NoStrikeOverrideBody,
         )
         raise HTTPException(401, "Password re-verification failed.")
 
-    # 2. A real, actively-typed justification (never a trivial placeholder).
-    if not _looks_like_real_attestation(body.justification):
+    # 2. A real, actively-typed justification (never a trivial placeholder) —
+    #    GATED on COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED. DEFAULT FALSE per
+    #    operator directive (pre-field): the mint proceeds without a real
+    #    justification. Every OTHER gate (password step-up above, the CIVILIAN
+    #    hard-floor refuse, single-use target+effect+bssid+category binding) is
+    #    untouched by the flag. The justification is still recorded on the token
+    #    and in the audit below (whatever the client sent).
+    if COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED and not _looks_like_real_attestation(body.justification):
         raise HTTPException(
             400,
             "A specific, actively-typed justification is required to mint a no-strike "
@@ -9918,7 +9958,11 @@ async def wifi_defeat_status(user: Dict = Depends(get_current_user)):
           "ts": p["ts"].isoformat()} for rid, p in _pending_wifi_defeat.items()),
         key=lambda s: s["ts"], reverse=True,
     )
-    return {"sessions": sessions[:20]}
+    # Surface the commander-override justification flag here (an EXISTING channel
+    # WifiDefeat already polls) so its no-strike override modal renders/requires
+    # the justification field conditionally with NO rebuild when the flag flips.
+    return {"sessions": sessions[:20],
+            "commander_override_justification_required": COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED}
 
 
 # =====================================================================

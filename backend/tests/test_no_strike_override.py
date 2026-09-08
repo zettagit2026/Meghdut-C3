@@ -257,12 +257,26 @@ def test_issuance_bad_password_401(monkeypatch):
     assert srv._no_strike_overrides == {}
 
 
-def test_issuance_trivial_justification_400(monkeypatch):
+def test_issuance_trivial_justification_400_when_flag_on(monkeypatch):
+    # Flag ON (near field deployment): a trivial/placeholder justification is refused.
+    monkeypatch.setattr(srv, "COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED", True)
     _stub(monkeypatch, detection=_wifi(), entries=[NEUTRAL_ENTRY])
     with pytest.raises(srv.HTTPException) as ei:
         _mint(justification="n/a")
     assert ei.value.status_code == 400
     assert srv._no_strike_overrides == {}
+
+
+def test_issuance_no_real_justification_mints_when_flag_off(monkeypatch):
+    # DEFAULT (flag off, pre-field): the mint proceeds WITHOUT a real justification
+    # (a trivial placeholder is accepted). Every OTHER gate is unchanged — the
+    # password step-up already passed and the NEUTRAL entry is overridable.
+    monkeypatch.setattr(srv, "COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED", False)
+    events, _ = _stub(monkeypatch, detection=_wifi(), entries=[NEUTRAL_ENTRY])
+    out = _mint(justification="n/a")
+    assert out["token"] in srv._no_strike_overrides
+    assert srv._no_strike_overrides[out["token"]]["category"] == "NEUTRAL"
+    assert any(e["kind"] == "NO_STRIKE_OVERRIDE_MINTED" for e in events)
 
 
 def test_issuance_not_matched_422(monkeypatch):

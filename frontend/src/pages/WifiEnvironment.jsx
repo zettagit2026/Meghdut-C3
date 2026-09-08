@@ -6,7 +6,7 @@ import { useAuth } from "@/context/AuthContext";
 import { Rss, ShieldAlert, ShieldPlus, ShieldCheck, Search, ArrowUp, ArrowDown, X, Crosshair } from "lucide-react";
 import {
   filterAps, sortAps, isPossibleUas, canDesignateUas, encryptionLabel, pmfLabel, lastSeenLabel, macOui,
-  hasConcreteBssid,
+  hasConcreteBssid, designateJustificationRequired, designateJustificationValid, DESIGNATE_JUSTIFICATION_MIN_LEN,
 } from "@/lib/wifiEnvironment";
 
 // WI-FI ENVIRONMENT — RF situational awareness.
@@ -188,17 +188,28 @@ function AddNoStrikeModal({ ap, onClose, onAdded }) {
 // byte-unchanged /wifi-defeat SafetyGate flow. The actual arm/confirm/fire
 // happens on that next screen — never here. Deliberate (a confirm modal),
 // never a bare one-click deauth, with HONEST spoofable-candidate copy.
-function DesignateUasModal({ ap, onConfirm, onClose }) {
+// `justificationRequired` is TRUE only for a commander-override (non-drone)
+// designation AND only when the backend COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED
+// flag is on (surfaced on the survey payload). When TRUE, a required ≥20-char
+// justification textarea is shown and the confirm stays disabled until it is
+// valid; the justification is sent in the designate POST. When FALSE (default,
+// pre-field), no field is shown, the confirm is enabled immediately, and the
+// POST omits the justification entirely.
+function DesignateUasModal({ ap, justificationRequired, onConfirm, onClose }) {
   const oui = macOui(ap.bssid);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState(null);
+  const [justification, setJustification] = useState("");
+
+  const justificationOk = !justificationRequired || designateJustificationValid(justification);
 
   async function submit(e) {
     e.preventDefault();
+    if (!justificationOk) return;
     setSaving(true);
     setErr(null);
     try {
-      await onConfirm();
+      await onConfirm(justificationRequired ? justification.trim() : undefined);
       // On success the parent navigates away; leave `saving` true so the
       // button stays disabled through the unmount (no flicker).
     } catch (e2) {
@@ -263,6 +274,31 @@ function DesignateUasModal({ ap, onConfirm, onClose }) {
               <dd className="text-slate-300">{ap.vendor || "unknown"}</dd>
             </div>
           </dl>
+          {justificationRequired && (
+            <label className="block">
+              <span className="font-mono text-[10px] uppercase tracking-widest text-slate-500">
+                Justification — required. Why is this NON-DRONE, possibly-civilian AP a target?
+                (min {DESIGNATE_JUSTIFICATION_MIN_LEN} chars, specific — not a placeholder)
+              </span>
+              <textarea
+                data-testid="wifi-env-designate-justification"
+                value={justification}
+                onChange={(e) => setJustification(e.target.value)}
+                rows={3}
+                required
+                className="mt-1 w-full tactical-input tactical-border px-3 py-2 font-mono text-xs focus:outline-none"
+                style={{ background: "var(--bg-surface)" }}
+                placeholder="e.g. Observed co-located with the reported UAS launch point, RSSI tracking the visual contact…"
+              />
+              <span
+                data-testid="wifi-env-designate-justification-count"
+                className="mt-1 block font-mono text-[9px] uppercase tracking-widest"
+                style={{ color: justificationOk ? "var(--accent-success)" : "var(--text-muted)" }}
+              >
+                {justification.trim().length}/{DESIGNATE_JUSTIFICATION_MIN_LEN} min
+              </span>
+            </label>
+          )}
           {err && (
             <div className="font-mono text-[10px]" style={{ color: "var(--accent-critical)" }} data-testid="wifi-env-designate-error">
               {err}
@@ -280,7 +316,7 @@ function DesignateUasModal({ ap, onConfirm, onClose }) {
             <button
               type="submit"
               data-testid="wifi-env-designate-confirm"
-              disabled={saving}
+              disabled={saving || !justificationOk}
               className="px-4 py-2 tactical-border font-mono text-xs font-bold uppercase tracking-widest hover-surface scanline-btn disabled:opacity-50"
               style={{ color: "var(--accent-warning)", borderColor: "var(--accent-warning)" }}
             >
@@ -360,7 +396,7 @@ export default function WifiEnvironment() {
   // existing /wifi-defeat SafetyGate flow. This call ONLY creates the contact +
   // routes — it does NOT arm or fire (WifiDefeat's SafetyGate is the deliberate
   // confirm). The backend re-derives every gate server-side.
-  const doDesignate = async (ap) => {
+  const doDesignate = async (ap, justification) => {
     const ch = ap.channel != null && ap.channel !== "" ? Number(ap.channel) : null;
     const { data } = await api.post("/wifi-environment/designate", {
       bssid: ap.bssid,
@@ -373,6 +409,10 @@ export default function WifiEnvironment() {
       // COMMANDER OVERRIDE: only set for a non-drone-tagged row the commander
       // deliberately designated (the backend forces the honest non-drone label).
       commander_override: ap.__commanderOverride === true,
+      // JUSTIFICATION: sent ONLY when the modal collected one (commander-override
+      // AND the backend flag is on). Omitted entirely otherwise, so the payload
+      // shape for a normal drone-tagged designate is unchanged.
+      ...(justification ? { justification } : {}),
     });
     toast.success("DESIGNATED — SUSPECTED UAS", {
       description: `${ap.ssid || ap.bssid} → Wi-Fi defeat (candidate, not identification)`,
@@ -670,8 +710,12 @@ export default function WifiEnvironment() {
       {designatingAp && (
         <DesignateUasModal
           ap={designatingAp}
+          justificationRequired={designateJustificationRequired(
+            designatingAp?.__commanderOverride === true,
+            survey?.commander_override_justification_required === true,
+          )}
           onClose={() => setDesignatingAp(null)}
-          onConfirm={() => doDesignate(designatingAp)}
+          onConfirm={(justification) => doDesignate(designatingAp, justification)}
         />
       )}
     </div>

@@ -195,6 +195,31 @@ export function sortAps(aps, key, dir = "desc") {
   return list;
 }
 
+// COMMANDER-OVERRIDE (non-drone) DESIGNATE justification. The backend gate is
+// GATED on COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED, surfaced to the frontend
+// on the /wifi-environment survey payload as
+// `commander_override_justification_required` (DEFAULT FALSE per operator
+// directive — the field is not needed until near field deployment). When the
+// flag is ON, a commander-override designate of a NON-DRONE (possibly-civilian)
+// AP requires a real, actively-typed justification (>=20 chars, floored
+// server-side by _looks_like_real_attestation); when OFF, no justification is
+// required and the field is not shown. These pure predicates let the modal
+// render/require the field with NO rebuild when the flag flips — the backend
+// remains the source of truth for every gate.
+export const DESIGNATE_JUSTIFICATION_MIN_LEN = 20;
+
+// Is a justification REQUIRED for this designate? Only for a commander-override
+// (non-drone) designation AND only when the backend flag is on.
+export function designateJustificationRequired(commanderOverride, flagOn) {
+  return commanderOverride === true && flagOn === true;
+}
+
+// Is the typed justification minimally valid (long enough, not blank)? Mirrors
+// the backend length floor; the backend re-checks and also rejects placeholders.
+export function designateJustificationValid(text) {
+  return typeof text === "string" && text.trim().length >= DESIGNATE_JUSTIFICATION_MIN_LEN;
+}
+
 // Seconds-since-last-seen -> compact relative label. `nowSec` injectable for
 // deterministic tests.
 export function lastSeenLabel(ap, nowSec) {

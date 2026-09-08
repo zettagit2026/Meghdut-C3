@@ -14,6 +14,7 @@ const {
   isPossibleUas, droneOuiVendor, ssidLooksLikeDrone, filterAps, sortAps,
   encryptionLabel, pmfLabel, lastSeenLabel, canDesignateUas, hasConcreteBssid,
   matchedNoStrikeEntry, noStrikeRowAction,
+  designateJustificationRequired, designateJustificationValid, DESIGNATE_JUSTIFICATION_MIN_LEN,
 } = require("./wifiEnvironment");
 
 // A small fixture in the exact survey shape the backend returns.
@@ -225,6 +226,32 @@ describe("filter + sort (drives what the table renders)", () => {
 // /wifi-defeat SafetyGate flow where the deliberate arm/fire lives. The page
 // must never call a fire/transmit endpoint directly. Scan its source.
 // ---------------------------------------------------------------------------
+describe("commander-override designate justification — flag-gated field-required predicate", () => {
+  test("required ONLY for a commander-override designate AND only when the flag is on", () => {
+    // Flag OFF (default, pre-field): never required — no field shown.
+    expect(designateJustificationRequired(true, false)).toBe(false);
+    expect(designateJustificationRequired(false, false)).toBe(false);
+    // Flag ON: required only on the commander-override (non-drone) path.
+    expect(designateJustificationRequired(true, true)).toBe(true);
+    expect(designateJustificationRequired(false, true)).toBe(false);
+  });
+
+  test("a normal drone-tagged designate never requires a justification, flag on or off", () => {
+    expect(designateJustificationRequired(false, false)).toBe(false);
+    expect(designateJustificationRequired(false, true)).toBe(false);
+  });
+
+  test("designateJustificationValid mirrors the backend length floor", () => {
+    expect(designateJustificationValid("")).toBe(false);
+    expect(designateJustificationValid("   ")).toBe(false);
+    expect(designateJustificationValid("too short")).toBe(false);
+    expect(designateJustificationValid(null)).toBe(false);
+    expect(designateJustificationValid("x".repeat(DESIGNATE_JUSTIFICATION_MIN_LEN))).toBe(true);
+    expect(designateJustificationValid(
+      "Visual confirmation of a rogue relay operating from this office AP.")).toBe(true);
+  });
+});
+
 describe("WifiEnvironment page: protect + designate, but transmits nothing itself", () => {
   const pageSrc = fs.readFileSync(
     path.join(__dirname, "..", "pages", "WifiEnvironment.jsx"), "utf8"
@@ -272,6 +299,17 @@ describe("WifiEnvironment page: protect + designate, but transmits nothing itsel
     // rendered when canDesignateUas(...) — which requires isCommander.
     expect(pageSrc).toMatch(/disabled=\{!isCommander/);
     expect(pageSrc).toMatch(/canDesignateUas\(ap,\s*\{\s*isCommander/);
+  });
+
+  test("the designate justification field + POST are gated on the flag-driven requirement", () => {
+    // The modal renders the justification textarea only when justificationRequired,
+    // and the confirm is disabled until it is valid (justificationOk).
+    expect(pageSrc).toMatch(/justificationRequired\s*&&\s*\(/);
+    expect(pageSrc).toMatch(/disabled=\{saving \|\| !justificationOk\}/);
+    // The required flag is derived from the backend survey payload, never assumed.
+    expect(pageSrc).toContain("survey?.commander_override_justification_required === true");
+    // The justification is included in the POST only when one was collected.
+    expect(pageSrc).toMatch(/\.\.\.\(justification \? \{ justification \} : \{\}\)/);
   });
 
   test("the panel issues NO api.* call to any fire/transmit endpoint", () => {

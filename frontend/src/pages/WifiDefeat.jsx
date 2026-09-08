@@ -13,7 +13,7 @@ import EmergencyAbort from "@/components/EmergencyAbort";
 import { useAuth } from "@/context/AuthContext";
 import {
   noStrikeOverrideNeeded, noStrikeOverrideCategory, noStrikeOverrideJustificationValid,
-  MIN_NO_STRIKE_OVERRIDE_JUSTIFICATION_LEN,
+  noStrikeOverrideJustificationRequired, MIN_NO_STRIKE_OVERRIDE_JUSTIFICATION_LEN,
 } from "@/lib/noStrikeOverride";
 
 // =============================================================================
@@ -148,6 +148,12 @@ export default function WifiDefeat() {
   const [overrideJustification, setOverrideJustification] = useState("");
   const [overrideSubmitting, setOverrideSubmitting] = useState(false);
   const [overrideErr, setOverrideErr] = useState(null);
+  // Backend COMMANDER_OVERRIDE_JUSTIFICATION_REQUIRED flag, read from the
+  // /wifi-defeat/status payload this page already polls. DEFAULT FALSE
+  // (pre-field): the override modal shows no justification field and the confirm
+  // gates on the password alone. Flips to require it with NO rebuild when the
+  // backend flag is turned on. The password step-up is always required.
+  const [justificationRequired, setJustificationRequired] = useState(false);
   const [lastSuccessAt, setLastSuccessAt] = useState(null);
   const [consecutiveFailures, setConsecutiveFailures] = useState(0);
   const [now, setNow] = useState(() => Date.now());
@@ -176,6 +182,8 @@ export default function WifiDefeat() {
     try {
       const { data } = await api.get("/wifi-defeat/status");
       setSessions(data.sessions || []);
+      setJustificationRequired(
+        noStrikeOverrideJustificationRequired(data.commander_override_justification_required === true));
       setLastSuccessAt(Date.now());
       setConsecutiveFailures(0);
     } catch {
@@ -314,7 +322,9 @@ export default function WifiDefeat() {
   const submitNoStrikeOverride = async (e) => {
     if (e && e.preventDefault) e.preventDefault();
     if (!target) return;
-    if (!noStrikeOverrideJustificationValid(overrideJustification)) {
+    // Justification is enforced client-side ONLY when the backend flag requires
+    // it; the backend re-checks. When not required (pre-field), skip the check.
+    if (justificationRequired && !noStrikeOverrideJustificationValid(overrideJustification)) {
       setOverrideErr(
         `Justification must be at least ${MIN_NO_STRIKE_OVERRIDE_JUSTIFICATION_LEN} characters.`);
       return;
@@ -703,18 +713,20 @@ export default function WifiDefeat() {
                 style={{ color: "var(--text-primary)" }}
               />
             </label>
-            <label className="block font-mono text-[10px] uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>
-              Justification (required, min {MIN_NO_STRIKE_OVERRIDE_JUSTIFICATION_LEN} chars)
-              <textarea
-                data-testid="no-strike-override-justification"
-                value={overrideJustification}
-                onChange={(e) => setOverrideJustification(e.target.value)}
-                rows={3}
-                placeholder="Why this NEUTRAL/FRIENDLY contact must be engaged — recorded verbatim in the audit trail."
-                className="mt-1 w-full px-3 py-2 tactical-border bg-transparent font-mono text-sm"
-                style={{ color: "var(--text-primary)" }}
-              />
-            </label>
+            {justificationRequired && (
+              <label className="block font-mono text-[10px] uppercase tracking-widest" style={{ color: "var(--text-muted)" }}>
+                Justification (required, min {MIN_NO_STRIKE_OVERRIDE_JUSTIFICATION_LEN} chars)
+                <textarea
+                  data-testid="no-strike-override-justification"
+                  value={overrideJustification}
+                  onChange={(e) => setOverrideJustification(e.target.value)}
+                  rows={3}
+                  placeholder="Why this NEUTRAL/FRIENDLY contact must be engaged — recorded verbatim in the audit trail."
+                  className="mt-1 w-full px-3 py-2 tactical-border bg-transparent font-mono text-sm"
+                  style={{ color: "var(--text-primary)" }}
+                />
+              </label>
+            )}
             {overrideErr && (
               <div className="font-mono text-[11px]" style={{ color: "var(--accent-critical)" }}>
                 {overrideErr}
@@ -732,7 +744,7 @@ export default function WifiDefeat() {
               <button
                 type="submit"
                 data-testid="no-strike-override-confirm"
-                disabled={overrideSubmitting || !noStrikeOverrideJustificationValid(overrideJustification) || !overridePassword}
+                disabled={overrideSubmitting || !overridePassword || (justificationRequired && !noStrikeOverrideJustificationValid(overrideJustification))}
                 className="px-3 py-1.5 tactical-border font-mono text-[11px] font-bold uppercase tracking-widest hover-surface disabled:opacity-30 disabled:cursor-not-allowed"
                 style={{ color: "var(--accent-critical)", borderColor: "var(--accent-critical)" }}
               >
