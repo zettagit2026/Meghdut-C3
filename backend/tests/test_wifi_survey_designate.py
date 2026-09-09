@@ -37,6 +37,7 @@ import asyncio
 
 import pytest
 
+import kismet_survey
 import server as srv
 
 COMMANDER = {"email": "cmd@unused.local", "role": "commander"}
@@ -50,6 +51,36 @@ GOOD_JUST = "Visual confirmation of a rogue relay operating from this office AP.
 # in kismet_survey.DRONE_MANUFACTURER_OUIS).
 DJI_BSSID = "60:60:1F:AA:BB:CC"
 DJI_OUI = "60:60:1F"
+
+# A second, DISTINCT drone-OUI BSSID used only to prove per-BSSID scoping (its
+# associated STAs must never bleed onto a DJI_BSSID designation).
+OTHER_DJI_BSSID = "60:60:1F:11:22:33"
+
+
+def _kismet_device(bssid, client_macs=(), ssid="Mavic-Air-1234"):
+    """A minimal real Kismet device-JSON object (the SAME schema Kismet's REST
+    API returns -- see kismet_survey.py's docstring / test_wifi_environment.py)
+    whose dot11.device.associated_client_map is KEYED by the given client MACs,
+    exactly like a real softAP's associated-client record."""
+    return {
+        "kismet.device.base.macaddr": bssid,
+        "kismet.device.base.phyname": "IEEE802.11",
+        "kismet.device.base.name": ssid,
+        "kismet.device.base.type": "Wi-Fi AP",
+        "kismet.device.base.manuf": "Dji Innovations",
+        "kismet.device.base.channel": "149",
+        "kismet.device.base.frequency": 5745000,
+        "kismet.device.base.first_time": 1_700_000_000,
+        "kismet.device.base.last_time": 1_700_000_600,
+        "kismet.device.base.signal": {"kismet.common.signal.last_signal": -50},
+        "dot11.device": {
+            "dot11.device.num_associated_clients": len(client_macs),
+            "dot11.device.associated_client_map": {mac: {} for mac in client_macs},
+            "dot11.device.last_beaconed_ssid_record": {
+                "dot11.advertisedssid.ssid": ssid,
+            },
+        },
+    }
 
 
 def _body(**overrides):
@@ -427,3 +458,83 @@ async def test_commander_override_designate_requires_justification_when_flag_on(
     assert ovr[0]["meta"]["justification"] == GOOD_JUST
     assert ovr[0]["meta"]["bssid"] == "AA:BB:CC:DD:EE:02"
     # A drone-tagged designation still needs NO justification (unchanged).
+
+
+# ---------------------------------------------------------------------
+# (g) DESIGNATE resolves associated_client_macs SERVER-SIDE from a live
+# Kismet survey, so the per-STA (unicast) deauth fire-time resolver has real
+# targets on the operator's actual test path (survey -> ENGAGE COMMANDER
+# OVERRIDE -> designate -> wifi-defeat), instead of an always-empty list.
+# ---------------------------------------------------------------------
+async def test_designate_resolves_associated_client_macs_from_kismet(monkeypatch):
+    """A BSSID whose (mocked) Kismet survey row HAS associated STAs -> the
+    created detection carries those associated_client_macs."""
+    db, _events = _setup(monkeypatch)
+    monkeypatch.setattr(srv, "KISMET_URL", "http://kismet:2501")
+    monkeypatch.setattr(srv, "KISMET_APIKEY", "apikey")
+    monkeypatch.setattr(
+        kismet_survey, "fetch_kismet_devices",
+        lambda url, key: [
+            _kismet_device(DJI_BSSID, client_macs=["DE:AD:BE:EF:00:01", "de:ad:be:ef:00:02"]),
+        ],
+    )
+
+    await srv.designate_wifi_survey_uas(_body(), user=COMMANDER)
+
+    doc = db.detections.docs[0]
+    assert doc["associated_client_macs"] == ["DE:AD:BE:EF:00:01", "DE:AD:BE:EF:00:02"]
+
+
+async def test_designate_with_no_associated_stas_is_honest_empty_list(monkeypatch):
+    """A BSSID whose (mocked) Kismet survey row has NO associated STAs yet ->
+    the detection's associated_client_macs is [] (honest, never fabricated).
+    This is CORRECT behavior: the fire path will honestly refuse a per-STA
+    deauth until Kismet has actually observed a client associate."""
+    db, _events = _setup(monkeypatch)
+    monkeypatch.setattr(srv, "KISMET_URL", "http://kismet:2501")
+    monkeypatch.setattr(srv, "KISMET_APIKEY", "apikey")
+    monkeypatch.setattr(
+        kismet_survey, "fetch_kismet_devices",
+        lambda url, key: [_kismet_device(DJI_BSSID, client_macs=[])],
+    )
+
+    await srv.designate_wifi_survey_uas(_body(), user=COMMANDER)
+
+    doc = db.detections.docs[0]
+    assert doc["associated_client_macs"] == []
+
+
+async def test_designate_without_kismet_configured_is_honest_empty_list(monkeypatch):
+    """KISMET_URL unset/unconfigured (no live survey to resolve against) ->
+    associated_client_macs is honestly [], never fabricated, and the endpoint
+    still creates the governed contact (unchanged pre-existing behavior)."""
+    db, _events = _setup(monkeypatch)
+    monkeypatch.setattr(srv, "KISMET_URL", "")
+
+    await srv.designate_wifi_survey_uas(_body(), user=COMMANDER)
+
+    doc = db.detections.docs[0]
+    assert doc["associated_client_macs"] == []
+
+
+async def test_designate_associated_client_macs_scoped_to_requested_bssid_only(monkeypatch):
+    """The resolved STA list is scoped to ONLY the requested BSSID -- a
+    DIFFERENT BSSID's associated STAs in the same Kismet survey must never
+    bleed onto this designation (no cross-AP bleed)."""
+    db, _events = _setup(monkeypatch)
+    monkeypatch.setattr(srv, "KISMET_URL", "http://kismet:2501")
+    monkeypatch.setattr(srv, "KISMET_APIKEY", "apikey")
+    monkeypatch.setattr(
+        kismet_survey, "fetch_kismet_devices",
+        lambda url, key: [
+            _kismet_device(DJI_BSSID, client_macs=["DE:AD:BE:EF:00:01"]),
+            _kismet_device(OTHER_DJI_BSSID, client_macs=["11:22:33:44:55:66"]),
+        ],
+    )
+
+    await srv.designate_wifi_survey_uas(_body(), user=COMMANDER)
+
+    doc = db.detections.docs[0]
+    assert doc["bssid"] == DJI_BSSID
+    assert doc["associated_client_macs"] == ["DE:AD:BE:EF:00:01"]
+    assert "11:22:33:44:55:66".upper() not in doc["associated_client_macs"]

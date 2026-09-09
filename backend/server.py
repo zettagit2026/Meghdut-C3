@@ -5202,7 +5202,39 @@ async def designate_wifi_survey_uas(body: WifiSurveyDesignateBody,
             "(reclassify the registry entry first).",
         )
 
-    # (d) Synthesize the governed ingest + upsert (creates a contact only).
+    # (d) Resolve this BSSID's associated STA MACs SERVER-SIDE from a live
+    # Kismet survey (never trust a client-supplied list -- WifiSurveyDesignateBody
+    # carries none). Reuses the SAME kismet_survey.fetch_kismet_devices +
+    # parse_kismet_device pipeline GET /api/wifi-environment already uses, so the
+    # associated_client_map enumeration/normalization logic is never duplicated.
+    # Per-BSSID scoped: only the ONE row matching body.bssid is taken -- no
+    # cross-AP bleed. Honest degrade: an unconfigured/unreachable Kismet, or an
+    # AP Kismet has not seen a client associate to yet, yields [] -- the fire-time
+    # resolver then correctly (and honestly) refuses until a client is observed;
+    # this NEVER fabricates a target.
+    resolved_client_macs: List[str] = []
+    if KISMET_URL:
+        try:
+            devices = await asyncio.to_thread(
+                kismet_survey.fetch_kismet_devices, KISMET_URL, KISMET_APIKEY or None
+            )
+            target_bssid = body.bssid.strip().upper()
+            for raw in devices:
+                if not isinstance(raw, dict):
+                    continue
+                row = kismet_survey.parse_kismet_device(raw)
+                if (row.get("bssid") or "").strip().upper() == target_bssid:
+                    resolved_client_macs = row.get("associated_client_macs") or []
+                    break
+        except Exception as e:  # noqa: BLE001 -- honest degrade, never crash designate
+            logger.warning("wifi-survey designate: Kismet STA resolve failed: %s", e)
+    # Defense-in-depth mirror of the field's own bound (WifiDroneIngestBody.
+    # associated_client_macs Field(max_length=64)) -- kismet_survey already
+    # upper-cases/de-dupes; only cap here so an oversized live list degrades
+    # honestly instead of raising a validation error.
+    resolved_client_macs = resolved_client_macs[:64]
+
+    # (e) Synthesize the governed ingest + upsert (creates a contact only).
     designate_caveats = ["Manually designated from Wi-Fi survey; SSID/OUI spoofable — "
                          "candidate, not identification"]
     if commander_override_used:
@@ -5219,15 +5251,22 @@ async def designate_wifi_survey_uas(body: WifiSurveyDesignateBody,
         channel=body.channel,
         bssid=body.bssid,
         source="WIFI_SURVEY_MANUAL",
-        # (e) PMF carry: persisted onto the contact's `pmf` field so
+        # (f) PMF carry: persisted onto the contact's `pmf` field so
         # _wifi_target_has_pmf is truthful for a PMF-required AP downstream.
         pmf_required=body.pmf_required,
         pmf_supported=body.pmf_supported,
+        # (g) The associated_client_macs resolved server-side in (d) above --
+        # so the fire-time per-STA (unicast) deauth resolver
+        # (targets = body.client_macs or [client_mac] or
+        # detection.get("associated_client_macs") or []) has real targets on
+        # the survey -> designate -> wifi-defeat path, instead of an always-
+        # empty list that forced an honest-but-operability-breaking refusal.
+        associated_client_macs=resolved_client_macs,
         caveats=designate_caveats,
     )
     detection_id = await _upsert_wifi_drone_detection(synth, body.bssid, user)
 
-    # (f) F2 FRICTION: a commander-override designation of a NON-DRONE (possibly
+    # (h) F2 FRICTION: a commander-override designation of a NON-DRONE (possibly
     # civilian) AP is loudly, distinctly audited on top of the routine designate
     # audit — the deliberate promotion of an unverified/possibly-civilian AP is
     # never silent in the hash-chained trail.
@@ -5248,7 +5287,7 @@ async def designate_wifi_survey_uas(body: WifiSurveyDesignateBody,
             actor=user["email"],
         )
 
-    # (g) Distinct audit event.
+    # (i) Distinct audit event.
     await log_event(
         "WIFI_SURVEY_DESIGNATE",
         f"COMMANDER designated Wi-Fi survey AP bssid={body.bssid} ssid="
