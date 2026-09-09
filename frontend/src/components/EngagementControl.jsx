@@ -6,7 +6,7 @@ import TxStatusChips from "@/components/TxStatusChips";
 import TxOnlineControl from "@/components/TxOnlineControl";
 import ResumeTx from "@/components/ResumeTx";
 import EmergencyAbort from "@/components/EmergencyAbort";
-import { readTxSubsystem, anyRangeAuthArmed, toneColor, TONE } from "@/lib/engagementGate";
+import { readTxSubsystem, deriveReadiness, toneColor } from "@/lib/engagementGate";
 
 const POLL_INTERVAL_MS = 3000;
 
@@ -39,38 +39,12 @@ export default function EngagementControl() {
   }, [refresh]);
 
   const tx = readTxSubsystem(health);
-  const raArmed = anyRangeAuthArmed(tx);
 
-  // Single plain-language readiness verdict, worst-blocker first. This mirrors
-  // the order the backend gates actually fire in, so the operator always sees
-  // the NEXT thing to fix.
-  let readiness;
-  if (tx.tx_halted) {
-    readiness = {
-      tone: TONE.crit,
-      icon: ShieldAlert,
-      text: "Fire path BLOCKED — transmit is HALTED. A commander must RESUME TX.",
-    };
-  } else if (!tx.bridges_online) {
-    readiness = {
-      tone: TONE.warn,
-      icon: ShieldAlert,
-      text: "Not ready — TX bridges are OFFLINE. A commander must Bring TX Online.",
-    };
-  } else if (!raArmed) {
-    readiness = {
-      tone: TONE.warn,
-      icon: ShieldAlert,
-      text: "TX online — arm RANGE-AUTH for the intended effect before firing.",
-    };
-  } else {
-    readiness = {
-      tone: TONE.ok,
-      icon: ShieldCheck,
-      text: "Engagement path READY — TX online, halt cleared, range-auth armed.",
-    };
-  }
-  const RIcon = readiness.icon;
+  // Single plain-language readiness verdict, worst-blocker first — the SAME
+  // derivation the header strip uses (engagementGate.deriveReadiness), so this
+  // panel and the header can never disagree about what "ready" means.
+  const readiness = deriveReadiness(health);
+  const RIcon = readiness.ready ? ShieldCheck : ShieldAlert;
 
   return (
     <div
@@ -102,7 +76,7 @@ export default function EngagementControl() {
         >
           <RIcon size={14} strokeWidth={2} className="mt-0.5 shrink-0" />
           <span className="font-mono text-[11px] font-bold uppercase tracking-widest">
-            {readiness.text}
+            {readiness.detail}
           </span>
         </div>
 

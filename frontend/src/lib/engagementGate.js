@@ -1,10 +1,24 @@
 // engagementGate.js — shared logic for the operator-facing engage-flow.
 //
-// Two jobs:
+// Three jobs:
 //   1. deriveTxChips(health): turn the backend /health tx_subsystem block into
-//      plain-language, color-coded status chips (TX OFFLINE/ONLINE, TX
-//      HALTED/LIVE, SiK LINK up/down, TX RADIO 930c, RANGE-AUTH armed/none).
-//   2. classifyEngageBlock(): translate a BLOCKED fire — whether it came back
+//      plain-language, color-coded status chips, grouped so they parse
+//      structurally (group: "transmit" | "authorization" | "link") instead of
+//      one flat pipe-separated row. Labels are deliberately UNAMBIGUOUS: the
+//      transmit-bridge chip reads "TX BRIDGES: ONLINE/OFFLINE" and the master
+//      transmit-halt chip reads "MASTER-HALT: CLEARED/ENGAGED" so the two
+//      never sit side by side reading as opposites of the same word ("TX
+//      OFFLINE" next to "TX LIVE" was the S1 operator-reported confusion —
+//      those are two DIFFERENT subsystems: bridges being brought online vs.
+//      the master halt being cleared).
+//   2. deriveReadiness(health): the ONE plain-language fire-readiness verdict
+//      ("READY TO FIRE" vs "NOT READY — <single next action>"), worst-blocker
+//      first, mirroring the exact precondition order the backend gates fire
+//      in (tx_halted -> bridges_online -> range_auth). This is the single
+//      source of truth for that verdict — every surface that needs it
+//      (header strip, Engagement Control panel) calls this, never a second
+//      copy of the priority logic.
+//   3. classifyEngageBlock(): translate a BLOCKED fire — whether it came back
 //      as an HTTP error (tx-halt / range-auth) or as a 200 response that never
 //      actually transmitted (no TX bridge subscribed) — into a plain-language
 //      reason plus the ONE button that fixes it. A fielded operator must never
@@ -61,6 +75,14 @@ export function anyRangeAuthArmed(txSub) {
   return Object.values(ra).some((l) => l && l.enabled);
 }
 
+// Group labels for the header's clustered layout (GROUP, don't string) — the
+// UI reads these off each chip's `group` field rather than re-deriving them.
+export const CHIP_GROUP = {
+  transmit: "transmit",           // bridges-online + master-halt + radio identity
+  authorization: "authorization", // range-auth lease
+  link: "link",                   // SiK radio link
+};
+
 // Build the ordered chip list for the header indicator + the panel.
 export function deriveTxChips(health) {
   const tx = readTxSubsystem(health);
@@ -68,7 +90,11 @@ export function deriveTxChips(health) {
   return [
     {
       key: "tx-online",
-      label: tx.bridges_online ? "TX ONLINE" : "TX OFFLINE",
+      group: CHIP_GROUP.transmit,
+      // Deliberately "TX BRIDGES: …" — NEVER bare "TX ONLINE/OFFLINE" — so this
+      // can never be misread as the opposite of the master-halt chip below.
+      // This chip answers "are the transmit bridges brought up?".
+      label: tx.bridges_online ? "TX BRIDGES: ONLINE" : "TX BRIDGES: OFFLINE",
       tone: tx.bridges_online ? TONE.ok : TONE.warn,
       title: tx.bridges_online
         ? "Transmit bridges are online and own the SiK radio."
@@ -76,7 +102,11 @@ export function deriveTxChips(health) {
     },
     {
       key: "tx-halt",
-      label: tx.tx_halted ? "TX HALTED" : "TX LIVE",
+      group: CHIP_GROUP.transmit,
+      // Deliberately "MASTER-HALT: …" — NEVER bare "TX HALTED/LIVE" — so this
+      // can never be misread as the opposite of the TX-bridges chip above.
+      // This chip answers "is the master transmit halt (tx_halted) in effect?".
+      label: tx.tx_halted ? "MASTER-HALT: ENGAGED" : "MASTER-HALT: CLEARED",
       tone: tx.tx_halted ? TONE.crit : TONE.ok,
       title: tx.tx_halted
         ? "Master transmit halt is IN EFFECT — a commander must RESUME TX before firing."
@@ -84,6 +114,7 @@ export function deriveTxChips(health) {
     },
     {
       key: "sik-link",
+      group: CHIP_GROUP.link,
       // Owner-aware, honest label. UP is only ever set from genuine liveness the
       // backend proved (rf-bridge owns the SiK with a connected TX consumer, or a
       // recent sniffer RX). Show WHICH mode so "UP" is never ambiguous.
@@ -99,6 +130,7 @@ export function deriveTxChips(health) {
     },
     {
       key: "tx-radio",
+      group: CHIP_GROUP.transmit,
       label: `TX RADIO ${TX_RADIO_LABEL}`,
       tone: tx.bridges_online ? TONE.ok : TONE.idle,
       title: `Dedicated MAVLink TX radio (${TX_RADIO_LABEL}). ${
@@ -107,6 +139,7 @@ export function deriveTxChips(health) {
     },
     {
       key: "range-auth",
+      group: CHIP_GROUP.authorization,
       label: raArmed ? "RANGE-AUTH ARMED" : "RANGE-AUTH NONE",
       tone: raArmed ? TONE.ok : TONE.warn,
       title: raArmed
@@ -193,4 +226,53 @@ export function classifyEngageBlock({ error, response } = {}) {
   }
 
   return null;
+}
+
+// ---- Fire-readiness verdict --------------------------------------------------
+// THE single plain-language answer to "can I fire right now, and if not, what
+// is the ONE next action?" — worst-blocker-first, mirroring the exact order
+// the backend preconditions actually gate in (tx_halted -> bridges_online ->
+// range_auth). This does not evaluate a new rule; it reads the same
+// tx_subsystem state deriveTxChips reads and orders it by what the operator
+// must fix FIRST. Every surface that shows a readiness verdict (the header
+// strip, the Engagement Control panel) calls this — never a second copy of
+// the priority logic.
+export function deriveReadiness(health) {
+  const tx = readTxSubsystem(health);
+  const raArmed = anyRangeAuthArmed(tx);
+
+  if (tx.tx_halted) {
+    return {
+      ready: false,
+      tone: TONE.crit,
+      action: "RESUME TX",
+      fix: FIX.resume,
+      detail: "Fire path BLOCKED — transmit is HALTED. A commander must RESUME TX.",
+    };
+  }
+  if (!tx.bridges_online) {
+    return {
+      ready: false,
+      tone: TONE.warn,
+      action: "BRING TX ONLINE",
+      fix: FIX.online,
+      detail: "Not ready — TX bridges are OFFLINE. A commander must Bring TX Online.",
+    };
+  }
+  if (!raArmed) {
+    return {
+      ready: false,
+      tone: TONE.warn,
+      action: "ARM RANGE-AUTH",
+      fix: FIX.rangeAuth,
+      detail: "TX online — arm RANGE-AUTH for the intended effect before firing.",
+    };
+  }
+  return {
+    ready: true,
+    tone: TONE.ok,
+    action: null,
+    fix: null,
+    detail: "Engagement path READY — TX online, halt cleared, range-auth armed.",
+  };
 }
