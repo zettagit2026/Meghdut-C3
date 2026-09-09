@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { api, formatApiError } from "@/lib/api";
 import { toast } from "sonner";
@@ -241,7 +241,12 @@ export default function Jamming() {
   // frequency — still the ONE SafetyGate component/flow, just with added
   // checklist items for the specific target (no second confirmation
   // mechanism).
-  const gateChecks = [
+  // Stabilize the reference so SafetyGate's checklist-reset effect doesn't
+  // treat this page's frequent re-renders (e.g. the range-auth countdown
+  // ticking every second) as a checklist change and wipe the operator's
+  // ticks. Only recompute when the inputs that actually change the wording
+  // change.
+  const gateChecks = useMemo(() => [
     ...JAM_CHECKS,
     ...(isGnssTarget ? [
       "GNSS TARGET SELECTED: navigation-denial jamming reaches FAR beyond comms jamming " +
@@ -257,7 +262,7 @@ export default function Jamming() {
         "target. Range authorization confirmed to cover area denial of this channel/frequency " +
         "(governed by the range-authorization lease, NOT by BSSID).",
     ] : []),
-  ];
+  ], [isGnssTarget, hasCustomFreq, customFreqMhz]);
 
   const fireJam = async () => {
     setSubmitting(true);

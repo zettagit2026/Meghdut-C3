@@ -98,6 +98,15 @@ export default function SafetyGate({
   const [ackChecked, setAckChecked] = useState(false);
   const [typedAck, setTypedAck] = useState("");
 
+  // Callers (Jamming.jsx, GnssSpoof.jsx, etc.) build `checks` as a NEW array
+  // literal on every render, and this dialog's host pages re-render often
+  // (e.g. the range-auth "expires in MM:SS" countdown ticks every second).
+  // Keying the reset effect on the raw `checks` reference would wipe the
+  // operator's ticks on every such re-render even though the checklist TEXT
+  // never changed. Key on a stable content signature instead, so the reset
+  // only fires when the gate opens or the checklist content itself changes.
+  const checksKey = checks.join("␞");
+
   useEffect(() => {
     if (open) {
       setTicks(checks.map(() => false));
@@ -105,7 +114,8 @@ export default function SafetyGate({
       setAckChecked(false);
       setTypedAck("");
     }
-  }, [open, checks]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, checksKey]);
 
   const allTicked = ticks.every(Boolean);
   // In fratricide mode the confirm is gated behind commander role AND both the
